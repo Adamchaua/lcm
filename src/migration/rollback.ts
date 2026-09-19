@@ -114,7 +114,7 @@ import {
   type RollbackEligibilityDecision,
   type RollbackEligibilityObservation,
 } from "./rollback-eligibility.js";
-import { buildRollbackGeneration } from "./rollback-generation.js";
+import { buildRollbackGeneration, type RollbackGenerationOutcome } from "./rollback-generation.js";
 import { installRollbackGeneration } from "./rollback-install.js";
 import { materializeRollbackSidecars } from "./rollback-sidecars.js";
 
@@ -642,15 +642,23 @@ function publishManifest(
  *    branches (fresh start, resume a pending prepare-rollback, continue a
  *    completed prepare-rollback with no pending effect); steps 2-8 for
  *    every eligibility outcome; step 9/11's post-write generation
- *    build+install+materialize path; step 12's report persistence and
- *    effect completion for the post-write happy path.
- *  - NOT implemented, refusing explicitly rather than guessing: pre-write
- *    and unactivated reinstallation (step 9's "no data movement" case).
- *    Reinstalling the untouched #622-preserved source generation
- *    (rollbackLineage.preservedSourceGenerationId) requires resolving its
- *    on-disk artifact path, which sqlite-snapshot.ts does not currently
- *    export -- inventing a parallel path scheme here would be exactly the
- *    "production wrapper to bridge the gap" plan-v2 section 7 forbids.
+ *    build+install+materialize path; step 9/11's pre-write and
+ *    unactivated selection-reversal path -- no build, no install, no
+ *    sidecar materialization, no generation directory, per plan-v2
+ *    section 1's "Data movement: none" for both eligibilities and issue
+ *    #626's acceptance ("an exact selection reversal with no data
+ *    copy") -- corrected in this continuation from a predecessor's
+ *    blanket "not-implemented" refusal for every non-post-write mode,
+ *    which this file's own module doc's Boundary section had wrongly
+ *    reasoned required resolving the #622-preserved source generation's
+ *    on-disk path; step 12's report persistence and effect completion
+ *    for both the post-write and pre-write/unactivated paths.
+ *  - NOT implemented: nothing at step 9 or step 11 remains unimplemented
+ *    for any eligibility. The maintenance-selection flip
+ *    (prepareMaintenanceSelection / completeMaintenanceSelection) is
+ *    unconditional across every eligibility, which is what makes
+ *    pre-write and unactivated a real "selection reversal" rather than a
+ *    no-op.
  *  - Best-effort, flagged as needing review rather than presented as
  *    settled: step 12's abandonment path's explicit backend-selection
  *    reconciliation (see recoverPendingPublishRollback below).
@@ -849,31 +857,41 @@ async function runPostPrepareSequence(
       "internal: runPostPrepareSequence received a refused decision",
     );
   }
-  if (decision.mode !== "post-write") {
-    throw new RollbackOrchestrationError(
-      "not-implemented",
-      'rollback mode "' + decision.mode + '" (eligibility "' + decision.eligibility + '") requires '
-        + "reinstalling the preserved source generation (rollbackLineage.preservedSourceGenerationId), "
-        + "which this item does not implement -- see this item's status report",
-    );
-  }
+  const mode = decision.mode;
 
-  // Step 9: build, verify (post-write only). Sidecars materialize after
-  // install, once the generation's canonical bytes are final.
-  const source = await session.openPortableSource();
-  const built = await buildRollbackGeneration({
-    homeDir: input.homeDir,
-    generationId: input.generationId + "-rb" + working.revision,
-    projectIdentity: input.projectIdentity,
-    source,
-    scratchParent: input.scratchParent,
-    signal: input.signal,
-  });
-  if (built.state === "quarantined") {
-    throw new RollbackOrchestrationError(
-      "unexpected-state",
-      "rollback generation build failed and was quarantined: " + built.reason,
-    );
+  // Step 9: build, verify -- post-write only. Corrected by this item's
+  // continuation: plan-v2 section 1's eligibility table records "Data
+  // movement: none" for BOTH "unactivated" and "pre-write", because in
+  // neither eligibility was anything ever durably written past
+  // activation -- the live SQLite database at input.canonicalPath is
+  // still the correct, current image. Building a reconstruction and
+  // installing it over that live database would replace a correct
+  // database with a reconstruction, which issue #626's acceptance
+  // ("an exact selection reversal with no data copy") and this table
+  // both forbid; the predecessor's blanket "not-implemented" refusal for
+  // every non-post-write mode was itself the defect this continuation
+  // corrects, not a conservative placeholder to keep. Sidecars
+  // materialize only after install, once a generation's canonical bytes
+  // are final, so they are skipped identically for pre-write: whatever
+  // sidecars already sit beside the live database are untouched by this
+  // rollback, exactly like the database itself.
+  let built: RollbackGenerationOutcome | null = null;
+  if (mode === "post-write") {
+    const source = await session.openPortableSource();
+    built = await buildRollbackGeneration({
+      homeDir: input.homeDir,
+      generationId: input.generationId + "-rb" + working.revision,
+      projectIdentity: input.projectIdentity,
+      source,
+      scratchParent: input.scratchParent,
+      signal: input.signal,
+    });
+    if (built.state === "quarantined") {
+      throw new RollbackOrchestrationError(
+        "unexpected-state",
+        "rollback generation build failed and was quarantined: " + built.reason,
+      );
+    }
   }
 
   // Step 10: revalidate under a NEW snapshot, never step 4's/9's own.
@@ -911,11 +929,31 @@ async function runPostPrepareSequence(
     mode: revalidatedDecision.mode,
   });
 
-  // Section 18: written BEFORE the selection is prepared, and only when
-  // there is an authoritative attempt to bind evidence to. See this
-  // item's status report on why "unactivated" writes neither binding:
-  // there is no prior activation for replay admission to have ever
-  // routed against, so there is nothing for this rollback to supersede.
+  // Section 18: written BEFORE the selection is prepared. Gated on
+  // authority.status === "authoritative" rather than on mode, because the
+  // binding names the ACTIVATION epoch/attempt this rollback reverses
+  // (epochId/attemptId above), and "unactivated" authority carries
+  // neither -- rollback-eligibility.ts's ActivationAuthority "unactivated"
+  // variant is exactly `{ status: "unactivated" }`, no fields, so there
+  // is genuinely nothing to name.
+  //
+  // OPEN QUESTION flagged to the owner rather than guessed (see this
+  // item's status report). This continuation's instruction was "write
+  // the rollback witness binding" even for "unactivated", reasoning that
+  // "an unactivated rollback is still an attempt that happened" (section
+  // 18). That is correct in the witnessed-but-unpublished sub-case -- an
+  // activation attempt WAS witnessed (fixtureWitnessedButUnpublished
+  // proves this state is reachable) but never selected, and "unactivated"
+  // is exactly that sub-case's outcome -- but resolveActivationAuthority's
+  // current, already-tested return shape discards that witness and
+  // returns the bare unactivated status with no epochId/attemptId to
+  // bind. Widening it to carry the witness would also break
+  // rollback-eligibility.test.ts's existing exact
+  // `.toEqual({ status: "unactivated" })` assertions against that same
+  // fixture, which read as an intentional decision to keep "unactivated"
+  // dataless. This item does not silently pick a side: no witness
+  // binding is written for "unactivated" here, and the tension is
+  // reported rather than resolved by guessing.
   if (authority.status === "authoritative") {
     deps.recordWitnessBinding({
       homeDir: input.homeDir,
@@ -932,18 +970,32 @@ async function runPostPrepareSequence(
 
   // Step 11: install precedes publication -- while PostgreSQL is still
   // the durably selected backend -- then flip maintenance selection to
-  // sqlite.
-  const installOutcome = installRollbackGeneration({
-    homeDir: input.homeDir,
-    generationId: built.generationId,
-    canonicalPath: input.canonicalPath,
-    verifiedDatabasePath: built.databasePath,
-  });
-  materializeRollbackSidecars({
-    homeDir: input.homeDir,
-    databasePath: installOutcome.canonicalPath,
-    localProjectId: input.localProjectId,
-  });
+  // sqlite. Post-write only: pre-write and unactivated install nothing
+  // and materialize no sidecars, because the live database at
+  // input.canonicalPath already IS the correct generation and its
+  // existing sidecars are untouched -- see step 9's comment above. The
+  // maintenance selection flip immediately below is unconditional: it is
+  // the actual "selection reversal" issue #626 asks pre-write and
+  // unactivated to perform, for every eligibility.
+  if (mode === "post-write") {
+    if (built === null || built.state !== "verified") {
+      throw new RollbackOrchestrationError(
+        "unexpected-state",
+        "internal: post-write mode reached step 11 without a verified built generation",
+      );
+    }
+    const installOutcome = installRollbackGeneration({
+      homeDir: input.homeDir,
+      generationId: built.generationId,
+      canonicalPath: input.canonicalPath,
+      verifiedDatabasePath: built.databasePath,
+    });
+    materializeRollbackSidecars({
+      homeDir: input.homeDir,
+      databasePath: installOutcome.canonicalPath,
+      localProjectId: input.localProjectId,
+    });
+  }
 
   const heldChecksum = requireMaintenanceChecksum(input.homeDir);
   const prepared = await deps.coordinator.prepareMaintenanceSelection({
@@ -1243,4 +1295,3 @@ async function recoverPendingPublishRollback(
     return { manifest: working, report };
   });
 }
-
