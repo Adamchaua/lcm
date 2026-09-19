@@ -25,13 +25,13 @@ import { createMigrationManifest } from "../../src/migration/protocol.js";
 
 const roots: string[] = [];
 
-// classifyMigrationCandidateOccupancy/resolveMigrationGenerationId require a
-// lock token only as compile-time proof the caller holds one (section 4.9
-// exposure 1, layer 1); neither function validates liveness. Real callers
-// obtain a real token from withBackendPublicationAppendBarrierAsync /
-// withBackendPublicationRetainedAppendAdmissionAsync, exercised directly in
-// the layer-2 tests below; this fixed placeholder is enough for the tests
-// in this file that are not themselves about the token.
+// classifyMigrationCandidateOccupancy now runtime-verifies the token via
+// assertBackendPublicationConsumerAccess (section 4.9 exposure 1, layer 1),
+// so every test that actually reaches that call uses a real token from
+// withBackendPublicationAppendBarrierAsync below. This fixed placeholder
+// remains valid only for the handful of tests whose input is rejected
+// before the occupancy check ever runs (an overlong base, a missing base,
+// an invalid probe-ordinal bound) — none of those consult the token.
 const DUMMY_LOCK_TOKEN = {} as BackendPublicationLockToken;
 
 afterEach(() => {
@@ -194,10 +194,26 @@ describe("computeMigrationGenerationBase", () => {
 });
 
 describe("classifyMigrationCandidateOccupancy (section 4.3 two-tree occupancy)", () => {
+  it("refuses permit-mismatch for a dummy, non-live token, proving section 4.9 exposure 1 layer 1 is runtime-enforced and not only a compile-time signature (red: this is exactly what a token-shaped placeholder that satisfies the type but holds no real admission would slip past if this assertion were removed)", async () => {
+    const home = makeHome();
+    await expect(classifyMigrationCandidateOccupancy({ lockToken: DUMMY_LOCK_TOKEN, generationId: "generation-1", homeDir: home }))
+      .rejects.toMatchObject({ reason: "permit-mismatch" });
+  });
+
+  it("accepts a real, live token acquired from withBackendPublicationAppendBarrierAsync (the positive control for the permit-mismatch test above: the same call succeeds once the token is genuinely active)", async () => {
+    const home = makeHome();
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      const result = await classifyMigrationCandidateOccupancy({ lockToken: token, generationId: "generation-1", homeDir: home });
+      expect(result).toEqual({ status: "free" });
+    });
+  });
+
   it("is free when both trees are authoritatively absent", async () => {
     const home = makeHome();
-    const result = await classifyMigrationCandidateOccupancy({ lockToken: DUMMY_LOCK_TOKEN, generationId: "generation-1", homeDir: home });
-    expect(result).toEqual({ status: "free" });
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      const result = await classifyMigrationCandidateOccupancy({ lockToken: token, generationId: "generation-1", homeDir: home });
+      expect(result).toEqual({ status: "free" });
+    });
   });
 
   it("is occupied when the snapshot is absent but the manifest is present (red: checking only the snapshot tree would wrongly free this candidate)", async () => {
@@ -211,8 +227,10 @@ describe("classifyMigrationCandidateOccupancy (section 4.3 two-tree occupancy)",
       preservedSourceGenerationId: "generation-1",
       createdAt: "2026-08-12T12:00:00.000Z",
     }));
-    const result = await classifyMigrationCandidateOccupancy({ lockToken: DUMMY_LOCK_TOKEN, generationId: "generation-1", homeDir: home, manifestStore: store });
-    expect(result).toEqual({ status: "occupied" });
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      const result = await classifyMigrationCandidateOccupancy({ lockToken: token, generationId: "generation-1", homeDir: home, manifestStore: store });
+      expect(result).toEqual({ status: "occupied" });
+    });
   });
 
   it("refuses when the manifest side is unresolvable, and never reports free (red: absence-by-catch would report free here)", async () => {
@@ -222,7 +240,8 @@ describe("classifyMigrationCandidateOccupancy (section 4.3 two-tree occupancy)",
     chmodSync(migrations, 0o755);
     let result: MigrationCandidateOccupancy;
     try {
-      result = await classifyMigrationCandidateOccupancy({ lockToken: DUMMY_LOCK_TOKEN, generationId: "generation-1", homeDir: home });
+      result = await withBackendPublicationAppendBarrierAsync(home, (token) =>
+        classifyMigrationCandidateOccupancy({ lockToken: token, generationId: "generation-1", homeDir: home }));
     } finally {
       chmodSync(migrations, 0o700);
     }
@@ -236,8 +255,10 @@ describe("classifyMigrationCandidateOccupancy (section 4.3 two-tree occupancy)",
     // asking the occupancy function to interpret it.
     expect(await classifySqliteSnapshotArtifact("generation-1", { homeDir: home }))
       .toEqual({ state: "partial", generationId: "generation-1" });
-    expect(await classifyMigrationCandidateOccupancy({ lockToken: DUMMY_LOCK_TOKEN, generationId: "generation-1", homeDir: home }))
-      .toEqual({ status: "occupied" });
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      expect(await classifyMigrationCandidateOccupancy({ lockToken: token, generationId: "generation-1", homeDir: home }))
+        .toEqual({ status: "occupied" });
+    });
   });
 
   it("refuses a replaced snapshot rather than advancing past it (red: treating replaced like partial would occupy-not-refuse)", async () => {
@@ -245,8 +266,10 @@ describe("classifyMigrationCandidateOccupancy (section 4.3 two-tree occupancy)",
     writeReplacedSnapshotFixture(home, "generation-1");
     expect(await classifySqliteSnapshotArtifact("generation-1", { homeDir: home }))
       .toEqual({ state: "replaced", generationId: "generation-1" });
-    expect(await classifyMigrationCandidateOccupancy({ lockToken: DUMMY_LOCK_TOKEN, generationId: "generation-1", homeDir: home }))
-      .toEqual({ status: "refuse", evidence: "snapshot-replaced" });
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      expect(await classifyMigrationCandidateOccupancy({ lockToken: token, generationId: "generation-1", homeDir: home }))
+        .toEqual({ status: "refuse", evidence: "snapshot-replaced" });
+    });
   });
 
   it("refuses a tampered snapshot rather than advancing past it", async () => {
@@ -254,44 +277,54 @@ describe("classifyMigrationCandidateOccupancy (section 4.3 two-tree occupancy)",
     writeTamperedSnapshotFixture(home, "generation-1");
     expect(await classifySqliteSnapshotArtifact("generation-1", { homeDir: home }))
       .toEqual({ state: "tampered", generationId: "generation-1" });
-    expect(await classifyMigrationCandidateOccupancy({ lockToken: DUMMY_LOCK_TOKEN, generationId: "generation-1", homeDir: home }))
-      .toEqual({ status: "refuse", evidence: "snapshot-tampered" });
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      expect(await classifyMigrationCandidateOccupancy({ lockToken: token, generationId: "generation-1", homeDir: home }))
+        .toEqual({ status: "refuse", evidence: "snapshot-tampered" });
+    });
   });
 
   it("treats a complete snapshot as occupied without consulting the manifest tree", async () => {
     const home = makeHome();
     const fakeComplete: SqliteSnapshotClassification = { state: "complete", witness: {} as never };
-    const result = await classifyMigrationCandidateOccupancy({ lockToken: DUMMY_LOCK_TOKEN,
-      generationId: "generation-1",
-      homeDir: home,
-      _operationsForTesting: { classifySnapshot: async () => fakeComplete },
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      const result = await classifyMigrationCandidateOccupancy({ lockToken: token,
+        generationId: "generation-1",
+        homeDir: home,
+        _operationsForTesting: { classifySnapshot: async () => fakeComplete },
+      });
+      expect(result).toEqual({ status: "occupied" });
     });
-    expect(result).toEqual({ status: "occupied" });
   });
 
   it("refuses when the real classifier throws its own typed error (a malformed generation id)", async () => {
     await expect(classifySqliteSnapshotArtifact("bad id", { homeDir: makeHome() }))
       .rejects.toBeInstanceOf(SqliteSnapshotError);
     const home = makeHome();
-    const result = await classifyMigrationCandidateOccupancy({ lockToken: DUMMY_LOCK_TOKEN, generationId: "bad id", homeDir: home });
-    expect(result).toEqual({ status: "refuse", evidence: "snapshot-invalid-input" });
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      const result = await classifyMigrationCandidateOccupancy({ lockToken: token, generationId: "bad id", homeDir: home });
+      expect(result).toEqual({ status: "refuse", evidence: "snapshot-invalid-input" });
+    });
   });
 
   it("propagates an unrecognised (non-SqliteSnapshotError) failure rather than fabricating evidence for it", async () => {
     const home = makeHome();
-    await expect(classifyMigrationCandidateOccupancy({ lockToken: DUMMY_LOCK_TOKEN,
-      generationId: "generation-1",
-      homeDir: home,
-      _operationsForTesting: { classifySnapshot: async () => { throw new Error("unexpected shape"); } },
-    })).rejects.toThrow("unexpected shape");
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      await expect(classifyMigrationCandidateOccupancy({ lockToken: token,
+        generationId: "generation-1",
+        homeDir: home,
+        _operationsForTesting: { classifySnapshot: async () => { throw new Error("unexpected shape"); } },
+      })).rejects.toThrow("unexpected shape");
+    });
   });
 });
 
 describe("resolveMigrationGenerationId (section 4.1 probe ordinal)", () => {
   it("takes ordinal 0 when nothing occupies it", async () => {
     const home = makeHome();
-    const result = await resolveMigrationGenerationId({ lockToken: DUMMY_LOCK_TOKEN, base: "base", homeDir: home });
-    expect(result).toEqual({ generationId: "base-0", probedOrdinals: 1 });
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      const result = await resolveMigrationGenerationId({ lockToken: token, base: "base", homeDir: home });
+      expect(result).toEqual({ generationId: "base-0", probedOrdinals: 1 });
+    });
   });
 
   it("advances past occupied ordinals to the first free one, and this is the cutover-collision regression: completing generation N must mint N+1, never reuse N (red: a resolver that never advances would loop forever or reuse an occupied id)", async () => {
@@ -307,8 +340,10 @@ describe("resolveMigrationGenerationId (section 4.1 probe ordinal)", () => {
         createdAt: "2026-08-12T12:00:00.000Z",
       }));
     }
-    const result = await resolveMigrationGenerationId({ lockToken: DUMMY_LOCK_TOKEN, base: "base", homeDir: home, manifestStore: store });
-    expect(result).toEqual({ generationId: "base-2", probedOrdinals: 3 });
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      const result = await resolveMigrationGenerationId({ lockToken: token, base: "base", homeDir: home, manifestStore: store });
+      expect(result).toEqual({ generationId: "base-2", probedOrdinals: 3 });
+    });
   });
 
   it("refuses probe-bound-exceeded rather than looping once every ordinal up to the bound is occupied", async () => {
@@ -324,8 +359,10 @@ describe("resolveMigrationGenerationId (section 4.1 probe ordinal)", () => {
         createdAt: "2026-08-12T12:00:00.000Z",
       }));
     }
-    await expect(resolveMigrationGenerationId({ lockToken: DUMMY_LOCK_TOKEN, base: "base", homeDir: home, manifestStore: store, maxProbeOrdinal: 1 }))
-      .rejects.toMatchObject({ reason: "probe-bound-exceeded" });
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      await expect(resolveMigrationGenerationId({ lockToken: token, base: "base", homeDir: home, manifestStore: store, maxProbeOrdinal: 1 }))
+        .rejects.toMatchObject({ reason: "probe-bound-exceeded" });
+    });
   });
 
   it("refuses identifier-bound-exceeded rather than minting an out-of-pattern or overlong id", async () => {
@@ -338,8 +375,10 @@ describe("resolveMigrationGenerationId (section 4.1 probe ordinal)", () => {
   it("propagates occupancy refusal evidence rather than skipping a refused candidate", async () => {
     const home = makeHome();
     writeTamperedSnapshotFixture(home, "base-0");
-    await expect(resolveMigrationGenerationId({ lockToken: DUMMY_LOCK_TOKEN, base: "base", homeDir: home }))
-      .rejects.toMatchObject({ reason: "occupancy-refused", evidence: "snapshot-tampered" });
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      await expect(resolveMigrationGenerationId({ lockToken: token, base: "base", homeDir: home }))
+        .rejects.toMatchObject({ reason: "occupancy-refused", evidence: "snapshot-tampered" });
+    });
   });
 
   it("rejects a missing base identity", async () => {
@@ -413,4 +452,3 @@ describe("resolveConfirmedMigrationGenerationId (section 4.9 exposure 1, layer 2
     });
   });
 });
-

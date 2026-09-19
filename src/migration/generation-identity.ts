@@ -1,5 +1,6 @@
 import {
   backendPublicationCanonicalSha256,
+  assertBackendPublicationConsumerAccess,
   type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
 import {
@@ -152,16 +153,34 @@ export type MigrationCandidateOccupancyOperations = Readonly<{
  * Never deletes or advances anything itself; the caller decides what a
  * `refuse` or `occupied` result means for the probe loop.
  *
- * `lockToken` (section 4.9 exposure 1, layer 1) is required but not
- * validated here: neither underlying read (`classifySqliteSnapshotArtifact`,
- * `probeManifestPresence`) consumes it, and this module has no exported way
- * to verify a token is currently active (that check is a module-private
- * `WeakSet` inside `backend-publication.ts`). Requiring the parameter is a
- * compile-time proof of possession, not a runtime guarantee of liveness: the
- * only way to obtain a token at all is from inside an active
- * `withBackendPublicationAppendBarrierAsync` /
- * `withBackendPublicationRetainedAppendAdmissionAsync` callback, so a caller
- * that cannot supply one cannot compile.
+ * `lockToken` (section 4.9 exposure 1, layer 1) is both a compile-time proof
+ * of possession and, now, a runtime-verified liveness check: this function
+ * opens by calling the exported `assertBackendPublicationConsumerAccess`
+ * with the token, which reaches the module-private `assertLockToken` and
+ * throws `permit-mismatch` for a dummy or revoked token
+ * (`backend-publication.ts:1677`, verified empirically — a fabricated token
+ * object is rejected, a real token from an active
+ * `withBackendPublicationAppendBarrierAsync` span is accepted). Neither
+ * underlying occupancy read (`classifySqliteSnapshotArtifact`,
+ * `probeManifestPresence`) consumes the token itself; this call is the sole
+ * source of the liveness guarantee.
+ *
+ * This assertion is scoped deliberately to occupancy classification, never
+ * to continuation. `assertBackendPublicationConsumerAccess` also asserts
+ * ordinary consumer access, which is fenced while a non-terminal maintenance
+ * hold exists (verified empirically: a genuinely live token refuses
+ * `unresolved-publication` against a `maintenance-held` journal). Occupancy
+ * classification only ever runs when no hold exists yet or the hold is
+ * terminal (absent or `probe-fresh`, section 4.2), so the assertion is
+ * exercised exactly where it is safe and never against a held journal it
+ * would incorrectly refuse. Do not reuse this assertion on the continuation
+ * path.
+ *
+ * A thrown `permit-mismatch` (or any other assertion failure) propagates
+ * rather than being converted into a `refuse` result: it represents a
+ * violation of this function's own calling convention — an invalid or dead
+ * token — not a legitimate business outcome the probe loop should
+ * interpret.
  */
 export async function classifyMigrationCandidateOccupancy(input: Readonly<{
   generationId: string;
@@ -178,6 +197,7 @@ export async function classifyMigrationCandidateOccupancy(input: Readonly<{
    */
   _operationsForTesting?: Partial<MigrationCandidateOccupancyOperations>;
 }>): Promise<MigrationCandidateOccupancy> {
+  assertBackendPublicationConsumerAccess({ homeDir: input.homeDir, lockToken: input.lockToken });
   const classify = input._operationsForTesting?.classifySnapshot ?? classifySqliteSnapshotArtifact;
   let snapshot: SqliteSnapshotClassification;
   try {
