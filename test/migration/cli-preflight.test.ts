@@ -147,7 +147,7 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
     expect(verifyReachability).not.toHaveBeenCalled();
   });
 
-  it("refuses daemon-presence-unresolvable distinctly from daemon-not-running (the two are not the same branch)", async () => {
+  it("refuses daemon-presence-unresolvable -- the only presence outcome that refuses (both present and authoritatively-absent proceed to ready, proven by the two tests below)", async () => {
     const fixture = await enrolled();
     const result = await resolveMigrationPreflight({
       cwd: fixture.cwd,
@@ -160,20 +160,21 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
     expect(result).toEqual({ status: "refuse", reason: "daemon-presence-unresolvable", evidence: "pidfile-live-no-answer" });
   });
 
-  it("refuses daemon-not-running for a real, positive absence -- never folded into the unresolvable case (red: collapsing this into the same branch as unresolvable would report the wrong evidence field and the wrong exit class)", async () => {
+  it("proceeds to ready when presence is authoritatively-absent -- a positively confirmed absence is establishing presence, not a refusal (red: refusing here would force an operator to start a daemon purely to pass this check, immediately before a hold that makes that very daemon's sweeps fail)", async () => {
     const fixture = await enrolled();
-    const verifyReachability = vi.fn();
     const result = await resolveMigrationPreflight({
       cwd: fixture.cwd,
       homeDir: fixture.homeDir,
       _operationsForTesting: {
         resolveTargetConfig: succeedingTargetConfig,
         classifyPresence: async () => ({ status: "authoritatively-absent" as const }),
-        verifyReachability,
+        verifyReachability: async () => verifiedReachability(),
+        resolveIdentity: () => fabricatedIdentity(fixture.local),
       },
     });
-    expect(result).toEqual({ status: "refuse", reason: "daemon-not-running" });
-    expect(verifyReachability).not.toHaveBeenCalled();
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") throw new Error("unreachable");
+    expect(result.presence).toEqual({ status: "authoritatively-absent" });
   });
 
   it("refuses with the reachability verifier's own reason and evidence when target verification fails, never proceeding to identity resolution", async () => {
@@ -287,7 +288,7 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
     expect(result).toEqual({ status: "refuse", reason: "continuation-mismatched-hold" });
   });
 
-  it("uses the real classifyMigrationDaemonPresence default (no injection): a fresh home with no daemon really is authoritatively-absent, landing on daemon-not-running", async () => {
+  it("uses the real classifyMigrationDaemonPresence default (no injection): a fresh home with no daemon really is authoritatively-absent, and preflight proceeds past it rather than refusing -- landing on the next real step's own refusal (target reachability against an unreachable host) instead", async () => {
     const fixture = await enrolled();
     const result = await resolveMigrationPreflight({
       cwd: fixture.cwd,
@@ -296,7 +297,8 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
         resolveTargetConfig: succeedingTargetConfig,
       },
     });
-    expect(result).toEqual({ status: "refuse", reason: "daemon-not-running" });
+    expect(result.status).toBe("refuse");
+    expect((result as { reason: string }).reason).toMatch(/^migration-target-verification-/);
   });
 
   it("uses the real verifyMigrationTargetReachability default (no injection): a genuinely unreachable target really fails verification, landing on a verification refusal", async () => {

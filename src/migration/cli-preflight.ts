@@ -33,18 +33,36 @@ import {
  *
  * **Never collapses a three-valued primitive into a boolean at this call
  * site.** `classifyMigrationDaemonPresence`'s three outcomes are handled as
- * three distinct branches below, not `if (present) ... else refuse`:
- * `unresolvable` refuses exit 5 (evidence could not be established) and
- * `authoritatively-absent` refuses exit 2 (a real, different fact -- no
- * daemon is running, and the operator has a real action: start one) rather
- * than being folded into the same case as `unresolvable`.
+ * three distinct branches below, not `if (present) ... else refuse`. Only
+ * `unresolvable` refuses (exit 5: evidence could not be established).
+ * `present` and `authoritatively-absent` both proceed -- they are two
+ * different positively-established facts, carried through to the caller
+ * distinctly, but neither is a refusal.
+ *
+ * **Why a positively confirmed absence proceeds rather than refuses.**
+ * Section 7 says `apply` "must positively establish daemon presence ...
+ * and refuses exit 5 when it cannot" -- "cannot establish" means
+ * `unresolvable`, not "established the answer is none". A confirmed
+ * absence *is* establishing presence; the established answer happens to be
+ * "no daemon". Refusing on absence would also be actively harmful: nothing
+ * in this migration needs a daemon (the daemon is a *consumer* of storage,
+ * not a participant in the copy), and section 7's policy already treats a
+ * running daemon as merely *permitted*, not required -- refusing here would
+ * force an operator to start a daemon purely to pass this check,
+ * immediately before a maintenance hold that makes that very daemon's
+ * passive-event sweeps fail for the whole capture-and-copy window. That is
+ * precisely the condition this check exists to warn about, not require.
+ * Section 6's restart-requirement precedent treats the identical
+ * observation (no pid file, no live process) as authoritative absence
+ * yielding exit 0 "no daemon to restart" -- this contract must not disagree
+ * with itself between sections 6 and 7.
  */
 
 export type MigrationPreflightResult =
   | Readonly<{
     status: "ready";
     targetConfig: ResolvedPostgreSqlConfig;
-    presence: Extract<MigrationDaemonPresence, { status: "present" }>;
+    presence: Extract<MigrationDaemonPresence, { status: "present" } | { status: "authoritatively-absent" }>;
     candidate: Extract<MigrationApplyCandidateResolution, { status: "candidate" }>;
     expectedIdentity: StorageIdentityContext;
     base: string;
@@ -94,11 +112,10 @@ export async function resolveMigrationPreflight(input: Readonly<{
   if (presence.status === "unresolvable") {
     return { status: "refuse", reason: "daemon-presence-unresolvable", evidence: presence.evidence };
   }
-  if (presence.status === "authoritatively-absent") {
-    // A real, different fact from "unresolvable": we positively know no
-    // daemon is running, and the operator has a real action (start one).
-    return { status: "refuse", reason: "daemon-not-running" };
-  }
+  // `present` and `authoritatively-absent` both proceed from here: neither
+  // is a refusal (see this module's own doc comment for why absence is not
+  // treated as a precondition failure). `presence` is now typed as exactly
+  // those two remaining variants and is carried through unchanged.
 
   // 3. Target reachability: a real connection, TLS and role verified.
   const verification = await verifyReachability({

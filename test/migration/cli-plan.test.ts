@@ -18,7 +18,7 @@ function home(): string {
 }
 
 describe("performMigrationPlan: entirely non-mutating, reports the shared preflight's result", () => {
-  it("maps a ready preflight into an ok outcome with the candidate id, disposition and daemon storage backend", async () => {
+  it("maps a ready preflight into an ok outcome with the candidate id, disposition and the full daemon presence, carried through rather than flattened", async () => {
     const homeDir = home();
     const result = await performMigrationPlan({
       cwd: join(homeDir, "project"),
@@ -36,7 +36,29 @@ describe("performMigrationPlan: entirely non-mutating, reports the shared prefli
       status: "ok",
       generationId: "generation-0",
       disposition: "fresh",
-      daemonStorageBackend: "postgresql",
+      daemonPresence: { status: "present", storageBackend: "postgresql", pid: 1, daemonInstanceId: "gen-1" },
+    });
+  });
+
+  it("maps a ready preflight with an authoritatively-absent daemon into an ok outcome carrying that exact presence, distinct from the present case above (red: a boolean-flattened or dropped presence field could not tell these two apart)", async () => {
+    const homeDir = home();
+    const result = await performMigrationPlan({
+      cwd: join(homeDir, "project"),
+      homeDir,
+      _preflight: async () => ({
+        status: "ready",
+        targetConfig: {} as never,
+        presence: { status: "authoritatively-absent" },
+        candidate: { status: "candidate", disposition: "fresh", generationId: "generation-0" },
+        expectedIdentity: {} as never,
+        base: "base-identity",
+      }),
+    });
+    expect(result).toEqual({
+      status: "ok",
+      generationId: "generation-0",
+      disposition: "fresh",
+      daemonPresence: { status: "authoritatively-absent" },
     });
   });
 

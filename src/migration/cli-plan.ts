@@ -1,4 +1,5 @@
 import { resolveMigrationPreflight, type MigrationPreflightResult } from "./cli-preflight.js";
+import type { MigrationDaemonPresence } from "./daemon-presence.js";
 
 /**
  * The `plan` command's CLI orchestration (section 3): entirely
@@ -17,7 +18,15 @@ export type MigrationPlanOutcome =
     status: "ok";
     generationId: string;
     disposition: string;
-    daemonStorageBackend: string;
+    /**
+     * The shared preflight's own daemon-presence classification, carried
+     * through unchanged rather than flattened. Both `present` (with its
+     * observed backend, which may disagree with the live config -- that
+     * disagreement is #1384's condition and a finding, not noise) and
+     * `authoritatively-absent` reach this point; `unresolvable` refuses
+     * upstream in the shared preflight and never reaches here.
+     */
+    daemonPresence: Extract<MigrationDaemonPresence, { status: "present" } | { status: "authoritatively-absent" }>;
   }>
   | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
 
@@ -39,6 +48,6 @@ export async function performMigrationPlan(input: Readonly<{
     status: "ok",
     generationId: preflight.candidate.generationId,
     disposition: preflight.candidate.disposition,
-    daemonStorageBackend: preflight.presence.storageBackend,
+    daemonPresence: preflight.presence,
   };
 }

@@ -171,9 +171,3 @@ describe("MIGRATION_REFUSAL_REASONS covers the target-reachability verification 
     },
   );
 });
-
-describe("MIGRATION_REFUSAL_REASONS covers cli-preflight's own daemon-not-running reason", () => {
-  it("covers real reason daemon-not-running", () => {
-    expect(() => migrationRefusalMapping("daemon-not-running")).not.toThrow();
-  });
-});

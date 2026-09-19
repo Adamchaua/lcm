@@ -224,10 +224,6 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     reason: "daemon-presence-unresolvable", exitClass: "refused-evidence",
     remedy: "Daemon presence could not be positively established. Run `lcm daemon status`, resolve the failure, and retry.",
   }),
-  Object.freeze({
-    reason: "daemon-not-running", exitClass: "refused-precondition",
-    remedy: "No daemon is running. Run `lcm daemon start` before retrying.",
-  }),
 
   // --- abort's own refusals, classified by classifyMigrationAbortRefusal
   // (abort.ts) rather than by the raw evidence string, for the exact
