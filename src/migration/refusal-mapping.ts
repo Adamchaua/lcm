@@ -37,6 +37,32 @@ export type MigrationRefusalMapping = Readonly<{
  * an unresumable state.
  */
 export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Object.freeze([
+  // --- Section 4.4/4.9's genesis-and-copy ownership plumbing, and the
+  // target resolution the root ruled on (docs/migration-operations.md
+  // documents storage.backend vs storage.postgresql's split explicitly). ---
+  Object.freeze({
+    reason: "unbound-postgresql-project", exitClass: "refused-precondition",
+    remedy: "This project has no PostgreSQL project binding. Run `lcm project create` (new project) or `lcm project link <project-id>` (existing project) from the project directory.",
+  }),
+  Object.freeze({
+    reason: "invalid-expected-owner", exitClass: "refused-precondition",
+    remedy: "storage.postgresql.migrationRole (or LCM_POSTGRES_MIGRATION_ROLE) is not a valid PostgreSQL role name. Fix the configured value before retrying.",
+  }),
+  Object.freeze({
+    reason: "migration-target-missing", exitClass: "refused-precondition",
+    remedy: "No usable PostgreSQL target is configured. Set storage.postgresql (url, caFile, migrationRole) or the LCM_POSTGRES_URL / LCM_POSTGRES_CA_FILE / LCM_POSTGRES_MIGRATION_ROLE environment variables.",
+  }),
+  Object.freeze({
+    reason: "migration-target-unresolvable", exitClass: "refused-evidence",
+    remedy: "The PostgreSQL target configuration could not be read or parsed. Run `lcm doctor` before retrying.",
+  }),
+
+  // --- dry-run's own refusal (section 3: owns dryRunAuthenticatedSqliteMigrationSource only) ---
+  Object.freeze({
+    reason: "dry-run-failed", exitClass: "refused-evidence",
+    remedy: "The SQLite source could not be dry-run checked. Run `lcm doctor` before retrying.",
+  }),
+
   // --- Section 4.2: journal observation ---
   Object.freeze({
     reason: "publication-occupies-slot", exitClass: "refused-contention",

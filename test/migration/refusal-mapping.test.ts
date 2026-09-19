@@ -126,3 +126,26 @@ describe("MIGRATION_REFUSAL_REASONS covers abort.ts's classified reasons", () =>
     },
   );
 });
+
+describe("MIGRATION_REFUSAL_REASONS covers the target-resolution and ownership reasons", () => {
+  const REASONS_TARGET_AND_OWNERSHIP_CAN_EMIT = [
+    "unbound-postgresql-project",
+    "invalid-expected-owner",
+    "migration-target-missing",
+    "migration-target-unresolvable",
+    "dry-run-failed",
+  ];
+
+  it.each(REASONS_TARGET_AND_OWNERSHIP_CAN_EMIT)(
+    "covers real reason %s",
+    (reason) => {
+      expect(() => migrationRefusalMapping(reason)).not.toThrow();
+    },
+  );
+
+  it("unbound-postgresql-project's remedy names both lcm project create and lcm project link, per identity-context.ts's own UNBOUND_POSTGRESQL_PROJECT_MESSAGE", () => {
+    const entry = migrationRefusalMapping("unbound-postgresql-project");
+    expect(entry.remedy).toContain("lcm project create");
+    expect(entry.remedy).toContain("lcm project link");
+  });
+});
