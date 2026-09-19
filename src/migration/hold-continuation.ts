@@ -15,8 +15,8 @@ export type MigrationHoldCandidate = Readonly<{
 }>;
 
 export type MigrationHoldDisposition =
-  | Readonly<{ action: "recover-entering" }>
-  | Readonly<{ action: "continue-held" }>
+  | Readonly<{ action: "recover-entering"; observedChecksumSha256: string }>
+  | Readonly<{ action: "continue-held"; observedChecksumSha256: string }>
   | Readonly<{ action: "refuse"; reason: "mismatched-hold" }>
   | Readonly<{ action: "refuse"; reason: "resume-required" }>
   | Readonly<{ action: "probe-fresh" }>;
@@ -66,6 +66,19 @@ function matchesHeldStableFields(
  *   here — `BackendMaintenancePhase` is exhausted below, so adding a phase
  *   without updating this function fails to compile rather than starting a
  *   fresh cutover on an unrecognised state.
+ *
+ * Section 4.9's second exposure: this journal is mutable, and the
+ * classification above is a snapshot of it taken at one moment. Both
+ * actionable dispositions (`recover-entering`, `continue-held`) carry the
+ * exact `checksumSha256` this function observed, so the caller can pass it
+ * on as the compare-and-swap input to whatever it calls next
+ * (`enterMaintenance`'s `expectedChecksumSha256` for a recovered entering
+ * journal; capture's `maintenanceChecksumSha256`, which `revalidate` already
+ * compares, for a continued hold) — never re-read at the point of use. A
+ * re-read would silently turn a compare-and-swap into a read-modify-write:
+ * the journal could move between this classification and the caller's next
+ * step, and a freshly re-read checksum would agree with whatever it moved
+ * to, defeating the comparison it exists to make.
  */
 export function resolveMigrationHoldContinuation(input: Readonly<{
   journal: BackendMaintenanceJournal;
@@ -73,10 +86,12 @@ export function resolveMigrationHoldContinuation(input: Readonly<{
 }>): MigrationHoldDisposition {
   const { journal, candidate } = input;
   if (journal.phase === "maintenance-entering") {
-    return { action: "recover-entering" };
+    return { action: "recover-entering", observedChecksumSha256: journal.checksumSha256 };
   }
   if (journal.phase === "maintenance-held") {
-    if (matchesHeldStableFields(journal, candidate)) return { action: "continue-held" };
+    if (matchesHeldStableFields(journal, candidate)) {
+      return { action: "continue-held", observedChecksumSha256: journal.checksumSha256 };
+    }
     return { action: "refuse", reason: "mismatched-hold" };
   }
   if (journal.phase === "selection-prepared") {

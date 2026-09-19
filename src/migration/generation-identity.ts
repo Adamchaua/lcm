@@ -194,6 +194,25 @@ export type MigrationGenerationIdResolution = Readonly<{
  * candidate is free (section 4.3), refusing rather than looping when the
  * identifier bound or the probe bound would be exceeded, or either tree
  * cannot be classified.
+ *
+ * **Calling convention, binding (section 4.9 exposure 1):** neither this
+ * function nor `classifyMigrationCandidateOccupancy` takes or checks a lock
+ * token, because the trees they read (`classifySqliteSnapshotArtifact`,
+ * `MigrationManifestStore.probeManifestPresence`) are themselves lock-free
+ * reads by design. That means the free/occupied conclusion this function
+ * reaches is a conclusion about one moment, and a concurrent local actor
+ * could occupy the returned ordinal immediately afterward if nothing holds
+ * the window shut. The caller (`apply`) is required to acquire the section
+ * 4.8 retained append admission (`withBackendPublicationRetainedAppendAdmissionAsync`)
+ * **before** calling this function, and to keep the hold and the capture
+ * that consume its result inside that same retained span — never call this
+ * function first and acquire the token afterward. This binds same-host
+ * actors only, which is the only class the publication lock binds at all;
+ * that residue is stated rather than hidden. #622's capture supplies an
+ * independent second defence (it re-classifies after private sampling and
+ * refuses "SQLite migration generation appeared before capture binding"),
+ * and the two defences are deliberately not merged — each must be able to
+ * fail on its own.
  */
 export async function resolveMigrationGenerationId(input: Readonly<{
   base: string;

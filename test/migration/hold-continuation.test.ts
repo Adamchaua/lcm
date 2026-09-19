@@ -85,7 +85,7 @@ describe("resolveMigrationHoldContinuation (section 4.5 continuation)", () => {
       journal: entering,
       candidate: candidateFor(held, { sourceSelectionSha256: "totally-unrelated-value-should-not-matter" }),
     });
-    expect(result).toEqual({ action: "recover-entering" });
+    expect(result).toEqual({ action: "recover-entering", observedChecksumSha256: entering.checksumSha256 });
   });
 
   it("continues a held journal after a real rebind moved queueEvidenceSha256, roster[0].queueCutoff and roster[0].evidenceSha256, because none of those are stable fields (red: comparing any of them would wrongly refuse a live, correct hold)", async () => {
@@ -110,7 +110,7 @@ describe("resolveMigrationHoldContinuation (section 4.5 continuation)", () => {
     expect(rebound.sourceSelectionSha256).toBe(held.sourceSelectionSha256);
 
     const result = resolveMigrationHoldContinuation({ journal: rebound, candidate: candidateFor(held) });
-    expect(result).toEqual({ action: "continue-held" });
+    expect(result).toEqual({ action: "continue-held", observedChecksumSha256: rebound.checksumSha256 });
   });
 
   it("refuses a genuinely different selection against a real held journal (red: this must not be confused with the rebind-drift case above)", async () => {
@@ -168,7 +168,7 @@ describe("resolveMigrationHoldContinuation (section 4.5 continuation)", () => {
     const home = makeHome();
     const held = await heldJournal(home);
     const result = resolveMigrationHoldContinuation({ journal: held, candidate: candidateFor(held) });
-    expect(result).toEqual({ action: "continue-held" });
+    expect(result).toEqual({ action: "continue-held", observedChecksumSha256: held.checksumSha256 });
   });
 
   it("routes selection-prepared to resume-required", async () => {
@@ -223,5 +223,65 @@ describe("resolveMigrationHoldContinuation (section 4.5 continuation)", () => {
     const unrecognised = { ...held, phase: "a-future-phase-not-yet-invented" as unknown as BackendMaintenanceJournal["phase"] };
     expect(() => resolveMigrationHoldContinuation({ journal: unrecognised, candidate: candidateFor(held) }))
       .toThrow(/unreachable migration maintenance phase/u);
+  });
+});
+
+describe("section 4.9's second exposure: the observed checksum must be carried, never re-read, at the point of use", () => {
+  it("carrying the observed checksum into enterMaintenance's recovery refuses once the journal has moved; re-reading instead of carrying would wrongly succeed on the moved state (red-first, both directions shown)", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    rewriteJournal(home, (journal) => ({ ...journal, phase: "maintenance-entering" }));
+    const entering = readBackendMaintenanceJournal(home)!;
+
+    const disposition = resolveMigrationHoldContinuation({
+      journal: entering,
+      candidate: candidateFor(held),
+    });
+    expect(disposition).toEqual({ action: "recover-entering", observedChecksumSha256: entering.checksumSha256 });
+
+    // The journal moves between observation and use: updatedAt changes, so
+    // the checksum changes, while every field enterMaintenance's own
+    // recovery comparison checks (publicationId, generationId,
+    // sourceSelectionSha256, queueEvidenceSha256, roster) stays identical.
+    // This models a second legitimate writer touching the journal in the
+    // gap, not a corruption.
+    rewriteJournal(home, (journal) => ({ ...journal, updatedAt: "2026-08-12T13:00:00.000Z" }));
+    const moved = readBackendMaintenanceJournal(home)!;
+    expect(moved.checksumSha256).not.toBe(entering.checksumSha256);
+    expect(moved.publicationId).toBe(entering.publicationId);
+    expect(moved.generationId).toBe(entering.generationId);
+    expect(moved.sourceSelectionSha256).toBe(entering.sourceSelectionSha256);
+    expect(moved.queueEvidenceSha256).toBe(entering.queueEvidenceSha256);
+    expect(moved.roster).toEqual(entering.roster);
+
+    // Carried: refuses, because the CAS input no longer matches what is on
+    // disk. This is the correct, required behaviour.
+    await expect(coordinatorFor(home).enterMaintenance({
+      publicationId: held.publicationId,
+      generationId: held.generationId,
+      sourceSelectionSha256: held.sourceSelectionSha256,
+      queueEvidenceSha256: held.queueEvidenceSha256,
+      roster: held.roster,
+      expectedChecksumSha256: disposition.observedChecksumSha256,
+    })).rejects.toMatchObject({ reason: "unexpected-state" });
+
+    // Positive control confirming the journal is genuinely still at
+    // maintenance-entering and untouched by the refused call above.
+    expect(readBackendMaintenanceJournal(home)!.checksumSha256).toBe(moved.checksumSha256);
+
+    // Re-read instead of carried: this is the defect the plan names. Using
+    // a freshly re-read checksum as the CAS input always agrees with
+    // whatever is currently on disk, so it wrongly succeeds even though the
+    // state moved between observation and use.
+    const reReadChecksum = readBackendMaintenanceJournal(home)!.checksumSha256;
+    const recovered = await coordinatorFor(home).enterMaintenance({
+      publicationId: held.publicationId,
+      generationId: held.generationId,
+      sourceSelectionSha256: held.sourceSelectionSha256,
+      queueEvidenceSha256: held.queueEvidenceSha256,
+      roster: held.roster,
+      expectedChecksumSha256: reReadChecksum,
+    });
+    expect(recovered.phase).toBe("maintenance-held");
   });
 });
