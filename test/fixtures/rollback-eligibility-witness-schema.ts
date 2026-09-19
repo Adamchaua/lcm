@@ -23,6 +23,7 @@ import type {
   MigrationSelectionBinding,
   MigrationWitnessBinding,
   MigrationWitnessResolution,
+  OperabilityFactResolution,
   RollbackModeClassification,
   RollbackModeClassifier,
 } from "../../src/migration/rollback-eligibility.js";
@@ -189,3 +190,19 @@ export function fixtureUnresolvable(reason: string): MigrationWitnessResolution 
   return { state: "unresolvable", reason };
 }
 
+// ---------------------------------------------------------------------------
+// Operability-fact fixtures, coordinator-seam-FROZEN.md v6 section 16.
+// Boundary C: #626 owns the production reader, so these are plain builders
+// for the already-resolved value -- not a mock of the production I/O path,
+// which is exercised for real in test/migration/backend-publication-operability.test.ts.
+// ---------------------------------------------------------------------------
+
+export function fixtureOperabilityPresent(valueSha256 = "e".repeat(64)): OperabilityFactResolution {
+  return { state: "present", valueSha256 };
+}
+
+export const fixtureOperabilityAbsent: OperabilityFactResolution = { state: "authoritatively-absent" };
+
+export function fixtureOperabilityUnresolvable(reason: string): OperabilityFactResolution {
+  return { state: "unresolvable", reason };
+}

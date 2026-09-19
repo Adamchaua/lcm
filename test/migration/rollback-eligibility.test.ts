@@ -23,6 +23,9 @@ import {
   fixtureCanonicalDelta,
   fixtureCensusVector,
   fixtureDestinationIdentity,
+  fixtureOperabilityAbsent,
+  fixtureOperabilityPresent,
+  fixtureOperabilityUnresolvable,
   fixtureResolvedWithActivationSelection,
   fixtureSchemaWitness,
   fixtureUnresolvable,
@@ -39,7 +42,7 @@ describe("resolveActivationAuthority", () => {
       witnessChecksumSha256: "a".repeat(64),
       publicationId: "publication-1",
     });
-    const authority = resolveActivationAuthority(resolution);
+    const authority = resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityAbsent });
     expect(authority).toEqual({
       status: "authoritative",
       selection: {
@@ -51,6 +54,23 @@ describe("resolveActivationAuthority", () => {
         publicationId: "publication-1",
       },
     });
+  });
+
+  it("resolves to authoritative when a binding exists even though the destination is currently operable -- the operability fact is irrelevant once a binding is published", () => {
+    // Same premise as the previous test with the operability fact flipped
+    // to "present". Row 3 of section 15's table: any activation binding
+    // present wins regardless of the operability fact's state. If the
+    // implementation ever started consulting the operability fact before
+    // checking for a binding, this would wrongly refuse.
+    const resolution = fixtureResolvedWithActivationSelection({
+      epochId: "epoch-1",
+      attemptId: "attempt-1",
+      manifestRevision: 3,
+      witnessChecksumSha256: "a".repeat(64),
+      publicationId: "publication-1",
+    });
+    const authority = resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityPresent() });
+    expect(authority.status).toBe("authoritative");
   });
 
   it("resolves to unactivated when the only selection binding is kind rollback, not activation", () => {
@@ -69,10 +89,11 @@ describe("resolveActivationAuthority", () => {
         publicationId: "publication-1",
       }],
     };
-    expect(resolveActivationAuthority(resolution)).toEqual({ status: "unactivated" });
+    expect(resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityAbsent }))
+      .toEqual({ status: "unactivated" });
   });
 
-  it("resolves to unactivated for the witnessed-but-unpublished state", () => {
+  it("resolves to unactivated for the witnessed-but-unpublished state when the destination is not yet operable", () => {
     const resolution = fixtureWitnessedButUnpublished({
       epochId: "epoch-2",
       attemptId: "attempt-2",
@@ -81,25 +102,104 @@ describe("resolveActivationAuthority", () => {
     });
     expect(resolution.state).toBe("resolved");
     expect((resolution as { witnesses: unknown[] }).witnesses).toHaveLength(1);
-    expect(resolveActivationAuthority(resolution)).toEqual({ status: "unactivated" });
+    expect(resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityAbsent }))
+      .toEqual({ status: "unactivated" });
   });
 
   it("resolves to unactivated for authoritative absence, and to refused for unresolvability -- proving the two are not collapsed", () => {
-    expect(resolveActivationAuthority(fixtureAuthoritativelyAbsent)).toEqual({ status: "unactivated" });
-    const unresolvable = resolveActivationAuthority(fixtureUnresolvable("artifact directory read failed"));
+    expect(resolveActivationAuthority({ resolution: fixtureAuthoritativelyAbsent, operabilityFact: fixtureOperabilityAbsent }))
+      .toEqual({ status: "unactivated" });
+    const unresolvable = resolveActivationAuthority({
+      resolution: fixtureUnresolvable("artifact directory read failed"),
+      operabilityFact: fixtureOperabilityAbsent,
+    });
     expect(unresolvable.status).toBe("refused");
     // Substituting one state for the other must change the answer. If a
     // caller ever collapsed "authoritatively-absent" into "unresolvable"
     // (or vice versa) this equality would start failing in one direction.
-    expect(resolveActivationAuthority(fixtureAuthoritativelyAbsent))
-      .not.toEqual(resolveActivationAuthority(fixtureUnresolvable("artifact directory read failed")));
+    expect(resolveActivationAuthority({ resolution: fixtureAuthoritativelyAbsent, operabilityFact: fixtureOperabilityAbsent }))
+      .not.toEqual(resolveActivationAuthority({
+        resolution: fixtureUnresolvable("artifact directory read failed"),
+        operabilityFact: fixtureOperabilityAbsent,
+      }));
   });
 
-  it("refuses when the resolution is unresolvable, carrying the reason", () => {
-    expect(resolveActivationAuthority(fixtureUnresolvable("home directory could not be opened"))).toEqual({
+  it("refuses when the witness resolution is unresolvable, carrying which resolver and reason", () => {
+    expect(resolveActivationAuthority({
+      resolution: fixtureUnresolvable("home directory could not be opened"),
+      operabilityFact: fixtureOperabilityAbsent,
+    })).toEqual({
       status: "refused",
-      reason: "activation authority is unresolvable: home directory could not be opened",
+      reason: "witness-resolution:unresolvable: home directory could not be opened",
     });
+  });
+
+  it("refuses when the operability fact is unresolvable, carrying which resolver and reason -- even though the witness resolution is cleanly resolved", () => {
+    // Breakable independently of the previous test: witness resolution is
+    // healthy here (authoritatively-absent, not itself unresolvable); only
+    // the operability fact is unresolvable. This proves the operability
+    // resolver's own unresolvable branch is checked, not merely that some
+    // unresolvable field anywhere produces a refusal.
+    expect(resolveActivationAuthority({
+      resolution: fixtureAuthoritativelyAbsent,
+      operabilityFact: fixtureOperabilityUnresolvable("lock contention"),
+    })).toEqual({
+      status: "refused",
+      reason: "operability-fact:unresolvable: lock contention",
+    });
+  });
+
+  it("refuses when the operability fact is unresolvable even though an activation binding exists -- row 4 overrides row 3", () => {
+    // The table's row 4 ("unresolvable | any") takes precedence over row 3
+    // ("binding present -> normal classification") regardless of the
+    // binding's presence. Breakable by reordering the checks: if the
+    // binding-present branch ran first, this would wrongly resolve to
+    // authoritative instead of refusing.
+    const resolution = fixtureResolvedWithActivationSelection({
+      epochId: "epoch-1",
+      attemptId: "attempt-1",
+      manifestRevision: 3,
+      witnessChecksumSha256: "a".repeat(64),
+      publicationId: "publication-1",
+    });
+    expect(resolveActivationAuthority({
+      resolution,
+      operabilityFact: fixtureOperabilityUnresolvable("unsafe storage"),
+    })).toEqual({
+      status: "refused",
+      reason: "operability-fact:unresolvable: unsafe storage",
+    });
+  });
+
+  it("refuses as published-but-unbound, never unactivated, when the destination is operable but no binding exists -- section 15's core repair", () => {
+    // This is the exact destructive-direction defect section 15 exists to
+    // close: version 4 would have answered "unactivated" here (empty
+    // selections), licensing a pre-write reversal that discards committed
+    // writes the destination already has. Paired with the next test, which
+    // flips only the operability fact and gets "unactivated" instead --
+    // proving this branch is the operability fact, not the resolution shape
+    // (which is identical, "witnessed but unpublished", in both tests).
+    const resolution = fixtureWitnessedButUnpublished({
+      epochId: "epoch-3",
+      attemptId: "attempt-3",
+      manifestRevision: 2,
+      witnessChecksumSha256: "f".repeat(64),
+    });
+    const decision = resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityPresent() });
+    expect(decision.status).toBe("refused");
+    expect(decision).not.toEqual({ status: "unactivated" });
+    expect((decision as { reason: string }).reason).toContain("published-but-unbound");
+  });
+
+  it("resolves to unactivated on the identical resolution shape when the operability fact is authoritatively absent instead of present", () => {
+    const resolution = fixtureWitnessedButUnpublished({
+      epochId: "epoch-3",
+      attemptId: "attempt-3",
+      manifestRevision: 2,
+      witnessChecksumSha256: "f".repeat(64),
+    });
+    expect(resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityAbsent }))
+      .toEqual({ status: "unactivated" });
   });
 
   it("takes the last activation-kind selection when more than one is present", () => {
@@ -120,7 +220,8 @@ describe("resolveActivationAuthority", () => {
       publicationId: "publication-newer",
     };
     const resolution = { state: "resolved" as const, witnesses: [], selections: [older, newer] };
-    expect(resolveActivationAuthority(resolution)).toEqual({ status: "authoritative", selection: newer });
+    expect(resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityAbsent }))
+      .toEqual({ status: "authoritative", selection: newer });
   });
 });
 

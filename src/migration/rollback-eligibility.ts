@@ -1,23 +1,31 @@
 /**
  * Pure rollback-eligibility decision logic for item #626.
  *
- * BOUNDARY NOTE (read before touching this file). Two couplings in this
+ * BOUNDARY NOTE (read before touching this file). Three couplings in this
  * module are deliberately left as required dependency-injected parameters
- * rather than imports, because the modules that own them do not exist on
- * `main` yet:
+ * rather than imports:
  *
  *  - `classifyRollbackMode` is owned by #624's `src/migration/activation-witness.ts`.
  *  - the witness/selection resolution consumed by {@link resolveActivationAuthority}
  *    is produced by #625's implementation of `resolveMigrationWitnessBindings`
  *    (coordinator-seam-FROZEN.md v4 section 14).
+ *  - the operability-fact resolution consumed by {@link resolveActivationAuthority}
+ *    (coordinator-seam-FROZEN.md v6 sections 15-16). Unlike the two boundaries
+ *    above, #626 owns this reader's production implementation, and its
+ *    dependencies are already merged on `main`. It is still injected as an
+ *    already-resolved value, per this module's no-I/O invariant below; the
+ *    production reader (the consumer lock, `readBackendPublicationJournal`,
+ *    `captureBackendPublicationState`) lives beside rollback.ts's
+ *    orchestration, where the "read before prepare()" ordering constraint
+ *    section 16 requires is enforced.
  *
- * Neither dependency has a default or fallback implementation anywhere in
+ * None of the three has a default or fallback implementation anywhere in
  * this file. There is nothing here that could silently satisfy a production
  * caller with wrong behavior if the real implementation is never wired in --
  * every caller, test or production, must supply an actual function. That is
- * what keeps this from type-checking as a production wrapper around either
- * missing module. Once #624 and #625 land, replace the local type mirrors
- * below with imports from their real modules and delete this note.
+ * what keeps this from type-checking as a production wrapper around any of
+ * them. Once #624 and #625 land, replace the local type mirrors below with
+ * imports from their real modules and delete that part of this note.
  *
  * This module performs no I/O. Every input is data the caller already
  * fetched (a live readback, a resolved witness/selection index, or a fully
@@ -172,9 +180,57 @@ export type RollbackModeClassifier = (
 ) => RollbackModeClassification;
 
 // ---------------------------------------------------------------------------
+// coordinator-seam-FROZEN.md v6 section 16 (adds to section 15). The
+// operability fact for a PostgreSQL destination: whether a version-2
+// backend publication journal sits in the live slot at phase "completed"
+// targeting "postgresql" -- the fact that makes the destination operable,
+// compared as a value rather than inferred from ordering or timing.
+// Boundary C. #626 owns the production reader (unlike Boundaries A and B);
+// this module still consumes only the already-resolved value.
+// ---------------------------------------------------------------------------
+
+export type OperabilityFactResolution =
+  | Readonly<{ state: "present"; valueSha256: string }>
+  | Readonly<{ state: "authoritatively-absent" }>
+  | Readonly<{ state: "unresolvable"; reason: string }>;
+
+/**
+ * Boundary C. #626 owns the production implementation: read the live
+ * `BackendPublicationJournal` (never the maintenance journal, and never by
+ * delegating to `assertBackendPublicationConsumerAccess` or
+ * `PostgreSqlStorageBackendFactory.capturePublicationWitness`, both of
+ * which throw identically for "the journal names a different backend" and
+ * for "the read itself failed" -- exactly the collapsed absence this
+ * boundary exists to avoid) under the backend-publication consumer lock,
+ * and classify three-valued:
+ *
+ *  - `present`: the read succeeded and the journal is non-null, phase
+ *    `completed`, `targetBackend` `postgresql`. `valueSha256` is
+ *    `backendPublicationCanonicalSha256` over the same four-field witness
+ *    shape the factory computes (`journalChecksum`, `journalPhase`,
+ *    `targetBackend`, `stateSha256` from `captureBackendPublicationState`),
+ *    so both consumers of this fact compare identical bytes.
+ *  - `authoritatively-absent`: the read succeeded and the journal is null,
+ *    or its phase or target is not that exact combination.
+ *  - `unresolvable`: the read itself did not succeed (lock contention,
+ *    unsafe storage, an unreadable or malformed journal, including the
+ *    in-progress-maintenance case where the live slot currently holds a
+ *    maintenance journal instead of a publication journal).
+ *
+ * MUST be read during eligibility, before this item's own `prepare()` runs
+ * (plan-v2 section 5 step 7): `prepare()` archives the live publication
+ * slot out of the live position, so a read taken afterward observes the
+ * rollback's own publication rather than the fact being asked about.
+ */
+export type OperabilityFactResolver = (
+  input: Readonly<{ homeDir: string }>,
+) => Promise<OperabilityFactResolution>;
+
+// ---------------------------------------------------------------------------
 // Section 12 (epoch absence, one direction only) as amended by section 14
-// (witnesses/selections split). Pure: takes an already-resolved
-// MigrationWitnessResolution, never performs the read itself.
+// (witnesses/selections split) and by sections 15-16 (the operability
+// fact). Pure: takes already-resolved MigrationWitnessResolution and
+// OperabilityFactResolution values, never performs either read itself.
 // ---------------------------------------------------------------------------
 
 export type ActivationAuthority =
@@ -183,35 +239,92 @@ export type ActivationAuthority =
   | Readonly<{ status: "refused"; reason: string }>;
 
 /**
- * Decides activation authority per coordinator-seam-FROZEN.md v4 section 14:
- * `unactivated` iff no selection binding of kind `activation` appears
- * anywhere in `selections`. This is a positively published fact, never an
- * inference from witness presence, epoch presence, or any journal phase.
+ * Decides activation authority per coordinator-seam-FROZEN.md v6 sections 15
+ * and 16. Version 4's rule -- `unactivated` iff no selection binding of
+ * kind `activation` appears anywhere in `selections` -- is WRONG and
+ * superseded: between the moment the destination becomes operable and the
+ * moment the selection binding is durably written, an empty `selections`
+ * means "not written yet", not "never published". Concluding `unactivated`
+ * there licenses a pre-write reversal that discards committed writes.
  *
- * `authoritatively-absent` and `unresolvable` are never collapsed: absence
- * resolves to `unactivated` (no selection was ever published, so nothing to
- * discard), while an unresolvable read refuses outright. Substituting one
- * for the other must change this function's answer, and it does, by
- * construction of the branch below.
+ * Section 15's table, decided in this order:
+ *
+ * 1. The operability fact unresolvable, or the witness resolution
+ *    unresolvable -- refuse, regardless of whether a binding exists. Both
+ *    are read failures and neither licenses any conclusion.
+ * 2. An activation selection binding exists -- normal classification
+ *    against the attempt it names, regardless of the operability fact's
+ *    state (present or authoritatively-absent). A published binding is
+ *    authority on its own; the operability fact matters only when no
+ *    binding exists yet.
+ * 3. No activation selection binding, operability fact authoritatively
+ *    absent -- `unactivated`. No selection was ever published.
+ * 4. No activation selection binding, operability fact present -- refuse,
+ *    "published but unbound". NEVER `unactivated`: the destination is
+ *    already operable under postgresql and the binding simply has not been
+ *    durably written yet.
+ *
+ * No branch collapses `authoritatively-absent` and `unresolvable`, for
+ * either resolver: substituting one for the other must change this
+ * function's answer, and it does, by construction of the branches below.
+ * Every refusal branch names which resolver and which of its three states
+ * produced it, so a consumer (#627, an operator) does not have to re-derive
+ * the attribution from a bare failure.
  */
-export function resolveActivationAuthority(
-  resolution: MigrationWitnessResolution,
-): ActivationAuthority {
+export function resolveActivationAuthority(input: Readonly<{
+  resolution: MigrationWitnessResolution;
+  operabilityFact: OperabilityFactResolution;
+}>): ActivationAuthority {
+  const { resolution, operabilityFact } = input;
+
+  // Row 4 first and unconditionally: an unresolvable operability fact
+  // refuses regardless of whether a binding exists, because we cannot
+  // attribute the missing binding (if any) to genuine absence.
+  if (operabilityFact.state === "unresolvable") {
+    return {
+      status: "refused",
+      reason: `operability-fact:unresolvable: ${operabilityFact.reason}`,
+    };
+  }
   if (resolution.state === "unresolvable") {
-    return { status: "refused", reason: `activation authority is unresolvable: ${resolution.reason}` };
+    return {
+      status: "refused",
+      reason: `witness-resolution:unresolvable: ${resolution.reason}`,
+    };
   }
-  if (resolution.state === "authoritatively-absent") {
-    return { status: "unactivated" };
+
+  // resolution.state is "authoritatively-absent" or "resolved"; a non-empty
+  // "witnesses" array with an empty "selections" array (the reachable
+  // "witnessed but unpublished" state) collapses into the same "no binding"
+  // case as "authoritatively-absent" here -- both mean no selection has
+  // been published, and the operability fact (not witness presence) is
+  // what distinguishes "never activated" from "activated, not yet bound".
+  const activationSelections = resolution.state === "resolved"
+    ? resolution.selections.filter((selection) => selection.kind === "activation")
+    : [];
+
+  // Row 3: any activation binding present, regardless of the operability
+  // fact -- normal classification against the attempt it names.
+  if (activationSelections.length > 0) {
+    const authoritative = activationSelections[activationSelections.length - 1]!;
+    return { status: "authoritative", selection: authoritative };
   }
-  // state === "resolved". A non-empty "witnesses" array with an empty
-  // "selections" array is the reachable "witnessed but unpublished" state
-  // (an ordinary crash between persisting a witness and preparing its
-  // selection) and resolves to "unactivated" here for the same reason as
-  // authoritative absence: no selection was ever published.
-  const activationSelections = resolution.selections.filter((selection) => selection.kind === "activation");
-  if (activationSelections.length === 0) return { status: "unactivated" };
-  const authoritative = activationSelections[activationSelections.length - 1]!;
-  return { status: "authoritative", selection: authoritative };
+
+  // No activation binding. Row 2 (operability fact present): refuse,
+  // published-but-unbound, never unactivated -- discarding the destination
+  // here would be a pre-write reversal over committed writes.
+  if (operabilityFact.state === "present") {
+    return {
+      status: "refused",
+      reason: "operability-fact:published-but-unbound: destination is "
+        + "operable under postgresql but no activation selection binding "
+        + "is bound yet",
+    };
+  }
+
+  // Row 1: operability fact authoritatively absent and no activation
+  // binding anywhere -- no selection was ever published.
+  return { status: "unactivated" };
 }
 
 // ---------------------------------------------------------------------------
@@ -327,4 +440,3 @@ export function evaluateRollbackEligibility(input: Readonly<{
   if (classification.mode === "pre-write") return { eligibility: "pre-write", mode: "pre-write" };
   return { eligibility: "post-write", mode: "post-write" };
 }
-
