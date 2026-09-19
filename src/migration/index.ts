@@ -35,3 +35,28 @@ export { inspectAuthenticatedSqliteMigrationSnapshot } from "./queue-evidence.js
 export type { AuthenticatedSqliteMigrationSnapshot, MigrationReceiptReference } from "./queue-evidence.js";
 export { runSqliteMigrationCopy, inspectSqliteMigrationCopy, MigrationCopyError } from './batch-copy.js';
 export type { SqliteMigrationCopyInput, MigrationCopyBoundary, MigrationCopyTestingDependencies } from './batch-copy.js';
+
+export {
+  readBackendPublicationOperabilityFact,
+  deriveRollbackPublicationId,
+  deriveRollbackPrepareInputSha256,
+  deriveRollbackReportId,
+  writeRollbackReport,
+  readRollbackReport,
+  runMigrationRollback,
+  RollbackOrchestrationError,
+} from "./rollback.js";
+export type {
+  MigrationSelectionBindingRecorder,
+  MigrationWitnessBindingRecorder,
+  RollbackAuthoritativeContextResolver,
+  RollbackFencedSession,
+  OpenRollbackFencedSession,
+  RollbackReportBody,
+  ComputeRollbackTerminalEvidenceInput,
+  RollbackTerminalEvidenceComputer,
+  RunMigrationRollbackDependencies,
+  RunMigrationRollbackInput,
+  RunMigrationRollbackOutcome,
+  RollbackOrchestrationErrorReason,
+} from "./rollback.js";

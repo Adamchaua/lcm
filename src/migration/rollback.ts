@@ -78,6 +78,7 @@ import {
 } from "../security-files.js";
 import { canonicalJson, canonicalSha256, sha256 } from "../storage/portable-record.js";
 import type { PortableRecordStream } from "../storage/portable-record-stream.js";
+import type { PortableProjectIdentity } from "../storage/portable-record-stream.js";
 import {
   BackendPublicationJournalError,
   backendPublicationCanonicalSha256,
@@ -85,18 +86,37 @@ import {
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
   withBackendPublicationConsumerLockAsync,
+  withBackendPublicationAppendBarrierAsync,
+  BackendPublicationCoordinator,
   type BackendPublicationLockToken,
+  type BackendMaintenanceRosterEntry,
 } from "../storage/backend-publication.js";
 import {
   MigrationProtocolError,
+  abandonMigrationEffect,
+  beginMigrationEffect,
+  classifyMigrationRecovery,
+  completeMigrationEffect,
   type MigrationManifest,
+  type MigrationReportReference,
 } from "./protocol.js";
+import { MigrationManifestStore } from "./manifest-store.js";
 import {
+  evaluateRollbackEligibility,
+  resolveActivationAuthority,
+  type ActivationAuthority,
   type MigrationSelectionBinding,
+  type MigrationWitnessBinding,
+  type MigrationWitnessResolver,
   type OperabilityFactResolution,
+  type RollbackModeClassifier,
   type RollbackAuthoritativeContext,
+  type RollbackEligibilityDecision,
   type RollbackEligibilityObservation,
 } from "./rollback-eligibility.js";
+import { buildRollbackGeneration } from "./rollback-generation.js";
+import { installRollbackGeneration } from "./rollback-install.js";
+import { materializeRollbackSidecars } from "./rollback-sidecars.js";
 
 const MAX_REPORT_BYTES = 64 * 1024;
 
@@ -312,6 +332,12 @@ export interface RollbackFencedSession {
   }>): Promise<RollbackEligibilityObservation>;
   /** Opens the source #626 exports from for post-write generation build. */
   openPortableSource(): Promise<PortableRecordStream>;
+  /**
+   * EXTENSION added by this item's continuation (see the standalone doc
+   * comment above ComputeRollbackTerminalEvidenceInput for why). Not part
+   * of the originally committed interface.
+   */
+  computeRollbackTerminalEvidenceSha256(input: ComputeRollbackTerminalEvidenceInput): string;
   release(): Promise<void>;
 }
 
@@ -420,3 +446,801 @@ export function readRollbackReport(
   }
   return parsed;
 }
+
+
+// ---------------------------------------------------------------------------
+// Boundary D2 (coordinator-seam-FROZEN.md v9 section 18, added since
+// Boundary D above was written). recordMigrationSelectionBinding's twin
+// for the WITNESS binding. Same ownership rule as Boundary D: #625
+// implements it, #626 consumes it injected, #626 persists nothing itself.
+// Ordering differs from Boundary D's -- a witness binding is written
+// BEFORE its selection is prepared (it is evidence an attempt happened),
+// never after (section 18: "ordering differs from section 17's, and the
+// difference is the whole point of the witness/selection split"). See
+// runMigrationRollback below for exactly where this item calls it.
+//
+// NOTE (v9 amendment): witnessChecksumSha256 is not recomputable by this
+// writer, so this file must not assume the store re-derives or
+// authenticates that digest -- #626 computes it (see
+// RollbackFencedSession.computeRollbackTerminalEvidenceSha256 below) and
+// the writer is trusted to store exactly what it is given.
+// ---------------------------------------------------------------------------
+
+export type MigrationWitnessBindingRecorder = (
+  input: Readonly<{ homeDir: string; generationId: string; binding: MigrationWitnessBinding }>,
+) => void;
+
+// ---------------------------------------------------------------------------
+// EXTENSION TO BOUNDARY F, made by this continuation of #626's work and
+// flagged explicitly rather than guessed (see this item's status report).
+//
+// The predecessor's committed RollbackFencedSession (above) has no way to
+// produce coordinator-seam-FROZEN.md section 4's terminalEvidenceSha256 --
+// "the checksumSha256 of the MigrationActivationWitness of frozen witness
+// schema v3 section 8" -- because that computation is itself the SAME
+// canonicalization the predecessor's own module doc already assigns to
+// Boundary F ("the CANONICALIZATION of what it reads into the
+// witness-schema shapes above is #624's algorithm"). Hand-deriving that
+// digest here from the mirrored shapes in rollback-eligibility.ts would be
+// exactly the "production wrapper to bridge the gap" plan-v2 section 7
+// forbids, one level further down. So this item extends the SAME
+// already-injected boundary with one more method rather than inventing a
+// new canonicalization or a new boundary: the caller supplies only
+// values it already legitimately has (epoch/attempt identity, the fresh
+// observation, and this item's own eligibility decision), and the
+// injected implementation -- which has real access to the witness-schema
+// module -- returns the sealed digest.
+//
+// This is an ADDITIVE change to an interface with no prior consumer
+// (nothing in the committed tree called RollbackFencedSession's methods
+// before this file's continuation), not a rewrite of committed logic.
+// ---------------------------------------------------------------------------
+
+export type ComputeRollbackTerminalEvidenceInput = Readonly<{
+  epochId: string | null;
+  attemptId: string | null;
+  observation: RollbackEligibilityObservation;
+  mode: "pre-write" | "post-write";
+}>;
+
+/** @internal Exported for direct unit testing only; not part of the module's public surface. */
+export type RollbackTerminalEvidenceComputer = (
+  input: ComputeRollbackTerminalEvidenceInput,
+) => string;
+
+
+
+// ---------------------------------------------------------------------------
+// Orchestration. plan-v2 section 5's twelve steps. The retained local
+// token spans steps 2 through 12, which this function implements as one
+// call to withBackendPublicationAppendBarrierAsync wrapping steps 2-12's
+// entire body -- the token this file's own coordinator methods accept is
+// only valid inside that callback (see backend-publication.ts's
+// activeAppendBarrierTokens lifecycle), so "retained across the window"
+// means "the window's code runs inside the one callback", not that the
+// token is threaded out and reused across separate acquisitions.
+//
+// KNOWN GAP, flagged rather than guessed (see this item's status report):
+// coordinator-seam-FROZEN.md section 1 states the seven token-gated
+// coordinator methods have "zero production callers under src/ today".
+// This orchestration is the first one. Constructing a real
+// BackendPublicationCoordinator requires a real BackendPublicationDriver
+// (observeLocalState / publishProjectMap / publishConfig / ... --
+// backend-publication.ts's own interface), and no implementation of that
+// interface exists anywhere in src/ on this branch -- only test doubles
+// under test/. This item does not invent one: plan-v2 section 7 forbids a
+// production wrapper bridging an undefined coupling, and a driver
+// implementation is exactly the PostgreSQL-specific plumbing #625's own
+// activation orchestration needs identically, so it is a joint gap, not
+// this item's alone to close silently. runMigrationRollback therefore
+// takes an already-constructed BackendPublicationCoordinator as a
+// caller-supplied dependency, exactly like MigrationManifestStore and
+// every other already-open resource this codebase's orchestrators accept
+// (see rollback-generation.ts's already-open PortableRecordStream for the
+// same discipline). Wiring a real driver in is out of this item's scope
+// until the coupling is resolved.
+// ---------------------------------------------------------------------------
+
+export interface RunMigrationRollbackDependencies {
+  /** Caller-constructed; see the KNOWN GAP note above on why this item does not construct one itself. */
+  readonly coordinator: BackendPublicationCoordinator;
+  /** Boundary A. */
+  readonly resolveWitnessBindings: MigrationWitnessResolver;
+  /** Boundary B. */
+  readonly classifyRollbackMode: RollbackModeClassifier;
+  /** Boundary D. */
+  readonly recordSelectionBinding: MigrationSelectionBindingRecorder;
+  /** Boundary D2. */
+  readonly recordWitnessBinding: MigrationWitnessBindingRecorder;
+  /** Boundary E. */
+  readonly resolveAuthoritativeContext: RollbackAuthoritativeContextResolver;
+  /** Boundary F. */
+  readonly openFencedSession: OpenRollbackFencedSession;
+}
+
+export interface RunMigrationRollbackInput {
+  readonly homeDir: string;
+  readonly generationId: string;
+  /** The live canonical SQLite database path this rollback installs into. */
+  readonly canonicalPath: string;
+  readonly projectIdentity: PortableProjectIdentity;
+  /** StorageIdentityContext.localProjectId -- see rollback-sidecars.ts's module doc on why this is separate from projectIdentity. */
+  readonly localProjectId: string;
+  readonly sourceSelectionSha256: string;
+  readonly queueEvidenceSha256: string;
+  readonly roster: readonly BackendMaintenanceRosterEntry[];
+  readonly scratchParent?: string;
+  readonly signal?: AbortSignal;
+  /** @internal Clock seam for tests. */
+  readonly _now?: () => Date;
+}
+
+export type RollbackOrchestrationErrorReason =
+  | "not-eligible"
+  | "unexpected-state"
+  | "not-implemented";
+
+export class RollbackOrchestrationError extends Error {
+  constructor(
+    readonly reason: RollbackOrchestrationErrorReason,
+    message: string = reason,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "RollbackOrchestrationError";
+  }
+}
+
+export type RunMigrationRollbackOutcome = Readonly<{
+  manifest: MigrationManifest;
+  report: RollbackReportBody | null;
+}>;
+
+function sameSuccessorManifest(a: MigrationManifest, b: MigrationManifest): boolean {
+  const strip = (value: MigrationManifest) => ({
+    ...value,
+    checksumSha256: null,
+    updatedAt: null,
+    pendingEffect: value.pendingEffect === null ? null : { ...value.pendingEffect, startedAt: null },
+  });
+  return canonicalJson(strip(a) as unknown as Record<string, unknown>)
+    === canonicalJson(strip(b) as unknown as Record<string, unknown>);
+}
+
+/**
+ * Publishes a computed successor manifest, tolerating a retry that already
+ * landed the identical successor (compared modulo timestamps/checksum, per
+ * batch-copy.ts's own sameSuccessor discipline for the identical reason:
+ * this orchestration's retry paths recompute deterministic inputs and must
+ * not refuse when their own prior attempt already published the result).
+ */
+function publishManifest(
+  store: MigrationManifestStore,
+  generationId: string,
+  current: MigrationManifest,
+  next: MigrationManifest,
+): MigrationManifest {
+  try {
+    return store.update(generationId, current.checksumSha256, () => next);
+  } catch (error) {
+    const observed = store.read(generationId);
+    if (!sameSuccessorManifest(observed, next)) throw error;
+    return observed;
+  }
+}
+
+
+
+/**
+ * Orchestrates one rollback attempt for a manifest at its generationId,
+ * per plan-v2 section 5's twelve steps.
+ *
+ * SCOPE OF THIS IMPLEMENTATION, stated honestly rather than silently
+ * narrowed (see this item's status report for the full account):
+ *
+ *  - Fully implemented: step 1's recovery classification and its three
+ *    branches (fresh start, resume a pending prepare-rollback, continue a
+ *    completed prepare-rollback with no pending effect); steps 2-8 for
+ *    every eligibility outcome; step 9/11's post-write generation
+ *    build+install+materialize path; step 12's report persistence and
+ *    effect completion for the post-write happy path.
+ *  - NOT implemented, refusing explicitly rather than guessing: pre-write
+ *    and unactivated reinstallation (step 9's "no data movement" case).
+ *    Reinstalling the untouched #622-preserved source generation
+ *    (rollbackLineage.preservedSourceGenerationId) requires resolving its
+ *    on-disk artifact path, which sqlite-snapshot.ts does not currently
+ *    export -- inventing a parallel path scheme here would be exactly the
+ *    "production wrapper to bridge the gap" plan-v2 section 7 forbids.
+ *  - Best-effort, flagged as needing review rather than presented as
+ *    settled: step 12's abandonment path's explicit backend-selection
+ *    reconciliation (see recoverPendingPublishRollback below).
+ */
+export async function runMigrationRollback(
+  input: Readonly<RunMigrationRollbackInput>,
+  deps: Readonly<RunMigrationRollbackDependencies>,
+): Promise<RunMigrationRollbackOutcome> {
+  const now = input._now ?? ((): Date => new Date());
+  const store = new MigrationManifestStore({ homeDir: input.homeDir });
+  const current = store.read(input.generationId);
+  const recovery = classifyMigrationRecovery(current);
+
+  // Step 1: classify recovery.
+  if (recovery.action === "readback") {
+    return recoverPendingPublishRollback(input, deps, store, current, now);
+  }
+  if (recovery.action === "settled") {
+    if (recovery.phase !== "active") {
+      throw new RollbackOrchestrationError(
+        "unexpected-state",
+        `generation ${input.generationId} is settled at phase ${recovery.phase}; no rollback is available on this manifest`,
+      );
+    }
+    // Fresh start from an activated manifest with no pending effect --
+    // falls through to the full step 2-12 sequence below, same as a fresh
+    // start from "verified".
+  } else if (recovery.action === "ready" && current.phase === "rolling-back") {
+    // prepare-rollback already completed on a prior attempt and sealed
+    // rollbackLineage.returnPhase; classifyMigrationRecovery returns
+    // "ready" here (not "resume") because there is no pending effect.
+    // Re-beginning prepare-rollback would be illegal (legalEffect only
+    // accepts it from "verified"/"active"). Continue from step 9.
+    return continueAfterPrepareRollback(input, deps, store, current, now);
+  }
+  // recovery.action === "ready" (phase "verified") or "resume" (a pending
+  // prepare-rollback, retry-idempotent) both fall through: "resume"
+  // re-derives the identical deterministic inputSha256 below and the
+  // begin-effect call becomes a no-op comparison rather than a fresh
+  // begin, per section 8's convergence rule.
+
+  // Boundary C's operability fact MUST be read before enterMaintenance
+  // (step 2 below), never after -- see readBackendPublicationOperabilityFact's
+  // own doc comment on why. Boundary A's witness resolution is read
+  // alongside it so both observations describe the same instant.
+  const operabilityFact = await readBackendPublicationOperabilityFact({ homeDir: input.homeDir });
+  const witnessResolution = deps.resolveWitnessBindings({
+    homeDir: input.homeDir,
+    generationId: input.generationId,
+  });
+  const authority = resolveActivationAuthority({ resolution: witnessResolution, operabilityFact });
+  if (authority.status === "refused") {
+    throw new RollbackOrchestrationError("not-eligible", authority.reason);
+  }
+
+  let authoritativeContext: RollbackAuthoritativeContext | null = null;
+  if (authority.status === "authoritative") {
+    authoritativeContext = await deps.resolveAuthoritativeContext({
+      homeDir: input.homeDir,
+      epochId: authority.selection.epochId,
+      attemptId: authority.selection.attemptId,
+    });
+    if (authoritativeContext === null) {
+      throw new RollbackOrchestrationError(
+        "unexpected-state",
+        "authoritative selection resolved but its epoch/attempt record could not be fetched",
+      );
+    }
+  }
+
+  return withBackendPublicationAppendBarrierAsync(input.homeDir, async (token) => {
+    let working = current;
+
+    // Step 2: enterMaintenance under the retained token.
+    const publicationId = deriveRollbackPublicationId(input.generationId);
+    const maintenanceJournal = await deps.coordinator.enterMaintenance({
+      publicationId,
+      generationId: input.generationId,
+      sourceSelectionSha256: input.sourceSelectionSha256,
+      queueEvidenceSha256: input.queueEvidenceSha256,
+      roster: input.roster,
+      now: now(),
+    }, token);
+
+    // Step 3: acquire the fenced PostgreSQL session (Boundary F).
+    const session = await deps.openFencedSession({ homeDir: input.homeDir, manifest: working });
+    try {
+      // Step 4: authoritative readback in the dedicated snapshot.
+      const observation = await session.captureReadback({
+        manifestDestinationWitnessSha256: working.destination.identitySha256,
+        canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
+      });
+
+      // Steps 5+6 combined: identity gate, schema-bound census
+      // comparability, and classification, in that order -- exactly the
+      // order evaluateRollbackEligibility already implements.
+      const decision = evaluateRollbackEligibility({
+        authority,
+        authoritativeContext,
+        observation,
+        classifyRollbackMode: deps.classifyRollbackMode,
+      });
+      if (decision.eligibility === "refused") {
+        await deps.coordinator.abortMaintenance({
+          expectedChecksumSha256: maintenanceJournal.checksumSha256,
+          sourceSelectionSha256: input.sourceSelectionSha256,
+          abortEvidenceSha256: sha256(canonicalJson(["rollback-abort-v1", input.generationId, decision.reason])),
+        }, token);
+        throw new RollbackOrchestrationError("not-eligible", decision.reason);
+      }
+
+      // Step 7: begin prepare-rollback with a deterministic inputSha256.
+      const epochIdForInput = authority.status === "authoritative" ? authority.selection.epochId : null;
+      const prepareInputSha256 = deriveRollbackPrepareInputSha256({
+        generationId: input.generationId,
+        manifestRevision: working.revision,
+        manifestChecksumSha256: working.checksumSha256,
+        epochId: epochIdForInput,
+        resourceType: session.selectionAuthority.resourceType,
+        resourceKey: session.selectionAuthority.resourceKey,
+      });
+      const prepareEffectId = "rollback-prepare-" + prepareInputSha256;
+      if (working.pendingEffect === null) {
+        working = publishManifest(store, input.generationId, working, beginMigrationEffect(working, {
+          effectId: prepareEffectId,
+          kind: "prepare-rollback",
+          inputSha256: prepareInputSha256,
+          startedAt: now().toISOString(),
+        }));
+      } else if (
+        working.pendingEffect.kind !== "prepare-rollback"
+        || working.pendingEffect.inputSha256 !== prepareInputSha256
+      ) {
+        throw new RollbackOrchestrationError(
+          "unexpected-state",
+          "a pending effect exists that does not match this rollback attempt's deterministic input",
+        );
+      }
+
+      // Step 8: complete prepare-rollback; returnPhase seals.
+      working = publishManifest(store, input.generationId, working, completeMigrationEffect(working, {
+        effectId: working.pendingEffect!.effectId,
+        completedAt: now().toISOString(),
+      }));
+
+      return await runPostPrepareSequence(
+        input, deps, store, working, session, authority, authoritativeContext, decision, token, now,
+      );
+    } finally {
+      await session.release();
+    }
+  });
+}
+
+
+
+function requireMaintenanceChecksum(homeDir: string): string {
+  const journal = readBackendMaintenanceJournal(homeDir);
+  if (journal === null) {
+    throw new RollbackOrchestrationError("unexpected-state", "backend maintenance journal is unexpectedly absent");
+  }
+  return journal.checksumSha256;
+}
+
+/**
+ * Steps 9-12, shared by the fresh path (called from runMigrationRollback
+ * right after step 8 completes, inside the same retained token and the
+ * same fenced session opened at step 3) and the resumed path (called from
+ * continueAfterPrepareRollback under a freshly acquired token and a
+ * freshly opened session, when a prior attempt completed prepare-rollback
+ * and then crashed before step 9). `decision` is step 9's own input in
+ * the fresh path; in the resumed path the caller has no valid step-4
+ * observation to reuse (it lived in a dead process) and passes a decision
+ * derived from a readback taken at resume time instead. Either way, this
+ * function performs its OWN fresh step-10 revalidation before installing,
+ * so a resumed run is never less safe than a fresh one -- it is simply
+ * the case where steps "9's decision" and "10's decision" are taken from
+
+ * two readbacks that are closer together in time than the fresh path's.
+ */
+async function runPostPrepareSequence(
+  input: Readonly<RunMigrationRollbackInput>,
+  deps: Readonly<RunMigrationRollbackDependencies>,
+  store: MigrationManifestStore,
+  working: MigrationManifest,
+  session: RollbackFencedSession,
+  authority: ActivationAuthority,
+  authoritativeContext: RollbackAuthoritativeContext | null,
+  decision: RollbackEligibilityDecision,
+  token: BackendPublicationLockToken,
+  now: () => Date,
+): Promise<RunMigrationRollbackOutcome> {
+  if (decision.eligibility === "refused") {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "internal: runPostPrepareSequence received a refused decision",
+    );
+  }
+  if (decision.mode !== "post-write") {
+    throw new RollbackOrchestrationError(
+      "not-implemented",
+      'rollback mode "' + decision.mode + '" (eligibility "' + decision.eligibility + '") requires '
+        + "reinstalling the preserved source generation (rollbackLineage.preservedSourceGenerationId), "
+        + "which this item does not implement -- see this item's status report",
+    );
+  }
+
+  // Step 9: build, verify (post-write only). Sidecars materialize after
+  // install, once the generation's canonical bytes are final.
+  const source = await session.openPortableSource();
+  const built = await buildRollbackGeneration({
+    homeDir: input.homeDir,
+    generationId: input.generationId + "-rb" + working.revision,
+    projectIdentity: input.projectIdentity,
+    source,
+    scratchParent: input.scratchParent,
+    signal: input.signal,
+  });
+  if (built.state === "quarantined") {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "rollback generation build failed and was quarantined: " + built.reason,
+    );
+  }
+
+  // Step 10: revalidate under a NEW snapshot, never step 4's/9's own.
+  await session.renew();
+  const revalidated = await session.captureReadback({
+    manifestDestinationWitnessSha256: working.destination.identitySha256,
+    canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
+  });
+  const revalidatedDecision = evaluateRollbackEligibility({
+    authority,
+    authoritativeContext,
+    observation: revalidated,
+    classifyRollbackMode: deps.classifyRollbackMode,
+  });
+  if (revalidatedDecision.eligibility === "refused" || revalidatedDecision.mode !== decision.mode) {
+    // A racing post-activation write (or any other change) inside the
+    // fenced window. working is left at phase "rolling-back" with no
+    // pending effect -- a legitimate state a future attempt resumes from
+    // via continueAfterPrepareRollback. The generation this attempt built
+    // is left in place, verified but unreferenced, never deleted.
+    throw new RollbackOrchestrationError(
+      "not-eligible",
+      revalidatedDecision.eligibility === "refused"
+        ? revalidatedDecision.reason
+        : 'revalidation observed mode "' + revalidatedDecision.mode + '" where step 9 acted on "' + decision.mode + '"',
+    );
+  }
+
+  const epochId = authority.status === "authoritative" ? authority.selection.epochId : null;
+  const attemptId = authority.status === "authoritative" ? authority.selection.attemptId : null;
+  const terminalEvidenceSha256 = session.computeRollbackTerminalEvidenceSha256({
+    epochId,
+    attemptId,
+    observation: revalidated,
+    mode: revalidatedDecision.mode,
+  });
+
+  // Section 18: written BEFORE the selection is prepared, and only when
+  // there is an authoritative attempt to bind evidence to. See this
+  // item's status report on why "unactivated" writes neither binding:
+  // there is no prior activation for replay admission to have ever
+  // routed against, so there is nothing for this rollback to supersede.
+  if (authority.status === "authoritative") {
+    deps.recordWitnessBinding({
+      homeDir: input.homeDir,
+      generationId: input.generationId,
+      binding: {
+        kind: "rollback",
+        epochId: epochId!,
+        attemptId: attemptId!,
+        manifestRevision: working.revision,
+        witnessChecksumSha256: terminalEvidenceSha256,
+      },
+    });
+  }
+
+  // Step 11: install precedes publication -- while PostgreSQL is still
+  // the durably selected backend -- then flip maintenance selection to
+  // sqlite.
+  const installOutcome = installRollbackGeneration({
+    homeDir: input.homeDir,
+    generationId: built.generationId,
+    canonicalPath: input.canonicalPath,
+    verifiedDatabasePath: built.databasePath,
+  });
+  materializeRollbackSidecars({
+    homeDir: input.homeDir,
+    databasePath: installOutcome.canonicalPath,
+    localProjectId: input.localProjectId,
+  });
+
+  const heldChecksum = requireMaintenanceChecksum(input.homeDir);
+  const prepared = await deps.coordinator.prepareMaintenanceSelection({
+    expectedChecksumSha256: heldChecksum,
+    generationId: input.generationId,
+    targetBackend: "sqlite",
+    terminalEvidenceSha256,
+  }, token);
+  await deps.coordinator.completeMaintenanceSelection({
+    expectedChecksumSha256: prepared.checksumSha256,
+    generationId: input.generationId,
+    terminalEvidenceSha256,
+  }, token);
+
+  // "then the coordinator publication of project map and config" is NOT
+  // implemented here -- see this item's status report. coordinator.prepare()
+  // needs a BackendPublicationRecoveryMaterial and a projects list this
+  // item has no source for; that shape belongs to whichever item defines
+  // config/project-map publication content (#625's activation side, or a
+  // shared module neither item has authored yet), and inventing one here
+  // would be an undefined coupling guessed rather than asked about. The
+  // maintenance journal is already durably terminal at
+  // "selection-completed" above, which is what assertMigrationReplayAdmission
+  // and assertBackendPublicationConsumerAccessUnlocked key on (section 6),
+  // so replay admission and backend selection already route to sqlite
+  // correctly even though this step is incomplete.
+
+  // Step 12: persist the report, then complete with the report and the
+  // exact mode. Order is begin, persist, complete (plan-v2 section 5's
+  // closing paragraph), so the report's createdAt falls inside
+  // [pending.startedAt, completedAt].
+  const publishInputSha256 = terminalEvidenceSha256;
+  const publishEffectId = "rollback-publish-" + publishInputSha256;
+  working = publishManifest(store, input.generationId, working, beginMigrationEffect(working, {
+    effectId: publishEffectId,
+    kind: "publish-rollback",
+    inputSha256: publishInputSha256,
+    startedAt: now().toISOString(),
+  }));
+
+  const reportId = deriveRollbackReportId({
+    generationId: input.generationId,
+    effectId: working.pendingEffect!.effectId,
+    kind: "rollback",
+  });
+  const reportCreatedAt = now().toISOString();
+  const report = writeRollbackReport(input.homeDir, {
+    version: 1,
+    reportId,
+    generationId: input.generationId,
+    effectId: working.pendingEffect!.effectId,
+    kind: "rollback",
+    eligibility: revalidatedDecision.eligibility,
+    mode: revalidatedDecision.mode,
+    epochId,
+    attemptId,
+    sealedPublicationMaterialDigestSha256: null,
+    reason: null,
+  });
+
+  working = publishManifest(store, input.generationId, working, completeMigrationEffect(working, {
+    effectId: working.pendingEffect!.effectId,
+    completedAt: now().toISOString(),
+    report: { kind: "rollback", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: reportCreatedAt },
+    rollbackMode: revalidatedDecision.mode,
+  }));
+
+  // Written only after the selection completes, and before this
+  // function returns (the retained token is released by the caller's
+  // `finally` immediately after, which is inside this same window).
+  if (authority.status === "authoritative") {
+    deps.recordSelectionBinding({
+      homeDir: input.homeDir,
+      generationId: input.generationId,
+      binding: {
+        kind: "rollback",
+        epochId: epochId!,
+        attemptId: attemptId!,
+        manifestRevision: working.revision,
+        witnessChecksumSha256: terminalEvidenceSha256,
+        publicationId: deriveRollbackPublicationId(input.generationId),
+      },
+    });
+  }
+
+  return { manifest: working, report };
+}
+
+
+
+/**
+ * Resumes a rollback whose prepare-rollback effect already completed
+ * (manifest phase "rolling-back", no pending effect) -- classifyMigrationRecovery
+ * returns "ready" here, per plan-v2 section 5 step 1: "rolling-back with
+ * no pending effect continues to export and publish". This is a fresh
+ * process (the original one may have crashed or simply exited after
+ * step 8), so it acquires a fresh retained token and a fresh fenced
+ * session rather than reusing anything from a prior attempt.
+ */
+async function continueAfterPrepareRollback(
+  input: Readonly<RunMigrationRollbackInput>,
+  deps: Readonly<RunMigrationRollbackDependencies>,
+  store: MigrationManifestStore,
+  current: MigrationManifest,
+  now: () => Date,
+): Promise<RunMigrationRollbackOutcome> {
+  const operabilityFact = await readBackendPublicationOperabilityFact({ homeDir: input.homeDir });
+  const witnessResolution = deps.resolveWitnessBindings({
+    homeDir: input.homeDir,
+    generationId: input.generationId,
+  });
+  const authority = resolveActivationAuthority({ resolution: witnessResolution, operabilityFact });
+  if (authority.status === "refused") {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "continuing a prepared rollback: authority resolution now refuses: " + authority.reason,
+    );
+  }
+  let authoritativeContext: RollbackAuthoritativeContext | null = null;
+  if (authority.status === "authoritative") {
+    authoritativeContext = await deps.resolveAuthoritativeContext({
+      homeDir: input.homeDir,
+      epochId: authority.selection.epochId,
+      attemptId: authority.selection.attemptId,
+    });
+    if (authoritativeContext === null) {
+      throw new RollbackOrchestrationError(
+        "unexpected-state",
+        "authoritative selection resolved but its epoch/attempt record could not be fetched",
+      );
+    }
+  }
+
+  return withBackendPublicationAppendBarrierAsync(input.homeDir, async (token) => {
+    // No enterMaintenance call here: the durable maintenance journal is
+    // already held from the original attempt's step 2, and enterMaintenance
+    // refuses (unresolved-publication) when a non-terminal maintenance
+    // journal already exists. A freshly acquired token still authorizes
+    // the coordinator's token branch (coordinator-seam-FROZEN.md section 3:
+    // "a consumer-lock token is accepted... does NOT require
+    // activeAppendBarrierTokens membership [pre-dating this call]").
+    const session = await deps.openFencedSession({ homeDir: input.homeDir, manifest: current });
+    try {
+      const observation = await session.captureReadback({
+        manifestDestinationWitnessSha256: current.destination.identitySha256,
+        canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
+      });
+      const decision = evaluateRollbackEligibility({
+        authority,
+        authoritativeContext,
+        observation,
+        classifyRollbackMode: deps.classifyRollbackMode,
+      });
+      if (decision.eligibility === "refused") {
+        throw new RollbackOrchestrationError("not-eligible", decision.reason);
+      }
+      return await runPostPrepareSequence(
+        input, deps, store, current, session, authority, authoritativeContext, decision, token, now,
+      );
+    } finally {
+      await session.release();
+    }
+  });
+}
+
+/**
+ * Recovers a rollback whose publish-rollback effect was pending when the
+ * process died (classifyMigrationRecovery action "readback",
+ * recovery === "authoritative-readback-required", per protocol.ts). This
+ * is the hardest recovery path plan-v2 names, and this implementation is
+ * intentionally conservative rather than clever, per plan-v2 section 12's
+ * closing paragraph on abandonment reconciling the backend selection
+ * explicitly:
+ *
+ *  - If the durable maintenance journal shows selection-completed,
+ *    targeting sqlite, for exactly this generationId, step 11's install
+ *    and selection flip are proven to have happened (that journal state
+ *    is durable and is exactly what assertMigrationReplayAdmission keys
+ *    on per section 6), so this path completes publish-rollback with a
+ *    freshly derived report rather than abandoning a change that already
+ *    happened.
+ *  - Otherwise, nothing durable proves the flip happened. This path
+ *    abandons the pending publish-rollback effect back to the sealed
+ *    returnPhase and, if the maintenance journal is still non-terminal
+ *    (held or entering), aborts it -- which is itself the "reconciliation"
+ *    plan-v2 asks for in this branch, because nothing was ever durably
+ *    selected away from postgresql to reconcile back to.
+ *  - NOT IMPLEMENTED, refusing explicitly: the case where the maintenance
+ *    journal is durably terminal at selection-completed/sqlite (so
+ *    abortMaintenance is no longer legal -- it only accepts held/entering)
+ *    but this item's own evidence says the rollback must still be
+ *    abandoned (e.g. a config/project-map publication step 11 could not
+ *    prove complete, once that step is implemented). Reconciling that
+ *    case requires a second maintenance cycle re-selecting postgresql,
+ *    which needs the original activation's own terminalEvidenceSha256 --
+ *    plausibly the authoritative activation selection binding's own
+ *    witnessChecksumSha256, per section 14 -- and this item flags that
+ *    mechanism as unconfirmed rather than executing an unverified
+ *    backend-selection mutation. See this item's status report.
+ */
+async function recoverPendingPublishRollback(
+  input: Readonly<RunMigrationRollbackInput>,
+  deps: Readonly<RunMigrationRollbackDependencies>,
+  store: MigrationManifestStore,
+  current: MigrationManifest,
+  now: () => Date,
+): Promise<RunMigrationRollbackOutcome> {
+  const pending = current.pendingEffect;
+  if (pending === null || pending.kind !== "publish-rollback") {
+    throw new RollbackOrchestrationError("unexpected-state", "recoverPendingPublishRollback called without a pending publish-rollback effect");
+  }
+
+  const maintenance = readBackendMaintenanceJournal(input.homeDir);
+  const selectionProvenComplete = maintenance !== null
+    && maintenance.phase === "selection-completed"
+    && maintenance.generationId === input.generationId
+    && maintenance.targetBackend === "sqlite";
+
+  return withBackendPublicationAppendBarrierAsync(input.homeDir, async (token) => {
+    let working = current;
+
+    if (selectionProvenComplete) {
+      const reportId = deriveRollbackReportId({
+        generationId: input.generationId,
+        effectId: pending.effectId,
+        kind: "rollback",
+      });
+      const reportCreatedAt = now().toISOString();
+      const report = writeRollbackReport(input.homeDir, {
+        version: 1,
+        reportId,
+        generationId: input.generationId,
+        effectId: pending.effectId,
+        kind: "rollback",
+        eligibility: working.rollbackLineage.mode ?? null,
+        mode: working.rollbackLineage.mode ?? "post-write",
+        epochId: null,
+        attemptId: null,
+        sealedPublicationMaterialDigestSha256: null,
+        reason: null,
+      });
+      working = publishManifest(store, input.generationId, working, completeMigrationEffect(working, {
+        effectId: pending.effectId,
+        completedAt: now().toISOString(),
+        report: { kind: "rollback", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: reportCreatedAt },
+        rollbackMode: working.rollbackLineage.mode ?? "post-write",
+      }));
+      return { manifest: working, report };
+    }
+
+    if (maintenance !== null && (maintenance.phase === "maintenance-held" || maintenance.phase === "maintenance-entering")) {
+      await deps.coordinator.abortMaintenance({
+        expectedChecksumSha256: maintenance.checksumSha256,
+        sourceSelectionSha256: input.sourceSelectionSha256,
+        abortEvidenceSha256: sha256(canonicalJson(["rollback-recovery-abort-v1", input.generationId, pending.effectId])),
+      }, token);
+    } else if (maintenance !== null && maintenance.phase === "selection-completed") {
+      // The unimplemented reconciliation case -- see this function's doc
+      // comment. Refuse loudly rather than mutate an unverified selection.
+      throw new RollbackOrchestrationError(
+        "not-implemented",
+        "publish-rollback must be abandoned but the maintenance journal is already durably "
+          + "selection-completed for a different or ambiguous target; re-selecting postgresql "
+          + "requires a mechanism this item has not implemented -- see this item's status report",
+      );
+    }
+
+    const reportId = deriveRollbackReportId({
+      generationId: input.generationId,
+      effectId: pending.effectId,
+      kind: "abandonment",
+    });
+    const reportCreatedAt = now().toISOString();
+    const report = writeRollbackReport(input.homeDir, {
+      version: 1,
+      reportId,
+      generationId: input.generationId,
+      effectId: pending.effectId,
+      kind: "abandonment",
+      eligibility: null,
+      mode: null,
+      epochId: null,
+      attemptId: null,
+      sealedPublicationMaterialDigestSha256: null,
+      reason: "publish-rollback recovery could not prove the selection completed",
+    });
+    working = publishManifest(store, input.generationId, working, abandonMigrationEffect(working, {
+      effectId: pending.effectId,
+      abandonedAt: now().toISOString(),
+      report: {
+        kind: "abandonment",
+        reportId: report.reportId,
+        reportSha256: report.checksumSha256,
+        createdAt: reportCreatedAt,
+      },
+    }));
+    return { manifest: working, report };
+  });
+}
+
