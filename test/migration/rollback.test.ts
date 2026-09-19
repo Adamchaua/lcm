@@ -53,6 +53,8 @@ import {
   RollbackOrchestrationError,
   deriveRollbackPublicationId,
   deriveRollbackPrepareInputSha256,
+  writeRollbackAuthorityArtifact,
+  readRollbackAuthorityArtifact,
   type RunMigrationRollbackDependencies,
   type RollbackFencedSession,
   type MigrationSelectionBindingRecorder,
@@ -610,21 +612,230 @@ describe("runMigrationRollback", () => {
     expect(witnessBindings).toHaveLength(1);
     expect((selectionBindings[0] as { attemptId: string }).attemptId).toBe("attempt-new");
     expect((witnessBindings[0] as { attemptId: string }).attemptId).toBe("attempt-new");
-    expect(existsSync(join(homeDir, "live.sqlite"))).toBe(false);
+   expect(existsSync(join(homeDir, "live.sqlite"))).toBe(false);
+ });
+
+  // donadiosolutions/lcm#1432. Three separate crash-and-resume tests,
+  // one per named boundary plan-v2 section 7 requires interruption
+  // recovery for: (1) maintenance entered but prepare-rollback never
+  // begun, (2) prepare-rollback begun but not completed, (3) prepare-
+  // rollback completed (continueAfterPrepareRollback's own domain --
+  // this is the crash the withdrawn predecessor test targeted). All
+  // three previously failed because readBackendPublicationOperabilityFact
+  // observes the still-held maintenance journal on any retry and
+  // answers "unresolvable", which resolveActivationAuthority turns into
+  // a permanent refusal; (1) and (2) additionally failed because
+  // enterMaintenance itself refuses to re-enter an already-held
+  // journal. Each test reconstructs its crash point precisely (manual
+  // state construction for (1)/(2), a REAL crash via a throwing fake
+  // session for (3)) against a REAL BackendPublicationCoordinator and
+  // MigrationManifestStore, then retries and asserts success.
+
+  it("resumes after a crash between step 2 and step 7: maintenance is held, no prepare-rollback effect was ever begun (donadiosolutions/lcm#1432)", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-resume-2-7");
+    const canonicalPath = join(homeDir, "live.sqlite");
+    const coordinator = coordinatorFor(homeDir);
+
+    // Simulates the crash: step 2 (enterMaintenance) durably succeeded
+    // and the durable rollback-authority artifact was persisted (both
+    // steps runMigrationRollback performs before entering the retained
+    // token window), then the process died before step 3 ever opened a
+    // session -- so the manifest is untouched, still phase "verified"
+    // with no pending effect, exactly like a manifest that was NEVER
+    // attempted. classifyMigrationRecovery cannot tell these apart; only
+    // the durable maintenance journal and artifact can.
+    const publicationId = deriveRollbackPublicationId("gen-resume-2-7");
+    await coordinator.enterMaintenance({
+      publicationId, generationId: "gen-resume-2-7",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+      now: new Date(capturedAt),
+    });
+    writeRollbackAuthorityArtifact(homeDir, {
+      version: 1,
+      generationId: "gen-resume-2-7",
+      operabilityFactState: "authoritatively-absent",
+      operabilityFactValueSha256: null,
+      authorityStatus: "unactivated",
+      epochId: null,
+      attemptId: null,
+    });
+    expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const outcome = await runMigrationRollback({
+      homeDir, generationId: "gen-resume-2-7", canonicalPath,
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator,
+      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => null,
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
+          destinationIdentity,
+          postEpochDelta: fixtureCanonicalDelta("delta"),
+          postEpochCensus: null,
+        }],
+        source: sqliteSourceStream,
+      }),
+    });
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
+    expect(outcome.report).not.toBeNull();
+    expect(outcome.report!.eligibility).toBe("unactivated");
+    expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-completed");
   });
 
-  // NOT WRITTEN, flagged explicitly rather than silently omitted (see
-  // this item's status report): a test resuming
-  // continueAfterPrepareRollback (a crash between step 8 and step 9)
-  // against a REAL BackendPublicationCoordinator. Writing it exposed a
-  // real, reachable defect rather than proving the resume path correct
-  // -- filed as donadiosolutions/lcm#1432 rather than fixed here, because
-  // the fix touches Boundary C's frozen read-timing contract
-  // (coordinator-seam-FROZEN.md section 16: "MUST be read... before
-  // enterMaintenance... never after") and very likely protocol.ts's
-  // manifest shape, neither of which this item owns unilaterally.
+  it("resumes after a crash between step 7's begin and step 8's complete: prepare-rollback is pending (donadiosolutions/lcm#1432)", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    const verified = manifestAtVerified(store, "gen-resume-7-8");
+    const canonicalPath = join(homeDir, "live.sqlite");
+    const coordinator = coordinatorFor(homeDir);
 
-  it("abandons a pending publish-rollback effect back to the sealed returnPhase when the selection was never durably proven complete", async () => {
+    const publicationId = deriveRollbackPublicationId("gen-resume-7-8");
+    await coordinator.enterMaintenance({
+      publicationId, generationId: "gen-resume-7-8",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+      now: new Date(capturedAt),
+    });
+    writeRollbackAuthorityArtifact(homeDir, {
+      version: 1,
+      generationId: "gen-resume-7-8",
+      operabilityFactState: "authoritatively-absent",
+      operabilityFactValueSha256: null,
+      authorityStatus: "unactivated",
+      epochId: null,
+      attemptId: null,
+    });
+    // Simulates the crash: step 7's begin durably succeeded (the SAME
+    // deterministic prepareInputSha256 runMigrationRollback itself would
+    // compute for this manifest state and fakeSession's default
+    // resourceType/resourceKey), then the process died before step 8's
+    // complete. classifyMigrationRecovery reads this as "resume" (a
+    // pending, retry-idempotent prepare-rollback).
+    const prepareInputSha256 = deriveRollbackPrepareInputSha256({
+      generationId: "gen-resume-7-8", manifestRevision: verified.revision, manifestChecksumSha256: verified.checksumSha256,
+      epochId: null, resourceType: "sqlite-generation", resourceKey: "gen",
+    });
+    const prepareEffectId = "rollback-prepare-" + prepareInputSha256;
+    const withPending = store.update("gen-resume-7-8", verified.checksumSha256, (c) => beginMigrationEffect(c, {
+      kind: "prepare-rollback", effectId: prepareEffectId, inputSha256: prepareInputSha256, startedAt: capturedAt,
+    }));
+    expect(withPending.pendingEffect?.kind).toBe("prepare-rollback");
+    expect(withPending.phase).toBe("verified");
+
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const outcome = await runMigrationRollback({
+      homeDir, generationId: "gen-resume-7-8", canonicalPath,
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator,
+      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => null,
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
+          destinationIdentity,
+          postEpochDelta: fixtureCanonicalDelta("delta"),
+          postEpochCensus: null,
+        }],
+        source: sqliteSourceStream,
+      }),
+    });
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
+  });
+
+  it("resumes after a crash between step 8 and step 9 via continueAfterPrepareRollback (donadiosolutions/lcm#1432, the predecessor's withdrawn test)", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-resume-8-9");
+    const canonicalPath = join(homeDir, "live.sqlite");
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const coordinator = coordinatorFor(homeDir);
+
+    // The FIRST call runs for real through step 8 (prepare-rollback
+    // durably completes) and then crashes for real at step 10's renew(),
+    // inside runPostPrepareSequence -- no manual state reconstruction.
+    const crashingSession = fakeSession({
+      observations: [{
+        manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
+        destinationIdentity,
+        postEpochDelta: fixtureCanonicalDelta("delta"),
+        postEpochCensus: null,
+      }],
+      source: sqliteSourceStream,
+    });
+    crashingSession.renew = async () => { throw new Error("simulated crash after step 8"); };
+
+    await expect(runMigrationRollback({
+      homeDir, generationId: "gen-resume-8-9", canonicalPath,
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator,
+      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => null,
+      openFencedSession: async () => crashingSession,
+    })).rejects.toThrow("simulated crash after step 8");
+
+    const midManifest = new MigrationManifestStore({ homeDir }).read("gen-resume-8-9");
+    expect(midManifest.phase).toBe("rolling-back");
+    expect(midManifest.pendingEffect).toBeNull();
+    expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+    expect(readRollbackAuthorityArtifact(homeDir, "gen-resume-8-9")).not.toBeNull();
+
+    // The SECOND call is a fresh process: classifyMigrationRecovery
+    // reads "ready" at phase "rolling-back" and routes to
+    // continueAfterPrepareRollback, which must recover the operability
+    // fact and authority from the durable artifact rather than
+    // re-deriving them live (the maintenance journal still holds the
+    // slot, so a live re-read would still answer "unresolvable").
+    const outcome = await runMigrationRollback({
+      homeDir, generationId: "gen-resume-8-9", canonicalPath,
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator,
+      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => null,
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
+          destinationIdentity,
+          postEpochDelta: fixtureCanonicalDelta("delta"),
+          postEpochCensus: null,
+        }],
+        source: sqliteSourceStream,
+      }),
+    });
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
+    expect(outcome.report).not.toBeNull();
+    expect(outcome.report!.eligibility).toBe("unactivated");
+  });
+
+ it("abandons a pending publish-rollback effect back to the sealed returnPhase when the selection was never durably proven complete", async () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });
     const verified = manifestAtVerified(store, "gen-abandon");
