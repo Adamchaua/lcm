@@ -137,7 +137,14 @@ export function requireInteger(value: bigint | number | string, field: string): 
   }
 }
 
-/** @internal Exported for direct unit testing only; not part of the module's public surface. */
+/**
+ * @internal Exported for direct unit testing only; not part of the
+ * module's public surface. Accepts Date because archived timestamp
+ * fields are typed PortableRawTimestamp = Date | string throughout
+ * portable-record.ts; today's concrete decode() always normalizes TEXT
+ * columns to a string before this module ever sees them, but the type
+ * itself is real, not merely wider than any possible caller.
+ */
 export function requireTimestamp(value: Date | string, field: string): string {
   if (value instanceof Date) return value.toISOString();
   if (typeof value === "string" && value.length > 0) return value;

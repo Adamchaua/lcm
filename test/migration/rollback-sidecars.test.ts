@@ -475,7 +475,17 @@ describe("requireTimestamp", () => {
     expect(requireTimestamp("2026-01-01T00:00:00.000000Z", "field")).toBe("2026-01-01T00:00:00.000000Z");
   });
 
-  it("converts a Date to its ISO string -- exercised directly against the function's declared Date|string contract, since real archived timestamps are always pre-normalized strings and never reach this branch through materializeRollbackSidecars's own call sites", () => {
+  // NOT dead-by-construction: v.updatedAt/v.createdAt from readArchiveDomain
+  // are typed PortableRawTimestamp = Date | string throughout
+  // portable-record.ts, the same shared type used for createPortableRecord's
+  // raw input. The concrete decode() implementation always normalizes TEXT
+  // columns to a string today, so no value currently exercises this branch,
+  // but the TYPE genuinely allows a Date -- a caller respecting that
+  // contract, or a future decode() variant, needs it handled correctly.
+  // This differs from a signature that is merely wider than any possible
+  // caller: the type is real, only today's one concrete producer of it
+  // happens not to use the Date half.
+  it("converts a Date to its ISO string, per PortableRawTimestamp's genuine Date|string contract", () => {
     const date = new Date("2026-01-01T00:00:00.000Z");
     expect(requireTimestamp(date, "field")).toBe(date.toISOString());
   });
