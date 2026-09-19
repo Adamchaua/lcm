@@ -149,3 +149,14 @@ describe("MIGRATION_REFUSAL_REASONS covers the target-resolution and ownership r
     expect(entry.remedy).toContain("lcm project link");
   });
 });
+
+describe("MIGRATION_REFUSAL_REASONS covers the abort command orchestration's own reasons", () => {
+  const REASONS_CLI_ABORT_CAN_EMIT = ["abort-nothing-to-abort", "abort-readback-mismatch"];
+
+  it.each(REASONS_CLI_ABORT_CAN_EMIT)(
+    "covers real reason %s",
+    (reason) => {
+      expect(() => migrationRefusalMapping(reason)).not.toThrow();
+    },
+  );
+});

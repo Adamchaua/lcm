@@ -243,6 +243,14 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     reason: "abort-unresolvable", exitClass: "refused-evidence",
     remedy: "The abort could not be classified into a known precondition or defect. Run `lcm doctor` before retrying.",
   }),
+  Object.freeze({
+    reason: "abort-nothing-to-abort", exitClass: "refused-precondition",
+    remedy: "There is no maintenance hold to abort.",
+  }),
+  Object.freeze({
+    reason: "abort-readback-mismatch", exitClass: "failed-operator-required",
+    remedy: "The abort appeared to complete but its terminal state could not be confirmed on readback. Run `lcm doctor` and inspect the maintenance journal and manifest directly.",
+  }),
 ] satisfies MigrationRefusalMapping[]);
 
 const REFUSAL_BY_REASON: ReadonlyMap<string, MigrationRefusalMapping> = new Map(
