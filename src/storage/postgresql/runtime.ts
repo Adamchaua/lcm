@@ -18,6 +18,7 @@ import {
   normalizePostgreSqlError,
   PostgreSqlStorageOperationError,
   PostgreSqlCommitOutcomeUnknownError,
+  sanitizeSqlState,
 } from "./errors.js";
 import {
   areRequiredPostgreSqlExtensionsReady,
@@ -297,7 +298,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
 
   /** Open after factory/schema/project admission; never changes mutation mode. */
   async openReadOnlySnapshot(
-    input: PostgreSqlSnapshotOptions,
+    input: Omit<PostgreSqlSnapshotOptions, "snapshotIdleTimeoutMs">,
   ): Promise<PostgreSqlSnapshotSession> {
     const context = { ...input, domain: "transaction", operation: "snapshot" } as const;
     const projectIds = normalizedProjectScope(context);
@@ -326,6 +327,14 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         throw error;
       }
     }
+    // idle_in_transaction_session_timeout is checked between statements,
+    // so the FATAL it produces on an idle snapshot ordinarily has no
+    // in-flight query to reject; node-pg instead emits 'error' on the
+    // checked-out Client. Scoped to this snapshot checkout only (see
+    // issue #1424 for the wider gap on other checked-out clients): without
+    // a listener that emit is an unhandled process-level error. Removed on
+    // release so it never lingers on a client returned to the pool.
+    let onClientAsyncFailure: ((error: unknown) => void) | undefined;
     session = await PostgreSqlSnapshotSession.open({
       query: <R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
         config: QueryConfig<I>, queryOptions: PostgreSqlQueryOptions,
@@ -334,8 +343,13 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       ),
       rollback: async () => { await client.query("ROLLBACK"); },
       release: (destroy) => {
+        if (onClientAsyncFailure) client.removeListener("error", onClientAsyncFailure);
         if (session) this.snapshots.delete(session);
         client.release(destroy);
+      },
+      onAsyncFailure: (handler) => {
+        onClientAsyncFailure = (error: unknown) => { handler(sanitizeSqlState(error)); };
+        client.on("error", onClientAsyncFailure);
       },
     }, options);
     if (this.closed) {

@@ -4,6 +4,7 @@ import { StorageOperationError } from "../errors.js";
 import type { PostgreSqlQueryExecutor, PostgreSqlQueryOptions } from "./contracts.js";
 import {
   isPostgreSqlConnectionError, isPostgreSqlSnapshotTerminationError, normalizePostgreSqlError,
+  PostgreSqlStorageOperationError,
 } from "./errors.js";
 
 /**
@@ -72,6 +73,20 @@ export interface PostgreSqlSnapshotIdentity {
 export interface PostgreSqlSnapshotTransport extends PostgreSqlQueryExecutor {
   rollback(): Promise<void>;
   release(destroy: boolean): void;
+  /**
+   * Optional. When present, the session registers exactly one handler here
+   * at construction time, and the transport must invoke it whenever the
+   * driver reports an asynchronous failure that arrives outside any
+   * query's promise chain: most notably a FATAL delivered to an idle
+   * checked-out client, such as an idle_in_transaction_session_timeout
+   * kill (PostgreSQL only ever checks that timeout between statements, so
+   * the FATAL ordinarily has no in-flight query to reject). The transport
+   * must swallow the underlying driver event itself so it never becomes an
+   * unhandled process-level error, and must invoke the handler with the
+   * failure's sanitized five-character SQLSTATE when the driver supplied
+   * one, or null otherwise.
+   */
+  onAsyncFailure?(handler: (sqlState: string | null) => void): void;
 }
 
 /** A single checked-out backend, retained until terminal rollback or disconnect. */
@@ -83,6 +98,15 @@ export class PostgreSqlSnapshotSession implements PostgreSqlQueryExecutor {
   private destroy = false;
   private closePromise: Promise<void> | undefined;
   private snapshotIdentity!: PostgreSqlSnapshotIdentity;
+  /**
+   * Set only by the transport's {@link PostgreSqlSnapshotTransport.onAsyncFailure}
+   * callback: the sanitized SQLSTATE of an out-of-band driver failure
+   * (idle-in-transaction FATAL, most often), captured because it never
+   * arrives on the promise a later query or close rejects with. Reattached
+   * by {@link normalize} so that later rejection still carries the real
+   * diagnostic instead of a generic, code-free "not queryable" message.
+   */
+  private capturedSqlState: string | null = null;
   private readonly onAbort = (): void => {
     void this.close().catch(() => undefined);
   };
@@ -94,6 +118,14 @@ export class PostgreSqlSnapshotSession implements PostgreSqlQueryExecutor {
     this.context = { domain: "transaction", operation: "snapshot", projectId: options.projectId };
     options.signal?.addEventListener("abort", this.onAbort, { once: true });
     if (options.signal?.aborted) this.onAbort();
+    // The listener can fire at any time once the transport's client is
+    // checked out, including before BEGIN completes and after close() has
+    // already started; it only ever marks this session destroyed and
+    // records a diagnostic, so it is safe regardless of session phase.
+    transport.onAsyncFailure?.((sqlState) => {
+      this.destroy = true;
+      this.capturedSqlState ??= sqlState;
+    });
   }
 
   static async open(
@@ -132,12 +164,37 @@ export class PostgreSqlSnapshotSession implements PostgreSqlQueryExecutor {
       return session;
     } catch (error) {
       await session.close().catch(() => undefined);
-      throw normalizePostgreSqlError(error, session.context);
+      throw session.normalize(error, session.context);
     }
   }
 
   get identity(): PostgreSqlSnapshotIdentity {
     return this.snapshotIdentity;
+  }
+
+  /**
+   * Normalizes a driver failure, then reattaches {@link capturedSqlState}
+   * when normalization left sqlState null. A captured async failure is by
+   * definition a connection-level event (an out-of-band driver 'error'),
+   * never an ordinary query-level SQL error, so the reattached error is
+   * always marked retryable regardless of what the code-free rejection it
+   * replaces would otherwise have computed.
+   */
+  private normalize(error: unknown, context: PostgreSqlQueryOptions): StorageOperationError {
+    const normalized = normalizePostgreSqlError(error, context);
+    if (
+      this.capturedSqlState !== null
+      && normalized instanceof PostgreSqlStorageOperationError
+      && normalized.sqlState === null
+    ) {
+      return new PostgreSqlStorageOperationError(
+        normalized.code as "STORAGE_INITIALIZATION_FAILED" | "STORAGE_OPERATION_FAILED",
+        context,
+        this.capturedSqlState,
+        true,
+      );
+    }
+    return normalized;
   }
 
   async query<R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
@@ -165,7 +222,7 @@ export class PostgreSqlSnapshotSession implements PostgreSqlQueryExecutor {
           || isPostgreSqlSnapshotTerminationError(error);
         // Do not await close inside the queue it must drain.
         void this.close().catch(() => undefined);
-        throw normalizePostgreSqlError(error, { ...options, projectId: this.options.projectId });
+        throw this.normalize(error, { ...options, projectId: this.options.projectId });
       }
     });
     this.queue = execute.then(() => undefined, () => undefined);
@@ -189,12 +246,12 @@ export class PostgreSqlSnapshotSession implements PostgreSqlQueryExecutor {
       if (!this.destroy) await this.transport.rollback();
     } catch (error) {
       this.destroy = true;
-      throw normalizePostgreSqlError(error, this.context);
+      throw this.normalize(error, this.context);
     } finally {
       try {
         this.transport.release(this.destroy);
       } catch (error) {
-        throw normalizePostgreSqlError(error, this.context);
+        throw this.normalize(error, this.context);
       }
     }
   }

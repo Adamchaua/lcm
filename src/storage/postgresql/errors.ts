@@ -106,7 +106,7 @@ export class PostgreSqlCommitOutcomeUnknownError extends StorageOperationError {
   }
 }
 
-function sanitizeSqlState(error: unknown): string | null {
+export function sanitizeSqlState(error: unknown): string | null {
   const code = (error as PostgreSqlDriverError | undefined)?.code;
   return typeof code === "string" && /^[0-9A-Z]{5}$/u.test(code) ? code : null;
 }
@@ -139,11 +139,28 @@ export function isPostgreSqlConnectionError(error: unknown): boolean {
 export function isPostgreSqlSnapshotTerminationError(error: unknown): boolean {
   if (error instanceof PostgreSqlStorageOperationError) {
     const sqlState = error.sqlState;
-    return sqlState !== null && (
-      sqlState === "25P03"
-      || (sqlState.length === 5 && sqlState.startsWith("08"))
-      || CONNECTION_TERMINATION_SQLSTATES.has(sqlState)
-    );
+    if (sqlState !== null) {
+      return sqlState === "25P03"
+        || (sqlState.length === 5 && sqlState.startsWith("08"))
+        || CONNECTION_TERMINATION_SQLSTATES.has(sqlState);
+    }
+    // idle_in_transaction_session_timeout fires while no statement is
+    // running: the FATAL arrives on the driver's asynchronous 'error'
+    // event, not on the promise the failing operation rejects with. A
+    // message-only torn connection (for example "Connection terminated
+    // unexpectedly") survives normalization with sqlState null and
+    // retryable true (RETRYABLE_DRIVER_MESSAGES / transport codes); that
+    // is the shape this branch tolerates. It does NOT cover "Client has
+    // encountered a connection error and is not queryable" (sqlState
+    // null, retryable false): that generic local rejection is exactly
+    // what an ordinary dead-but-undiagnosed client also produces, so it
+    // stays untolerated here unless the snapshot checkout's async-failure
+    // listener already captured a real diagnostic and reattached it
+    // (see PostgreSqlSnapshotSession), which gives it a real sqlState and
+    // takes the branch above instead. retryable alone is not a sufficient
+    // signal in general: a 40001 serialization failure is retryable too,
+    // but it keeps its own sqlState and never reaches this branch.
+    return error.retryable === true;
   }
   const candidate = error as PostgreSqlDriverError | undefined;
   const code = candidate?.code;

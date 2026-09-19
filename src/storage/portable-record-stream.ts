@@ -10,6 +10,7 @@ import {
   serializePortableRecord,
   sha256,
 } from "./portable-record.js";
+import { isPostgreSqlSnapshotTerminationError } from "./postgresql/errors.js";
 import type {
   PortableDomain,
   PortableRecord,
@@ -852,13 +853,18 @@ async function readSourcePage(
   } catch (error) {
     checkAbort(input.signal);
     if (error instanceof PortableStreamError) {
-      // A source-unavailable PortableStreamError (for example a mid-transfer
-      // 25P03 idle-kill) is a transient connection loss, not corrupt source
-      // data. Recoding it to source-invalid would mislabel it as
-      // non-retryable; keep the code and forward the already-sanitized
-      // cause so operators see why. Every other source-reported code stays
-      // source-invalid, as before.
-      if (error.code === "source-unavailable") sourceFailure("source-unavailable", error.cause);
+      // A source-unavailable PortableStreamError is preserved as retryable
+      // only when its cause genuinely indicates a PostgreSQL connection
+      // termination or idle-in-transaction kill (25P03/08xxx/57P0x, or a
+      // message-only torn connection that survives normalization as
+      // retryable with no sqlState). safeError's fallback branch also
+      // reports source-unavailable for a non-transient storage failure it
+      // does not otherwise recognize (for example permission-denied); that
+      // must still fail fast as source-invalid, exactly like every other
+      // source-reported code, not retry indefinitely.
+      if (error.code === "source-unavailable" && isPostgreSqlSnapshotTerminationError(error.cause)) {
+        sourceFailure("source-unavailable", error.cause);
+      }
       sourceFailure("source-invalid");
     }
     sourceFailure("source-unavailable");
@@ -1192,8 +1198,12 @@ export async function createPortableRecordStream(
       closePromise = operationTail.then(async () => {
         try {
           await source.close();
-        } catch {
-          sourceFailure("source-unavailable");
+        } catch (error) {
+          // portable-source attaches the already-sanitized underlying
+          // failure as cause on its own close-failure PortableStreamError;
+          // forward it here instead of discarding it, so a direct
+          // source.close() caller keeps that diagnostic.
+          sourceFailure("source-unavailable", error instanceof PortableStreamError ? error.cause : undefined);
         }
       });
       return closePromise;

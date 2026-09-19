@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import type { Client, Pool, PoolClient, QueryResult, QueryResultRow } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
@@ -45,7 +46,15 @@ function fixture(
     return execute;
   });
   const release = vi.fn();
-  const connect = vi.fn(async () => ({ query, release }) as unknown as PoolClient);
+  // A real EventEmitter, not a plain object, so the transport's
+  // client.on("error", ...)/removeListener("error", ...) calls behave
+  // exactly like the real pg PoolClient (which extends EventEmitter).
+  // Shared across connect() calls in one fixture: sequential sessions on
+  // the same fixture register and deregister their own listener on it,
+  // exactly like reopening a session on the same recycled backend would.
+  const clientEvents = new EventEmitter();
+  const connect = vi.fn(async () => Object.assign(clientEvents, { query, release }) as unknown as PoolClient);
+  const emitClientError = (error: unknown): void => { clientEvents.emit("error", error); };
   const end = vi.fn(async () => undefined);
   const cancel = vi.fn(async () => {
     active?.callback(new Error("cancelled private query"));
@@ -60,7 +69,7 @@ function fixture(
     createPool: () => ({ connect, end, on: vi.fn() }) as unknown as Pool,
     createClient: () => ({ connect: async () => undefined, query: cancel, end: async () => undefined }) as unknown as Client,
   });
-  return { runtime, query, connect, release, end, cancel, statements, configs };
+  return { runtime, query, connect, release, end, cancel, statements, configs, clientEvents, emitClientError };
 }
 
 describe("dedicated PostgreSQL snapshot session", () => {
@@ -413,6 +422,74 @@ describe("dedicated PostgreSQL snapshot session", () => {
     await session.close();
     expect(f.statements).not.toContain("ROLLBACK");
     expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+    await f.runtime.close();
+  });
+
+  it("captures an async client failure via the checkout listener and skips ROLLBACK on close", async () => {
+    // idle_in_transaction_session_timeout fires with no query in flight: on
+    // the real driver the FATAL arrives as an 'error' event on the checked-
+    // out client, not as a query rejection. The runtime's checkout listener
+    // must observe it, mark the session destroyed immediately, and never
+    // let it become an unhandled process error.
+    const f = fixture();
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    expect(f.clientEvents.listenerCount("error")).toBe(1);
+    f.emitClientError(Object.assign(
+      new Error("terminating connection due to idle-in-transaction timeout"), { code: "25P03" },
+    ));
+    await session.close();
+    expect(f.statements).not.toContain("ROLLBACK");
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+    await f.runtime.close();
+  });
+
+  it("reattaches the captured async sqlState to a later query that fails without one", async () => {
+    const f = fixture(async (text) => {
+      if (text === "SELECT after-kill") {
+        throw new Error("Client has encountered a connection error and is not queryable");
+      }
+      return result();
+    });
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    f.emitClientError(Object.assign(
+      new Error("terminating connection due to idle-in-transaction timeout"), { code: "25P03" },
+    ));
+    // The listener already marked the session destroyed; the driver's own
+    // "not queryable" rejection for the next query carries no code at all,
+    // but the session reattaches the earlier captured diagnostic so the
+    // caller still sees the real, retryable failure instead of a generic
+    // code-free one.
+    await expect(session.query({ text: "SELECT after-kill" }, options))
+      .rejects.toMatchObject({ sqlState: "25P03", retryable: true });
+    await session.close();
+    expect(f.statements).not.toContain("ROLLBACK");
+    await f.runtime.close();
+  });
+
+  it("keeps the first captured sqlState across multiple async failures on the same session", async () => {
+    const f = fixture(async (text) => {
+      if (text === "SELECT late") throw new Error("Connection terminated unexpectedly");
+      return result();
+    });
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    f.emitClientError(Object.assign(
+      new Error("terminating connection due to idle-in-transaction timeout"), { code: "25P03" },
+    ));
+    // The socket-end message that typically follows the FATAL carries no
+    // code; it must not overwrite the real diagnostic already captured.
+    f.emitClientError(new Error("Connection terminated unexpectedly"));
+    await expect(session.query({ text: "SELECT late" }, options))
+      .rejects.toMatchObject({ sqlState: "25P03", retryable: true });
+    await session.close();
+    await f.runtime.close();
+  });
+
+  it("removes the async-failure listener from the client on release", async () => {
+    const f = fixture();
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    expect(f.clientEvents.listenerCount("error")).toBe(1);
+    await session.close();
+    expect(f.clientEvents.listenerCount("error")).toBe(0);
     await f.runtime.close();
   });
 

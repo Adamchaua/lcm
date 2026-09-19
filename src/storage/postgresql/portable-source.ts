@@ -446,12 +446,17 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
         try {
           await session.close();
         } catch (error) {
-          // Tolerate only a session already dead from a 25P03 idle-kill or
-          // connection-termination failure: a transfer that finished
-          // cleanly and then hits an idle-kill or dropped connection on
-          // close should not surface as a failure. Disk-index and pool
-          // close failures below still propagate loudly; this tolerance is
-          // scoped to the session arm only.
+          // Tolerate a session already dead from a 25P03 idle-kill,
+          // 08xxx/57P0x connection termination, or a message-only torn
+          // connection that survives normalization as retryable with no
+          // sqlState (isPostgreSqlSnapshotTerminationError). It does NOT
+          // tolerate a generic "not queryable" local rejection (no
+          // sqlState, not retryable) unless the snapshot checkout's
+          // async-failure listener already captured a real diagnostic and
+          // reattached it (PostgreSqlSnapshotSession.normalize); an
+          // undiagnosed dead session still fails loudly here. Disk-index
+          // and pool close failures below always propagate; this
+          // tolerance is scoped to the session arm only.
           if (!isPostgreSqlSnapshotTerminationError(error)) { failed=true; cause??=error; }
         }
         try { await runtime.close(); } catch (error) { failed=true; cause??=error; }

@@ -169,4 +169,36 @@ describe("PostgreSQL error normalization", () => {
       expect(isPostgreSqlSnapshotTerminationError(error)).toBe(false);
     },
   );
+
+  it("tolerates a live message-only torn connection but not a live generic not-queryable rejection", () => {
+    const context = { domain: "transaction", operation: "snapshot", projectId: "project" } as const;
+    // idle_in_transaction_session_timeout fires with no query in flight;
+    // the FATAL never reaches the operation's own rejection. What the
+    // operation actually rejects with, after the socket end follows, is
+    // this message-only shape (RETRYABLE_DRIVER_MESSAGES match, no code).
+    const tornConnection = normalizePostgreSqlError(new Error("Connection terminated unexpectedly"), context);
+    expect(tornConnection).toMatchObject({ sqlState: null, retryable: true });
+    expect(isPostgreSqlSnapshotTerminationError(tornConnection)).toBe(true);
+
+    // A generic "not queryable" local rejection (what pg's Client.query
+    // produces once _queryable is false, with no code and not in
+    // RETRYABLE_DRIVER_MESSAGES) must NOT be tolerated on its own: an
+    // ordinary, undiagnosed dead session looks exactly like this too, and
+    // the whole point of the async-failure listener + reattach is that
+    // this predicate should not have to guess.
+    const notQueryable = normalizePostgreSqlError(
+      new Error("Client has encountered a connection error and is not queryable"), context,
+    );
+    expect(notQueryable).toMatchObject({ sqlState: null, retryable: false });
+    expect(isPostgreSqlSnapshotTerminationError(notQueryable)).toBe(false);
+
+    // retryable alone, without a null sqlState, is never sufficient: 40001
+    // keeps its own sqlState through normalization and is retryable, but
+    // it is a serialization failure, not a connection termination.
+    const serializationFailure = normalizePostgreSqlError(
+      Object.assign(new Error("could not serialize access"), { code: "40001" }), context,
+    );
+    expect(serializationFailure).toMatchObject({ sqlState: "40001", retryable: true });
+    expect(isPostgreSqlSnapshotTerminationError(serializationFailure)).toBe(false);
+  });
 });

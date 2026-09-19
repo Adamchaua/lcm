@@ -116,6 +116,8 @@ const expectedComponents = [
     paths: [
       "^src/daemon/auth\\.ts$",
       "^src/daemon/client\\.ts$",
+      // #1410 adds the validated, persisted snapshotIdleTimeoutMs
+      // PostgreSQL tuning key here.
       "^src/daemon/config\\.ts$",
       "^src/daemon/content-fence\\.ts$",
       "^src/daemon/http-url\\.ts$",
@@ -216,7 +218,12 @@ const expectedComponents = [
       "^src/storage/index\\.ts$",
       // Curated portable package API remains storage-abstractions-owned.
       "^src/storage/portable\\.ts$",
+      // #1410 adds the optional, non-serialized PortableStreamError cause
+      // here.
       "^src/storage/portable-record\\.ts$",
+      // #1410 classifies a read-path source-unavailable as retryable only
+      // when its cause is a genuine PostgreSQL connection termination or
+      // idle kill, and forwards the source's close cause, here.
       "^src/storage/portable-record-stream\\.ts$",
       "^src/storage/portable-transfer\\.ts$",
       "^src/storage/portable-index\\.ts$",
@@ -359,11 +366,21 @@ const expectedComponents = [
     paths: [
       "^src/daemon/staged-postgresql\\.ts$",
       "^src/storage/postgresql/client-config\\.ts$",
+      // #1410 adds the optional snapshotIdleTimeoutMs connection setting
+      // here.
       "^src/storage/postgresql/contracts\\.ts$",
+      // #1410 adds the snapshot-local termination predicate, covering a
+      // captured async-diagnostic reattachment shape, here.
       "^src/storage/postgresql/errors\\.ts$",
+      // #1410 threads snapshotIdleTimeoutMs through resolved connection
+      // settings here.
       "^src/storage/postgresql/factory\\.ts$",
       "^src/storage/postgresql/index\\.ts$",
+      // #1410 attaches the snapshot checkout's async-failure listener and
+      // resolves the snapshot idle bound here.
       "^src/storage/postgresql/runtime\\.ts$",
+      // #1410 separates the snapshot's idle-in-transaction bound from
+      // statementTimeoutMs and captures its async FATAL diagnostic here.
       "^src/storage/postgresql/snapshot-session\\.ts$",
       "^src/storage/postgresql\\.ts$",
     ],
@@ -373,6 +390,8 @@ const expectedComponents = [
     name: "Integration - PostgreSQL Portable Transfer",
     paths: [
       // #618 canonical self-provenance stays in PostgreSQL portable transfer.
+      // #1410 narrows session-close tolerance to a real snapshot-
+      // termination diagnostic here.
       "^src/storage/postgresql/portable-source\\.ts$",
       "^src/storage/postgresql/portable-destination\\.ts$",
       "^src/storage/postgresql/portable-mapping\\.ts$",

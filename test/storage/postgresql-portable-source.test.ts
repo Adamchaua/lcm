@@ -335,6 +335,28 @@ describe('PostgreSQL source failure boundaries',()=>{
     expect(error).toMatchObject({code:'source-unavailable'});
     expect((error as {cause?:unknown}).cause).toBe(ordinaryFailure);
   });
+  it('tolerates a live message-only torn connection but not a live generic not-queryable close failure',async()=>{
+    // What a session.close() ROLLBACK actually rejects with, live, after an
+    // idle-in-transaction FATAL: either a message-only torn connection
+    // that survives normalization as retryable with no sqlState, or, if
+    // undiagnosed, a generic "not queryable" rejection that never carries
+    // a code and is not retryable. Only the first is tolerated.
+    const tornConnection=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},null,true,
+    );
+    const h=dataHarness(),source=await open(h);
+    h.session.close.mockRejectedValue(tornConnection);
+    await expect(source.close()).resolves.toBeUndefined();
+
+    const notQueryable=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},null,false,
+    );
+    const h2=dataHarness(),source2=await open(h2);
+    h2.session.close.mockRejectedValue(notQueryable);
+    const error=await source2.close().catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable'});
+    expect((error as {cause?:unknown}).cause).toBe(notQueryable);
+  });
   it('still fails a close when index closure fails, even alongside a tolerated 25P03 session close',async()=>{
     const h=dataHarness(),source=await open(h),original=PortableIndex.prototype.close;
     vi.spyOn(PortableIndex.prototype,'close').mockImplementation(function(){original.call(this);throw new Error('index-secret');});
