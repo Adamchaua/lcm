@@ -1298,6 +1298,27 @@ function normalizePostgreSqlMigrationRole(
  * backend; that decision, and its scope restriction to the migration
  * command surface, lives entirely in the migration-specific caller.
  */
+/**
+ * **Scope warning, read before calling this from anywhere new.** This
+ * function resolves PostgreSQL connection settings *independent of the
+ * active \`storage.backend\`* — it will happily return a usable
+ * \`ResolvedPostgreSqlConfig["postgresql"]\` even while \`storage.backend\`
+ * is \`"sqlite"\`. That is deliberate and exists for exactly one reason:
+ * issue #627's migration command surface (\`src/migration/target-config.ts\`)
+ * needs the PostgreSQL target while the project has not yet cut over.
+ *
+ * It is not safe to call from the ordinary storage path, and it must never
+ * be reached from \`loadIdentityStorageConfig\` or any other general-purpose
+ * config accessor. Doing so would let a non-migration caller reach
+ * PostgreSQL while SQLite remains selected, which breaches issue #627's own
+ * scope exclusion that SQLite stays the zero-configuration default and
+ * nothing may silently fall back from (or bypass) a configured backend
+ * selection. \`resolveStorageConfig\` below is the backend-gated function
+ * every ordinary caller must keep using; this export exists only to let the
+ * migration surface reuse its validation logic verbatim rather than forking
+ * a second copy of it, per this item's own rule against duplicated
+ * decisions.
+ */
 export function resolvePostgreSqlStorageSettings(
   storage: Record<string, unknown>,
   env: Record<string, string | undefined>,
