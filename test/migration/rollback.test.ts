@@ -22,7 +22,7 @@
  * the explicit list of what remains.
  */
 
-import { mkdirSync, mkdtempSync, chmodSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, chmodSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -51,6 +51,8 @@ import {
   runMigrationRollback,
   readRollbackReport,
   RollbackOrchestrationError,
+  deriveRollbackPublicationId,
+  deriveRollbackPrepareInputSha256,
   type RunMigrationRollbackDependencies,
   type RollbackFencedSession,
   type MigrationSelectionBindingRecorder,
@@ -273,21 +275,24 @@ describe("runMigrationRollback", () => {
     expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
   });
 
-  it("does not refuse on the identical setup when witness resolution instead reports authoritative absence (positive control)", async () => {
+  it("does not refuse on the identical setup when witness resolution instead reports authoritative absence (positive control), and completes as an unactivated selection reversal", async () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });
     manifestAtVerified(store, "gen-control");
+    const canonicalPath = join(homeDir, "live.sqlite");
+    const selectionBindings: unknown[] = [];
+    const witnessBindings: unknown[] = [];
 
     const outcome = await runMigrationRollback({
-      homeDir, generationId: "gen-control", canonicalPath: join(homeDir, "live.sqlite"),
+      homeDir, generationId: "gen-control", canonicalPath,
       projectIdentity: identity, localProjectId: "local-1",
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
       resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
       classifyRollbackMode: referenceClassifyRollbackMode,
-      recordSelectionBinding: () => undefined,
-      recordWitnessBinding: () => undefined,
+      recordSelectionBinding: (input) => { selectionBindings.push(input.binding); },
+      recordWitnessBinding: (input) => { witnessBindings.push(input.binding); },
       resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => {
         const destinationIdentity = fixtureDestinationIdentity("d");
@@ -301,15 +306,33 @@ describe("runMigrationRollback", () => {
           source: sqliteSourceStream,
         });
       },
-    }).catch((error: unknown) => error);
-    // "unactivated" always yields mode "pre-write", which this item does
-    // not implement (step 9's data-movement-none path) -- so this
-    // positive control reaches a DIFFERENT, later failure than the
-    // unresolvable case above, proving the two setups are not
-    // indistinguishable to the code under test.
-    expect(outcome).toMatchObject({ name: "RollbackOrchestrationError", reason: "not-implemented" });
-    const manifest = new MigrationManifestStore({ homeDir }).read("gen-control");
-    expect(manifest.phase).toBe("rolling-back");
+    });
+    // "unactivated" always yields mode "pre-write" (plan-v2 section 1: no
+    // epoch ever existed, so there is nothing to compare beyond the
+    // manifest's own sealed destination witness) -- so this positive
+    // control reaches a DIFFERENT, later outcome (success) than the
+    // unresolvable case above (refusal before maintenance), proving the
+    // two setups are not indistinguishable to the code under test.
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
+    expect(outcome.report).not.toBeNull();
+    expect(outcome.report!.mode).toBe("pre-write");
+    expect(outcome.report!.eligibility).toBe("unactivated");
+
+    // No selection was ever published, so there is no activation
+    // epoch/attempt to name: neither a witness nor a selection binding
+    // is written for "unactivated" (see rollback.ts's OPEN QUESTION
+    // comment on this exact point).
+    expect(selectionBindings).toHaveLength(0);
+    expect(witnessBindings).toHaveLength(0);
+
+    // Selection reversal, not reinstallation: the maintenance selection
+    // flips to sqlite, but nothing is installed at canonicalPath -- this
+    // rollback never touches the live database.
+    const maintenance = readBackendMaintenanceJournal(homeDir);
+    expect(maintenance?.phase).toBe("selection-completed");
+    expect(maintenance?.targetBackend).toBe("sqlite");
+    expect(existsSync(canonicalPath)).toBe(false);
   });
 
   it("post-write: builds, installs, materializes, publishes, and reports, ending at phase rolled-back", async () => {
@@ -425,5 +448,235 @@ describe("runMigrationRollback", () => {
     const maintenance = readBackendMaintenanceJournal(homeDir);
     expect(maintenance?.phase).toBe("maintenance-aborted");
   });
-});
 
+  it("refuses as a racing post-activation write when step 10's revalidation observes a mode change from step 9's, leaving the generation preserved and unreferenced", async () => {
+    // A pre-write decision at step 9 (delta matches baseline, census
+    // matches) followed by a DIFFERENT observation at step 10 (delta now
+    // drifted, simulating a write that landed inside the fenced window
+    // between the two readbacks). Breakable independently: the positive
+    // control below (identical setup, but the second observation equals
+    // the first) completes successfully instead of refusing, proving this
+    // refusal comes from the mismatch and not from the fixture shape.
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-race");
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const baseline = fixtureCanonicalDelta("race-baseline");
+    const census = fixtureCensusVector("race-census");
+
+    await expect(runMigrationRollback({
+      homeDir, generationId: "gen-race", canonicalPath: join(homeDir, "live.sqlite"),
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator: coordinatorFor(homeDir),
+      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
+        epochId: "epoch-race", attemptId: "attempt-race", manifestRevision: 1,
+        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-race",
+      }),
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => ({
+        epoch: { destinationIdentity, censusVector: census, schemaWitness: fixtureSchemaWitness("s") },
+        attempt: { canonicalDeltaBaseline: baseline },
+      }),
+      openFencedSession: async () => fakeSession({
+        observations: [
+          {
+            manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+            destinationIdentity, postEpochDelta: baseline, postEpochCensus: census,
+          },
+          {
+            manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+            destinationIdentity, postEpochDelta: fixtureCanonicalDelta("race-write-landed"), postEpochCensus: null,
+          },
+        ],
+        source: sqliteSourceStream,
+      }),
+    })).rejects.toMatchObject({
+      name: "RollbackOrchestrationError",
+      reason: "not-eligible",
+      message: expect.stringContaining("revalidation observed mode"),
+    });
+
+    const manifest = new MigrationManifestStore({ homeDir }).read("gen-race");
+    expect(manifest.phase).toBe("rolling-back");
+    expect(manifest.pendingEffect).toBeNull();
+  });
+
+  it("positive control for the race test above: an unchanged second observation completes as pre-write instead of refusing", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-race-control");
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const baseline = fixtureCanonicalDelta("race-control-baseline");
+    const census = fixtureCensusVector("race-control-census");
+    const observation = {
+      manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+      destinationIdentity, postEpochDelta: baseline, postEpochCensus: census,
+    };
+
+    const outcome = await runMigrationRollback({
+      homeDir, generationId: "gen-race-control", canonicalPath: join(homeDir, "live.sqlite"),
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator: coordinatorFor(homeDir),
+      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
+        epochId: "epoch-race-control", attemptId: "attempt-race-control", manifestRevision: 1,
+        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-race-control",
+      }),
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => ({
+        epoch: { destinationIdentity, censusVector: census, schemaWitness: fixtureSchemaWitness("s") },
+        attempt: { canonicalDeltaBaseline: baseline },
+      }),
+      openFencedSession: async () => fakeSession({ observations: [observation, observation], source: sqliteSourceStream }),
+    });
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
+  });
+
+  it("takeover-and-retry: resolves the epoch/attempt via the BOUND attempt only, never the unbound one, even though both are present as witnesses", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-takeover");
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const baselineBound = fixtureCanonicalDelta("bound-baseline");
+    const censusBound = fixtureCensusVector("bound-census");
+    const baselineUnboundWrong = fixtureCanonicalDelta("unbound-wrong-baseline");
+    const selectionBindings: unknown[] = [];
+    const witnessBindings: unknown[] = [];
+    const resolveAuthoritativeContextCalls: string[] = [];
+
+    // Two attempts share one generation after a takeover: "attempt-old"
+    // was superseded and never selected (a witness only); "attempt-new"
+    // is the one an actual selection was published against. Both are
+    // returned as witnesses -- only "attempt-new" is a selection.
+    const resolution = {
+      state: "resolved" as const,
+      witnesses: [
+        { kind: "activation" as const, epochId: "epoch-takeover", attemptId: "attempt-old", manifestRevision: 1, witnessChecksumSha256: "a".repeat(64) },
+        { kind: "activation" as const, epochId: "epoch-takeover", attemptId: "attempt-new", manifestRevision: 2, witnessChecksumSha256: "b".repeat(64) },
+      ],
+      selections: [
+        { kind: "activation" as const, epochId: "epoch-takeover", attemptId: "attempt-new", manifestRevision: 2, witnessChecksumSha256: "b".repeat(64), publicationId: "pub-new" },
+      ],
+    };
+
+    const outcome = await runMigrationRollback({
+      homeDir, generationId: "gen-takeover", canonicalPath: join(homeDir, "live.sqlite"),
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator: coordinatorFor(homeDir),
+      resolveWitnessBindings: () => resolution,
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: (input) => { selectionBindings.push(input.binding); },
+      recordWitnessBinding: (input) => { witnessBindings.push(input.binding); },
+      resolveAuthoritativeContext: async (input) => {
+        resolveAuthoritativeContextCalls.push(input.attemptId);
+        if (input.attemptId !== "attempt-new") {
+          // If this were ever reached with the unbound attempt, a
+          // mismatching baseline makes the wrong-attempt path diverge
+          // (post-write here vs. pre-write below) rather than silently
+          // agreeing with the correct path's outcome.
+          return {
+            epoch: { destinationIdentity, censusVector: fixtureCensusVector("unbound-wrong-census"), schemaWitness: fixtureSchemaWitness("s") },
+            attempt: { canonicalDeltaBaseline: baselineUnboundWrong },
+          };
+        }
+        return {
+          epoch: { destinationIdentity, censusVector: censusBound, schemaWitness: fixtureSchemaWitness("s") },
+          attempt: { canonicalDeltaBaseline: baselineBound },
+        };
+      },
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+          destinationIdentity, postEpochDelta: baselineBound, postEpochCensus: censusBound,
+        }],
+        source: sqliteSourceStream,
+      }),
+    });
+
+    expect(resolveAuthoritativeContextCalls).toEqual(["attempt-new"]);
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
+    expect(selectionBindings).toHaveLength(1);
+    expect(witnessBindings).toHaveLength(1);
+    expect((selectionBindings[0] as { attemptId: string }).attemptId).toBe("attempt-new");
+    expect((witnessBindings[0] as { attemptId: string }).attemptId).toBe("attempt-new");
+    expect(existsSync(join(homeDir, "live.sqlite"))).toBe(false);
+  });
+
+  // NOT WRITTEN, flagged explicitly rather than silently omitted (see
+  // this item's status report): a test resuming
+  // continueAfterPrepareRollback (a crash between step 8 and step 9)
+  // against a REAL BackendPublicationCoordinator. Writing it exposed a
+  // real, reachable defect rather than proving the resume path correct
+  // -- filed as donadiosolutions/lcm#1432 rather than fixed here, because
+  // the fix touches Boundary C's frozen read-timing contract
+  // (coordinator-seam-FROZEN.md section 16: "MUST be read... before
+  // enterMaintenance... never after") and very likely protocol.ts's
+  // manifest shape, neither of which this item owns unilaterally.
+
+  it("abandons a pending publish-rollback effect back to the sealed returnPhase when the selection was never durably proven complete", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    const verified = manifestAtVerified(store, "gen-abandon");
+    const coordinator = coordinatorFor(homeDir);
+
+    const publicationId = deriveRollbackPublicationId("gen-abandon");
+    await coordinator.enterMaintenance({
+      publicationId, generationId: "gen-abandon",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+      now: new Date(capturedAt),
+    });
+    const prepareInputSha256 = deriveRollbackPrepareInputSha256({
+      generationId: "gen-abandon", manifestRevision: verified.revision, manifestChecksumSha256: verified.checksumSha256,
+      epochId: null, resourceType: "sqlite-generation", resourceKey: "gen",
+    });
+    const prepareEffectId = "rollback-prepare-" + prepareInputSha256;
+    let m = store.update("gen-abandon", verified.checksumSha256, (c) => beginMigrationEffect(c, {
+      kind: "prepare-rollback", effectId: prepareEffectId, inputSha256: prepareInputSha256, startedAt: capturedAt,
+    }));
+    m = store.update("gen-abandon", m.checksumSha256, (c) => completeMigrationEffect(c, { effectId: prepareEffectId, completedAt: capturedAt }));
+    // Simulates a crash mid step-11, after publish-rollback began but
+    // before the maintenance selection ever reached selection-completed
+    // -- the maintenance journal is still at "maintenance-held" from the
+    // enterMaintenance call above.
+    m = store.update("gen-abandon", m.checksumSha256, (c) => beginMigrationEffect(c, {
+      kind: "publish-rollback", effectId: "pub-abandon", inputSha256: "a".repeat(64), startedAt: capturedAt,
+    }));
+    expect(m.phase).toBe("rolling-back");
+    expect(m.pendingEffect?.kind).toBe("publish-rollback");
+    expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+
+    const outcome = await runMigrationRollback({
+      homeDir, generationId: "gen-abandon", canonicalPath: join(homeDir, "live.sqlite"),
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator,
+      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => null,
+      openFencedSession: async () => { throw new Error("must not open a session during abandonment recovery"); },
+    });
+
+    expect(outcome.manifest.phase).toBe("verified");
+    expect(outcome.manifest.rollbackLineage.returnPhase).toBeNull();
+    expect(outcome.manifest.pendingEffect).toBeNull();
+    expect(outcome.report).not.toBeNull();
+    expect(outcome.report!.kind).toBe("abandonment");
+    expect(outcome.report!.reason).not.toBeNull();
+    const maintenance = readBackendMaintenanceJournal(homeDir);
+    expect(maintenance?.phase).toBe("maintenance-aborted");
+  });
+});
