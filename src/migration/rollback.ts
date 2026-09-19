@@ -70,10 +70,12 @@
  * reportId), per section 8's convergence rule.
  */
 
+import { opendirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   atomicWritePrivateFileDurable,
   ensurePrivateDirectory,
+  openPrivateDirectoryIfExists,
   readBoundedRegularFileWithStat,
 } from "../security-files.js";
 import { canonicalJson, canonicalSha256, sha256 } from "../storage/portable-record.js";
@@ -1207,6 +1209,84 @@ function requireMaintenanceChecksum(homeDir: string): string {
   return journal.checksumSha256;
 }
 
+function rollbackGenerationBuildRoot(homeDir: string): string {
+  return join(resolve(homeDir), ".lcm", "migration-rollback-generations");
+}
+
+const ROLLBACK_GENERATION_BUILD_ATTEMPT_ORDINAL_PATTERN = /^[1-9][0-9]*$/u;
+const MAX_ROLLBACK_GENERATION_BUILD_ATTEMPT_ENTRIES = 100_000;
+
+/**
+ * donadiosolutions/lcm#626 (post-write build retry). Three-valued, like
+ * every other resolver in this file: the private root directory not
+ * existing yet is a legitimate, positively-determined "no attempt has
+ * EVER built here" -- it is created lazily by buildRollbackGeneration's
+ * own first call, for any generationId -- not a read failure. Any OTHER
+ * failure to open, authenticate or list it REFUSES rather than
+ * defaulting to "none found", because a silent default here could mint
+ * a build target that collides with an existing quarantined failed
+ * generation, the one artifact this item treats as immutable evidence.
+ *
+ * The match against baseGenerationId/revision is EXACT, never startsWith:
+ * the prefix carries its own trailing "-" separator, and the remainder
+ * after stripping it must be a bare positive integer with nothing else,
+ * so a differently-shaped generationId that happens to share a textual
+ * prefix (including one containing "-rb" itself) can never be mistaken
+ * for one of THIS generationId/revision pair's own attempts.
+ */
+function highestRollbackGenerationBuildAttempt(
+  homeDir: string,
+  baseGenerationId: string,
+  revision: number,
+): number {
+  const root = rollbackGenerationBuildRoot(homeDir);
+  try {
+    // The whole body -- including opening the directory -- is inside
+    // this one try/catch, deliberately: an EACCES (or any other) failure
+    // opening the private directory must be wrapped in the SAME
+    // distinguishable message as a failure listing it, so a caller (and
+    // a test) can tell this guard fired rather than some other nearby
+    // code throwing an incidental, differently-shaped error.
+    const handle = openPrivateDirectoryIfExists(root);
+    if (handle === undefined) return 0;
+    try {
+      const prefix = baseGenerationId + "-rb" + revision.toString(10) + "-";
+      const directory = opendirSync(root, { bufferSize: 1 });
+      let highest = 0;
+      try {
+        let seen = 0;
+        for (;;) {
+          const entry = directory.readSync();
+          if (entry === null) break;
+          seen += 1;
+          if (seen > MAX_ROLLBACK_GENERATION_BUILD_ATTEMPT_ENTRIES) {
+            throw new RollbackOrchestrationError(
+              "unexpected-state",
+              "rollback generation build root has more entries than this enumeration will scan; refusing rather than risk an undercounted ordinal",
+            );
+          }
+          if (!entry.name.startsWith(prefix)) continue;
+          const remainder = entry.name.slice(prefix.length);
+          if (!ROLLBACK_GENERATION_BUILD_ATTEMPT_ORDINAL_PATTERN.test(remainder)) continue;
+          const ordinal = Number(remainder);
+          if (Number.isSafeInteger(ordinal) && ordinal > highest) highest = ordinal;
+        }
+      } finally {
+        directory.closeSync();
+      }
+      return highest;
+    } finally {
+      handle.close();
+    }
+  } catch (error) {
+    if (error instanceof RollbackOrchestrationError) throw error;
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "could not enumerate existing rollback generation build attempts: " + describeUnresolvable(error),
+    );
+  }
+}
+
 /**
  * Steps 9-12, shared by the fresh path (called from runMigrationRollback
  * right after step 8 completes, inside the same retained token and the
@@ -1262,9 +1342,34 @@ async function runPostPrepareSequence(
   let built: RollbackGenerationOutcome | null = null;
   if (mode === "post-write") {
     const source = await session.openPortableSource();
+    // The build target must be a FRESH physical generation per attempt,
+    // never reused: plan-v2 section 4's "Resumability, stated honestly"
+    // requires "crash recovery creates a new generation under the
+    // already-sealed prepare-rollback", with the incomplete one
+    // "quarantined read-only at 0400, never deleted" -- and
+    // rollback-generation.ts's own SCOPE NOTE refuses ("generation-
+    // exists") rather than accept a second build at one path, pushing
+    // the mint-or-retry decision up to this orchestration explicitly.
+    // The ordinal is derived by enumerating the durable filesystem
+    // state rather than threaded through in-memory or manifest state,
+    // for the same reason every other identity in this file is: it is
+    // compared/derived as a value, attributable evidence rather than an
+    // unattributable nonce, and ordered so an operator inspecting
+    // quarantined generations reads them in attempt sequence. This does
+    // NOT engage contract section 8 (no attempt-time observation in a
+    // DETERMINISTIC identity that must converge across retries):
+    // section 8 governs identities that must produce the SAME bytes on
+    // every retry; this identity must do the opposite, differing per
+    // attempt BY CONSTRUCTION, so there is nothing for section 8 to
+    // forbid here. buildRollbackGeneration's own "generation-exists"
+    // refusal stays as the final guard regardless: even a wrong ordinal
+    // fails closed rather than overwriting evidence.
+    const buildAttemptOrdinal = highestRollbackGenerationBuildAttempt(
+      input.homeDir, input.generationId, working.revision,
+    ) + 1;
     built = await buildRollbackGeneration({
       homeDir: input.homeDir,
-      generationId: input.generationId + "-rb" + working.revision,
+      generationId: input.generationId + "-rb" + working.revision + "-" + buildAttemptOrdinal,
       projectIdentity: input.projectIdentity,
       source,
       scratchParent: input.scratchParent,
