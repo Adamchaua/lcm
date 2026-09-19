@@ -1,5 +1,6 @@
 import {
   backendPublicationCanonicalSha256,
+  type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
 import {
   classifySqliteSnapshotArtifact,
@@ -17,6 +18,15 @@ import {
  * decision: both call the exact existing classifiers (#622's snapshot
  * classification, this item's own manifest presence probe) and refuse rather
  * than guess when either cannot be established.
+ *
+ * **Fencing residue (section 4.9), stated rather than hidden.** The
+ * publication lock this module's callers are required to hold (see
+ * {@link resolveMigrationGenerationId}) binds same-host processes only. It
+ * does not, and cannot, bind a second LCM installation pointed at the same
+ * project, a direct `sqlite3` session opened outside LCM, or any process on
+ * another host. No exclusion proof exists across those boundaries; none is
+ * claimed. This is the same residue the frozen witness schema's section 10
+ * records and the same one #625 and #626 state for their own fences.
  */
 
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -141,10 +151,22 @@ export type MigrationCandidateOccupancyOperations = Readonly<{
  * Section 4.3's two-tree occupancy check for one candidate generation id.
  * Never deletes or advances anything itself; the caller decides what a
  * `refuse` or `occupied` result means for the probe loop.
+ *
+ * `lockToken` (section 4.9 exposure 1, layer 1) is required but not
+ * validated here: neither underlying read (`classifySqliteSnapshotArtifact`,
+ * `probeManifestPresence`) consumes it, and this module has no exported way
+ * to verify a token is currently active (that check is a module-private
+ * `WeakSet` inside `backend-publication.ts`). Requiring the parameter is a
+ * compile-time proof of possession, not a runtime guarantee of liveness: the
+ * only way to obtain a token at all is from inside an active
+ * `withBackendPublicationAppendBarrierAsync` /
+ * `withBackendPublicationRetainedAppendAdmissionAsync` callback, so a caller
+ * that cannot supply one cannot compile.
  */
 export async function classifyMigrationCandidateOccupancy(input: Readonly<{
   generationId: string;
   homeDir: string;
+  lockToken: BackendPublicationLockToken;
   manifestStore?: MigrationManifestStore;
   /**
    * @internal Deterministic failure-injection seam for tests only, matching
@@ -217,6 +239,7 @@ export type MigrationGenerationIdResolution = Readonly<{
 export async function resolveMigrationGenerationId(input: Readonly<{
   base: string;
   homeDir: string;
+  lockToken: BackendPublicationLockToken;
   manifestStore?: MigrationManifestStore;
   maxProbeOrdinal?: number;
 }>): Promise<MigrationGenerationIdResolution> {
@@ -240,6 +263,7 @@ export async function resolveMigrationGenerationId(input: Readonly<{
     const occupancy = await classifyMigrationCandidateOccupancy({
       generationId: candidate,
       homeDir: input.homeDir,
+      lockToken: input.lockToken,
       manifestStore: store,
     });
     if (occupancy.status === "free") {
@@ -258,4 +282,46 @@ export async function resolveMigrationGenerationId(input: Readonly<{
     "migration generation probe ordinal bound was exceeded before a free candidate was found",
     `max-${maxProbeOrdinal}`,
   );
+}
+
+export type MigrationConfirmedGenerationResolution =
+  | Readonly<{ status: "confirmed"; generationId: string; probedOrdinals: number }>
+  | Readonly<{ status: "refuse"; reason: "occupied-since-probe" | "unresolvable-since-probe"; evidence?: string }>;
+
+/**
+ * Section 4.9 exposure 1, layer 2: re-runs the occupancy check for the
+ * already-selected candidate immediately before the hold, inside the same
+ * retained span (same `lockToken`) as the original probe. The probe result
+ * and this re-check are two independent observations of one fact — whether
+ * the candidate is still free — and either can be corrupted on its own: a
+ * test can occupy the candidate between them, or make the re-check itself
+ * unresolvable, and each must be caught.
+ *
+ * This detects the realistic same-host window; it does not, and must not be
+ * described as, a proof that no race occurred. #622's capture supplies an
+ * independent third observation after private sampling and refuses "SQLite
+ * migration generation appeared before capture binding" — deliberately not
+ * merged with this check, so each can fail on its own.
+ */
+export async function resolveConfirmedMigrationGenerationId(input: Readonly<{
+  base: string;
+  homeDir: string;
+  lockToken: BackendPublicationLockToken;
+  manifestStore?: MigrationManifestStore;
+  maxProbeOrdinal?: number;
+}>): Promise<MigrationConfirmedGenerationResolution> {
+  const resolution = await resolveMigrationGenerationId(input);
+  const recheck = await classifyMigrationCandidateOccupancy({
+    generationId: resolution.generationId,
+    homeDir: input.homeDir,
+    lockToken: input.lockToken,
+    manifestStore: input.manifestStore,
+  });
+  if (recheck.status === "free") {
+    return { status: "confirmed", generationId: resolution.generationId, probedOrdinals: resolution.probedOrdinals };
+  }
+  if (recheck.status === "occupied") {
+    return { status: "refuse", reason: "occupied-since-probe" };
+  }
+  return { status: "refuse", reason: "unresolvable-since-probe", evidence: recheck.evidence };
 }
