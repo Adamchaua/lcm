@@ -216,5 +216,12 @@ describe("resolveMigrationHoldContinuation (section 4.5 continuation)", () => {
     const result = resolveMigrationHoldContinuation({ journal: aborted, candidate: candidateFor(held) });
     expect(result).toEqual({ action: "probe-fresh" });
   });
-});
 
+  it("throws rather than silently starting a fresh cutover for a phase outside the closed union (the exhaustiveness guard, exercised only by deliberately bypassing the type system the way a genuinely new phase value would arrive at runtime)", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const unrecognised = { ...held, phase: "a-future-phase-not-yet-invented" as unknown as BackendMaintenanceJournal["phase"] };
+    expect(() => resolveMigrationHoldContinuation({ journal: unrecognised, candidate: candidateFor(held) }))
+      .toThrow(/unreachable migration maintenance phase/u);
+  });
+});

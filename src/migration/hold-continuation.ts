@@ -59,9 +59,13 @@ function matchesHeldStableFields(
  *   all (`maintenance-held` is not in its existing-journal allowlist) —
  *   this is the section 2.4 / A-1 defect plan-v1 shipped.
  * - `selection-prepared`: not this item's state; `resume` owns it.
- * - Any terminal phase (`selection-completed`, `maintenance-aborted`):
- *   probe for a fresh candidate, subject to the section 4.6 abort gate,
- *   which this function does not itself apply.
+ * - `selection-completed` or `maintenance-aborted` (named explicitly, not
+ *   inferred as "whatever is left"): probe for a fresh candidate, subject
+ *   to the section 4.6 abort gate, which this function does not itself
+ *   apply. A phase this function does not recognise is not silently routed
+ *   here — `BackendMaintenancePhase` is exhausted below, so adding a phase
+ *   without updating this function fails to compile rather than starting a
+ *   fresh cutover on an unrecognised state.
  */
 export function resolveMigrationHoldContinuation(input: Readonly<{
   journal: BackendMaintenanceJournal;
@@ -78,6 +82,15 @@ export function resolveMigrationHoldContinuation(input: Readonly<{
   if (journal.phase === "selection-prepared") {
     return { action: "refuse", reason: "resume-required" };
   }
-  return { action: "probe-fresh" };
+  if (journal.phase === "selection-completed" || journal.phase === "maintenance-aborted") {
+    return { action: "probe-fresh" };
+  }
+  // Exhaustiveness guard, not a residual default: a future phase added to
+  // BackendMaintenancePhase must fail to compile here rather than silently
+  // falling through to probe-fresh, which is the one disposition that
+  // starts a fresh cutover. Concluding "not one of the phases I named,
+  // therefore terminal" would be an inference from absence, not a positive
+  // observation.
+  const exhaustive: never = journal.phase;
+  throw new Error(`unreachable migration maintenance phase: ${exhaustive as string}`);
 }
-
