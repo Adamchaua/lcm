@@ -355,8 +355,15 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
       if (filePathChildBearing[closed] === 1) filePathChildBearing[parent] = 1;
       if (fileChildSettled[closed] === 1) fileChildSettled[parent] = 1;
       // A child that carried both URL syntax and a path root hands its wrapper
-      // an owned tail. A literal-only or path-less child hands over nothing.
-      if (urlBearing[closed] === 1 && rootedBearing[closed] === 1) childCloseOwner[index] = 1;
+      // an owned tail, whether the root was classified directly or reached
+      // through a nested file child's own path. A literal-only, bare, or
+      // query-only child hands over nothing.
+      if (
+        urlBearing[closed] === 1 &&
+        (rootedBearing[closed] === 1 || filePathChildBearing[closed] === 1)
+      ) {
+        childCloseOwner[index] = 1;
+      }
       // The close belongs to the parent, so an adjacent tail reads the wrapper
       // that outlives the closed child instead of the child that just ended.
       groupOf[index] = parent;
@@ -417,7 +424,11 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
         const authorityStop = authorityEnd >= 0 ? chars[authorityEnd] : undefined;
         if (authorityStop === "?" || authorityStop === "#") {
           pathlessChildQueryStarts[authorityEnd] = 1;
-        } else {
+        } else if (authorityStop === "/" || authorityStop === "\\") {
+          // Only a path stop makes the child path-bearing. A bare child that
+          // ends at its wrapper bracket (or any other non-path stop) reached
+          // neither ownership grammar, so recording it here manufactured
+          // ownership its wrapper never earned.
           filePathChildBearing[current] = 1;
         }
         // A child settles on a grammar of its own unless its authority ran

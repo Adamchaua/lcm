@@ -4519,6 +4519,16 @@ describe("sanitizeError", () => {
         "https://outer.test/x?next=file://host&later<path>",
       ],
       [
+        "Review P2 a bracket-closed bare child owns no ampersand successor",
+        "file://h?x=[[file://host]&later/Users/alice/secret.db]",
+        "file://h?x=[[file://host]&later/Users/alice/secret.db]",
+      ],
+      [
+        "Review a path-bearing child forces a post-close Windows root",
+        "file://h?x=[[https://e.test/t|file://host/private]\\Users\\SECRET\\x]",
+        "file://h?x=[[https://e.test/t|file://host<path>]<path>]",
+      ],
+      [
         "R3a a one-character scheme classifies as URL syntax",
         "file://h?x=[a://public.test|name=\\Users\\SECRET\\x]",
         "file://h?x=[a://public.test|name=<path>]",
