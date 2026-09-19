@@ -160,3 +160,14 @@ describe("MIGRATION_REFUSAL_REASONS covers the abort command orchestration's own
     },
   );
 });
+
+describe("MIGRATION_REFUSAL_REASONS covers the target-reachability verification reasons", () => {
+  const REASONS_VERIFICATION_CAN_EMIT = ["migration-target-verification-failed", "migration-target-verification-unresolvable"];
+
+  it.each(REASONS_VERIFICATION_CAN_EMIT)(
+    "covers real reason %s",
+    (reason) => {
+      expect(() => migrationRefusalMapping(reason)).not.toThrow();
+    },
+  );
+});

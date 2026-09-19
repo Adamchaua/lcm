@@ -56,6 +56,14 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     reason: "migration-target-unresolvable", exitClass: "refused-evidence",
     remedy: "The PostgreSQL target configuration could not be read or parsed. Run `lcm doctor` before retrying.",
   }),
+  Object.freeze({
+    reason: "migration-target-verification-failed", exitClass: "refused-precondition",
+    remedy: "The PostgreSQL target was reached but failed TLS or migration-role verification. Fix the role grants or TLS configuration, then retry.",
+  }),
+  Object.freeze({
+    reason: "migration-target-verification-unresolvable", exitClass: "refused-evidence",
+    remedy: "The PostgreSQL target could not be reached to verify TLS or role access. Check network connectivity and the target address, then retry.",
+  }),
 
   // --- dry-run's own refusal (section 3: owns dryRunAuthenticatedSqliteMigrationSource only) ---
   Object.freeze({
