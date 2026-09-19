@@ -335,16 +335,17 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     // a listener that emit is an unhandled process-level error. Removed on
     // release so it never lingers on a client returned to the pool.
     //
-    // Attached unconditionally, right here, rather than gated on whether
-    // PostgreSqlSnapshotSession.open ever calls onAsyncFailure: the
-    // session constructor always does in this runtime-driven flow, so a
-    // conditional guard around detach would have a structurally
-    // unreachable false arm. forwardAsyncFailure starts as a no-op and is
-    // replaced once the session registers; if a client 'error' arrives in
-    // the brief window before that registration, it is safely swallowed
-    // (no unhandled process error) even though no diagnostic is captured
-    // yet for it.
-    let forwardAsyncFailure: (sqlState: string | null) => void = () => undefined;
+    // forwardAsyncFailure is definitely assigned before any 'error' can be
+    // delivered: PostgreSqlSnapshotSession.open constructs the session
+    // synchronously and its constructor calls onAsyncFailure in the same
+    // tick as the attach below, before open's first await. EventEmitter
+    // delivery is synchronous as well, so no event can reach
+    // onClientAsyncFailure while the variable is unassigned; there is no
+    // pre-registration window and therefore no placeholder to fill it.
+    // Attach and detach are unconditional for the same reason: the
+    // session always registers in this runtime-driven flow, so a guard
+    // around either would have a structurally unreachable arm.
+    let forwardAsyncFailure!: (sqlState: string | null) => void;
     const onClientAsyncFailure = (error: unknown): void => { forwardAsyncFailure(sanitizeSqlState(error)); };
     client.on("error", onClientAsyncFailure);
     session = await PostgreSqlSnapshotSession.open({
