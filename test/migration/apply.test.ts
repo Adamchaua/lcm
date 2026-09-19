@@ -13,7 +13,7 @@ import {
   type SqliteMigrationEnrollmentInput,
 } from "../../src/migration/maintenance.js";
 import { classifySqliteSnapshotArtifact } from "../../src/migration/sqlite-snapshot.js";
-import { computeMigrationGenerationBase } from "../../src/migration/generation-identity.js";
+import { computeMigrationGenerationBase, MigrationIdentityError } from "../../src/migration/generation-identity.js";
 import { migrationEntryRoster, migrationQueueEvidenceSentinel } from "../../src/migration/hold-entry.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import { createMigrationManifest } from "../../src/migration/protocol.js";
@@ -392,6 +392,71 @@ describe("performMigrationApplyThroughCapture, refusal paths and their red-first
       _operationsForTesting: { resolveGenerationId: async () => ({ status: "refuse", reason: "unresolvable-since-probe", evidence: "manifest-internal-error" }) },
     });
     expect(result).toEqual({ status: "refuse", reason: "generation-unresolvable-since-probe", evidence: "manifest-internal-error" });
+  });
+
+  it("catches a thrown MigrationIdentityError('probe-bound-exceeded') from resolveGenerationId and converts it into generation-probe-bound-exceeded, never letting it escape as an uncaught exception (red-first: before the catch was added, this exact scenario rejected with the raw MigrationIdentityError instead of resolving to a refuse result)", async () => {
+    const fixture = await enrolled();
+    const result = await performMigrationApplyThroughCapture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      _operationsForTesting: {
+        resolveGenerationId: async () => {
+          throw new MigrationIdentityError("probe-bound-exceeded", "test probe bound exceeded", "max-9999");
+        },
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "generation-probe-bound-exceeded", evidence: "max-9999" });
+  });
+
+  it("catches a thrown MigrationIdentityError('identifier-bound-exceeded') and converts it into generation-identifier-bound-exceeded", async () => {
+    const fixture = await enrolled();
+    const result = await performMigrationApplyThroughCapture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      _operationsForTesting: {
+        resolveGenerationId: async () => {
+          throw new MigrationIdentityError("identifier-bound-exceeded", "test identifier bound exceeded", "ordinal-3");
+        },
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "generation-identifier-bound-exceeded", evidence: "ordinal-3" });
+  });
+
+  it("catches a thrown MigrationIdentityError('occupancy-refused') and converts it into generation-occupancy-refused, carrying the underlying evidence", async () => {
+    const fixture = await enrolled();
+    const result = await performMigrationApplyThroughCapture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      _operationsForTesting: {
+        resolveGenerationId: async () => {
+          throw new MigrationIdentityError("occupancy-refused", "test occupancy refused", "snapshot-snapshot-io");
+        },
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "generation-occupancy-refused", evidence: "snapshot-snapshot-io" });
+  });
+
+  it("catches a thrown MigrationIdentityError('invalid-input') with a null evidence and converts the null to undefined, matching the envelope's optional-evidence shape", async () => {
+    const fixture = await enrolled();
+    const result = await performMigrationApplyThroughCapture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      _operationsForTesting: {
+        resolveGenerationId: async () => {
+          throw new MigrationIdentityError("invalid-input", "test invalid input", null);
+        },
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "generation-invalid-input", evidence: undefined });
+  });
+
+  it("re-throws a thrown error that is not a MigrationIdentityError, never misclassifying an unrecognised failure as a generation refusal (red: broadening the instanceof check to Error would swallow this and wrongly report a generation refusal)", async () => {
+    const fixture = await enrolled();
+    const outcome = performMigrationApplyThroughCapture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      _operationsForTesting: {
+        resolveGenerationId: async () => {
+          throw new Error("an unrelated, unrecognised failure");
+        },
+      },
+    });
+    await expect(outcome).rejects.toThrow("an unrelated, unrecognised failure");
   });
 
   it("refuses multi-machine-installation for a shared (remote-mapped) project identity, never silently fencing it (#625's D-625-4)", async () => {

@@ -17,7 +17,7 @@ import {
   type MigrationHoldCandidate,
   type MigrationHoldDisposition,
 } from "./hold-continuation.js";
-import { resolveConfirmedMigrationGenerationId } from "./generation-identity.js";
+import { resolveConfirmedMigrationGenerationId, MigrationIdentityError } from "./generation-identity.js";
 import { classifyEnteringRecoveryFailure, migrationEntryRoster, migrationQueueEvidenceSentinel } from "./hold-entry.js";
 import { classifyMigrationAbortGate } from "./abort.js";
 import { MigrationManifestStore } from "./manifest-store.js";
@@ -197,13 +197,31 @@ async function freshCutoverUnderBarrier(
   token: BackendPublicationLockToken,
 ): Promise<MigrationApplyThroughCaptureOutcome> {
   const resolveGenerationId = input._operationsForTesting?.resolveGenerationId ?? resolveConfirmedMigrationGenerationId;
-  const resolution = await resolveGenerationId({
-    base: input.base,
-    homeDir: input.homeDir,
-    lockToken: token,
-    manifestStore,
-    maxProbeOrdinal: input.maxProbeOrdinal,
-  });
+  let resolution: Awaited<ReturnType<typeof resolveConfirmedMigrationGenerationId>>;
+  try {
+    resolution = await resolveGenerationId({
+      base: input.base,
+      homeDir: input.homeDir,
+      lockToken: token,
+      manifestStore,
+      maxProbeOrdinal: input.maxProbeOrdinal,
+    });
+  } catch (error) {
+    // resolveConfirmedMigrationGenerationId's own inner
+    // resolveMigrationGenerationId throws MigrationIdentityError (never
+    // returns a refuse result) for identifier-bound-exceeded,
+    // probe-bound-exceeded, occupancy-refused and invalid-input, unlike
+    // its own layer-2 recheck, which does return a refuse result. Left
+    // uncaught, this would escape performMigrationApplyThroughCapture as
+    // an unclassified exception, violating section 11 test 12's "every
+    // exit path maps to one of the nine closed classes, none escape
+    // uncaught". Converted here into the same generation-<reason> refuse
+    // shape the layer-2 recheck already produces, so both paths reach the
+    // CLI through one uniform vocabulary rather than two.
+    if (!(error instanceof MigrationIdentityError)) throw error;
+    const reason = `generation-${error.reason}`;
+    return { status: "refuse", reason, evidence: error.evidence ?? undefined };
+  }
   if (resolution.status === "refuse") {
     return { status: "refuse", reason: `generation-${resolution.reason}`, evidence: resolution.evidence };
   }
