@@ -13,9 +13,16 @@
  * two independent observations it compares, and is proven breakable. The
  * "red-proof" test below is the most important one in this file: it proves
  * that corrupting ONLY the on-disk serialized manifest is caught by this
- * module's second verification pass, while leaving runPortableTransfer's
- * own built-in check (which never re-reads the disk copy) unaffected --
- * which is the exact defect plan-v2 section 4 requires a fix for.
+ * module's second verification pass, while runPortableTransfer's own
+ * built-in verifyComplete call -- which DOES reopen the destination file
+ * from disk and IS independent on the data axis -- stays unaffected,
+ * because the manifest it compares against never itself crosses a
+ * durability boundary: it is the same in-memory object derived from
+ * source.describe() before a single record was read. This module's
+ * second pass adds independence on exactly that manifest axis, binding
+ * the comparand to a durable, disk-round-tripped artifact the built-in
+ * check does not use -- not a second, redundant data-axis check, and the
+ * module doc comment below states that distinction precisely.
  */
 
 import { mkdirSync, mkdtempSync, chmodSync, statSync, writeFileSync, rmSync } from "node:fs";
@@ -333,12 +340,16 @@ describe("buildRollbackGeneration", () => {
     // module's to depend on -- if that module ever relaxes or reorders
     // its ledger-consistency check, this comparison is what still catches
     // a genuine content divergence. Second, plan-v2 section 4 requires an
-    // independent second verification specifically BECAUSE
-    // runPortableTransfer's own built-in check compares a manifest
-    // against itself; a verification that only fires when some other
-    // module happens to decline to open is not independent. This is
-    // defence in depth, not redundancy, and the fake is what proves the
-    // depth is real rather than assumed.
+    // independent second verification on the manifest axis specifically
+    // BECAUSE runPortableTransfer's own built-in check, while genuinely
+    // independent for the destination's bytes (it reopens the file from
+    // disk), compares those bytes against a manifest that never itself
+    // crosses a durability boundary -- the same in-memory object
+    // runPortableTransfer derived at the very start. A verification that
+    // only fires when some other module happens to decline to open is
+    // not independent on the content axis either. This is defence in
+    // depth, not redundancy, and the fake is what proves the depth is
+    // real rather than assumed.
     const homeDir = tempHome();
     const source = await sqliteSourceStream(sqliteFixture());
     const generationId = "gen-content-mismatch-mocked";
