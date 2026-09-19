@@ -295,7 +295,7 @@ function compactPreviewFailure(result) {
     ["project-storage-discovery", "project storage discovery failed"],
     ["project-discovery", "project discovery failed"],
     ["no-eligible-sessions", "Nothing to compact — no sessions are currently eligible."],
-    ["preview-emitted", "[dry-run] would compact:"],
+    ["preview-emitted", "uncompacted conversation"],
   ].find(([, marker]) => result.stderr.includes(marker))?.[0] ?? "unclassified";
   return `exit-${exit}:${category}`;
 }
@@ -327,7 +327,17 @@ async function compaction(context) {
   await ingest(context, "parity-batch-discovery", messages("Paritybatch", 12), context.secondaryProjectPath);
   const before = await context.snapshot();
   const dry = await context.cli(["compact", "--all", "--dry-run", "--no-promote"]);
-  check(dry.code === 0 && /would compact/u.test(dry.stderr), `compact:batch-dry-run-discovery:${compactPreviewFailure(dry)}`);
+  // src/batch-compact.ts (donadiosolutions/lcm
+  // .changeset/1338-compact-discovery-locators.md): the batch discovery
+  // rewrite removed the "[dry-run] would compact:" summary line. Discovery
+  // itself is unchanged and still unconditionally reports what it found,
+  // e.g. "Found 1 uncompacted conversation (8.0k tokens)", before dry-run
+  // and real processing diverge. A live repro against a real daemon (real
+  // ingest, real batchCompact call) confirmed both that line and a
+  // "session-terminal" event with outcome "dry-run" fire for a genuinely
+  // discovered secondary-project session. Assert that discovery line
+  // instead of the removed preview text.
+  check(dry.code === 0 && /Found \d+ uncompacted conversation/u.test(dry.stderr), `compact:batch-dry-run-discovery:${compactPreviewFailure(dry)}`);
   const previewBookkeeping = assertLogicalSnapshotUnchanged(await context.snapshot(), before, "compact:dry-run");
   context.recordBookkeeping("compact-preview", previewBookkeeping);
   const batch = await context.cli(["compact", "--all", "--no-promote"]);

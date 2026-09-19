@@ -345,11 +345,48 @@ async function identity(context) {
   const renewedShown = json(await context.cli(["project", "show", retiredRoot, "--json"]));
   assert.equal(renewedShown.hash, expectedSuccessor);
   assert.equal(renewedShown.entry.canonical, retiredRoot);
-  await ingest(context, retiredRoot, "surface-identity-retired", "Identity corpus violet retired renewal");
-  assert.equal((await matches(context, retiredRoot, "violet retired renewal")).length, 1);
+  // Renewal is deliberately narrow (docs/project-identity.md): it accepts
+  // and rekeys only a retired identity that already had "no aliases or
+  // PostgreSQL identity" (src/project-map.ts renewRetiredProjectIdentity),
+  // and it never grants a PostgreSQL binding. On PostgreSQL the renewed
+  // successor is therefore still unbound, and a durable write against it
+  // is refused exactly like any other unbound local identity (compare the
+  // "unbound PostgreSQL path must refuse durable writes" check above).
+  if (pg) {
+    const unbound = await context.request("POST", "/ingest", {
+      cwd: retiredRoot, session_id: "surface-identity-retired",
+      messages: [{ role: "user", content: "Identity corpus violet retired renewal", tokenCount: 8 }],
+    });
+    await sameLifetime(context, lifetime);
+    assert.equal(unbound.status, 409);
+    assert.deepEqual(unbound.body, {
+      code: "STORAGE_IDENTITY_REQUIRED",
+      error: "local project has no PostgreSQL binding; from the affected project directory, "
+        + "run `lcm project create` or `lcm project link <project-id>`",
+      storageBackend: "postgresql",
+    });
+    // This renewed successor stays permanently local-only by design (see
+    // above); it is not a retired-identity fence itself, so a later
+    // listCliProjects() sweep (e.g. `compact --all`, `import --all`) would
+    // hit src/cli-storage.ts's unguarded resolveStorageIdentityContext call
+    // for it and abort its ENTIRE enumeration, not just skip this one
+    // project (github.com/donadiosolutions/lcm/issues/1403). Remove this
+    // test-owned entry now that its refusal is proven, so later, unrelated
+    // scenarios sharing this home are not poisoned by it. The retained
+    // fence at the retired id is untouched.
+    const cleanupMap = JSON.parse(readFileSync(mapPath, "utf8"));
+    assert.equal(Object.hasOwn(cleanupMap, expectedSuccessor), true);
+    const { [expectedSuccessor]: removedEntry, ...remainingMap } = cleanupMap;
+    assert.ok(removedEntry);
+    writeFileSync(mapPath, `${JSON.stringify(remainingMap)}\n`, { mode: 0o600 });
+  } else {
+    await ingest(context, retiredRoot, "surface-identity-retired", "Identity corpus violet retired renewal");
+    assert.equal((await matches(context, retiredRoot, "violet retired renewal")).length, 1);
+  }
   await sameLifetime(context, lifetime);
   rows.push(receipt("project renew-retired-identity", {
     code: 0, renewed: renewed.changed, idempotent: !idempotent.changed, sameProject: renewedShown.hash === expectedSuccessor,
+    unboundRefused: pg,
   }));
   return rows;
 }
@@ -625,9 +662,14 @@ export function expectedIdentityObservations(backend) {
     "cli:project link": { code: 0, sameProject: true, isolated: true, remote: pg },
     "cli:project list": { code: 0, projectsPresent: 2, remote: pg },
     "cli:project reconcile-worktrees": { code: 0, status: "not-needed", unchanged: true, linkedWorktree: true },
-    "cli:project renew-retired-identity": { code: 0, renewed: true, idempotent: true, sameProject: true },
+    "cli:project renew-retired-identity": { code: 0, renewed: true, idempotent: true, sameProject: true, unboundRefused: pg },
     "cli:project unlink": { code: 0, aliasRemoved: true, originalPreserved: true, unboundRefused: pg },
-    "cli:postgres migrate": pg ? { code: 0, backend: "postgresql", applied: [], current: ["0001_migration_ledger", "0002_schema_baseline", "0003_machine_identity_key", "0004_machine_display_name", "0005_summary_context_integrity", "0006_transfer_ledger"] } : refusal,
+    // src/storage/postgresql/migrations.ts: main added 0007 after this
+    // pinned list was last updated. The live "admin" scenario always
+    // compares against loadPostgreSqlMigrations() directly (never this
+    // static list), so this is only the cross-backend architecture-result
+    // comparison catching up to the real, current migration ledger.
+    "cli:postgres migrate": pg ? { code: 0, backend: "postgresql", applied: [], current: ["0001_migration_ledger", "0002_schema_baseline", "0003_machine_identity_key", "0004_machine_display_name", "0005_summary_context_integrity", "0006_transfer_ledger", "0007_promoted_content_digest"] } : refusal,
     "cli:events promote": { code: 0, promoted: 0, errors: 0 },
     "cli:events status": pg ? { code: 0, pending: 0, quarantined: 0, remotePending: "0" } : refusal,
     "cli:events validate": pg ? { code: 0, checked: 0, matched: 0, missing: [], mismatched: [] } : refusal,
