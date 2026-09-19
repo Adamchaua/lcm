@@ -12,9 +12,9 @@ import * as identityApi from "../../src/machine-identity.js";
 import { closeLcmConnection } from "../../src/db/connection.js";
 import { clearProjectMapCache } from "../../src/project-map.js";
 import type { IdentityRepository } from "../../src/identity-service.js";
-import { StorageIdentityConfigurationError } from "../../src/storage/identity-context.js";
 import { MigrationIdentityError } from "../../src/migration/generation-identity.js";
 import type { ResolvedPostgreSqlConfig } from "../../src/daemon/config.js";
+import type { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 
 const roots: string[] = [];
 const REGISTERED_MACHINE = "018f0b5d-1234-7abc-8def-1234567890ab";
@@ -23,6 +23,7 @@ afterEach(() => {
   closeLcmConnection();
   vi.restoreAllMocks();
   clearProjectMapCache();
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -97,20 +98,28 @@ function verifiedReachability() {
   return { status: "verified" as const };
 }
 
-function fabricatedIdentity(local: { id: string; canonical: string }) {
+/**
+ * A stub identity runtime: never a real PostgreSQL connection. This unit
+ * file tests step 4's composition, not resolveMigrationTargetProjectId's
+ * own real-PostgreSQL correctness -- that is target-identity.test.ts's job
+ * (mocked) and the real-PostgreSQL round-trip's job (assembled, for real).
+ */
+function stubIdentityRuntime(): PostgreSqlRuntime {
+  return { close: vi.fn(async () => undefined) } as unknown as PostgreSqlRuntime;
+}
+
+function identitySeams(projectId = "remote-project-1") {
   return {
-    id: "remote-project-1",
-    localProjectId: local.id,
-    canonical: local.canonical,
-    remoteProjectId: "remote-project-1",
-    machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
-    selectedPath: local.canonical,
+    requireMachine: vi.fn(() => ({ machineId: "018f0b5d-1234-4abc-8def-1234567890ab" }) as never),
+    createIdentityRuntime: vi.fn(stubIdentityRuntime),
+    resolveTargetIdentity: vi.fn(async () => ({ status: "resolved" as const, projectId })),
   };
 }
 
-describe("resolveMigrationPreflight: composes all six steps for real, never collapsing a three-valued primitive", () => {
-  it("succeeds end to end using real base computation and candidate resolution against a real enrolled project, with target config/presence/reachability/identity-binding injected to succeed (each of those four is independently, thoroughly tested elsewhere with real state -- identity binding specifically requires a real remote project link this fixture does not set up, which unbound-postgresql-project's own dedicated test below covers for real)", async () => {
+describe("resolveMigrationPreflight: composes every step for real, never collapsing a three-valued primitive", () => {
+  it("succeeds end to end using real base computation and candidate resolution against a real enrolled project, with target config/presence/reachability/machine-identity/destination-identity injected to succeed (each is independently, thoroughly tested elsewhere: machine identity for real below, destination identity in target-identity.test.ts and the real-PostgreSQL round trip)", async () => {
     const fixture = await enrolled();
+    const seams = identitySeams();
     const result = await resolveMigrationPreflight({
       cwd: fixture.cwd,
       homeDir: fixture.homeDir,
@@ -118,7 +127,7 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
         resolveTargetConfig: succeedingTargetConfig,
         classifyPresence: async () => presentPresence(),
         verifyReachability: async () => verifiedReachability(),
-        resolveIdentity: () => fabricatedIdentity(fixture.local),
+        ...seams,
       },
     });
     expect(result.status).toBe("ready");
@@ -126,7 +135,15 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
     expect(result.candidate.disposition).toBe("fresh");
     expect(result.presence.status).toBe("present");
     expect(result.expectedIdentity.localProjectId).toBe(fixture.local.id);
+    expect(result.expectedIdentity.remoteProjectId).toBe("remote-project-1");
+    expect(result.expectedIdentity.id).toBe("remote-project-1");
+    expect(result.expectedIdentity.canonical).toBe(fixture.local.canonical);
+    expect(result.expectedIdentity.selectedPath).toBe(fixture.local.canonical);
     expect(result.base.length).toBeGreaterThan(0);
+    // The identity runtime is always constructed and always closed, even
+    // when resolveTargetIdentity itself is injected -- it is passed a real
+    // repository wrapping whatever runtime this seam returns.
+    expect(seams.createIdentityRuntime).toHaveBeenCalledOnce();
   });
 
   it("refuses at step 1 (target config) with the target resolver's own reason, never proceeding to presence or reachability", async () => {
@@ -169,7 +186,7 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
         resolveTargetConfig: succeedingTargetConfig,
         classifyPresence: async () => ({ status: "authoritatively-absent" as const }),
         verifyReachability: async () => verifiedReachability(),
-        resolveIdentity: () => fabricatedIdentity(fixture.local),
+        ...identitySeams(),
       },
     });
     expect(result.status).toBe("ready");
@@ -177,9 +194,9 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
     expect(result.presence).toEqual({ status: "authoritatively-absent" });
   });
 
-  it("refuses with the reachability verifier's own reason and evidence when target verification fails, never proceeding to identity resolution", async () => {
+  it("refuses with the reachability verifier's own reason and evidence when target verification fails, never proceeding to machine or destination identity resolution", async () => {
     const fixture = await enrolled();
-    const resolveIdentity = vi.fn();
+    const seams = identitySeams();
     const result = await resolveMigrationPreflight({
       cwd: fixture.cwd,
       homeDir: fixture.homeDir,
@@ -187,15 +204,33 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
         resolveTargetConfig: succeedingTargetConfig,
         classifyPresence: async () => presentPresence(),
         verifyReachability: async () => ({ status: "refuse", reason: "migration-target-verification-failed", evidence: "readiness-runtime-role-policy" }),
-        resolveIdentity,
+        ...seams,
       },
     });
     expect(result).toEqual({ status: "refuse", reason: "migration-target-verification-failed", evidence: "readiness-runtime-role-policy" });
-    expect(resolveIdentity).not.toHaveBeenCalled();
+    expect(seams.requireMachine).not.toHaveBeenCalled();
+    expect(seams.resolveTargetIdentity).not.toHaveBeenCalled();
   });
 
-  it("refuses unbound-postgresql-project for real: the enrolled() fixture never links a remote PostgreSQL project, so the real (not injected) resolveStorageIdentityContext genuinely throws StorageIdentityConfigurationError here -- this is the same real failure the success test above works around by injecting identity resolution", async () => {
+  it("refuses machine-identity-unregistered for real: a fresh, never-enrolled home genuinely has no registered machine identity (the real, not injected, requireMachineIdentity default)", async () => {
+    const homeDir = home();
+    const cwd = join(homeDir, "project");
+    mkdirSync(cwd, { mode: 0o700 });
+    const result = await resolveMigrationPreflight({
+      cwd,
+      homeDir,
+      _operationsForTesting: {
+        resolveTargetConfig: succeedingTargetConfig,
+        classifyPresence: async () => presentPresence(),
+        verifyReachability: async () => verifiedReachability(),
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "machine-identity-unregistered" });
+  });
+
+  it("resolves machine identity for real (the real, not injected, requireMachineIdentity default) against a real enrolled project, proceeding to the injected destination-identity step with the real machineId", async () => {
     const fixture = await enrolled();
+    const resolveTargetIdentity = vi.fn(async () => ({ status: "resolved" as const, projectId: "remote-project-2" }));
     const result = await resolveMigrationPreflight({
       cwd: fixture.cwd,
       homeDir: fixture.homeDir,
@@ -203,27 +238,49 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
         resolveTargetConfig: succeedingTargetConfig,
         classifyPresence: async () => presentPresence(),
         verifyReachability: async () => verifiedReachability(),
+        createIdentityRuntime: stubIdentityRuntime,
+        resolveTargetIdentity,
       },
     });
-    expect(result).toEqual({ status: "refuse", reason: "unbound-postgresql-project" });
+    expect(result.status).toBe("ready");
+    expect(resolveTargetIdentity).toHaveBeenCalledWith(expect.objectContaining({ machineId: REGISTERED_MACHINE }));
   });
 
-  it("also refuses unbound-postgresql-project for an injected StorageIdentityConfigurationError, confirming the real-error type check itself rather than only the real fixture's own failure mode", async () => {
+  it("uses the real createIdentityRuntime default (no injection): constructs a real PostgreSqlRuntime for the target settings and closes it for real, with only destination-identity resolution itself injected", async () => {
     const fixture = await enrolled();
+    const resolveTargetIdentity = vi.fn(async () => ({ status: "resolved" as const, projectId: "remote-project-3" }));
+    // PostgreSqlRuntime's constructor synchronously reads and validates
+    // caFile (client-config.ts) before this test's injected
+    // resolveTargetIdentity ever runs, so the shared REAL_TARGET_CONFIG's
+    // placeholder "/unused" path is not enough here -- a real, readable
+    // (if not genuinely trusted) file is required to get past
+    // construction.
+    const caFile = join(fixture.homeDir, "dummy-ca.pem");
+    writeFileSync(caFile, "-----BEGIN CERTIFICATE-----\ndummy\n-----END CERTIFICATE-----\n", { mode: 0o600 });
     const result = await resolveMigrationPreflight({
       cwd: fixture.cwd,
       homeDir: fixture.homeDir,
       _operationsForTesting: {
-        resolveTargetConfig: succeedingTargetConfig,
+        resolveTargetConfig: () => ({
+          status: "resolved" as const,
+          config: { backend: "postgresql" as const, postgresql: { ...REAL_TARGET_CONFIG.postgresql, caFile } },
+        }),
         classifyPresence: async () => presentPresence(),
         verifyReachability: async () => verifiedReachability(),
-        resolveIdentity: () => { throw new StorageIdentityConfigurationError("local project has no PostgreSQL binding"); },
+        resolveTargetIdentity,
       },
     });
-    expect(result).toEqual({ status: "refuse", reason: "unbound-postgresql-project" });
+    expect(result.status).toBe("ready");
+    expect(resolveTargetIdentity).toHaveBeenCalledOnce();
+    // The real runtime was constructed and handed a real
+    // PostgreSqlIdentityRepository wrapping it -- resolveTargetIdentity's
+    // own first argument is the repository, never asserted structurally
+    // here since target-identity.test.ts already covers that shape; this
+    // test's job is only proving the real construct-then-close path runs
+    // without needing a live connection (no query is ever issued).
   });
 
-  it("re-throws a non-StorageIdentityConfigurationError from the identity resolver rather than misclassifying it", async () => {
+  it("re-throws a non-MachineIdentityFileError from requireMachine rather than misclassifying it", async () => {
     const fixture = await enrolled();
     const outcome = resolveMigrationPreflight({
       cwd: fixture.cwd,
@@ -232,10 +289,65 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
         resolveTargetConfig: succeedingTargetConfig,
         classifyPresence: async () => presentPresence(),
         verifyReachability: async () => verifiedReachability(),
-        resolveIdentity: () => { throw new Error("an unrelated failure"); },
+        requireMachine: () => { throw new Error("an unrelated failure"); },
       },
     });
     await expect(outcome).rejects.toThrow("an unrelated failure");
+  });
+
+  it("propagates the destination-identity resolver's own refusal unchanged", async () => {
+    const fixture = await enrolled();
+    const result = await resolveMigrationPreflight({
+      cwd: fixture.cwd,
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        resolveTargetConfig: succeedingTargetConfig,
+        classifyPresence: async () => presentPresence(),
+        verifyReachability: async () => verifiedReachability(),
+        requireMachine: identitySeams().requireMachine,
+        createIdentityRuntime: stubIdentityRuntime,
+        resolveTargetIdentity: async () => ({ status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" }),
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" });
+  });
+
+  it("closes the identity runtime even when resolveTargetIdentity itself throws, and still propagates the throw", async () => {
+    const fixture = await enrolled();
+    const close = vi.fn(async () => undefined);
+    const outcome = resolveMigrationPreflight({
+      cwd: fixture.cwd,
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        resolveTargetConfig: succeedingTargetConfig,
+        classifyPresence: async () => presentPresence(),
+        verifyReachability: async () => verifiedReachability(),
+        requireMachine: identitySeams().requireMachine,
+        createIdentityRuntime: () => ({ close }) as unknown as PostgreSqlRuntime,
+        resolveTargetIdentity: async () => { throw new Error("connection reset"); },
+      },
+    });
+    await expect(outcome).rejects.toThrow("connection reset");
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("closes the identity runtime even when the runtime's own close() itself throws, without masking the real outcome (red: an unguarded close() rejection here would replace a clean ready result with an unrelated throw)", async () => {
+    const fixture = await enrolled();
+    const close = vi.fn(async () => { throw new Error("close failed"); });
+    const result = await resolveMigrationPreflight({
+      cwd: fixture.cwd,
+      homeDir: fixture.homeDir,
+      _operationsForTesting: {
+        resolveTargetConfig: succeedingTargetConfig,
+        classifyPresence: async () => presentPresence(),
+        verifyReachability: async () => verifiedReachability(),
+        requireMachine: identitySeams().requireMachine,
+        createIdentityRuntime: () => ({ close }) as unknown as PostgreSqlRuntime,
+        resolveTargetIdentity: async () => ({ status: "resolved" as const, projectId: "remote-project-1" }),
+      },
+    });
+    expect(result.status).toBe("ready");
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it("converts a MigrationIdentityError from base computation into a generation-<reason> refusal", async () => {
@@ -247,7 +359,7 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
         resolveTargetConfig: succeedingTargetConfig,
         classifyPresence: async () => presentPresence(),
         verifyReachability: async () => verifiedReachability(),
-        resolveIdentity: () => fabricatedIdentity(fixture.local),
+        ...identitySeams(),
         computeBase: () => {
           throw new MigrationIdentityError("invalid-input", "test", null);
         },
@@ -265,7 +377,7 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
         resolveTargetConfig: succeedingTargetConfig,
         classifyPresence: async () => presentPresence(),
         verifyReachability: async () => verifiedReachability(),
-        resolveIdentity: () => fabricatedIdentity(fixture.local),
+        ...identitySeams(),
         computeBase: () => { throw new Error("an unrelated base computation failure"); },
       },
     });
@@ -281,7 +393,7 @@ describe("resolveMigrationPreflight: composes all six steps for real, never coll
         resolveTargetConfig: succeedingTargetConfig,
         classifyPresence: async () => presentPresence(),
         verifyReachability: async () => verifiedReachability(),
-        resolveIdentity: () => fabricatedIdentity(fixture.local),
+        ...identitySeams(),
         resolveCandidate: async () => ({ status: "refuse", reason: "continuation-mismatched-hold" }),
       },
     });

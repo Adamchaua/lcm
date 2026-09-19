@@ -14,6 +14,17 @@ import {
   type InvocationControlRequest,
   type InvocationControlResponse,
 } from "../src/daemon/client.js";
+import { performMigrationPlan } from "../src/migration/cli-plan.js";
+import { performMigrationDryRunCheck } from "../src/migration/cli-dry-run.js";
+import { performMigrationApply } from "../src/migration/cli-apply.js";
+import { performMigrationAbortCommand } from "../src/migration/cli-abort.js";
+import {
+  renderMigrationPlanEnvelope,
+  renderMigrationDryRunEnvelope,
+  renderMigrationApplyEnvelope,
+  renderMigrationAbortEnvelope,
+} from "../src/migration/cli-render.js";
+import { serializeMigrationEnvelope, type MigrationEnvelope } from "../src/migration/envelope.js";
 import {
   ConfigValidationError,
   DEFAULT_LLM_MAX_CONCURRENCY,
@@ -1242,7 +1253,7 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   if (topLevel && (action === "stats" || action === "doctor")) return false;
   if (topLevel && (action === "diagnose" || action === "help")) return false;
   if ((action === "list" || action === "doctor") && actionCommand.parent?.name() === "connectors") return false;
-  if (topLevel && ["daemon", "config", "machine", "project", "postgres", "events", "connectors"].includes(action)) return false;
+  if (topLevel && ["daemon", "config", "machine", "project", "postgres", "migration", "events", "connectors"].includes(action)) return false;
   return true;
 }
 
@@ -2040,6 +2051,130 @@ export function registerMachineCommand(program: Command): void {
 
   program.addCommand(machineCmd);
 }
+
+
+/**
+ * Section 3's `lcm migration` command group -- `plan`, `dry-run`, `apply`,
+ * `abort` (this candidate's scope per issue #627 section 13; `resume`,
+ * `verify`, `report`'s full body, `activate` and `rollback` are not
+ * wired here). Modelled on `registerPostgreSqlCommand` above.
+ *
+ * Every action handler is thin glue by design: call the orchestration
+ * function from `src/migration/cli-*.ts`, call the matching `render*`
+ * function from `src/migration/cli-render.ts` to build the section 10
+ * envelope, then emit it. All classification, evidence construction and
+ * exit-class lookup happens in those already-unit-tested modules, not
+ * here -- this function's own job is argument parsing and I/O routing.
+ *
+ * **Section 10's stream separation.** `--json` prints exactly the
+ * envelope to stdout, written once, via `writeCliOutput`; without
+ * `--json`, stdout carries one short human-readable summary line built
+ * only from already-sanitized envelope fields. Progress and diagnostic
+ * text always go to stderr via `writeCliError`, regardless of `--json`,
+ * so stdout's single document is never mixed with anything else.
+ */
+function migrationHumanSummary(envelope: MigrationEnvelope): string {
+  if (envelope.refusal !== null) {
+    return `Refused (${envelope.outcome}, exit ${envelope.exitCode}): ${envelope.refusal.reason} -- ${envelope.refusal.remedy}`;
+  }
+  const parts = [`${envelope.command}: ok (exit 0)`];
+  if (envelope.generation !== null) parts.push(`generation=${envelope.generation}`);
+  if (envelope.manifestPhase !== null) parts.push(`phase=${envelope.manifestPhase}`);
+  parts.push(`applied=${String(envelope.applied)}`);
+  if (envelope.next !== null) parts.push(`next=${envelope.next}`);
+  return parts.join(" ");
+}
+
+function emitMigrationEnvelope(envelope: MigrationEnvelope, jsonFlag: boolean | undefined): void {
+  if (jsonFlag) {
+    writeCliOutput(serializeMigrationEnvelope(envelope));
+  } else {
+    writeCliOutput(`${migrationHumanSummary(envelope)}\n`);
+  }
+  process.exitCode = envelope.exitCode;
+}
+
+export function registerMigrationCommand(program: Command): void {
+  type MigrationJsonOptions = { help?: boolean; json?: boolean };
+  type MigrationApplyOptions = MigrationJsonOptions & {
+    confirmGeneration?: string;
+    dryRun?: boolean;
+    maxRecords?: string;
+    maxBytes?: string;
+  };
+
+  const migrationCmd = new Command("migration")
+    .description("Reversible SQLite-to-PostgreSQL cutover (plan, dry-run, apply, abort)");
+  migrationCmd.helpOption(false).option("-h, --help", "Show help");
+  migrationCmd.action(async () => {
+    writeCliError("Usage: lcm migration <plan|dry-run|apply|abort> [--json]\n");
+    exit(1);
+  });
+
+  migrationCmd
+    .command("plan")
+    .description("Preview the next migration generation without mutating anything")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationJsonOptions) => {
+      writeCliError("Resolving migration preflight...\n");
+      const outcome = await performMigrationPlan({ cwd: process.cwd(), homeDir: homedir() });
+      writeCliError("Migration plan finished.\n");
+      emitMigrationEnvelope(renderMigrationPlanEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("dry-run")
+    .description("Check the SQLite migration source without touching PostgreSQL or the journal")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationJsonOptions) => {
+      writeCliError("Checking the SQLite migration source...\n");
+      const outcome = await performMigrationDryRunCheck({ cwd: process.cwd(), homeDir: homedir() });
+      writeCliError("Migration dry-run finished.\n");
+      emitMigrationEnvelope(renderMigrationDryRunEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("apply")
+    .description("Apply the confirmed migration generation: capture, manifest genesis and copy")
+    .option("--confirm-generation <id>", "The exact generation id `lcm migration plan` printed")
+    .option("--dry-run", "Stop after the confirmation fence; do not capture, copy, or mutate anything")
+    .option("--max-records <n>", "Maximum records per copy batch")
+    .option("--max-bytes <n>", "Maximum bytes per copy batch")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      const maxRecords = opts.maxRecords === undefined ? undefined : parsePositiveInteger(opts.maxRecords, "--max-records");
+      const maxBytes = opts.maxBytes === undefined ? undefined : parsePositiveInteger(opts.maxBytes, "--max-bytes");
+      writeCliError("Resolving migration preflight...\n");
+      const outcome = await performMigrationApply({
+        cwd: process.cwd(),
+        homeDir: homedir(),
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+        maxRecords,
+        maxBytes,
+      });
+      writeCliError("Migration apply finished.\n");
+      emitMigrationEnvelope(renderMigrationApplyEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("abort")
+    .description("Abort a held or entering migration, completing whichever recovery write is missing")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationJsonOptions) => {
+      writeCliError("Aborting the migration hold...\n");
+      const outcome = await performMigrationAbortCommand({ homeDir: homedir() });
+      writeCliError("Migration abort finished.\n");
+      emitMigrationEnvelope(renderMigrationAbortEnvelope(outcome), opts.json);
+    });
+
+  program.addCommand(migrationCmd);
+}
+
 
 export function registerPostgreSqlCommand(program: Command): void {
   type PostgreSqlOptions = {
@@ -3552,6 +3687,7 @@ export async function runCli(
   registerMachineCommand(program);
   registerProjectCommand(program, runWithPublicationRetry);
   registerPostgreSqlCommand(program);
+  registerMigrationCommand(program);
   registerMemoryCommands(
     program,
     async (options) => (await createDaemonReadClientOrExit(preflightSeams, options)).client,

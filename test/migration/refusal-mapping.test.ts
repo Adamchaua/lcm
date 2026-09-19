@@ -129,8 +129,9 @@ describe("MIGRATION_REFUSAL_REASONS covers abort.ts's classified reasons", () =>
 
 describe("MIGRATION_REFUSAL_REASONS covers the target-resolution and ownership reasons", () => {
   const REASONS_TARGET_AND_OWNERSHIP_CAN_EMIT = [
-    "unbound-postgresql-project",
     "invalid-expected-owner",
+    "machine-identity-unregistered",
+    "migration-target-identity-unresolvable",
     "migration-target-missing",
     "migration-target-unresolvable",
     "dry-run-failed",
@@ -143,10 +144,8 @@ describe("MIGRATION_REFUSAL_REASONS covers the target-resolution and ownership r
     },
   );
 
-  it("unbound-postgresql-project's remedy names both lcm project create and lcm project link, per identity-context.ts's own UNBOUND_POSTGRESQL_PROJECT_MESSAGE", () => {
-    const entry = migrationRefusalMapping("unbound-postgresql-project");
-    expect(entry.remedy).toContain("lcm project create");
-    expect(entry.remedy).toContain("lcm project link");
+  it("unbound-postgresql-project is no longer a migration refusal reason: the remedy it used to name would have told an operator to bind the exact project-map field that must stay unset through capture, genesis and copy (section 4.10)", () => {
+    expect(() => migrationRefusalMapping("unbound-postgresql-project")).toThrow(/no exit-class mapping/u);
   });
 });
 

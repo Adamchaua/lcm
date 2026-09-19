@@ -153,6 +153,24 @@ const HELP: Record<string, CommandHelp> = {
     notes: "Configure storage.backend=postgresql and set the non-secret expected owner through storage.postgresql.migrationRole or its LCM_POSTGRES_MIGRATION_ROLE fallback. Supply migration-owner credentials through LCM_POSTGRES_URL and the verified CA path through LCM_POSTGRES_CA_FILE. The command validates PostgreSQL 18, extensions, ownership, migration checksums, and schema fingerprints. It does not install extensions or grant runtime privileges.",
   },
 
+  migration: {
+    summary: "Reversible SQLite-to-PostgreSQL cutover: plan, dry-run, apply, abort.",
+    usage: "lcm migration <plan|dry-run|apply|abort> [--json]",
+    options: [
+      ["plan [--json]", "Preview the next migration generation without mutating anything"],
+      ["dry-run [--json]", "Check the SQLite migration source alone (no PostgreSQL, no journal)"],
+      ["apply --confirm-generation <id> [--dry-run] [--max-records <n>] [--max-bytes <n>] [--json]", "Capture, mint the manifest, and copy to the confirmed generation"],
+      ["abort [--json]", "Complete whichever recovery write (journal or manifest) is missing"],
+    ],
+    examples: [
+      ["lcm migration plan", "Print the candidate generation id to confirm with apply"],
+      ["lcm migration apply --confirm-generation <id>", "Apply exactly the generation plan printed"],
+      ["lcm migration apply --confirm-generation <id> --dry-run", "Stop after the confirmation fence; mutate nothing"],
+      ["lcm migration abort", "Abort a held or entering migration"],
+    ],
+    notes: "This project must already be linked to a PostgreSQL project (see docs/migration-operations.md). apply refuses unless --confirm-generation exactly matches the candidate a fresh plan resolves at the moment apply runs; a stale or missing token refuses rather than proceeding. Never a silent fallback: an unresolvable or unverified target, an unresolvable daemon presence, or a state that does not admit the operation all refuse with a distinct, closed reason. See docs/migration-operations.md for the full exit-class table, every refusal's remedy, and the fencing residue.",
+  },
+
   search: {
     summary: "Search memory across episodic and promoted layers for the current project.",
     usage: "lcm search <query> [--limit N] [--layer episodic|promoted] [--tag <tag>]",
@@ -503,6 +521,7 @@ const GROUPS = [
       { name: "machine <register|show|recover>", summary: "Manage this machine's PostgreSQL identity" },
       { name: "project <create|link|unlink|list|show|reconcile-worktrees>", summary: "Manage local and PostgreSQL project identities" },
       { name: "postgres migrate [--json]", summary: "Apply packaged PostgreSQL schema migrations" },
+      { name: "migration <plan|dry-run|apply|abort> [--json]", summary: "Reversible SQLite-to-PostgreSQL cutover" },
       { name: "mcp", summary: "Start the MCP server (stdio transport)" },
     ],
   },

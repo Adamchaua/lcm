@@ -252,7 +252,15 @@ journals must still have an authenticated supported shape; malformed or unknown
 versions and unsafe paths refuse. Consumer operations remain fenced until their
 own authoritative terminal readback.
 After an authenticated abort, SQLite consumer admission resumes. After selected-
-generation completion, only the recorded target backend is admitted.
+generation completion, only the recorded target backend is admitted -- for
+*new* consumer admission checks. A daemon process already running at that
+moment does not re-read this state: it resolved its storage backend once at
+its own startup and keeps using that resolution for the rest of its process
+lifetime, regardless of what selected-generation completion now admits. A
+cutover completing while such a daemon is still running therefore leaves a
+live process holding a stale startup backend until it is restarted; durable
+state is correct, but the cutover is not reportable as successful until a
+restart is confirmed (see issue #1384).
 
 Do not edit a held journal to release it. Preserve the journal and snapshot
 generation when capture, selection, or abort readback fails. A migration report,

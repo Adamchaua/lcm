@@ -1,0 +1,167 @@
+import { describe, expect, it } from "vitest";
+import {
+  renderMigrationPlanEnvelope,
+  renderMigrationDryRunEnvelope,
+  renderMigrationApplyEnvelope,
+  renderMigrationAbortEnvelope,
+} from "../../src/migration/cli-render.js";
+import { migrationExitClassForName } from "../../src/migration/exit-classes.js";
+import type { SqliteSnapshotDryRun } from "../../src/migration/sqlite-snapshot.js";
+
+const DRY_RUN_FIXTURE: SqliteSnapshotDryRun = {
+  sourceSelectionSha256: "a".repeat(64),
+  sourceByteWitnessSha256: "b".repeat(64),
+  checksumSha256: "c".repeat(64),
+  roles: [{ role: "project" } as never, { role: "passive-events" } as never],
+  inspectedAt: "2026-01-01T00:00:00.000Z",
+};
+
+describe("renderMigrationPlanEnvelope", () => {
+  it("builds an ok envelope for a fresh candidate with a present daemon, carrying its observed backend", () => {
+    const envelope = renderMigrationPlanEnvelope({
+      status: "ok", generationId: "gen-1", disposition: "fresh",
+      daemonPresence: { status: "present", storageBackend: "postgresql", pid: 1, daemonInstanceId: "d1" },
+    });
+    expect(envelope.outcome).toBe("ok");
+    expect(envelope.exitCode).toBe(0);
+    expect(envelope.applied).toBe(false);
+    expect(envelope.generation).toBe("gen-1");
+    expect(envelope.next).toBe("apply");
+    expect(envelope.evidence).toEqual({
+      disposition: "fresh", daemonPresent: true, daemonStorageBackend: "postgresql",
+    });
+    expect(envelope.refusal).toBeNull();
+  });
+
+  it("builds an ok envelope for an authoritatively-absent daemon, carrying daemonPresent: false and no storageBackend field (red: a boolean-collapsed presence could not tell this apart from a real error)", () => {
+    const envelope = renderMigrationPlanEnvelope({
+      status: "ok", generationId: "gen-2", disposition: "continue-held",
+      daemonPresence: { status: "authoritatively-absent" },
+    });
+    expect(envelope.evidence).toEqual({ disposition: "continue-held", daemonPresent: false });
+    expect("daemonStorageBackend" in envelope.evidence).toBe(false);
+  });
+
+  it("builds a refusal envelope using the closed refusal-mapping table's exit class and remedy, sanitized evidence carrying the reason's own evidence detail", () => {
+    const envelope = renderMigrationPlanEnvelope({
+      status: "refuse", reason: "daemon-presence-unresolvable", evidence: "pidfile-live-no-answer",
+    });
+    expect(envelope.outcome).toBe("refused-evidence");
+    expect(envelope.exitCode).toBe(migrationExitClassForName("refused-evidence").code);
+    expect(envelope.applied).toBe(false);
+    expect(envelope.refusal).toEqual({
+      reason: "daemon-presence-unresolvable",
+      remedy: "Daemon presence could not be positively established. Run `lcm daemon status`, resolve the failure, and retry.",
+    });
+    expect(envelope.evidence).toEqual({ detail: "pidfile-live-no-answer" });
+  });
+
+  it("builds a refusal envelope with empty evidence when the outcome carries no evidence detail", () => {
+    const envelope = renderMigrationPlanEnvelope({ status: "refuse", reason: "machine-identity-unregistered" });
+    expect(envelope.evidence).toEqual({});
+  });
+
+  it("throws for an unrecognised refusal reason rather than guessing a class (proves this layer never silently defaults)", () => {
+    expect(() => renderMigrationPlanEnvelope({ status: "refuse", reason: "not-a-real-reason" }))
+      .toThrow(/no exit-class mapping/u);
+  });
+});
+
+describe("renderMigrationDryRunEnvelope", () => {
+  it("builds an ok envelope with the flat dry-run evidence, never applied", () => {
+    const envelope = renderMigrationDryRunEnvelope({ status: "ok", dryRun: DRY_RUN_FIXTURE });
+    expect(envelope.outcome).toBe("ok");
+    expect(envelope.applied).toBe(false);
+    expect(envelope.evidence).toEqual({
+      sourceSelectionSha256: "a".repeat(64),
+      sourceByteWitnessSha256: "b".repeat(64),
+      checksumSha256: "c".repeat(64),
+      roleCount: 2,
+      inspectedAt: "2026-01-01T00:00:00.000Z",
+    });
+  });
+
+  it("builds a refusal envelope for dry-run-failed", () => {
+    const envelope = renderMigrationDryRunEnvelope({ status: "refuse", reason: "dry-run-failed", evidence: "unsupported-platform" });
+    expect(envelope.refusal?.reason).toBe("dry-run-failed");
+    expect(envelope.evidence).toEqual({ detail: "unsupported-platform" });
+  });
+});
+
+describe("renderMigrationApplyEnvelope", () => {
+  it("builds an ok envelope for a real copy, applied true, next null", () => {
+    const envelope = renderMigrationApplyEnvelope({ status: "ok", generationId: "gen-1", applied: true, phase: "copied" });
+    expect(envelope.outcome).toBe("ok");
+    expect(envelope.applied).toBe(true);
+    expect(envelope.generation).toBe("gen-1");
+    expect(envelope.manifestPhase).toBe("copied");
+    expect(envelope.next).toBeNull();
+  });
+
+  it("builds an ok envelope for --dry-run, applied false, next suggests dropping --dry-run", () => {
+    const envelope = renderMigrationApplyEnvelope({ status: "ok", generationId: "gen-1", applied: false });
+    expect(envelope.applied).toBe(false);
+    expect(envelope.manifestPhase).toBeNull();
+    expect(envelope.next).toMatch(/--dry-run/u);
+  });
+
+  it("reports applied: true for a refusal after capture already durably mutated state (red: reporting false here would tell an operator nothing moved when it did)", () => {
+    const envelope = renderMigrationApplyEnvelope({ status: "refuse", reason: "copy-failed", evidence: "PostgreSqlStorageOperationError" });
+    expect(envelope.applied).toBe(true);
+    expect(envelope.refusal?.reason).toBe("copy-failed");
+  });
+
+  it("reports applied: true for capture-failed specifically, the other durable-mutation producer", () => {
+    const envelope = renderMigrationApplyEnvelope({ status: "refuse", reason: "capture-failed" });
+    expect(envelope.applied).toBe(true);
+  });
+
+  it("reports applied: false for a preflight-stage refusal before any durable mutation in this invocation (red: reporting true here would falsely claim state moved)", () => {
+    const envelope = renderMigrationApplyEnvelope({ status: "refuse", reason: "machine-identity-unregistered" });
+    expect(envelope.applied).toBe(false);
+  });
+
+  it("reports applied: false for a confirmation-fence refusal", () => {
+    const envelope = renderMigrationApplyEnvelope({ status: "refuse", reason: "confirmation-missing" });
+    expect(envelope.applied).toBe(false);
+  });
+});
+
+describe("renderMigrationAbortEnvelope", () => {
+  it("builds an ok envelope, always applied (abort always writes at least one terminal state)", () => {
+    const envelope = renderMigrationAbortEnvelope({
+      status: "ok", generationId: "gen-1", journalPhase: "maintenance-aborted", manifestPhase: "aborted",
+    });
+    expect(envelope.applied).toBe(true);
+    expect(envelope.generation).toBe("gen-1");
+    expect(envelope.manifestPhase).toBe("aborted");
+    expect(envelope.evidence).toEqual({ journalPhase: "maintenance-aborted" });
+  });
+
+  it("builds an ok envelope with a null manifestPhase when the manifest was genuinely never created", () => {
+    const envelope = renderMigrationAbortEnvelope({
+      status: "ok", generationId: "gen-1", journalPhase: "maintenance-aborted", manifestPhase: null,
+    });
+    expect(envelope.manifestPhase).toBeNull();
+  });
+
+  it("builds a refusal envelope for abort-nothing-to-abort, never applied", () => {
+    const envelope = renderMigrationAbortEnvelope({ status: "refuse", reason: "abort-nothing-to-abort" });
+    expect(envelope.applied).toBe(false);
+    expect(envelope.refusal?.reason).toBe("abort-nothing-to-abort");
+  });
+});
+
+describe("every command's ok and refusal envelopes keep outcome/exitCode agreement (buildMigrationEnvelope's own construction-time assertion, exercised through every render function)", () => {
+  it("agrees for every render function's ok path", () => {
+    for (const envelope of [
+      renderMigrationPlanEnvelope({ status: "ok", generationId: "g", disposition: "fresh", daemonPresence: { status: "authoritatively-absent" } }),
+      renderMigrationDryRunEnvelope({ status: "ok", dryRun: DRY_RUN_FIXTURE }),
+      renderMigrationApplyEnvelope({ status: "ok", generationId: "g", applied: true, phase: "copied" }),
+      renderMigrationAbortEnvelope({ status: "ok", generationId: "g", journalPhase: "maintenance-aborted", manifestPhase: null }),
+    ]) {
+      expect(migrationExitClassForName(envelope.outcome).code).toBe(envelope.exitCode);
+    }
+  });
+});
+

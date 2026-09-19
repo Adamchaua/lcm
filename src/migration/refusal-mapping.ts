@@ -41,12 +41,16 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   // target resolution the root ruled on (docs/migration-operations.md
   // documents storage.backend vs storage.postgresql's split explicitly). ---
   Object.freeze({
-    reason: "unbound-postgresql-project", exitClass: "refused-precondition",
-    remedy: "This project has no PostgreSQL project binding. Run `lcm project create` (new project) or `lcm project link <project-id>` (existing project) from the project directory.",
-  }),
-  Object.freeze({
     reason: "invalid-expected-owner", exitClass: "refused-precondition",
     remedy: "storage.postgresql.migrationRole (or LCM_POSTGRES_MIGRATION_ROLE) is not a valid PostgreSQL role name. Fix the configured value before retrying.",
+  }),
+  Object.freeze({
+    reason: "machine-identity-unregistered", exitClass: "refused-precondition",
+    remedy: "This machine has no registered PostgreSQL identity. Run `lcm machine register` before retrying.",
+  }),
+  Object.freeze({
+    reason: "migration-target-identity-unresolvable", exitClass: "refused-evidence",
+    remedy: "The destination PostgreSQL project identity could not be resolved or minted. Run `lcm doctor` before retrying.",
   }),
   Object.freeze({
     reason: "migration-target-missing", exitClass: "refused-precondition",
