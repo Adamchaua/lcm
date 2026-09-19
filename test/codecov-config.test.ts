@@ -592,7 +592,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(243);
+    expect(productionFiles).toHaveLength(248);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -622,10 +622,10 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(243);
+    expect(ownershipCounts.size).toBe(248);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#626 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -831,6 +831,16 @@ describe("Codecov configuration", () => {
       ["src/migration/receipts.ts", "unit-migration-cutover"],
       ["src/migration/queue-evidence.ts", "unit-migration-cutover"],
       ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"],
+      // #626 adds reversible rollback into a new SQLite generation. Its
+      // eligibility, generation build, install and sidecar materialization
+      // modules, and the orchestration that sequences them, are all cutover
+      // lifecycle work and keep the same owner as the forward path they
+      // reverse.
+      ["src/migration/rollback-eligibility.ts", "unit-migration-cutover"],
+      ["src/migration/rollback-generation.ts", "unit-migration-cutover"],
+      ["src/migration/rollback-install.ts", "unit-migration-cutover"],
+      ["src/migration/rollback-sidecars.ts", "unit-migration-cutover"],
+      ["src/migration/rollback.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
       // #1354 supplies the promoted-memory decision serializer only from the
