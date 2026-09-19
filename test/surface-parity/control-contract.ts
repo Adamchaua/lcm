@@ -233,7 +233,7 @@ async function variants(path: ControlPath, fixture: Fixture): Promise<Observatio
 const groupUsage: Partial<Record<ControlPath, string>> = {
   events: "Usage: lcm events <promote|status|validate|quarantine|replay> [options]",
   machine: "Usage: lcm machine <register|show|recover> [options]",
-  project: "Usage: lcm project <create|link|unlink|list|show|reconcile-worktrees> [options]",
+  project: "Usage: lcm project <create|link|unlink|list|show|reconcile-worktrees|renew-retired-identity> [options]",
   postgres: "Usage: lcm postgres migrate [--json]",
   connectors: "Usage: lcm connectors <list|install|remove|doctor> [options]",
 };

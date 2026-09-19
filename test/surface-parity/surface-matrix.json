@@ -2596,6 +2596,7 @@
       "arguments": [],
       "children": [
         "reconcile-worktrees",
+        "renew-retired-identity",
         "list",
         "show",
         "link",
@@ -2903,6 +2904,66 @@
         }
       ],
       "path": "project reconcile-worktrees"
+    },
+    "scenario": "identity",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:project renew-retired-identity",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [
+        {
+          "choices": null,
+          "default": null,
+          "name": "path",
+          "required": false,
+          "variadic": false
+        }
+      ],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "renew-retired-identity",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "project renew-retired-identity"
     },
     "scenario": "identity",
     "source": "bin/lcm.ts:runCli"
@@ -4252,7 +4313,7 @@
     "id": "mcp:lcm_expand",
     "kind": "mcp",
     "registration": {
-      "description": "Decompress a summary node into its full source content by traversing the DAG. Use when a summary references something that needs more detail.",
+      "description": "Traverse a summary node's DAG links and return its child summaries as short snippets. Use when a condensed summary references detail recorded in its children; this tool does not return raw source messages.",
       "inputSchema": {
         "properties": {
           "depth": {

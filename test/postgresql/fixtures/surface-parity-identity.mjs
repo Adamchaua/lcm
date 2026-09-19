@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createGitFixture, createLinkedWorktreeFixture } from "../../surface-parity/git-fixture.mjs";
 
@@ -9,6 +9,10 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 const ABSENT_ID = "01900000-0000-7000-8000-000000000099";
 const REMOTE_REFUSAL = /require.*storage\.backend.*postgresql/iu;
 const PATTERN = "parity_private_[0-9]{4}";
+// Mirrors src/project-map.ts's unexported successor domain separator exactly;
+// this independently re-derives the successor id to verify CLI output rather
+// than importing production internals into the public-surface fixture.
+const RETIRED_SUCCESSOR_DOMAIN = "lcm:retired-project-identity-successor:v1\0";
 
 export function json(result, code = 0) {
   if (result.code !== code) {
@@ -305,6 +309,48 @@ async function identity(context) {
     await context.finishSqliteRebound();
     Object.assign(context, context.runtimeState());
   }
+  // Retired local identity renewal repairs a worktree-reconciliation fence
+  // and is local-only: the successor rekey does not depend on the
+  // configured storage backend, matching reconcile-worktrees' architecture.
+  // The fence precondition is fixture scaffolding written directly to disk,
+  // the same way privateRoot seeds Git metadata before any CLI call; the
+  // surface under certification is exercised only through context.cli.
+  lifetime = context.currentDaemonIdentity();
+  await sameLifetime(context, lifetime);
+  const retiredRoot = privateRoot(context, "identity-retired");
+  const retiredId = hash(retiredRoot);
+  const projectsRoot = join(context.homeDir, ".lcm", "projects");
+  mkdirSync(projectsRoot, { recursive: true, mode: 0o700 });
+  const retiredFence = `${JSON.stringify({ version: 1, hash: retiredId, kind: "project" })}\n`;
+  writeFileSync(join(projectsRoot, retiredId), retiredFence, { mode: 0o600 });
+  const beforeRetiredMap = JSON.parse(readFileSync(mapPath, "utf8"));
+  assert.equal(Object.hasOwn(beforeRetiredMap, retiredId), false);
+  writeFileSync(mapPath, `${JSON.stringify({ ...beforeRetiredMap, [retiredId]: { canonical: retiredRoot, aliases: [] } })}\n`, { mode: 0o600 });
+  await invalid(context, ["project", "renew-retired-identity", retiredRoot]);
+  const expectedSuccessor = createHash("sha256")
+    .update(RETIRED_SUCCESSOR_DOMAIN).update(retiredId).update("\0").update(retiredRoot).digest("hex");
+  const renewed = json(await context.cli(["project", "renew-retired-identity", retiredRoot, "--json"]));
+  assert.equal(renewed.oldId, retiredId);
+  assert.equal(renewed.newId, expectedSuccessor);
+  assert.equal(renewed.changed, true);
+  const afterRetiredMap = JSON.parse(readFileSync(mapPath, "utf8"));
+  assert.equal(Object.hasOwn(afterRetiredMap, retiredId), false);
+  assert.deepEqual(afterRetiredMap[expectedSuccessor], { canonical: retiredRoot, aliases: [] });
+  assert.equal(readFileSync(join(projectsRoot, retiredId), "utf8"), retiredFence);
+  await sameLifetime(context, lifetime);
+  const idempotent = json(await context.cli(["project", "renew-retired-identity", retiredRoot, "--json"]));
+  assert.equal(idempotent.oldId, retiredId);
+  assert.equal(idempotent.newId, expectedSuccessor);
+  assert.equal(idempotent.changed, false);
+  const renewedShown = json(await context.cli(["project", "show", retiredRoot, "--json"]));
+  assert.equal(renewedShown.hash, expectedSuccessor);
+  assert.equal(renewedShown.entry.canonical, retiredRoot);
+  await ingest(context, retiredRoot, "surface-identity-retired", "Identity corpus violet retired renewal");
+  assert.equal((await matches(context, retiredRoot, "violet retired renewal")).length, 1);
+  await sameLifetime(context, lifetime);
+  rows.push(receipt("project renew-retired-identity", {
+    code: 0, renewed: renewed.changed, idempotent: !idempotent.changed, sameProject: renewedShown.hash === expectedSuccessor,
+  }));
   return rows;
 }
 
@@ -579,6 +625,7 @@ export function expectedIdentityObservations(backend) {
     "cli:project link": { code: 0, sameProject: true, isolated: true, remote: pg },
     "cli:project list": { code: 0, projectsPresent: 2, remote: pg },
     "cli:project reconcile-worktrees": { code: 0, status: "not-needed", unchanged: true, linkedWorktree: true },
+    "cli:project renew-retired-identity": { code: 0, renewed: true, idempotent: true, sameProject: true },
     "cli:project unlink": { code: 0, aliasRemoved: true, originalPreserved: true, unboundRefused: pg },
     "cli:postgres migrate": pg ? { code: 0, backend: "postgresql", applied: [], current: ["0001_migration_ledger", "0002_schema_baseline", "0003_machine_identity_key", "0004_machine_display_name", "0005_summary_context_integrity", "0006_transfer_ledger"] } : refusal,
     "cli:events promote": { code: 0, promoted: 0, errors: 0 },

@@ -48,7 +48,7 @@ export const CLI_SCENARIO_PATHS = {
   hooks: ["restore", "session-end", "user-prompt", "post-tool", "session-snapshot"],
   diagnostics: ["status", "stats", "doctor", "diagnose"],
   events: ["events promote", "events status", "events validate", "events quarantine", "events replay"],
-  identity: ["machine register", "machine show", "machine recover", "project reconcile-worktrees", "project list", "project show", "project link", "project unlink", "project create"],
+  identity: ["machine register", "machine show", "machine recover", "project reconcile-worktrees", "project renew-retired-identity", "project list", "project show", "project link", "project unlink", "project create"],
   admin: ["postgres migrate"],
   sensitive: ["sensitive", "sensitive list", "sensitive add", "sensitive remove", "sensitive test", "sensitive purge"],
   "native-import": ["import"],

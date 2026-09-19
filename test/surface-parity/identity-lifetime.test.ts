@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
@@ -10,7 +10,12 @@ import { runIdentityScenario } from "../postgresql/fixtures/surface-parity-ident
 const hash = (path: string) => createHash("sha256").update(path).digest("hex");
 const invalid = "--surface-parity-invalid-option";
 const absent = "01900000-0000-7000-8000-000000000099";
-const names = ["machine register", "machine show", "machine recover", "project create", "project show", "project link", "project list", "project reconcile-worktrees", "project unlink"];
+const names = ["machine register", "machine show", "machine recover", "project create", "project show", "project link", "project list", "project reconcile-worktrees", "project renew-retired-identity", "project unlink"];
+// Mirrors src/project-map.ts's unexported successor domain separator, the
+// same way surface-parity-identity.mjs independently re-derives it.
+const RETIRED_SUCCESSOR_DOMAIN = "lcm:retired-project-identity-successor:v1\0";
+const successorOf = (retiredId: string, canonical: string) =>
+  createHash("sha256").update(RETIRED_SUCCESSOR_DOMAIN).update(retiredId).update("\0").update(canonical).digest("hex");
 
 function fixture(drift?: { command: "link" | "unlink"; field: "pid" | "generation" }) {
   const homeDir = mkdtempSync(join(tmpdir(), "surface-identity-recorder-"));
@@ -21,8 +26,10 @@ function fixture(drift?: { command: "link" | "unlink"; field: "pid" | "generatio
   const other = join(homeDir, "projects", "surface-identity-other");
   const alias = join(homeDir, "projects", "surface-identity-alias");
   const worktree = join(homeDir, "projects", "surface-identity-linked-worktree");
+  const retired = join(homeDir, "projects", "surface-identity-retired");
   const id = hash(root);
   const aliases: string[] = [];
+  let renewedId: string | undefined;
   const trace: unknown[][] = [];
   const calls: string[][] = [];
   let lifetime = { pid: 100, generation: 1 };
@@ -56,9 +63,25 @@ function fixture(drift?: { command: "link" | "unlink"; field: "pid" | "generatio
         if (drift?.command === "unlink") lifetime[drift.field]++;
         return result({ hash: id, aliasRemoved: true });
       }
-      if (command === "show") return result({ hash: id, entry: { canonical: root, aliases: [...aliases] } });
+      if (command === "show") {
+        if (target === retired) return result({ hash: renewedId, entry: { canonical: retired, aliases: [] } });
+        return result({ hash: id, entry: { canonical: root, aliases: [...aliases] } });
+      }
       if (command === "list") return result({ local: [{ hash: id, aliases: [...aliases] }, { hash: hash(other), aliases: [] }] });
       if (command === "reconcile-worktrees") return result({ status: "not-needed", targetHash: id, sourceHashes: [], backupPaths: [], aliases: [worktree] });
+      if (command === "renew-retired-identity") {
+        const oldId = hash(target);
+        const newId = successorOf(oldId, target);
+        const changed = renewedId !== newId;
+        if (changed) {
+          const mapPath = join(homeDir, ".lcm", "map.json");
+          const map = JSON.parse(readFileSync(mapPath, "utf8"));
+          const { [oldId]: retiredEntry, ...rest } = map;
+          writeFileSync(mapPath, `${JSON.stringify({ ...rest, [newId]: { canonical: target, aliases: [] } })}\n`, { mode: 0o600 });
+        }
+        renewedId = newId;
+        return result({ oldId, newId, changed });
+      }
       throw new Error("unexpected recorder CLI");
     },
     async request(method: string, path: string, body?: { cwd: string }) {
@@ -70,7 +93,7 @@ function fixture(drift?: { command: "link" | "unlink"; field: "pid" | "generatio
       throw new Error("unexpected recorder HTTP");
     },
   };
-  return { context, root, other, alias, worktree, id, trace, calls, cleanup: () => rmSync(homeDir, { recursive: true, force: true }) };
+  return { context, root, other, alias, worktree, retired, id, trace, calls, cleanup: () => rmSync(homeDir, { recursive: true, force: true }) };
 }
 
 it("records the unchanged SQLite CLI occurrence sequence and completes each live proof before stop", async () => {
@@ -89,6 +112,9 @@ it("records the unchanged SQLite CLI occurrence sequence and completes each live
       ["project", "reconcile-worktrees", f.worktree, "--dry-run", "--json"], ["project", "reconcile-worktrees", f.worktree, "--json"],
       ["project", "show", f.worktree, "--json"], ["project", "unlink", f.alias, invalid],
       ["project", "unlink", f.alias, "--json"], ["project", "show", f.root, "--json"],
+      ["project", "renew-retired-identity", f.retired, invalid],
+      ["project", "renew-retired-identity", f.retired, "--json"], ["project", "renew-retired-identity", f.retired, "--json"],
+      ["project", "show", f.retired, "--json"],
     ]);
     const boundaries = f.trace.reduce<number[]>((out, event, index) => event[0] === "stop" ? [...out, index] : out, []);
     expect(boundaries).toHaveLength(5);
@@ -99,6 +125,7 @@ it("records the unchanged SQLite CLI occurrence sequence and completes each live
     expect(ingests).toEqual([
       ["http", "POST", "/ingest", { cwd: f.root, session_id: "surface-identity-main", messages: [{ role: "user", content: "Identity corpus amber nautical separator", tokenCount: 8 }] }],
       ["http", "POST", "/ingest", { cwd: f.other, session_id: "surface-identity-other", messages: [{ role: "user", content: "Identity corpus cobalt unrelated separator", tokenCount: 8 }] }],
+      ["http", "POST", "/ingest", { cwd: f.retired, session_id: "surface-identity-retired", messages: [{ role: "user", content: "Identity corpus violet retired renewal", tokenCount: 8 }] }],
     ]);
     const firstLive = f.trace.slice(boundaries[0] + 1, boundaries[1]);
     expect(firstLive.filter(event => event[0] === "http").map(event => event[2])).toEqual(["/ingest", "/health/observe", "/ingest", "/health", "/health/observe"]);
