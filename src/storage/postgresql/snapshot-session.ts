@@ -4,7 +4,7 @@ import { StorageOperationError } from "../errors.js";
 import type { PostgreSqlQueryExecutor, PostgreSqlQueryOptions } from "./contracts.js";
 import {
   isPostgreSqlConnectionError, isPostgreSqlSnapshotTerminationError, normalizePostgreSqlError,
-  PostgreSqlStorageOperationError,
+  isPostgreSqlSnapshotTerminationSqlState, PostgreSqlStorageOperationError,
 } from "./errors.js";
 
 /**
@@ -184,6 +184,7 @@ export class PostgreSqlSnapshotSession implements PostgreSqlQueryExecutor {
     const normalized = normalizePostgreSqlError(error, context);
     if (
       this.capturedSqlState !== null
+      && isPostgreSqlSnapshotTerminationSqlState(this.capturedSqlState)
       && normalized instanceof PostgreSqlStorageOperationError
       && normalized.sqlState === null
     ) {
@@ -213,16 +214,27 @@ export class PostgreSqlSnapshotSession implements PostgreSqlQueryExecutor {
       try {
         return await this.transport.query<R, I>(config, effectiveOptions);
       } catch (error) {
+        // Normalize first so a captured async diagnostic (see
+        // capturedSqlState / normalize) can participate in the destroy
+        // decision: a raw post-kill rejection can be a generic, code-free
+        // "not queryable" message that isPostgreSqlSnapshotTerminationError
+        // would not recognize on its own, even though the reattached,
+        // normalized error correctly carries the real captured sqlState.
+        // isPostgreSqlConnectionError still reads the raw error: it is a
+        // raw-driver-shape check (transport codes, connection-loss
+        // messages) that a normalized StorageOperationError can never
+        // match, so normalizing first would only ever make it return false.
+        const normalized = this.normalize(error, { ...options, projectId: this.options.projectId });
         // A 25P03 idle-in-transaction kill (or any connection-termination
         // failure) marks the backend dead immediately, so finishClose skips
         // ROLLBACK on the FATAL-dead session and releases with destroy=true
         // instead of attempting a doomed rollback.
         this.destroy ||= effectiveOptions.signal.aborted
           || isPostgreSqlConnectionError(error)
-          || isPostgreSqlSnapshotTerminationError(error);
+          || isPostgreSqlSnapshotTerminationError(normalized);
         // Do not await close inside the queue it must drain.
         void this.close().catch(() => undefined);
-        throw this.normalize(error, { ...options, projectId: this.options.projectId });
+        throw normalized;
       }
     });
     this.queue = execute.then(() => undefined, () => undefined);

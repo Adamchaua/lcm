@@ -342,7 +342,16 @@ const expectedComponents = [
   {
     component_id: "unit-diagnostics",
     name: "Unit - Diagnostics",
-    paths: ["^src/diagnose\\.ts$", "^src/storage/diagnostics\\.ts$", "^src/storage/diagnostic-renderer\\.ts$", "^src/storage/diagnostic-project\\.ts$", "^src/storage/postgresql/diagnostics\\.ts$", "src/doctor/"],
+    paths: [
+      "^src/diagnose\\.ts$",
+      // #1410 threads snapshotIdleTimeoutMs into the diagnostics probe's
+      // connection settings here.
+      "^src/storage/diagnostics\\.ts$",
+      "^src/storage/diagnostic-renderer\\.ts$",
+      "^src/storage/diagnostic-project\\.ts$",
+      "^src/storage/postgresql/diagnostics\\.ts$",
+      "src/doctor/",
+    ],
   },
   {
     component_id: "integration-service-managers",

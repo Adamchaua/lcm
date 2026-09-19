@@ -334,7 +334,19 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     // issue #1424 for the wider gap on other checked-out clients): without
     // a listener that emit is an unhandled process-level error. Removed on
     // release so it never lingers on a client returned to the pool.
-    let onClientAsyncFailure: ((error: unknown) => void) | undefined;
+    //
+    // Attached unconditionally, right here, rather than gated on whether
+    // PostgreSqlSnapshotSession.open ever calls onAsyncFailure: the
+    // session constructor always does in this runtime-driven flow, so a
+    // conditional guard around detach would have a structurally
+    // unreachable false arm. forwardAsyncFailure starts as a no-op and is
+    // replaced once the session registers; if a client 'error' arrives in
+    // the brief window before that registration, it is safely swallowed
+    // (no unhandled process error) even though no diagnostic is captured
+    // yet for it.
+    let forwardAsyncFailure: (sqlState: string | null) => void = () => undefined;
+    const onClientAsyncFailure = (error: unknown): void => { forwardAsyncFailure(sanitizeSqlState(error)); };
+    client.on("error", onClientAsyncFailure);
     session = await PostgreSqlSnapshotSession.open({
       query: <R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
         config: QueryConfig<I>, queryOptions: PostgreSqlQueryOptions,
@@ -343,14 +355,11 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       ),
       rollback: async () => { await client.query("ROLLBACK"); },
       release: (destroy) => {
-        if (onClientAsyncFailure) client.removeListener("error", onClientAsyncFailure);
+        client.removeListener("error", onClientAsyncFailure);
         if (session) this.snapshots.delete(session);
         client.release(destroy);
       },
-      onAsyncFailure: (handler) => {
-        onClientAsyncFailure = (error: unknown) => { handler(sanitizeSqlState(error)); };
-        client.on("error", onClientAsyncFailure);
-      },
+      onAsyncFailure: (handler) => { forwardAsyncFailure = handler; },
     }, options);
     if (this.closed) {
       await session.close();

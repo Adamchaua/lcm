@@ -357,6 +357,25 @@ describe('PostgreSQL source failure boundaries',()=>{
     expect(error).toMatchObject({code:'source-unavailable'});
     expect((error as {cause?:unknown}).cause).toBe(notQueryable);
   });
+  it('drives the generic stream close-cause-forwarding true arm through the real PostgreSQL source, not a synthetic double',async()=>{
+    // portable-record-stream.ts's own close() forwards error.cause only
+    // when the caught error is instanceof PortableStreamError. The one
+    // production source that ever throws that shape from close() is this
+    // PostgreSQL source (via safeError attaching an already-sanitized
+    // StorageOperationError as cause); every other unit fixture in the
+    // stream's own test file throws a plain Error, which never reaches
+    // that arm. Wrap the real source in the real generic stream and close
+    // the stream (not the source directly) so the true arm executes for a
+    // genuine reason, not a hand-built PortableStreamError.
+    const h=dataHarness(),source=await open(h),stream=await createPortableRecordStream(source);
+    const ordinaryFailure=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'23505',false,
+    );
+    h.session.close.mockRejectedValue(ordinaryFailure);
+    const error=await stream.close().catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable',retryable:true});
+    expect((error as {cause?:unknown}).cause).toBe(ordinaryFailure);
+  });
   it('still fails a close when index closure fails, even alongside a tolerated 25P03 session close',async()=>{
     const h=dataHarness(),source=await open(h),original=PortableIndex.prototype.close;
     vi.spyOn(PortableIndex.prototype,'close').mockImplementation(function(){original.call(this);throw new Error('index-secret');});

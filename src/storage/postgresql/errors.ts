@@ -125,6 +125,23 @@ export function isPostgreSqlConnectionError(error: unknown): boolean {
 }
 
 /**
+ * Whether a five-character SQLSTATE, already known to be present, has the
+ * shape of a genuine PostgreSQL connection termination or idle-in-
+ * transaction kill (25P03, 08xxx, 57P01/57P02/57P03). Shared by the
+ * snapshot-local predicate below and by
+ * {@link PostgreSqlSnapshotSession}'s captured-diagnostic reattach, so an
+ * out-of-band client 'error' event can only ever be reattached and
+ * classified as a termination when its own code actually looks like one;
+ * a hypothetical async event carrying an unrelated code (pg never emits
+ * one on a client 'error' event in practice) is captured but not reattached.
+ */
+export function isPostgreSqlSnapshotTerminationSqlState(sqlState: string): boolean {
+  return sqlState === "25P03"
+    || (sqlState.length === 5 && sqlState.startsWith("08"))
+    || CONNECTION_TERMINATION_SQLSTATES.has(sqlState);
+}
+
+/**
  * A narrower, snapshot-local predicate for the read-only snapshot session
  * only. Matches 25P03 (idle-in-transaction session kill), 08xxx (connection
  * exception), 57P01/57P02/57P03 (admin/crash shutdown) and the existing
@@ -140,9 +157,7 @@ export function isPostgreSqlSnapshotTerminationError(error: unknown): boolean {
   if (error instanceof PostgreSqlStorageOperationError) {
     const sqlState = error.sqlState;
     if (sqlState !== null) {
-      return sqlState === "25P03"
-        || (sqlState.length === 5 && sqlState.startsWith("08"))
-        || CONNECTION_TERMINATION_SQLSTATES.has(sqlState);
+      return isPostgreSqlSnapshotTerminationSqlState(sqlState);
     }
     // idle_in_transaction_session_timeout fires while no statement is
     // running: the FATAL arrives on the driver's asynchronous 'error'

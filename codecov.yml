@@ -433,6 +433,8 @@ component_management:
       name: "Unit - Diagnostics"
       paths:
         - "^src/diagnose\\.ts$"
+        # #1410 threads snapshotIdleTimeoutMs into the diagnostics probe's
+        # connection settings here.
         # #619 retains authenticated daemon pool observations across probe failures.
         - "^src/storage/diagnostics\\.ts$"
         - "^src/storage/diagnostic-renderer\\.ts$"

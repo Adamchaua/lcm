@@ -2956,6 +2956,20 @@ describe("portable record stream public seam", () => {
     await expectAsyncCode(() => stream.readBatch({ domain: "messages", maxRecords: 1, maxBytes: PORTABLE_LIMITS.maxBatchBytes }), "closed");
   });
 
+  it("forwards the source's own close cause instead of discarding it", async () => {
+    const source = new FakePortableSource();
+    const stream = await createPortableRecordStream(source);
+    const closeCause = new Error("private underlying storage close cause");
+    source.closeFailure = new PortableStreamError("source-unavailable", { cause: closeCause });
+    try {
+      await stream.close();
+      throw new Error("close unexpectedly succeeded");
+    } catch (error) {
+      expectSanitizedError(error, "source-unavailable");
+      expect((error as PortableStreamError).cause).toBe(closeCause);
+    }
+  });
+
   it("keeps public batches, checkpoints, manifests, and verifications deeply immutable", async () => {
     const source = new FakePortableSource();
     const stream = await createPortableRecordStream(source);

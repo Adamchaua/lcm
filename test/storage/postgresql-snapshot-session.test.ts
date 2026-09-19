@@ -484,6 +484,24 @@ describe("dedicated PostgreSQL snapshot session", () => {
     await f.runtime.close();
   });
 
+  it("does not reattach a captured code that is not termination-shaped", async () => {
+    // pg never actually emits a client 'error' event carrying an
+    // unrelated code such as 40001 in practice (those are query-class
+    // rejections, not out-of-band connection events), but the reattach
+    // gate must still refuse to launder a hypothetical one into a false
+    // termination diagnostic on a later, otherwise-undiagnosed rejection.
+    const f = fixture(async (text) => {
+      if (text === "SELECT late") throw new Error("Client has encountered a connection error and is not queryable");
+      return result();
+    });
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    f.emitClientError(Object.assign(new Error("serialization failure"), { code: "40001" }));
+    const error = await session.query({ text: "SELECT late" }, options).catch((e: unknown) => e);
+    expect(error).toMatchObject({ sqlState: null });
+    await session.close();
+    await f.runtime.close();
+  });
+
   it("removes the async-failure listener from the client on release", async () => {
     const f = fixture();
     const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
