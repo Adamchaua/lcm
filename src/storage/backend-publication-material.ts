@@ -1,0 +1,392 @@
+import { dirname } from "node:path";
+import { normalizeUuidV7 } from "../machine-identity.js";
+import { projectMapPath } from "../project-map.js";
+import { configPath } from "../runtime-paths.js";
+import type { StorageBackendName } from "./contracts.js";
+import {
+  captureBackendPublicationFileWitness,
+  readAuthenticatedBackendPublicationMaterial,
+  readBackendPublicationJournal,
+  withBackendPublicationReadRoot,
+  type BackendPublicationFileSnapshot,
+  type BackendPublicationJournal,
+  type BackendPublicationRecoveryFile,
+  type BackendPublicationRecoveryMaterial,
+} from "./backend-publication.js";
+
+const EVIDENCE_SHA256_SHAPE_PATTERN = /^[0-9a-f]{64}$/u;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function describeError(error: unknown): string {
+  // String(error) on an Error instance already includes its name and
+  // message (e.g. "BackendPublicationJournalError: ..."), so this needs
+  // no branch on the thrown value's type to stay informative.
+  return String(error);
+}
+
+function assertStorageBackendName(value: unknown): asserts value is StorageBackendName {
+  if (value !== "sqlite" && value !== "postgresql") {
+    throw new TypeError(
+      `backend publication targetBackend must be "sqlite" or "postgresql", received: ${JSON.stringify(value)}`,
+    );
+  }
+}
+
+function recoveryFileFromSnapshot(
+  snapshot: BackendPublicationFileSnapshot,
+): BackendPublicationRecoveryFile {
+  if (snapshot.witness.presence === "absent") {
+    return { presence: "absent" };
+  }
+  const witness = snapshot.witness;
+  return {
+    presence: "present",
+    // captureBackendPublicationFileWitness only returns a null content
+    // alongside an absent witness (handled by the branch above), so a
+    // present witness always carries real string content here.
+    content: Buffer.from(snapshot.content as string, "utf-8"),
+    mode: witness.mode,
+    uid: witness.uid,
+    gid: witness.gid,
+    nlink: witness.nlink,
+    dev: witness.dev,
+    ino: witness.ino,
+    parentDev: witness.parentDev,
+    parentIno: witness.parentIno,
+  };
+}
+
+export type CaptureBackendPublicationSourceMaterialInput = Readonly<{
+  homeDir?: string;
+}>;
+
+export type BackendPublicationSourceMaterial = Readonly<{
+  config: BackendPublicationRecoveryFile;
+  projectMap: BackendPublicationRecoveryFile;
+}>;
+
+/**
+ * Read the LIVE `config.json` and `map.json` under the LCM home as the
+ * ONLY source of source material for a composed publication. This is always
+ * read from disk; it is never supplied by a caller, so a caller cannot
+ * substitute stale or invented source bytes for the live installation
+ * state.
+ */
+export function captureBackendPublicationSourceMaterial(
+  input: CaptureBackendPublicationSourceMaterialInput = {},
+): BackendPublicationSourceMaterial {
+  return withBackendPublicationReadRoot(input.homeDir, (assertReadRoot) => {
+    const guarded = <T>(read: () => T): T => {
+      assertReadRoot();
+      const value = read();
+      assertReadRoot();
+      return value;
+    };
+    const configFilePath = configPath(input.homeDir);
+    const mapFilePath = projectMapPath(input.homeDir);
+    const config = guarded(() =>
+      captureBackendPublicationFileWitness(configFilePath, dirname(configFilePath)));
+    const projectMap = guarded(() =>
+      captureBackendPublicationFileWitness(mapFilePath, dirname(mapFilePath)));
+    return {
+      config: recoveryFileFromSnapshot(config),
+      projectMap: recoveryFileFromSnapshot(projectMap),
+    };
+  });
+}
+
+export type BackendPublicationProjectBinding = Readonly<{
+  localProjectId: string;
+  remoteProjectId: string;
+  evidenceSha256: string;
+}>;
+
+function validateBindingShape(
+  binding: BackendPublicationProjectBinding,
+): BackendPublicationProjectBinding {
+  if (
+    typeof binding.localProjectId !== "string"
+    || binding.localProjectId.length === 0
+    || binding.localProjectId.length > 256
+  ) {
+    throw new TypeError(
+      "backend publication binding localProjectId must be a non-empty string of at most 256 characters",
+    );
+  }
+  // project-map.ts:1943-1946 (setRemoteProjectBinding) and
+  // src/doctor/doctor.ts:494 both reject a project-map remoteProjectId that
+  // fails normalizeUuidV7. backend-publication.ts's own project validation
+  // (assertProjects, backend-publication.ts:827-845) is generic over
+  // backends and accepts any non-empty string. Composing a value for the
+  // project map means meeting the map's stricter rule, not the publication
+  // layer's more permissive one: a target that satisfies only the
+  // permissive rule would publish cleanly and then leave the installation
+  // failing its own `lcm doctor` health check.
+  const normalizedRemoteProjectId = typeof binding.remoteProjectId === "string"
+    ? normalizeUuidV7(binding.remoteProjectId)
+    : null;
+  if (normalizedRemoteProjectId === null) {
+    throw new TypeError(
+      `backend publication binding remoteProjectId must be a PostgreSQL UUIDv7: ${String(binding.remoteProjectId)}`,
+    );
+  }
+  if (
+    typeof binding.evidenceSha256 !== "string"
+    || !EVIDENCE_SHA256_SHAPE_PATTERN.test(binding.evidenceSha256)
+  ) {
+    // evidenceSha256's definition is settled: it is bindingSha256 from
+    // bindMigrationCopySource (src/migration/copy-source.ts:134). It is
+    // an INPUT here, not something this module reads, because the
+    // readback artifact that would carry it durably is on an unmerged
+    // branch at the base this was built against — the follow-on here is
+    // wiring once that artifact merges, not an open decision. This
+    // validates SHAPE only (64 lowercase hex, matching HASH_PATTERN's
+    // convention in backend-publication.ts) and never mints or
+    // recomputes the digest, and deliberately does not import anything
+    // from src/migration/.
+    throw new TypeError(
+      "backend publication binding evidenceSha256 must be 64 lowercase hex characters",
+    );
+  }
+  return {
+    localProjectId: binding.localProjectId,
+    remoteProjectId: normalizedRemoteProjectId,
+    evidenceSha256: binding.evidenceSha256,
+  };
+}
+
+function validateBindings(
+  bindings: readonly BackendPublicationProjectBinding[],
+): readonly BackendPublicationProjectBinding[] {
+  const validated = bindings.map(validateBindingShape);
+  const seen = new Set<string>();
+  for (const binding of validated) {
+    if (seen.has(binding.localProjectId)) {
+      throw new TypeError(
+        `backend publication bindings must not repeat localProjectId: ${binding.localProjectId}`,
+      );
+    }
+    seen.add(binding.localProjectId);
+  }
+  return validated;
+}
+
+function composeTargetConfigFile(
+  source: BackendPublicationRecoveryFile,
+  targetBackend: StorageBackendName,
+): BackendPublicationRecoveryFile {
+  if (source.presence === "absent") {
+    // BackendPublicationRecoveryFile's present arm requires an owner-only
+    // mode (assertWitnessShape's isOwnerOnlyFileMode check, enforced via
+    // the journal witness), and applyBackendPublicationConfigFile
+    // (config-manager.ts) writes the target file with
+    // `finalMode: recoveryFile.mode` taken verbatim from this material —
+    // there is no mode to carry forward from an absent source. Minting one
+    // would mean creating a config file from nothing, which is not a
+    // backend selection change; refuse instead.
+    throw new RangeError(
+      "backend publication cannot compose a target config: the source config is absent",
+    );
+  }
+  const decoded = new TextDecoder("utf-8", { fatal: true }).decode(source.content);
+  const parsed: unknown = JSON.parse(decoded);
+  if (!isRecord(parsed)) {
+    throw new TypeError("backend publication source config is not a JSON object");
+  }
+  const storage = isRecord(parsed.storage) ? parsed.storage : {};
+  const targetParsed = {
+    ...parsed,
+    storage: { ...storage, backend: targetBackend },
+  };
+  const serialized = `${JSON.stringify(targetParsed, null, 2)}
+`;
+  return {
+    presence: "present",
+    content: Buffer.from(serialized, "utf-8"),
+    mode: source.mode,
+    uid: source.uid,
+    gid: source.gid,
+    nlink: source.nlink,
+    dev: source.dev,
+    ino: source.ino,
+    parentDev: source.parentDev,
+    parentIno: source.parentIno,
+  };
+}
+
+function parseSourceProjectMapObject(content: string): Record<string, Record<string, unknown>> {
+  const parsed: unknown = JSON.parse(content);
+  if (!isRecord(parsed)) {
+    throw new TypeError("backend publication source project map is not a JSON object");
+  }
+  const result: Record<string, Record<string, unknown>> = {};
+  for (const [hash, value] of Object.entries(parsed)) {
+    if (!isRecord(value)) {
+      throw new TypeError(`backend publication source project map entry ${hash} is not an object`);
+    }
+    result[hash] = value;
+  }
+  return result;
+}
+
+function composeTargetProjectMapFile(
+  source: BackendPublicationRecoveryFile,
+  targetBackend: StorageBackendName,
+  bindings: readonly BackendPublicationProjectBinding[],
+): BackendPublicationRecoveryFile {
+  const sourceMapObject = source.presence === "absent"
+    ? {}
+    : parseSourceProjectMapObject(new TextDecoder("utf-8", { fatal: true }).decode(source.content));
+
+  const missing = bindings.filter(
+    (binding) => !Object.prototype.hasOwnProperty.call(sourceMapObject, binding.localProjectId),
+  );
+  if (missing.length > 0) {
+    throw new RangeError(
+      `backend publication binding names a project absent from the live map: ${missing
+        .map((binding) => binding.localProjectId)
+        .join(", ")}`,
+    );
+  }
+
+  if (source.presence === "absent") {
+    // No binding could have survived the check above against an empty map,
+    // so the target map is legitimately absent too: there is nothing to
+    // write and, as with config, no mode to mint one with. This is reached
+    // as a natural consequence of the missing-binding refusal above rather
+    // than a second, separate refusal.
+    return { presence: "absent" };
+  }
+
+  const targetMapObject: Record<string, Record<string, unknown>> = {};
+  for (const [hash, entry] of Object.entries(sourceMapObject)) {
+    targetMapObject[hash] = { ...entry };
+  }
+  for (const binding of bindings) {
+    // project-map.ts:1543-1547 (resolveProjectIdentityUnlocked) indexes
+    // the live map directly with a project's `id`, and
+    // src/cli-storage.ts:106 treats that same `id` and a publication
+    // record's `localProjectId` as one value
+    // (`"localProjectId" in identity ? identity.localProjectId : identity.id`).
+    // That coupling is real in merged code but UNENFORCED by
+    // backend-publication.ts itself (assertProjects only requires a
+    // non-empty, <=256-character, array-unique string), so the refusal
+    // above is load-bearing rather than defensive.
+    if (targetBackend === "postgresql") {
+      targetMapObject[binding.localProjectId]!.remoteProjectId = binding.remoteProjectId;
+    } else {
+      delete targetMapObject[binding.localProjectId]!.remoteProjectId;
+    }
+  }
+
+  const serialized = `${JSON.stringify(targetMapObject, null, 2)}
+`;
+  return {
+    presence: "present",
+    content: Buffer.from(serialized, "utf-8"),
+    mode: source.mode,
+    uid: source.uid,
+    gid: source.gid,
+    nlink: source.nlink,
+    dev: source.dev,
+    ino: source.ino,
+    parentDev: source.parentDev,
+    parentIno: source.parentIno,
+  };
+}
+
+export type ComposeBackendPublicationMaterialInput = Readonly<{
+  homeDir?: string;
+  targetBackend: StorageBackendName;
+  bindings: readonly BackendPublicationProjectBinding[];
+}>;
+
+export type ComposeBackendPublicationMaterialResult = Readonly<{
+  material: BackendPublicationRecoveryMaterial;
+  projects: readonly BackendPublicationProjectBinding[];
+}>;
+
+/**
+ * Derive a publication's `material` and `projects` from ONE input
+ * (`bindings`) in one place. `material.target.projectMap` and `projects`
+ * are two encodings of the same local-to-remote project binding fact; two
+ * consumers composing them separately at two call sites is how they come
+ * to disagree. Deriving both here, from the same validated bindings, makes
+ * disagreement structurally unreachable rather than merely unlikely.
+ */
+export function composeBackendPublicationMaterial(
+  input: ComposeBackendPublicationMaterialInput,
+): ComposeBackendPublicationMaterialResult {
+  assertStorageBackendName(input.targetBackend);
+  const bindings = validateBindings(input.bindings);
+  const source = captureBackendPublicationSourceMaterial({ homeDir: input.homeDir });
+  const targetConfig = composeTargetConfigFile(source.config, input.targetBackend);
+  const targetProjectMap = composeTargetProjectMapFile(source.projectMap, input.targetBackend, bindings);
+  return {
+    material: {
+      source: { config: source.config, projectMap: source.projectMap },
+      target: { config: targetConfig, projectMap: targetProjectMap },
+    },
+    projects: bindings,
+  };
+}
+
+export type RetainedBackendPublicationMaterialResult =
+  | Readonly<{
+    status: "present";
+    journal: BackendPublicationJournal;
+    material: BackendPublicationRecoveryMaterial;
+  }>
+  | Readonly<{ status: "authoritatively-absent" }>
+  | Readonly<{ status: "unresolvable"; reason: string }>;
+
+export type ReadRetainedBackendPublicationMaterialInput = Readonly<{
+  homeDir?: string;
+}>;
+
+/**
+ * Read the retained material for #626's rollback target, THREE-VALUED:
+ *
+ * - the live journal slot read itself fails -> `unresolvable`, with the
+ *   reason
+ * - the read succeeds and there is no journal, or the journal is not at
+ *   phase `completed` -> `authoritatively-absent`
+ * - the journal is `completed` and the material read throws (including
+ *   ENOENT) -> `unresolvable`, NOT absent. A completed journal asserts a
+ *   `recoveryReference`; a missing or unauthenticatable file under that
+ *   assertion is an inconsistent store, and concluding "absent" there
+ *   would license a reversal with nothing to reverse to.
+ * - the journal is `completed` and the material authenticates ->
+ *   `present`, carrying BOTH the material and the journal. This function
+ *   does not filter on `targetBackend`: that check belongs to the
+ *   consumer (contract section 16), which has more information than this
+ *   reader does about what it is eligible to roll back.
+ *
+ * Mechanism: the coordinator does not delete the material file on the
+ * completed path (only the abort path consumes it), and the completed
+ * journal stays in the live slot until the next `prepare()` archives it.
+ * So the completed journal's `publicationId`/`recoveryReference` are read
+ * from the live slot, and the retained material is read through those.
+ */
+export function readRetainedBackendPublicationMaterial(
+  input: ReadRetainedBackendPublicationMaterialInput = {},
+): RetainedBackendPublicationMaterialResult {
+  let journal: BackendPublicationJournal | null;
+  try {
+    journal = readBackendPublicationJournal(input.homeDir);
+  } catch (error) {
+    return { status: "unresolvable", reason: describeError(error) };
+  }
+  if (journal === null || journal.phase !== "completed") {
+    return { status: "authoritatively-absent" };
+  }
+  try {
+    const material = readAuthenticatedBackendPublicationMaterial(journal, input.homeDir);
+    return { status: "present", journal, material };
+  } catch (error) {
+    return { status: "unresolvable", reason: describeError(error) };
+  }
+}

@@ -1,0 +1,9 @@
+references: ["#1433"]
+rationale: >-
+  #1433 adds the production BackendPublicationDriver and coordinator factory
+  and the composed publication material source with its retained-material
+  reader. Both new files are tightly coupled extensions of the backend
+  publication coordinator and join its existing storage-abstractions owner.
+pins:
+  - ["src/storage/backend-publication-driver.ts", "unit-storage-abstractions"]
+  - ["src/storage/backend-publication-material.ts", "unit-storage-abstractions"]

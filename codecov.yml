@@ -316,6 +316,11 @@ component_management:
         # synchronous-origin tokens at asynchronous coordinator seams in this
         # existing owner; #1407 is its test and documentation debt.
         - "^src/storage/backend-publication\\.ts$"
+        # #1433 adds the one production BackendPublicationDriver/Coordinator
+        # factory and the composed publication material/retained-material
+        # reader as tightly-coupled extensions of this same subsystem.
+        - "^src/storage/backend-publication-driver\\.ts$"
+        - "^src/storage/backend-publication-material\\.ts$"
         # #910 keeps shared publication retry deadlines monotonic in this owner.
         - "^src/storage/publication-convergence\\.ts$"
         - "^src/storage/capabilities\\.ts$"

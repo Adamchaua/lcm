@@ -228,6 +228,8 @@ const expectedComponents = [
       // #1285 retains terminal archive history identity through exclusive
       // publication, exact replay, and descriptor-bound durability flushes.
       "^src/storage/backend-publication\\.ts$",
+      "^src/storage/backend-publication-driver\\.ts$",
+      "^src/storage/backend-publication-material\\.ts$",
       // #910 keeps shared publication retry deadlines monotonic in this owner.
       "^src/storage/publication-convergence\\.ts$",
       "^src/storage/capabilities\\.ts$",
@@ -783,7 +785,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(258);
+    expect(productionFiles).toHaveLength(260);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -813,7 +815,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(258);
+    expect(ownershipCounts.size).toBe(260);
   });
 
   test("keeps every recorded ownership decision in its intended component", () => {
