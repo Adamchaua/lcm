@@ -61,11 +61,11 @@ describe("MIGRATION_COMMAND_CONTRACTS (section 5.1's per-command postcondition a
     expect(MIGRATION_COMMAND_CONTRACTS.map((entry) => entry.command)).toEqual(expectedCommands);
   });
 
-  it("marks exactly plan, dry-run, apply, report and abort as implemented, and the rest as outline (section 13's implementable-now list)", () => {
+  it("marks exactly plan, dry-run, apply and abort as implemented, and the rest (including report) as outline -- section 13's implementable-now list names exactly these four, and report has no CLI wiring in this candidate (no cli-report.ts, no bin/lcm.ts registration)", () => {
     const implemented = MIGRATION_COMMAND_CONTRACTS.filter((entry) => entry.status === "implemented").map((entry) => entry.command);
-    expect(implemented.sort()).toEqual(["abort", "apply", "dry-run", "plan", "report"].sort());
+    expect(implemented.sort()).toEqual(["abort", "apply", "dry-run", "plan"].sort());
     const outline = MIGRATION_COMMAND_CONTRACTS.filter((entry) => entry.status === "outline").map((entry) => entry.command);
-    expect(outline.sort()).toEqual(["activate", "resume", "rollback", "verify"].sort());
+    expect(outline.sort()).toEqual(["activate", "report", "resume", "rollback", "verify"].sort());
   });
 
   it("gives every command a non-empty, never-'nothing threw' exit-zero postcondition, and every command can emit 0", () => {

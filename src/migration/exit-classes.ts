@@ -98,9 +98,14 @@ export function migrationExitClassForName(name: MigrationExitClassName): Migrati
 /**
  * All nine commands issue #627's contract names, not only the four this
  * candidate implements (section 13's "implementable now" list: `plan`,
- * `dry-run`, `apply`, `abort`; `report` is manifest-level only). The
- * remaining five (`resume`, `verify`, `activate`, `rollback`, and
- * `report`'s full verification-report readback) are recorded here as
+ * `dry-run`, `apply`, `abort`). `report` was previously marked
+ * `status: "implemented"` here, which self-contradicted this very
+ * sentence's "four" -- section 13 never lists `report` among what this
+ * candidate implements, and no CLI wiring for it exists (checked at
+ * source: no `cli-report.ts`, no `performMigrationReport`, no
+ * `bin/lcm.ts` registration). Corrected to `"outline"`, matching every
+ * other not-yet-wired command. The remaining five (`resume`, `verify`,
+ * `report`, `activate`, `rollback`) are recorded here as
  * `status: "outline"` — named and given their documented postcondition and
  * emittable classes for the runbook and for #624/#625/#626's own future
  * candidates to bind to, but with no frozen test claiming that behaviour
@@ -150,7 +155,7 @@ export const MIGRATION_COMMAND_CONTRACTS: readonly MigrationCommandContract[] = 
     canEmit: [0, 1, 2, 3, 4, 5, 6, 7] as const,
   }),
   Object.freeze({
-    command: "report", status: "implemented",
+    command: "report", status: "outline",
     exitZeroPostcondition: "Every read succeeded and evidence is complete. Manifest-level only in this candidate; the verification-report body readback lands with #624's integration.",
     canEmit: [0, 1, 2, 5, 8] as const,
   }),
