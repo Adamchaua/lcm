@@ -43,6 +43,7 @@ import {
   type BackendPublicationRecoveryFile,
 } from "../../src/storage/backend-publication.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
+import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
 import {
   createMigrationManifest,
   beginMigrationEffect,
@@ -1379,6 +1380,128 @@ describe("runMigrationRollback", () => {
         source: sqliteSourceStream,
       }),
     });
-    expect(readableOutcome.manifest.phase).toBe("rolled-back");
+   expect(readableOutcome.manifest.phase).toBe("rolled-back");
+ });
+});
+
+// donadiosolutions/lcm#1431, coordinator-seam-FROZEN.md section 17's
+// crash window: "between the moment a selection completes and the
+// moment its binding is durably written, selections is missing the
+// binding that authority actually rests on." Section 17's obligation:
+// a consumer concludes nothing from that absence while an unresolved
+// publish effect exists for that generation, and recovery re-derives
+// and rewrites the binding from the authoritative readback, which the
+// writer's idempotency rule makes safe.
+describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-written", () => {
+  it("the manifest reaches rolled-back durably even when recordSelectionBinding crashes, replay admission already routes to sqlite from the maintenance journal alone, and the same deterministic binding can be re-derived from durable state and rewritten idempotently", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-1431");
+    const canonicalPath = join(homeDir, "live.sqlite");
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const baseline = fixtureCanonicalDelta("1431-baseline");
+    const census = fixtureCensusVector("1431-census");
+
+    let attemptedBinding: unknown = null;
+    let bindingCalls = 0;
+
+    await expect(runMigrationRollback({
+      homeDir, generationId: "gen-1431", canonicalPath,
+      projectIdentity: identity, localProjectId: "local-1431",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator: coordinatorFor(homeDir),
+      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
+        epochId: "epoch-1431", attemptId: "attempt-1431", manifestRevision: 1,
+        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-1431",
+      }),
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: (input) => {
+        bindingCalls += 1;
+        attemptedBinding = input.binding;
+        throw new Error("simulated crash: selection completed but the binding write never landed");
+      },
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => ({
+        epoch: { destinationIdentity, censusVector: census, schemaWitness: fixtureSchemaWitness("schema-1431") },
+        attempt: { canonicalDeltaBaseline: baseline },
+      }),
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+          destinationIdentity, postEpochDelta: baseline, postEpochCensus: census,
+        }],
+        source: sqliteSourceStream,
+      }),
+    })).rejects.toThrow("simulated crash: selection completed but the binding write never landed");
+    expect(bindingCalls).toBe(1);
+
+    // The manifest completed publish-rollback and was durably persisted
+    // BEFORE recordSelectionBinding ever ran (rollback.ts calls it last,
+    // after publishManifest for the publish-rollback completion) -- so
+    // the crash inside the binding writer does not roll the manifest
+    // back. This is the absence section 17 requires a consumer not to
+    // conclude "never published" from.
+    const terminal = new MigrationManifestStore({ homeDir }).read("gen-1431");
+    expect(terminal.phase).toBe("rolled-back");
+    expect(terminal.pendingEffect).toBeNull();
+    expect(terminal.rollbackLineage.mode).toBe("pre-write");
+
+    // assertMigrationReplayAdmission -- the ACTUAL replay-admission
+    // consumer this codebase has today -- keys on the maintenance
+    // journal alone (selection-completed + terminalEvidenceSha256), not
+    // on the selection-binding store, so it already routes correctly to
+    // sqlite even though the binding write crashed. This is the
+    // concrete claim rollback.ts's own step-11 comment makes; proven
+    // here rather than asserted.
+    const maintenance = readBackendMaintenanceJournal(homeDir);
+    expect(maintenance?.phase).toBe("selection-completed");
+    expect(maintenance?.targetBackend).toBe("sqlite");
+    const admission = assertMigrationReplayAdmission({
+      homeDir, generationId: "gen-1431", evidenceSha256: maintenance!.terminalEvidenceSha256!,
+    });
+    expect(admission).toEqual({ backend: "sqlite", disposition: "selected" });
+
+    // Re-derive the SAME selection binding independently from durable
+    // state left behind -- exactly what section 17 requires recovery to
+    // do -- and prove it is byte-identical to what runPostPrepareSequence
+    // actually attempted, which is what makes "rewrite it" safe per the
+    // idempotency rule (contract section 17: accept a re-write of an
+    // identical binding for the same generation and kind).
+    const rollbackReportRef = terminal.reports.find((report) => report.kind === "rollback");
+    expect(rollbackReportRef).toBeDefined();
+    const rollbackReport = readRollbackReport(homeDir, "gen-1431", rollbackReportRef!.reportId);
+    expect(rollbackReport).not.toBeNull();
+    expect(rollbackReport!.epochId).toBe("epoch-1431");
+    expect(rollbackReport!.attemptId).toBe("attempt-1431");
+
+    const rederivedBinding = {
+      kind: "rollback" as const,
+      epochId: rollbackReport!.epochId!,
+      attemptId: rollbackReport!.attemptId!,
+      manifestRevision: terminal.revision,
+      witnessChecksumSha256: maintenance!.terminalEvidenceSha256!,
+      publicationId: deriveRollbackPublicationId("gen-1431"),
+    };
+    expect(rederivedBinding).toEqual(attemptedBinding);
+
+    // A recovery agent's rewrite with this re-derived value must be
+    // ACCEPTED as an idempotent identical rewrite (never refused, never
+    // treated as a conflict) -- proven here against a recorder that
+    // distinguishes "first write" from "rewrite of the identical value"
+    // the same way #625's real writer must, per contract section 17.
+    const recovered: unknown[] = [];
+    const recoveryRecorder: MigrationSelectionBindingRecorder = (input) => {
+      const existing = recovered.find((entry) => (
+        (entry as { kind: string; attemptId: string }).kind === input.binding.kind
+      ));
+      if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(input.binding)) {
+        throw new Error("conflict: a different binding was already recorded for this generation and kind");
+      }
+      recovered.push(input.binding);
+    };
+    recoveryRecorder({ homeDir, generationId: "gen-1431", binding: rederivedBinding });
+    expect(() => recoveryRecorder({ homeDir, generationId: "gen-1431", binding: rederivedBinding })).not.toThrow();
+    expect(recovered).toHaveLength(2);
   });
 });
