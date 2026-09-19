@@ -5296,6 +5296,41 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
   // wired wrong -- token ignored, or untokened path silently skipping the
   // lock -- the corresponding assertion goes red on its own.
 
+  it("enterMaintenance: accepts a retained barrier token", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const active = coordinator(home, fake.driver);
+    const held = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.enterMaintenance({
+      publicationId: "maintenance-publication",
+      generationId: "maintenance-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{
+        machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+        queueCutoff: null,
+        evidenceSha256: "a".repeat(64),
+      }],
+    }, token));
+    expect(held.phase).toBe("maintenance-held");
+  });
+
+  it("enterMaintenance: still acquires the lock when no token is supplied", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.enterMaintenance({
+      publicationId: "maintenance-publication",
+      generationId: "maintenance-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{
+        machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+        queueCutoff: null,
+        evidenceSha256: "a".repeat(64),
+      }],
+    }))).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
   it("prepareMaintenanceSelection: accepts a retained barrier token", async () => {
     const home = makeHome();
     const fake = makeDriver(material());
@@ -5477,6 +5512,39 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
       { allowUnresolved: true },
     );
     expect(resumed.phase).toBe("completed");
+  });
+
+  it("refuses a synchronous-origin token before an async prepare can mutate after lock release", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const observeLocalState = fake.driver.observeLocalState;
+    let releaseObservation!: () => void;
+    const observationReleased = new Promise<void>((resolve) => { releaseObservation = resolve; });
+    fake.driver.observeLocalState = vi.fn(async (context) => {
+      await observationReleased;
+      return observeLocalState(context);
+    });
+    const active = coordinator(home, fake.driver);
+    let escaped: Promise<BackendPublicationJournal> | undefined;
+    let escapedError: unknown;
+
+    expect(() => withBackendPublicationConsumerLock(home, (token) => {
+      escaped = active.prepare(inputFor(input), token);
+      void escaped.catch((error: unknown) => { escapedError = error; });
+      return escaped;
+    }, { allowUnresolved: true })).toThrowError(expect.objectContaining({
+      name: "BackendPublicationJournalError",
+      reason: "unsafe-storage",
+    }));
+
+    releaseObservation();
+    await escaped?.catch(() => undefined);
+    expect(readBackendPublicationJournal(home)).toBeNull();
+    expect(escapedError).toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "permit-mismatch",
+    });
   });
 });
 
