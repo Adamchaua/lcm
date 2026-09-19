@@ -302,7 +302,15 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     const context = { ...input, domain: "transaction", operation: "snapshot" } as const;
     const projectIds = normalizedProjectScope(context);
     if (projectIds.length !== 1) throw transactionScopeError(context);
-    const options = { projectId: projectIds[0]!, signal: input.signal };
+    const options = {
+      projectId: projectIds[0]!,
+      signal: input.signal,
+      // Derived once from this runtime's own connection settings, never
+      // from a per-call caller override. This is the single seam that
+      // resolves an omitted snapshotIdleTimeoutMs to the definite fallback
+      // the snapshot actually applies.
+      snapshotIdleTimeoutMs: this.settings.snapshotIdleTimeoutMs,
+    };
     this.assertOpen(context);
     const client = await this.acquire(context).catch((error: unknown): never => {
       throw normalizePostgreSqlError(error, context);

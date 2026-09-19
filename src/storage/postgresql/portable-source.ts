@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import { normalizeUuidV7 } from "../../machine-identity.js";
 import { normalizeProjectPath } from "../../project-map.js";
 import type { StorageIdentityContext } from "../contracts.js";
+import { StorageOperationError } from "../errors.js";
 import {
   PORTABLE_LIMITS, PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_RECORD_SCHEMA_SHA256,
   PortableStreamError, canonicalJson, createPortableRecord, serializePortableRecord, sha256,
@@ -16,6 +17,7 @@ import type {
 import type {
   PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlRuntimeHealth,
 } from "./contracts.js";
+import { isPostgreSqlSnapshotTerminationError } from "./errors.js";
 import { PostgreSqlRuntime } from "./runtime.js";
 import { verifyPostgreSqlRuntimeSchema, verifyPostgreSqlTransferSchema } from "./runtime-readiness.js";
 import { PortableTransferError } from "../portable-transfer.js";
@@ -70,7 +72,13 @@ function safeError(error: unknown): PortableStreamError {
     if (error.code === "unsupported-capability") return new PortableStreamError("record-unrepresentable");
     if (error.code === "invalid-input") return new PortableStreamError("source-invalid");
   }
-  return new PortableStreamError("source-unavailable");
+  // Attach the cause only when it already arrived sanitized (a
+  // StorageOperationError never carries connection strings, credentials or
+  // raw driver detail such as internalQuery/host). A raw, unnormalized
+  // error is never attached: that is the leak path.
+  return new PortableStreamError("source-unavailable", {
+    cause: error instanceof StorageOperationError ? error : undefined,
+  });
 }
 function invalid(): never { throw new PortableStreamError("source-invalid"); }
 function rawOrder(order: readonly PortableOrderScalar[]): unknown[] {
@@ -433,10 +441,25 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       closed=true;brands.delete(source);
       closePromise=tail.then(async()=> {
         let failed=false;
-        try { index.close(); } catch { failed=true; }
-        try { await session.close(); } catch { failed=true; }
-        try { await runtime.close(); } catch { failed=true; }
-        if (failed) throw new PortableStreamError("source-unavailable");
+        let cause: unknown;
+        try { index.close(); } catch (error) { failed=true; cause=error; }
+        try {
+          await session.close();
+        } catch (error) {
+          // Tolerate only a session already dead from a 25P03 idle-kill or
+          // connection-termination failure: a transfer that finished
+          // cleanly and then hits an idle-kill or dropped connection on
+          // close should not surface as a failure. Disk-index and pool
+          // close failures below still propagate loudly; this tolerance is
+          // scoped to the session arm only.
+          if (!isPostgreSqlSnapshotTerminationError(error)) { failed=true; cause??=error; }
+        }
+        try { await runtime.close(); } catch (error) { failed=true; cause??=error; }
+        if (failed) {
+          throw new PortableStreamError("source-unavailable", {
+            cause: cause instanceof StorageOperationError ? cause : undefined,
+          });
+        }
       });
       return closePromise;
     },

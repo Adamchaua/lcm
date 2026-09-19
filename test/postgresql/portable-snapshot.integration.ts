@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { beforeAll, describe, expect, it } from "vitest";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS } from "../../src/storage/postgresql/snapshot-session.js";
 import {
   assertHarnessReady,
   settings,
@@ -139,6 +140,76 @@ describe("PostgreSQL 18 portable snapshot session", () => {
         controller.abort();
         await session.close();
         await administrator.close();
+      }
+    });
+  });
+
+  it("bounds the snapshot's idle-in-transaction timeout independently of the connection-level statement-scale bound", async () => {
+    await withPostgreSqlTestDatabase("snapshot-idle-timeout", async (database) => {
+      const projectId = await createFixture(database);
+      const options = { ...context, projectId };
+      const idleSetting = {
+        text: "SELECT setting FROM pg_catalog.pg_settings WHERE name = 'idle_in_transaction_session_timeout'",
+      };
+      const session = await database.runtime.openReadOnlySnapshot({ projectId });
+      try {
+        // pg_settings.setting is the raw effective value in the GUC's base
+        // unit (ms for this setting), unaffected by current_setting()'s
+        // "nicest unit" pretty-printing (for example "5min"), so comparing
+        // it as a plain integer cannot flake on display formatting.
+        const effective = await session.query<{ setting: string }>(idleSetting, options);
+        expect(Number(effective.rows[0]!.setting)).toBe(DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS);
+      } finally {
+        await session.close();
+      }
+      const ordinary = await database.runtime.query<{ setting: string }>(idleSetting, context);
+      expect(Number(ordinary.rows[0]!.setting)).toBe(5_000);
+    });
+  });
+
+  it("reverts the relaxed idle bound on the same pooled client after the snapshot closes", async () => {
+    await withPostgreSqlTestDatabase("snapshot-idle-revert", async (database) => {
+      const projectId = await createFixture(database);
+      // A single-connection pool guarantees the post-close query below
+      // reuses the exact physical backend the snapshot held, proving
+      // is_local revert semantics rather than merely a fresh connection.
+      const solo = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }));
+      try {
+        const session = await solo.openReadOnlySnapshot({ projectId });
+        const backendPid = session.identity.backendPid;
+        await session.close();
+        const reused = await solo.query<{ pid: number; setting: string }>({
+          text: `SELECT pg_catalog.pg_backend_pid() AS pid,
+                   (SELECT setting FROM pg_catalog.pg_settings
+                    WHERE name = 'idle_in_transaction_session_timeout') AS setting`,
+        }, { ...context, projectId });
+        expect(reused.rows[0]!.pid).toBe(backendPid);
+        expect(Number(reused.rows[0]!.setting)).toBe(5_000);
+      } finally {
+        await solo.close();
+      }
+    });
+  });
+
+  it("enforces a deliberately tiny snapshotIdleTimeoutMs bound per session", async () => {
+    await withPostgreSqlTestDatabase("snapshot-idle-enforced", async (database) => {
+      const projectId = await createFixture(database);
+      const tiny = new PostgreSqlRuntime(settings(database.runtimeUrl, { snapshotIdleTimeoutMs: 200 }));
+      try {
+        const session = await tiny.openReadOnlySnapshot({ projectId });
+        try {
+          // idle_in_transaction_session_timeout is checked between
+          // statements, so this needs a real client-side wait longer than
+          // the configured bound; it cannot rely on host scheduling
+          // slowness to exceed it incidentally.
+          await new Promise((resolve) => { setTimeout(resolve, 500); });
+          await expect(session.query(readValue(projectId), { ...context, projectId }))
+            .rejects.toMatchObject({ sqlState: "25P03" });
+        } finally {
+          await session.close().catch(() => undefined);
+        }
+      } finally {
+        await tiny.close();
       }
     });
   });

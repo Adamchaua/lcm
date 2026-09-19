@@ -148,6 +148,7 @@ function connectionSettings(
     connectionTimeoutMs: config.postgresql.connectionTimeoutMs,
     idleTimeoutMs: config.postgresql.idleTimeoutMs,
     statementTimeoutMs: config.postgresql.statementTimeoutMs,
+    snapshotIdleTimeoutMs: config.postgresql.snapshotIdleTimeoutMs,
   };
 }
 

@@ -13,6 +13,22 @@ const CONNECTION_TERMINATION_SQLSTATES = new Set([
   "57P03",
 ]);
 
+/**
+ * Sessions killed by idle_in_transaction_session_timeout (25P03) are FATAL
+ * and dead, exactly like a transport-level connection loss, but 25P03 is
+ * class 25 ("Invalid Transaction State"), not 08 ("Connection Exception"),
+ * so it is deliberately kept out of {@link CONNECTION_TERMINATION_SQLSTATES}.
+ * Folding it in there would widen {@link isRetryablePostgreSqlError} and the
+ * runtime's destroy decisions across the whole PostgreSQL layer, retrying a
+ * FATAL idle-kill as if it were transient like ECONNRESET. That is the
+ * wrong blast radius. It is used only by the narrower snapshot-local
+ * predicate below.
+ */
+const SNAPSHOT_TERMINATION_SQLSTATES = new Set([
+  "25P03",
+  ...CONNECTION_TERMINATION_SQLSTATES,
+]);
+
 const RETRYABLE_TRANSPORT_CODES = new Set([
   "EAI_AGAIN",
   "ECONNABORTED",
@@ -101,6 +117,39 @@ export function isPostgreSqlConnectionError(error: unknown): boolean {
   if (typeof code === "string" && (
     (code.length === 5 && code.startsWith("08"))
     || CONNECTION_TERMINATION_SQLSTATES.has(code)
+    || RETRYABLE_TRANSPORT_CODES.has(code)
+  )) {
+    return true;
+  }
+  return error instanceof Error && RETRYABLE_DRIVER_MESSAGES.has(error.message);
+}
+
+/**
+ * A narrower, snapshot-local predicate for the read-only snapshot session
+ * only. Matches 25P03 (idle-in-transaction session kill), 08xxx (connection
+ * exception), 57P01/57P02/57P03 (admin/crash shutdown) and the existing
+ * transport codes/messages, reading either the raw pre-normalize driver
+ * error or the sqlState already carried by a normalized
+ * {@link PostgreSqlStorageOperationError}. Deliberately NOT the same set as
+ * {@link isPostgreSqlConnectionError}: use this only at the two seams that
+ * need it (snapshot session destroy-on-error, and the session arm of
+ * portable-source close() tolerance), never for the general retry/destroy
+ * decisions the wider helper feeds.
+ */
+export function isPostgreSqlSnapshotTerminationError(error: unknown): boolean {
+  if (error instanceof PostgreSqlStorageOperationError) {
+    const sqlState = error.sqlState;
+    return sqlState !== null && (
+      sqlState === "25P03"
+      || (sqlState.length === 5 && sqlState.startsWith("08"))
+      || CONNECTION_TERMINATION_SQLSTATES.has(sqlState)
+    );
+  }
+  const candidate = error as PostgreSqlDriverError | undefined;
+  const code = candidate?.code;
+  if (typeof code === "string" && (
+    (code.length === 5 && code.startsWith("08"))
+    || SNAPSHOT_TERMINATION_SQLSTATES.has(code)
     || RETRYABLE_TRANSPORT_CODES.has(code)
   )) {
     return true;

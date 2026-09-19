@@ -510,7 +510,8 @@ timeout settings in `~/.lcm/config.json`:
       "poolMax": 5,
       "connectionTimeoutMs": 10000,
       "idleTimeoutMs": 30000,
-      "statementTimeoutMs": 60000
+      "statementTimeoutMs": 60000,
+      "snapshotIdleTimeoutMs": 300000
     }
   }
 }
@@ -523,6 +524,33 @@ timeout settings in `~/.lcm/config.json`:
 | `connectionTimeoutMs` | `10000` | `1`-`600000` |
 | `idleTimeoutMs` | `30000` | `0`-`3600000` |
 | `statementTimeoutMs` | `60000` | `1`-`3600000` |
+| `snapshotIdleTimeoutMs` | `300000` | `1`-`3600000` |
+
+`snapshotIdleTimeoutMs` bounds only the read-only, repeatable-read snapshot
+transaction that a portable transfer holds open for the lifetime of its source
+handle (`idle_in_transaction_session_timeout`, set with `SET LOCAL` semantics
+inside that transaction only). It is deliberately separate from
+`statementTimeoutMs`, which bounds how long a single query may run:
+deriving the idle bound from the statement bound previously caused a
+long-lived snapshot to be killed for doing exactly what it exists to do,
+surfacing as a sanitized `source-unavailable` transfer failure.
+
+PostgreSQL resets this timer on every statement the snapshot issues, so it
+bounds the longest single gap between reads, not the snapshot's total
+lifetime. A transfer that keeps paging through source records, however long
+that takes overall, is never killed by this setting; only a snapshot that
+goes idle for longer than the bound (an abandoned or stalled handle) is
+reclaimed. Raise the value for a slow or remote destination whose
+per-batch write, verify, or backpressure gap can exceed the default; lower it
+for a strict-autovacuum deployment that needs abandoned snapshots reclaimed
+faster, since every open snapshot pins the database's `xmin` horizon for as
+long as it stays open and multiple concurrent snapshots multiply that
+autovacuum-holdback pressure. Each open snapshot also holds one pooled
+connection for its lifetime, so raising this value on a deployment that runs
+many concurrent transfers reduces effective pool capacity for other work;
+size `poolMax` accordingly. The value is rejected below `1`: PostgreSQL
+treats `0` as disabling the bound entirely, and a bound must always exist so
+an abandoned snapshot is eventually reclaimed.
 
 Supply the connection URL and CA certificate path through the environment. LCM
 rejects `url` and `caFile` keys in JSON so credentials cannot be persisted by

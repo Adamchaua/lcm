@@ -10,6 +10,7 @@ import { PortableTransferError } from '../../src/storage/portable-transfer.js';
 import * as mapping from '../../src/storage/postgresql/portable-mapping.js';
 import { createPortableRecordStream, PORTABLE_RECORD_DOMAIN_ORDER, serializePortableRecord, type PortableDomain } from '../../src/storage/portable-record-stream.js';
 import type { StorageIdentityContext } from '../../src/storage/contracts.js';
+import { PostgreSqlStorageOperationError } from '../../src/storage/postgresql/errors.js';
 
 const projectId = '01990000-0000-7000-8000-000000000001';
 const machineId = '01990000-0000-7000-8000-000000000002';
@@ -67,6 +68,27 @@ describe('PostgreSQL portable source admission', () => {
     const h=harness(), controller=new AbortController();controller.abort();
     await expect(adapter.createPostgreSqlPortableSource({settings,expectedOwner:'owner',expectedIdentity:identity(),signal:controller.signal},h.dependencies as never)).rejects.toMatchObject({code:'aborted'});
     expect(h.dependencies.createRuntime).not.toHaveBeenCalled();
+  });
+  it('attaches an already-sanitized storage cause but never a raw driver error', async()=>{
+    const h=harness();
+    const sanitizedCause=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'25P03',true,
+    );
+    h.dependencies.verifyRuntimeSchema.mockRejectedValue(sanitizedCause);
+    const error=await adapter.createPostgreSqlPortableSource(
+      {settings,expectedOwner:'owner',expectedIdentity:identity()},h.dependencies as never,
+    ).catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable'});
+    expect((error as {cause?:unknown}).cause).toBe(sanitizedCause);
+
+    const h2=harness();
+    h2.dependencies.verifyRuntimeSchema.mockRejectedValue(new Error('raw driver secret'));
+    const error2=await adapter.createPostgreSqlPortableSource(
+      {settings,expectedOwner:'owner',expectedIdentity:identity()},h2.dependencies as never,
+    ).catch((e:unknown)=>e);
+    expect(error2).toMatchObject({code:'source-unavailable'});
+    expect((error2 as {cause?:unknown}).cause).toBeUndefined();
+    expect(JSON.stringify(error2)).not.toContain('raw driver secret');
   });
 });
 
@@ -294,6 +316,34 @@ describe('PostgreSQL source failure boundaries',()=>{
     h.runtime.close.mockRejectedValue(new Error('runtime-secret'));
     await expect(source.close()).rejects.toMatchObject({code:'source-unavailable'});
     expect(h.session.close).toHaveBeenCalledTimes(1);expect(h.runtime.close).toHaveBeenCalledTimes(1);
+  });
+  it('tolerates a 25P03 (or connection-termination) session close failure, unlike an ordinary one',async()=>{
+    const idleKill=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'25P03',true,
+    );
+    const h=dataHarness(),source=await open(h);
+    h.session.close.mockRejectedValue(idleKill);
+    await expect(source.close()).resolves.toBeUndefined();
+    expect(h.session.close).toHaveBeenCalledTimes(1);expect(h.runtime.close).toHaveBeenCalledTimes(1);
+
+    const h2=dataHarness(),source2=await open(h2);
+    const ordinaryFailure=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'23505',false,
+    );
+    h2.session.close.mockRejectedValue(ordinaryFailure);
+    const error=await source2.close().catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable'});
+    expect((error as {cause?:unknown}).cause).toBe(ordinaryFailure);
+  });
+  it('still fails a close when index closure fails, even alongside a tolerated 25P03 session close',async()=>{
+    const h=dataHarness(),source=await open(h),original=PortableIndex.prototype.close;
+    vi.spyOn(PortableIndex.prototype,'close').mockImplementation(function(){original.call(this);throw new Error('index-secret');});
+    h.session.close.mockRejectedValue(new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'25P03',true,
+    ));
+    const error=await source.close().catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable'});
+    expect(JSON.stringify(error)).not.toContain('index-secret');
   });
 });
 

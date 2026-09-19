@@ -822,8 +822,11 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
   });
 }
 
-function sourceFailure(code: "source-changed" | "source-invalid" | "source-unavailable"): never {
-  fail(code, { retryable: code === "source-unavailable" });
+function sourceFailure(
+  code: "source-changed" | "source-invalid" | "source-unavailable",
+  cause?: unknown,
+): never {
+  fail(code, { retryable: code === "source-unavailable", cause });
 }
 
 function sourceDescription(source: PortableRecordSource): PortableSourceDescription {
@@ -848,7 +851,16 @@ async function readSourcePage(
     return await source.readDomainPage(input);
   } catch (error) {
     checkAbort(input.signal);
-    if (error instanceof PortableStreamError) sourceFailure("source-invalid");
+    if (error instanceof PortableStreamError) {
+      // A source-unavailable PortableStreamError (for example a mid-transfer
+      // 25P03 idle-kill) is a transient connection loss, not corrupt source
+      // data. Recoding it to source-invalid would mislabel it as
+      // non-retryable; keep the code and forward the already-sanitized
+      // cause so operators see why. Every other source-reported code stays
+      // source-invalid, as before.
+      if (error.code === "source-unavailable") sourceFailure("source-unavailable", error.cause);
+      sourceFailure("source-invalid");
+    }
     sourceFailure("source-unavailable");
   }
 }

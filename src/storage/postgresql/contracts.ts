@@ -8,6 +8,17 @@ export interface PostgreSqlConnectionSettings {
   readonly connectionTimeoutMs: number;
   readonly idleTimeoutMs: number;
   readonly statementTimeoutMs: number;
+  /**
+   * Bounds the longest single idle gap inside the read-only snapshot
+   * transaction opened by {@link PostgreSqlRuntime.openReadOnlySnapshot}.
+   * PostgreSQL resets this timer on every statement, so it does not bound
+   * total snapshot lifetime; a transfer that keeps reading is never killed
+   * by it. Optional: when omitted, the snapshot seam applies a fixed
+   * 300000 ms (5 minute) fallback. Deliberately independent from
+   * {@link statementTimeoutMs}, which bounds one query's execution time,
+   * not how long a transaction may sit idle.
+   */
+  readonly snapshotIdleTimeoutMs?: number;
 }
 
 export interface PostgreSqlOperationContext {

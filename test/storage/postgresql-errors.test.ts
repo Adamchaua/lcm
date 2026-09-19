@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { StorageOperationError } from "../../src/storage/errors.js";
 import {
   isPostgreSqlConnectionError,
+  isPostgreSqlSnapshotTerminationError,
   isRetryablePostgreSqlError,
   normalizePostgreSqlError,
   PostgreSqlCommitOutcomeUnknownError,
@@ -122,4 +123,50 @@ describe("PostgreSQL error normalization", () => {
       operation: "commit",
     }).toJSON()).not.toHaveProperty("machineId");
   });
+
+  it.each(["25P03", "08000", "08006", "57P01", "57P02", "57P03", "ECONNRESET", "ETIMEDOUT"])(
+    "classifies raw driver failure %s as a snapshot termination, unlike the wider connection-error helper",
+    (code) => {
+      const raw = Object.assign(new Error("driver secret"), { code });
+      expect(isPostgreSqlSnapshotTerminationError(raw)).toBe(true);
+    },
+  );
+
+  it("does not classify 25P03 as a connection error, only as a snapshot termination", () => {
+    const idleKill = Object.assign(new Error("idle-in-transaction session timeout"), { code: "25P03" });
+    expect(isPostgreSqlConnectionError(idleKill)).toBe(false);
+    expect(isPostgreSqlSnapshotTerminationError(idleKill)).toBe(true);
+  });
+
+  it.each(["23505", "40001", "080000"])(
+    "does not classify ordinary or malformed SQLSTATE %s as a snapshot termination",
+    (code) => {
+      expect(isPostgreSqlSnapshotTerminationError(Object.assign(new Error("private"), { code }))).toBe(false);
+    },
+  );
+
+  it("reads sqlState from an already-normalized PostgreSqlStorageOperationError", () => {
+    const idleKill = normalizePostgreSqlError(
+      Object.assign(new Error("idle-in-transaction session timeout"), { code: "25P03" }),
+      { domain: "transaction", operation: "snapshot", projectId: "project" },
+    );
+    expect(isPostgreSqlSnapshotTerminationError(idleKill)).toBe(true);
+    const ordinary = normalizePostgreSqlError(
+      Object.assign(new Error("unique violation"), { code: "23505" }),
+      { domain: "transaction", operation: "snapshot", projectId: "project" },
+    );
+    expect(isPostgreSqlSnapshotTerminationError(ordinary)).toBe(false);
+    const unknownState = normalizePostgreSqlError(
+      new Error("unknown driver failure"),
+      { domain: "transaction", operation: "snapshot", projectId: "project" },
+    );
+    expect(isPostgreSqlSnapshotTerminationError(unknownState)).toBe(false);
+  });
+
+  it.each([undefined, null, {}, { code: 123 }])(
+    "does not classify unsafe value %# as a snapshot termination",
+    (error) => {
+      expect(isPostgreSqlSnapshotTerminationError(error)).toBe(false);
+    },
+  );
 });
