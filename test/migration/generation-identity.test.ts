@@ -253,7 +253,7 @@ describe("classifyMigrationCandidateOccupancy (section 4.3 two-tree occupancy)",
     const result = await classifyMigrationCandidateOccupancy({
       generationId: "generation-1",
       homeDir: home,
-      _classifySnapshot: async () => fakeComplete,
+      _operationsForTesting: { classifySnapshot: async () => fakeComplete },
     });
     expect(result).toEqual({ status: "occupied" });
   });
@@ -271,7 +271,7 @@ describe("classifyMigrationCandidateOccupancy (section 4.3 two-tree occupancy)",
     await expect(classifyMigrationCandidateOccupancy({
       generationId: "generation-1",
       homeDir: home,
-      _classifySnapshot: async () => { throw new Error("unexpected shape"); },
+      _operationsForTesting: { classifySnapshot: async () => { throw new Error("unexpected shape"); } },
     })).rejects.toThrow("unexpected shape");
   });
 });

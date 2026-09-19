@@ -133,6 +133,10 @@ export type MigrationCandidateOccupancy =
   | Readonly<{ status: "occupied" }>
   | Readonly<{ status: "refuse"; evidence: string }>;
 
+export type MigrationCandidateOccupancyOperations = Readonly<{
+  classifySnapshot: typeof classifySqliteSnapshotArtifact;
+}>;
+
 /**
  * Section 4.3's two-tree occupancy check for one candidate generation id.
  * Never deletes or advances anything itself; the caller decides what a
@@ -143,14 +147,16 @@ export async function classifyMigrationCandidateOccupancy(input: Readonly<{
   homeDir: string;
   manifestStore?: MigrationManifestStore;
   /**
-   * @internal Deterministic failure-injection seam for tests only. Every
+   * @internal Deterministic failure-injection seam for tests only, matching
+   * the `_operationsForTesting` convention used elsewhere in
+   * `src/migration/` (see `sqlite-snapshot.ts`, `maintenance.ts`). Every
    * documented throw from `classifySqliteSnapshotArtifact` is a typed
    * `SqliteSnapshotError` (`invalid-input`, `unsupported-platform`,
    * `snapshot-io`); this default is never overridden in production.
    */
-  _classifySnapshot?: typeof classifySqliteSnapshotArtifact;
+  _operationsForTesting?: Partial<MigrationCandidateOccupancyOperations>;
 }>): Promise<MigrationCandidateOccupancy> {
-  const classify = input._classifySnapshot ?? classifySqliteSnapshotArtifact;
+  const classify = input._operationsForTesting?.classifySnapshot ?? classifySqliteSnapshotArtifact;
   let snapshot: SqliteSnapshotClassification;
   try {
     snapshot = await classify(input.generationId, { homeDir: input.homeDir });
