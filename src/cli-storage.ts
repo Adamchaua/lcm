@@ -1,22 +1,25 @@
 import { inspectExistingLcmDatabasePath } from "./db/connection.js";
 import { realpathSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { ensureProjectDirForIdentity, projectIdentity, projectPathsForIdentity } from "./daemon/project.js";
 import {
+  UnauthenticatedProjectIdentityError,
   hashProjectPath,
+  isAuthenticatedProjectIdentity,
   normalizeProjectIdentityPath,
   readProjectMapSnapshot,
   resolveExistingProjectIdentity,
   resolveProjectIdentity,
+  type ProjectIdentity,
 } from "./project-map.js";
 import { configPath, lcmHomeDir } from "./runtime-paths.js";
 import { ensurePrivateDirectory, atomicWritePrivateFileExclusive } from "./security-files.js";
 import { selectStorageBackendForConfig, assertStorageBackendPublication } from "./storage/backend.js";
 import { withBackendPublicationConsumerLockAsync } from "./storage/backend-publication.js";
-import type { ProjectStorage, StorageBackendFactory } from "./storage/contracts.js";
+import type { ProjectStorage, StorageBackendFactory, StorageIdentityContext } from "./storage/contracts.js";
 import { createStorageBackendFactory } from "./storage/factory.js";
-import { resolveStorageIdentityContext } from "./storage/identity-context.js";
+import { resolveStorageIdentityContext, StorageIdentityConfigurationError } from "./storage/identity-context.js";
 import { withPublicationAdmissionRetry, type PublicationConvergence } from "./storage/publication-convergence.js";
 import { SqliteStorageBackendFactory } from "./storage/sqlite/factory.js";
 import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
@@ -171,8 +174,23 @@ export async function listCliProjects(): Promise<Array<{ id: string; canonical: 
     const map = readProjectMapSnapshot(undefined, token);
     const selected = new Map<string, { id: string; canonical: string; aliases: readonly string[] }>();
     for (const [id, entry] of Object.entries(map)) {
-      const existing = resolveExistingProjectIdentity(entry.canonical, token);
+      let existing: ReturnType<typeof resolveExistingProjectIdentity>;
+      try {
+        existing = resolveExistingProjectIdentity(entry.canonical, token);
+      } catch (error) {
+        // An entry whose key no local evidence authenticates is refused by
+        // admission and reconciliation, so enumerating it would advertise a
+        // project that cannot be opened. Skip it and keep the inventory whole
+        // for every other project.
+        if (error instanceof UnauthenticatedProjectIdentityError) continue;
+        throw error;
+      }
       const local = existing ?? { id, ...entry };
+      // A successor-shaped identity resolves normally but is only openable
+      // while its retained predecessor fence authenticates it. Enumerating an
+      // unauthenticated one would advertise a project that admission and
+      // reconciliation refuse.
+      if (!isAuthenticatedProjectIdentity(local.id, resolve(local.canonical))) continue;
       if (local.id !== id && inspectExistingLcmDatabasePath(projectPathsForIdentity({id,canonical:entry.canonical}).dbPath) !== null) {
         throw new Error("Legacy worktree storage requires reconciliation before project enumeration.");
       }
@@ -183,14 +201,37 @@ export async function listCliProjects(): Promise<Array<{ id: string; canonical: 
       // backend-specific identity resolution runs. Under a PostgreSQL
       // config, resolveStorageIdentityContext throws its generic
       // unbound-project message for any entry without a remote binding,
-      // including a fenced one; that would escape this loop and abort the
-      // whole enumeration, so a fenced project would never reach the
-      // per-project RetiredProjectIdentityError branch in the caller. A
-      // fenced entry enumerates with its own local identity instead, which
-      // keeps enumeration whole for every other project.
-      const identity = isAuthenticatedRetiredProjectIdentityFence(projectPathsForIdentity(local).dir, local.id)
-        ? local
-        : resolveStorageIdentityContext(config.storage, local, undefined, local.canonical);
+      // including a fenced one. A fenced entry enumerates with its own
+      // local identity instead, which keeps enumeration whole for every
+      // other project. A non-fenced unbound entry no longer escapes this
+      // loop either: the guarded resolution below degrades it to its own
+      // local identity too, through the same per-project path, instead of
+      // aborting enumeration for every other project.
+      //
+      // The two "Legacy worktree storage ..." throws and the ambiguous
+      // project-map propagation earlier in this loop remain deliberately
+      // fail-closed and still abort the whole enumeration, because they
+      // signal a machine-local storage conflict rather than a per-project
+      // binding gap. MachineIdentityFileError raised by
+      // requireMachineIdentity inside resolveStorageIdentityContext also
+      // still aborts enumeration unchanged, since a broken machine identity
+      // is a machine-wide condition, not a per-project one.
+      const fenced = isAuthenticatedRetiredProjectIdentityFence(projectPathsForIdentity(local).dir, local.id);
+      let identity: ProjectIdentity | (StorageIdentityContext & { readonly localProjectId: string });
+      if (fenced) {
+        identity = local;
+      } else {
+        try {
+          identity = resolveStorageIdentityContext(config.storage, local, undefined, local.canonical);
+        } catch (error) {
+          // An entry with no remote binding is a per-project condition, not
+          // an enumeration failure: keep it selected under its local
+          // identity so the caller reports it and every other project is
+          // still processed.
+          if (!(error instanceof StorageIdentityConfigurationError)) throw error;
+          identity = local;
+        }
+      }
       const prior = selected.get(identity.id);
       selected.set(identity.id, {
         id: identity.id,
