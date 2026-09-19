@@ -243,7 +243,23 @@ describe("performMigrationApplyGenesisAndCopy (section 8's genesis-and-copy row)
     }));
     expect(runCopy).toHaveBeenCalledWith(expect.objectContaining({
       leaseTtlMs: 60000, maximumTransactionAttempts: 5, signal: controller.signal,
-    }));
+    }), undefined);
+  });
+
+  it("forwards the optional testing dependencies through to runSqliteMigrationCopy's own second parameter, the identical seam threaded one layer up rather than reinvented (real-PostgreSQL proof of what this seam is for lives in migration-apply-genesis-copy.integration.ts)", async () => {
+    classify.mockResolvedValueOnce({ state: "complete", generationId: "generation-1", witness: {} as never });
+    inspect.mockResolvedValueOnce({ source: witness("1".repeat(64)), destination: witness("2".repeat(64), "postgresql"), bindingSha256: "b".repeat(64) });
+    runCopy.mockResolvedValueOnce({ phase: "copied" as const, generationId: "generation-1" });
+    const testing = { observe: vi.fn() };
+    const input = baseInput({ testing });
+    const outcome = await performMigrationApplyGenesisAndCopy(input);
+    expect(outcome.status).toBe("copied");
+    // The exact same object reference reaches runSqliteMigrationCopy's
+    // second argument, unmodified and un-re-wrapped -- a caller that did
+    // not supply testing (every production caller today) still causes a
+    // second argument to be passed, but as undefined, matching
+    // runSqliteMigrationCopy's own default-parameter behaviour exactly.
+    expect(runCopy).toHaveBeenCalledWith(expect.objectContaining({ generationId: "generation-1" }), testing);
   });
 
   it("refuses genesis-create-failed with manifest-internal-error evidence when the create step throws something other than a MigrationProtocolError (proves protocolEvidence's fallback, not just its typed branch)", async () => {

@@ -2,7 +2,12 @@ import { backendPublicationCanonicalSha256 } from "../storage/backend-publicatio
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import type { PostgreSqlConnectionSettings } from "../storage/postgresql/contracts.js";
 import { classifySqliteSnapshotArtifact } from "./sqlite-snapshot.js";
-import { inspectSqliteMigrationCopy, runSqliteMigrationCopy, type SqliteMigrationCopyInput } from "./batch-copy.js";
+import {
+  inspectSqliteMigrationCopy,
+  runSqliteMigrationCopy,
+  type MigrationCopyTestingDependencies,
+  type SqliteMigrationCopyInput,
+} from "./batch-copy.js";
 import { MigrationManifestStore } from "./manifest-store.js";
 import {
   beginMigrationEffect,
@@ -64,6 +69,15 @@ export type MigrationApplyGenesisAndCopyInput = Readonly<{
   signal?: AbortSignal;
   manifestStore?: MigrationManifestStore;
   now?: Date;
+  /**
+   * Forwarded verbatim to `runSqliteMigrationCopy`'s own second parameter.
+   * The identical seam already used at the batch-copy layer for
+   * deterministic interruption in tests, threaded one layer up rather than
+   * invented anew. Never consulted by production callers; an omitted value
+   * behaves exactly as it always has, since `runSqliteMigrationCopy`
+   * defaults this parameter to `{}` when passed `undefined`.
+   */
+  testing?: MigrationCopyTestingDependencies;
 }>;
 
 export type MigrationApplyGenesisAndCopyOutcome =
@@ -202,7 +216,7 @@ export async function performMigrationApplyGenesisAndCopy(
 
   let result: Awaited<ReturnType<typeof runSqliteMigrationCopy>>;
   try {
-    result = await runSqliteMigrationCopy(copyInput);
+    result = await runSqliteMigrationCopy(copyInput, input.testing);
   } catch (error) {
     return { status: "refuse", reason: "copy-failed", evidence: error instanceof Error ? error.name : "unknown-copy-failure" };
   }
