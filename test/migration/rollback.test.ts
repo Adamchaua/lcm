@@ -22,7 +22,7 @@
  * the explicit list of what remains.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, chmodSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, chmodSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -1168,7 +1168,217 @@ describe("runMigrationRollback", () => {
     })).rejects.toMatchObject({
       name: "RollbackOrchestrationError",
       reason: "unexpected-state",
-      message: expect.stringContaining("freshly resolved authority disagrees with the durable rollback-authority artifact"),
+     message: expect.stringContaining("freshly resolved authority disagrees with the durable rollback-authority artifact"),
+   });
+ });
+
+  // plan-v2 section 7: interruption "between install and config" must
+  // resume to exactly one authoritative selection. Config/project-map
+  // publication is not implemented on this branch (see this file's own
+  // module doc and runPostPrepareSequence's step 11 comment), so the
+  // nearest real boundary after install is the maintenance-selection
+  // flip completing. A crash there leaves NO pending effect (publish-
+  // rollback's begin is step 12, strictly after the flip completes), so
+  // classifyMigrationRecovery routes a retry back through
+  // continueAfterPrepareRollback -- the SAME resume path already
+  // covered above, exercised here specifically in post-write mode so a
+  // retry rebuilds/reinstalls the generation rather than skipping it.
+  it("resumes after a crash between install and the maintenance-selection flip completing (post-write, plan-v2 section 7)", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-install-config");
+    const canonicalPath = join(homeDir, "live.sqlite");
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const baseline = fixtureCanonicalDelta("install-config-baseline");
+    const coordinator = coordinatorFor(homeDir);
+    const realPrepareMaintenanceSelection = coordinator.prepareMaintenanceSelection.bind(coordinator);
+    let prepareCalls = 0;
+    coordinator.prepareMaintenanceSelection = (async (...args: Parameters<typeof realPrepareMaintenanceSelection>) => {
+      prepareCalls += 1;
+      if (prepareCalls === 1) throw new Error("simulated crash after install, before the maintenance-selection flip");
+      return realPrepareMaintenanceSelection(...args);
+    }) as typeof coordinator.prepareMaintenanceSelection;
+
+    const deps: RunMigrationRollbackDependencies = {
+      coordinator,
+      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
+        epochId: "epoch-ic", attemptId: "attempt-ic", manifestRevision: 1,
+        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-ic",
+      }),
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => ({
+        epoch: { destinationIdentity, censusVector: fixtureCensusVector("census-ic"), schemaWitness: fixtureSchemaWitness("schema-ic") },
+        attempt: { canonicalDeltaBaseline: baseline },
+      }),
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+          destinationIdentity,
+          postEpochDelta: fixtureCanonicalDelta("install-config-changed"),
+          postEpochCensus: null,
+        }],
+        source: sqliteSourceStream,
+      }),
+    };
+
+    await expect(runMigrationRollback({
+      homeDir, generationId: "gen-install-config", canonicalPath,
+      projectIdentity: identity, localProjectId: "local-ic",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, deps)).rejects.toThrow("simulated crash after install, before the maintenance-selection flip");
+    expect(prepareCalls).toBe(1);
+
+    // Install already happened before the simulated crash: the
+    // canonical database is real, installed, verified content -- not
+    // an empty file a naive resume might mint.
+    expect(existsSync(canonicalPath)).toBe(true);
+    const installed = new DatabaseSync(canonicalPath, { readOnly: true });
+    try {
+      const row = installed.prepare(
+        "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name LIKE 'portable_archive_%'",
+      ).get() as { n: number };
+      expect(row.n).toBeGreaterThan(0);
+    } finally {
+      installed.close();
+    }
+
+    const midManifest = new MigrationManifestStore({ homeDir }).read("gen-install-config");
+    expect(midManifest.phase).toBe("rolling-back");
+    expect(midManifest.pendingEffect).toBeNull();
+    expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+
+    const outcome = await runMigrationRollback({
+      homeDir, generationId: "gen-install-config", canonicalPath,
+      projectIdentity: identity, localProjectId: "local-ic",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, deps);
+
+   expect(outcome.manifest.phase).toBe("rolled-back");
+   expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+   expect(prepareCalls).toBe(2);
+   expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-completed");
+
+    // The retry's build target must be a FRESH physical generation, not
+    // a reuse of the crashed attempt's -- plan-v2 section 4: "crash
+    // recovery creates a NEW generation under the already-sealed
+    // prepare-rollback", the incomplete one "quarantined read-only at
+    // 0400, never deleted". Both attempt directories must exist:
+    // deriving the retry's ordinal from the durable filesystem state
+    // must never overwrite, delete or otherwise touch the first
+    // attempt's evidence.
+    const buildRoot = join(homeDir, ".lcm", "migration-rollback-generations");
+    const buildEntries = readdirSync(buildRoot).filter((name) => name.startsWith("gen-install-config-rb"));
+    expect(buildEntries).toHaveLength(2);
+    const firstAttempt = buildEntries.find((name) => name.endsWith("-1"));
+    const secondAttempt = buildEntries.find((name) => name.endsWith("-2"));
+    expect(firstAttempt).toBeDefined();
+    expect(secondAttempt).toBeDefined();
+    expect(existsSync(join(buildRoot, firstAttempt!, "witness.json"))).toBe(true);
+    expect(existsSync(join(buildRoot, secondAttempt!, "witness.json"))).toBe(true);
+  });
+
+  // Red-first: the enumeration must REFUSE when the read fails, never
+ // silently return ordinal 1 (which would collide with the existing
+ // attempt's evidence). Proven by making the build root exist but be
+ // unreadable by this process (wrong mode), then showing the retry
+ // refuses with a distinguishable reason rather than quietly minting a
+ // colliding build target.
+  it("refuses rather than defaulting to ordinal 1 when the build-attempt enumeration cannot read the existing evidence", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-enum-refuse");
+    const canonicalPath = join(homeDir, "live.sqlite");
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const baseline = fixtureCanonicalDelta("enum-refuse-baseline");
+    const coordinator = coordinatorFor(homeDir);
+
+    const buildRoot = join(homeDir, ".lcm", "migration-rollback-generations");
+    mkdirSync(buildRoot, { mode: 0o700 });
+    mkdirSync(join(buildRoot, "gen-enum-refuse-rb10-1"), { mode: 0o700 });
+    chmodSync(buildRoot, 0o000);
+
+    let observed: unknown;
+    try {
+      await runMigrationRollback({
+        homeDir, generationId: "gen-enum-refuse", canonicalPath,
+        projectIdentity: identity, localProjectId: "local-enum",
+        sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+      }, {
+        coordinator,
+        resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
+          epochId: "epoch-enum", attemptId: "attempt-enum", manifestRevision: 1,
+          witnessChecksumSha256: "w".repeat(64), publicationId: "pub-enum",
+        }),
+        classifyRollbackMode: referenceClassifyRollbackMode,
+        recordSelectionBinding: () => undefined,
+        recordWitnessBinding: () => undefined,
+        resolveAuthoritativeContext: async () => ({
+          epoch: { destinationIdentity, censusVector: fixtureCensusVector("census-enum"), schemaWitness: fixtureSchemaWitness("schema-enum") },
+          attempt: { canonicalDeltaBaseline: baseline },
+        }),
+        openFencedSession: async () => fakeSession({
+          observations: [{
+            manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+            destinationIdentity,
+            postEpochDelta: fixtureCanonicalDelta("enum-refuse-changed"),
+            postEpochCensus: null,
+          }],
+          source: sqliteSourceStream,
+        }),
+      });
+    } catch (error) {
+      observed = error;
+    } finally {
+      chmodSync(buildRoot, 0o700);
+    }
+
+    // Confirm this is genuinely the enumeration's own refusal, not an
+    // unrelated failure with the same shape: match the EXACT wrapped
+    // message highestRollbackGenerationBuildAttempt produces (never a
+    // bare error-type check, which a different EACCES-raising path
+    // nearby could satisfy just as well and prove nothing).
+    expect(observed).toBeInstanceOf(Error);
+    expect((observed as Error).message).toContain(
+      "could not enumerate existing rollback generation build attempts",
+    );
+
+    // Breakable independently: the SAME scenario with the root left
+    // readable (its correct 0o700 mode) proceeds past enumeration
+    // instead of refusing -- proving THIS refusal is caused by the
+    // unreadable root, not by something else in the fixture.
+    const readableHomeDir = tempHome();
+    const readableStore = new MigrationManifestStore({ homeDir: readableHomeDir });
+    manifestAtVerified(readableStore, "gen-enum-control");
+    const readableCoordinator = coordinatorFor(readableHomeDir);
+    const readableOutcome = await runMigrationRollback({
+      homeDir: readableHomeDir, generationId: "gen-enum-control", canonicalPath: join(readableHomeDir, "live.sqlite"),
+      projectIdentity: identity, localProjectId: "local-enum-control",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator: readableCoordinator,
+      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
+        epochId: "epoch-enum-control", attemptId: "attempt-enum-control", manifestRevision: 1,
+        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-enum-control",
+      }),
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => ({
+        epoch: { destinationIdentity, censusVector: fixtureCensusVector("census-enum-control"), schemaWitness: fixtureSchemaWitness("schema-enum-control") },
+        attempt: { canonicalDeltaBaseline: baseline },
+      }),
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+          destinationIdentity,
+          postEpochDelta: fixtureCanonicalDelta("enum-refuse-changed"),
+          postEpochCensus: null,
+        }],
+        source: sqliteSourceStream,
+      }),
     });
+    expect(readableOutcome.manifest.phase).toBe("rolled-back");
   });
 });
