@@ -124,6 +124,24 @@ describe("lcm migration command group", () => {
     expect(envelope.evidence.roleCount).toBe(1);
   });
 
+  it("dry-run: human mode prints a one-line ok summary that omits generation= entirely (dry-run never resolves a generation, so migrationHumanSummary's generation !== null branch must be provably false here, not merely untested)", async () => {
+    state.dryRun.mockResolvedValueOnce({
+      status: "ok",
+      dryRun: {
+        sourceSelectionSha256: "a".repeat(64), sourceByteWitnessSha256: "b".repeat(64),
+        checksumSha256: "c".repeat(64), roles: [{ role: "project" }], inspectedAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "dry-run");
+    const line = stdoutText(out);
+    expect(line).toBe("dry-run: ok (exit 0) applied=false\n");
+    expect(line).not.toContain("generation=");
+    expect(line).not.toContain("phase=");
+    expect(line).not.toContain("next=");
+    expect(process.exitCode).toBe(0);
+  });
+
   it("dry-run: a refusal reports exit 5 (refused-evidence) with the dry-run-failed remedy", async () => {
     state.dryRun.mockResolvedValueOnce({ status: "refuse", reason: "dry-run-failed", evidence: "unsupported-platform" });
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
