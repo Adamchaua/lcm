@@ -37,7 +37,10 @@ import { canonicalSha256, PORTABLE_RECORD_SCHEMA_SHA256 } from "../../src/storag
 import {
   BackendPublicationCoordinator,
   readBackendMaintenanceJournal,
+  backendPublicationMaterialWitness,
   type BackendPublicationDriver,
+  type BackendPublicationRecoveryMaterial,
+  type BackendPublicationRecoveryFile,
 } from "../../src/storage/backend-publication.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import {
@@ -55,6 +58,7 @@ import {
   deriveRollbackPrepareInputSha256,
   writeRollbackAuthorityArtifact,
   readRollbackAuthorityArtifact,
+  readBackendPublicationOperabilityFact,
   type RunMigrationRollbackDependencies,
   type RollbackFencedSession,
   type MigrationSelectionBindingRecorder,
@@ -129,6 +133,96 @@ function unexpectedDriver(): BackendPublicationDriver {
 
 function coordinatorFor(homeDir: string): BackendPublicationCoordinator {
   return new BackendPublicationCoordinator({ homeDir, driver: unexpectedDriver() });
+}
+
+// ---------------------------------------------------------------------------
+// donadiosolutions/lcm#1432 disagreement-refusal tests: a REAL completed
+// postgresql BackendPublicationJournal, constructed via a fake driver
+// (no live PostgreSQL, no network) so the "live side" of the
+// operability-fact disagreement check can be independently corrupted
+// with a genuinely resolvable "present" fact, not merely a fabricated
+// artifact. Mirrors test/backend-publication.test.ts's own
+// material()/makeDriver()/prepare()+resume() pattern -- deliberately NOT
+// imported from that file (test files do not share fixtures across
+// modules in this repo) but faithful to the same construction.
+// ---------------------------------------------------------------------------
+
+function publicationRecoveryFile(content: string): BackendPublicationRecoveryFile {
+  return {
+    presence: "present",
+    content: Buffer.from(content),
+    mode: 0o600,
+    uid: typeof process.getuid === "function" ? process.getuid() : 0,
+    gid: typeof process.getgid === "function" ? process.getgid() : 0,
+    nlink: "1",
+    dev: "1",
+    ino: "2",
+    parentDev: "3",
+    parentIno: "4",
+  };
+}
+
+function publicationMaterial(): BackendPublicationRecoveryMaterial {
+  return {
+    source: {
+      config: publicationRecoveryFile('{"backend":"sqlite"}'),
+      projectMap: publicationRecoveryFile('{"projects":[]}'),
+    },
+    target: {
+      config: publicationRecoveryFile('{"backend":"postgresql"}'),
+      projectMap: publicationRecoveryFile('{"projects":["remote"]}'),
+    },
+  };
+}
+
+function workingPublicationDriver(materialInput: BackendPublicationRecoveryMaterial): BackendPublicationDriver {
+  let state = backendPublicationMaterialWitness(materialInput);
+  const targetState = backendPublicationMaterialWitness({ source: materialInput.target, target: materialInput.target });
+  return {
+    observeLocalState: async () => state,
+    publishProjectMap: async ({ permit }) => {
+      permit.assertActive();
+      state = { ...state, projectMap: targetState.projectMap };
+      return targetState.projectMap;
+    },
+    publishConfig: async ({ permit }) => {
+      permit.assertActive();
+      state = { ...state, config: targetState.config };
+      return targetState.config;
+    },
+    restoreConfig: async ({ permit }) => {
+      permit.assertActive();
+      return targetState.config;
+    },
+    restoreProjectMap: async ({ permit }) => {
+      permit.assertActive();
+      return targetState.projectMap;
+    },
+  };
+}
+
+/**
+ * Drives a REAL BackendPublicationCoordinator through prepare()+resume()
+ * against a fake (in-memory) driver, landing a genuine version-2
+ * BackendPublicationJournal at phase "completed", targetBackend
+ * "postgresql", in the live slot -- exactly the state
+ * readBackendPublicationOperabilityFact resolves as "present". No
+ * maintenance journal is ever touched, so this never collides with the
+ * rollback orchestration's own enterMaintenance in the same homeDir.
+ */
+async function establishCompletedPostgresqlPublication(homeDir: string): Promise<void> {
+  const materialInput = publicationMaterial();
+  const driver = workingPublicationDriver(materialInput);
+  const pub = new BackendPublicationCoordinator({ homeDir, driver });
+  await pub.prepare({
+    publicationId: "disagreement-fixture-publication",
+    sourceBackend: "sqlite",
+    targetBackend: "postgresql",
+    material: materialInput,
+    projects: [{ localProjectId: "local-project", remoteProjectId: "remote-project", evidenceSha256: "a".repeat(64) }],
+    now: new Date(capturedAt),
+  });
+  await pub.resume();
 }
 
 function storageWitness(backend: "sqlite" | "postgresql", seed: string): MigrationStorageWitness {
@@ -447,9 +541,9 @@ describe("runMigrationRollback", () => {
       }),
     })).rejects.toMatchObject({ name: "RollbackOrchestrationError", reason: "not-eligible" });
 
-    const maintenance = readBackendMaintenanceJournal(homeDir);
-    expect(maintenance?.phase).toBe("maintenance-aborted");
-  });
+   const maintenance = readBackendMaintenanceJournal(homeDir);
+   expect(maintenance?.phase).toBe("maintenance-aborted");
+ });
 
   it("refuses as a racing post-activation write when step 10's revalidation observes a mode change from step 9's, leaving the generation preserved and unreferenced", async () => {
     // A pre-write decision at step 9 (delta matches baseline, census
@@ -889,5 +983,192 @@ describe("runMigrationRollback", () => {
     expect(outcome.report!.reason).not.toBeNull();
     const maintenance = readBackendMaintenanceJournal(homeDir);
     expect(maintenance?.phase).toBe("maintenance-aborted");
+  });
+
+  // donadiosolutions/lcm#1432, plan-v2 section 10 red-proof requirement.
+  // "the artifact's recorded fact disagrees with a resolvable live read
+  // must produce a refusal" -- proven with BOTH sides independently
+  // corruptible, for BOTH comparisons resolveRollbackOperabilityFact and
+  // assertAuthorityAgreesWithArtifact perform: the operability fact
+  // VALUE, and the resolved AUTHORITY. One shared baseline (agreement,
+  // succeeds) plus four mutations, each corrupting exactly one side of
+  // exactly one comparison. The "live fact" mutation uses a REAL
+  // completed postgresql BackendPublicationJournal (via a fake driver,
+  // no network) rather than a fabricated value, so that side is a
+  // genuine production code path, not another hand-set fixture.
+
+  it("disagreement baseline: artifact and a resolvable live read agree on both the operability fact and the authority -- succeeds (positive control)", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-agree");
+    const canonicalPath = join(homeDir, "live.sqlite");
+    writeRollbackAuthorityArtifact(homeDir, {
+      version: 1,
+      generationId: "gen-agree",
+      operabilityFactState: "authoritatively-absent",
+      operabilityFactValueSha256: null,
+      authorityStatus: "unactivated",
+      epochId: null,
+      attemptId: null,
+    });
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const outcome = await runMigrationRollback({
+      homeDir, generationId: "gen-agree", canonicalPath,
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator: coordinatorFor(homeDir),
+      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => null,
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
+          destinationIdentity,
+          postEpochDelta: fixtureCanonicalDelta("delta"),
+          postEpochCensus: null,
+        }],
+        source: sqliteSourceStream,
+      }),
+    });
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(readRollbackAuthorityArtifact(homeDir, "gen-agree")).not.toBeNull();
+  });
+
+  it("disagreement mutation (artifact side, operability fact): artifact records present, a resolvable live read finds authoritatively-absent -- refuses", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-fact-artifact-wrong");
+    writeRollbackAuthorityArtifact(homeDir, {
+      version: 1,
+      generationId: "gen-fact-artifact-wrong",
+      operabilityFactState: "present",
+      operabilityFactValueSha256: "e".repeat(64),
+      authorityStatus: "unactivated",
+      epochId: null,
+      attemptId: null,
+    });
+    await expect(runMigrationRollback({
+      homeDir, generationId: "gen-fact-artifact-wrong", canonicalPath: join(homeDir, "live.sqlite"),
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator: coordinatorFor(homeDir),
+      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => null,
+      openFencedSession: async () => { throw new Error("must not open a session: refusal happens before maintenance"); },
+    })).rejects.toMatchObject({
+      name: "RollbackOrchestrationError",
+      reason: "not-eligible",
+      message: expect.stringContaining("disagrees with the durable rollback-authority artifact"),
+    });
+  });
+
+  it("disagreement mutation (live side, operability fact): artifact records authoritatively-absent, a resolvable live read finds a REAL completed postgresql publication -- refuses", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-fact-live-wrong");
+    writeRollbackAuthorityArtifact(homeDir, {
+      version: 1,
+      generationId: "gen-fact-live-wrong",
+      operabilityFactState: "authoritatively-absent",
+      operabilityFactValueSha256: null,
+      authorityStatus: "unactivated",
+      epochId: null,
+      attemptId: null,
+    });
+    await establishCompletedPostgresqlPublication(homeDir);
+    const live = await readBackendPublicationOperabilityFact({ homeDir });
+    expect(live.state).toBe("present");
+
+    await expect(runMigrationRollback({
+      homeDir, generationId: "gen-fact-live-wrong", canonicalPath: join(homeDir, "live.sqlite"),
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator: coordinatorFor(homeDir),
+      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => null,
+      openFencedSession: async () => { throw new Error("must not open a session: refusal happens before maintenance"); },
+    })).rejects.toMatchObject({
+      name: "RollbackOrchestrationError",
+      reason: "not-eligible",
+      message: expect.stringContaining("disagrees with the durable rollback-authority artifact"),
+    });
+  });
+
+  it("disagreement mutation (artifact side, authority): artifact records an authoritative epoch/attempt, a fresh Boundary A read resolves unactivated -- refuses", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-authority-artifact-wrong");
+    writeRollbackAuthorityArtifact(homeDir, {
+      version: 1,
+      generationId: "gen-authority-artifact-wrong",
+      operabilityFactState: "authoritatively-absent",
+      operabilityFactValueSha256: null,
+      authorityStatus: "authoritative",
+      epochId: "epoch-mismatch",
+      attemptId: "attempt-mismatch",
+    });
+    await expect(runMigrationRollback({
+      homeDir, generationId: "gen-authority-artifact-wrong", canonicalPath: join(homeDir, "live.sqlite"),
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator: coordinatorFor(homeDir),
+      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => null,
+      openFencedSession: async () => { throw new Error("must not open a session: refusal happens before maintenance"); },
+    })).rejects.toMatchObject({
+      name: "RollbackOrchestrationError",
+      reason: "unexpected-state",
+      message: expect.stringContaining("freshly resolved authority is unactivated but the durable rollback-authority artifact"),
+    });
+  });
+
+  it("disagreement mutation (live side, authority): artifact records unactivated, a fresh Boundary A read resolves an authoritative selection -- refuses", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-authority-live-wrong");
+    writeRollbackAuthorityArtifact(homeDir, {
+      version: 1,
+      generationId: "gen-authority-live-wrong",
+      operabilityFactState: "authoritatively-absent",
+      operabilityFactValueSha256: null,
+      authorityStatus: "unactivated",
+      epochId: null,
+      attemptId: null,
+    });
+    await expect(runMigrationRollback({
+      homeDir, generationId: "gen-authority-live-wrong", canonicalPath: join(homeDir, "live.sqlite"),
+      projectIdentity: identity, localProjectId: "local-1",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator: coordinatorFor(homeDir),
+      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
+        epochId: "epoch-y", attemptId: "attempt-y", manifestRevision: 1,
+        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-y",
+      }),
+      classifyRollbackMode: referenceClassifyRollbackMode,
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      resolveAuthoritativeContext: async () => { throw new Error("must not resolve authoritative context: refusal happens before this call"); },
+      openFencedSession: async () => { throw new Error("must not open a session: refusal happens before maintenance"); },
+    })).rejects.toMatchObject({
+      name: "RollbackOrchestrationError",
+      reason: "unexpected-state",
+      message: expect.stringContaining("freshly resolved authority disagrees with the durable rollback-authority artifact"),
+    });
   });
 });
