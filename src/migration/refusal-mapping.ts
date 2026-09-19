@@ -191,20 +191,32 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     remedy: "Daemon presence could not be positively established. Run `lcm daemon status`, resolve the failure, and retry.",
   }),
 
-  // --- abort's own refusal reasons are deliberately NOT yet in this
-  // table. performMigrationAbort returns free-form evidence strings
-  // (journal-<phase>, journal-<coordinator error reason>,
-  // manifest-<protocol error reason>, manifest-<recovery action>) rather
-  // than a closed reason enum. Collapsing them into a reason string here
-  // without first classifying *why* each one occurred -- a wrong phase
-  // versus a coordinator write failure versus an unresolvable manifest
-  // read are different facts, not the same fact reached three ways --
-  // would repeat exactly the by-reason-not-by-throw mistake this item
-  // already corrected once, for enterMaintenance's own recovery failure.
-  // A deliberate classifier for abort's evidence family, analogous to
-  // classifyEnteringRecoveryFailure, is required before this table can
-  // honestly claim to cover abort. Tracked as remaining work, not guessed
-  // at here.
+  // --- abort's own refusals, classified by classifyMigrationAbortRefusal
+  // (abort.ts) rather than by the raw evidence string, for the exact
+  // reason recorded there: a wrong phase, a coordinator CAS mismatch, an
+  // internal-defect malformed input, and "resume is required" are
+  // different facts, and every reason this classifier cannot positively
+  // attribute lands on abort-unresolvable rather than being guessed. ---
+  Object.freeze({
+    reason: "abort-wrong-phase", exitClass: "refused-precondition",
+    remedy: "The maintenance journal is not in an abortable phase (it is either absent or already past a successful cutover). Nothing to abort.",
+  }),
+  Object.freeze({
+    reason: "abort-journal-moved", exitClass: "refused-precondition",
+    remedy: "The maintenance journal changed since it was last observed. Re-run `lcm migration abort` to act on its current state.",
+  }),
+  Object.freeze({
+    reason: "abort-invalid-input", exitClass: "failed-operator-required",
+    remedy: "The CLI constructed an invalid abort request. This is an internal defect; file an issue rather than retrying.",
+  }),
+  Object.freeze({
+    reason: "abort-manifest-needs-resume", exitClass: "failed-operator-required",
+    remedy: "The manifest has an in-progress copy effect that only `resume` can complete or abandon. This candidate does not implement resume; file an issue.",
+  }),
+  Object.freeze({
+    reason: "abort-unresolvable", exitClass: "refused-evidence",
+    remedy: "The abort could not be classified into a known precondition or defect. Run `lcm doctor` before retrying.",
+  }),
 ] satisfies MigrationRefusalMapping[]);
 
 const REFUSAL_BY_REASON: ReadonlyMap<string, MigrationRefusalMapping> = new Map(

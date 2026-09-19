@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   classifyMigrationAbortGate,
+  classifyMigrationAbortRefusal,
   performMigrationAbort,
 } from "../../src/migration/abort.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
@@ -455,3 +456,57 @@ describe("abort.ts's protocol-error-instance branch, for the same fallback terna
   });
 });
 
+
+describe("classifyMigrationAbortRefusal (classified by actual reason, never by throw-or-not)", () => {
+  it("classifies journal-selection-prepared as abort-wrong-phase/precondition", () => {
+    expect(classifyMigrationAbortRefusal("journal-selection-prepared")).toEqual({ reason: "abort-wrong-phase", class: "precondition" });
+  });
+
+  it("classifies journal-selection-completed as abort-wrong-phase/precondition", () => {
+    expect(classifyMigrationAbortRefusal("journal-selection-completed")).toEqual({ reason: "abort-wrong-phase", class: "precondition" });
+  });
+
+  it("classifies journal-unexpected-state as abort-journal-moved/precondition (abortMaintenance's own CAS mismatch, the one reason it itself asserts as a precondition failure)", () => {
+    expect(classifyMigrationAbortRefusal("journal-unexpected-state")).toEqual({ reason: "abort-journal-moved", class: "precondition" });
+  });
+
+  it("classifies journal-invalid-input as abort-invalid-input/unresumable (an internal defect, not an operator-fixable precondition)", () => {
+    expect(classifyMigrationAbortRefusal("journal-invalid-input")).toEqual({ reason: "abort-invalid-input", class: "unresumable" });
+  });
+
+  it("classifies manifest-resume as abort-manifest-needs-resume/unresumable", () => {
+    expect(classifyMigrationAbortRefusal("manifest-resume")).toEqual({ reason: "abort-manifest-needs-resume", class: "unresumable" });
+  });
+
+  it("classifies manifest-readback as abort-manifest-needs-resume/unresumable too (both are classifyMigrationRecovery's pending-effect answers, distinguished from each other only by whether resume can safely retry, which is irrelevant to a candidate that does not implement resume)", () => {
+    expect(classifyMigrationAbortRefusal("manifest-readback")).toEqual({ reason: "abort-manifest-needs-resume", class: "unresumable" });
+  });
+
+  it.each([
+    "journal-publication-evidence-missing",
+    "journal-unsafe-storage",
+    "journal-malformed-journal",
+    "journal-checksum-mismatch",
+    "journal-unresolved-publication",
+    "journal-permit-mismatch",
+    "journal-backend-mismatch",
+    "journal-internal-error",
+    "manifest-invalid-input",
+    "manifest-malformed-manifest",
+    "manifest-checksum-mismatch",
+    "manifest-recovery-required",
+    "manifest-unexpected-state",
+    "manifest-internal-error",
+    "manifest-not-a-real-manifest-reason",
+  ])(
+    "classifies every other evidence string (%s) as abort-unresolvable/evidence rather than guessing a precondition or contention (red: this is the safety default -- an unclassifiable failure must not be asserted as a conclusion)",
+    (evidence) => {
+      expect(classifyMigrationAbortRefusal(evidence)).toEqual({ reason: "abort-unresolvable", class: "evidence" });
+    },
+  );
+
+  it("is a total function over any string, including one that shares no structure with a real evidence value", () => {
+    expect(classifyMigrationAbortRefusal("")).toEqual({ reason: "abort-unresolvable", class: "evidence" });
+    expect(classifyMigrationAbortRefusal("garbage")).toEqual({ reason: "abort-unresolvable", class: "evidence" });
+  });
+});

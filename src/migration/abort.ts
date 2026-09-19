@@ -224,3 +224,65 @@ export async function performMigrationAbort(input: Readonly<{
   }
   return { status: "completed" };
 }
+
+export type MigrationAbortRefusalClass = "precondition" | "unresumable" | "evidence";
+
+export type MigrationAbortRefusalClassification = Readonly<{
+  reason: string;
+  class: MigrationAbortRefusalClass;
+}>;
+
+/**
+ * Classifies `performMigrationAbort`'s flat `evidence` string by the actual
+ * fact it represents, never by the mere fact that it refused. This mirrors
+ * `classifyEnteringRecoveryFailure`'s discipline exactly, for the same
+ * coordinator and largely the same underlying error family: only a reason
+ * this function can positively attribute to a specific, source-verified
+ * fact is classified as anything other than unresolvable evidence.
+ *
+ * Read directly at source, not guessed:
+ *
+ * - `journal-selection-prepared` / `journal-selection-completed`: the
+ *   journal's own pre-check in `performMigrationAbort` for "not in an
+ *   abortable phase at all" (`abort.ts`'s own two explicit
+ *   `journal-${journal.phase}` refusals). A genuine, well-understood
+ *   precondition: there is nothing to abort.
+ * - `journal-unexpected-state`: `BackendPublicationCoordinator#abortMaintenance`'s
+ *   own compare-and-swap check (`backend-publication.ts`'s `abortMaintenance`:
+ *   phase, checksum or `sourceSelectionSha256` no longer match what the
+ *   caller observed). The one `BackendPublicationJournalError` reason
+ *   `abortMaintenance` itself asserts is a precondition mismatch, exactly as
+ *   `classifyEnteringRecoveryFailure` treats the same reason from the same
+ *   coordinator.
+ * - `journal-invalid-input`: `abortMaintenance`'s own malformed-CAS-input
+ *   check. The CLI constructed the compare-and-swap input itself, so this
+ *   reflects an internal defect, never an operator-fixable precondition.
+ * - `manifest-resume` / `manifest-readback`: `classifyMigrationRecovery`'s
+ *   own explicit "a pending copy effect exists" answer (`protocol.ts`), not
+ *   an error at all. This candidate does not implement `resume`, so neither
+ *   disposition has an automatic path here.
+ * - Everything else (`journal-publication-evidence-missing`,
+ *   `journal-unsafe-storage`, `journal-malformed-journal`,
+ *   `journal-checksum-mismatch`, `journal-unresolved-publication`,
+ *   `journal-permit-mismatch`, `journal-backend-mismatch`,
+ *   `journal-internal-error`, every other `manifest-<protocol reason>`, and
+ *   `manifest-internal-error`) is not a reason this function can positively
+ *   attribute to a specific fact from `abort.ts`'s own call sites, so it is
+ *   unresolvable evidence, never a guessed precondition or contention: an
+ *   unclassifiable failure must not be asserted as a conclusion.
+ */
+export function classifyMigrationAbortRefusal(evidence: string): MigrationAbortRefusalClassification {
+  if (evidence === "journal-selection-prepared" || evidence === "journal-selection-completed") {
+    return { reason: "abort-wrong-phase", class: "precondition" };
+  }
+  if (evidence === "journal-unexpected-state") {
+    return { reason: "abort-journal-moved", class: "precondition" };
+  }
+  if (evidence === "journal-invalid-input") {
+    return { reason: "abort-invalid-input", class: "unresumable" };
+  }
+  if (evidence === "manifest-resume" || evidence === "manifest-readback") {
+    return { reason: "abort-manifest-needs-resume", class: "unresumable" };
+  }
+  return { reason: "abort-unresolvable", class: "evidence" };
+}

@@ -109,3 +109,20 @@ describe("migrationRefusalMapping", () => {
     );
   });
 });
+
+describe("MIGRATION_REFUSAL_REASONS covers abort.ts's classified reasons", () => {
+  const REASONS_ABORT_TS_CAN_EMIT = [
+    "abort-wrong-phase",
+    "abort-journal-moved",
+    "abort-invalid-input",
+    "abort-manifest-needs-resume",
+    "abort-unresolvable",
+  ];
+
+  it.each(REASONS_ABORT_TS_CAN_EMIT)(
+    "covers classifyMigrationAbortRefusal's real reason %s",
+    (reason) => {
+      expect(() => migrationRefusalMapping(reason)).not.toThrow();
+    },
+  );
+});
