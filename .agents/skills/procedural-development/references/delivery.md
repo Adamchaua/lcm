@@ -1,6 +1,8 @@
 # Item delivery and review
 
-Apply [the run contract](../SKILL.md) and only the assigned role's instructions.
+Apply [the run contract](../SKILL.md), required [worker execution](worker-execution.md)
+and the assigned role's delivery instructions. Execution ownership, explicit resource
+limits and cleanup apply to all roles, including independent reviewers.
 
 ## Directives
 
@@ -14,7 +16,9 @@ services. Never experiment on production state or another worker's publication
 lock. Preserve supported integration harnesses. Include required docs, release
 metadata, component classification and focused tests in the candidate.
 
-All reviewers are read-only. Every PR-head change, including CI/test fixes,
+All reviewers are read-only with respect to candidate source. Run reviewer tests
+in worker-owned frozen checkouts and private fixtures/artifacts, not the owner's
+checkout. Verify source integrity before/after review. Every PR-head change, including CI/test fixes,
 automated-review remediation, rebases and conflicts, invalidates prior cleanliness.
 An ancestor's approval does not certify its descendant.
 
@@ -80,13 +84,19 @@ findings need no follow-up.
 
 ### Deferred findings
 
-Create GitHub issues under caller classification rules, describing the distinct
-remaining problem with source item, candidate, review context, reproduction and
-evidence. Link source and PR. Before publication, create the issue with its PR link
-pending; this satisfies the pre-publication gate. Add that link immediately after
-publication; missing links block merge/final audit. Follow-ups never enter inventory
-or become native children of its tracker. Read back required type and current
-resolution; preserve valid fixes, duplicates and successors.
+Use the caller's `FOLLOWUP_CHANNEL`: default `github-issue` creates GitHub issues
+under caller classification rules; explicit `private-record` creates durable
+records in the caller's private campaign directory instead. Never infer the private
+channel for existing Bug/Epic callers or silently publish a private record.
+
+Both channels require the distinct remaining problem, acceptance criteria, owner,
+source item, candidate, review context, reproduction and evidence. Link source and
+PR. Before publication, create the record with its PR link pending; this satisfies
+the pre-publication gate. Add that link immediately after publication; missing
+links block merge/final audit. Follow-ups never enter inventory or become native
+children of its tracker. Read back the record and current resolution; verify native
+type when using GitHub issues. Preserve valid fixes, duplicates and successors.
+Private evidence and record paths must not enter public PR text or comments.
 
 ## Publish and merge
 
@@ -111,6 +121,10 @@ resolution; preserve valid fixes, duplicates and successors.
    open. Owner conflict resolutions/target integrations require full new-SHA review.
 
 ## Event payload
+
+Every terminal worker report includes [command completion evidence](worker-execution.md#completion).
+The owner validates terminal execution and cleanup before accepting a report or
+completing a candidate round; `task_complete` alone does not establish either.
 
 Owners immediately report publication/merge requests, blockers, parking, worker
 failure, escalation, cleared blockers and necessary deconfliction. Include item,

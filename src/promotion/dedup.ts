@@ -77,8 +77,10 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
   const insertConfidence = newEntryConfidence ?? confidence;
 
   if (!("store" in params)) {
-    // Search and mutation share one backend transaction so two concurrent
-    // promotions cannot both observe an empty candidate set and insert.
+    // Search and mutation share one backend transaction. That alone does not
+    // serialize the decision under READ COMMITTED, so the run below asks the
+    // backend to serialize this exact content first, on backends that supply
+    // a serializer.
     const run = (repositories: TransactionRepositories) => deduplicateAndInsertInRepositories(repositories, {
       content,
       tags,
@@ -141,6 +143,14 @@ export async function deduplicateAndInsertInRepositories(
   repositories: TransactionRepositories,
   input: DedupInsertInput,
 ): Promise<string> {
+  // Hold this project's decisions for the rest of the caller's transaction
+  // before reading candidates. Without it two concurrent transactions each
+  // read an empty candidate set, each take the insert branch below, and both
+  // commit a separate active memory for identical content. The grain is the
+  // project, so a transaction holds one lock however many entries it decides.
+  // Backends whose root transactions already run on one connection supply no
+  // serializer.
+  await repositories.promotedDecisionSerializer?.serializeDecision();
   const candidateSourceProjectId = input.candidateScope === "owner"
     && input.backend === "postgresql"
     ? undefined
@@ -151,7 +161,24 @@ export async function deduplicateAndInsertInRepositories(
     undefined,
     candidateSourceProjectId,
   );
-  const duplicates = candidates.filter(
+  const exact = input.candidateScope === "owner" && input.backend === "postgresql"
+    ? await repositories.promotedMemory.findExactContent(input.content, candidateSourceProjectId)
+    : null;
+  const exactCandidate = exact === null ? [] : [{
+    id: exact.id,
+    content: exact.content,
+    tags: exact.tags,
+    projectId: exact.projectId,
+    sessionId: exact.sessionId,
+    confidence: exact.confidence,
+    createdAt: exact.createdAt,
+    rank: 0,
+  }];
+  const fuzzyIds = new Set(candidates.map((candidate) => candidate.id));
+  const combinedCandidates = exact !== null && !fuzzyIds.has(exact.id)
+    ? [...exactCandidate, ...candidates]
+    : candidates;
+  const duplicates = combinedCandidates.filter(
     (candidate) => isDuplicateCandidate(candidate, input.content, input.thresholds.dedupBm25Threshold),
   );
   if (duplicates.length === 0) {

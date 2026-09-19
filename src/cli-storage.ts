@@ -1,9 +1,17 @@
 import { inspectExistingLcmDatabasePath } from "./db/connection.js";
 import { realpathSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { ensureProjectDirForIdentity, projectIdentity, projectPathsForIdentity } from "./daemon/project.js";
-import { hashProjectPath, readProjectMapSnapshot, resolveExistingProjectIdentity } from "./project-map.js";
+import {
+  UnauthenticatedProjectIdentityError,
+  hashProjectPath,
+  isAuthenticatedProjectIdentity,
+  normalizeProjectIdentityPath,
+  readProjectMapSnapshot,
+  resolveExistingProjectIdentity,
+  resolveProjectIdentity,
+} from "./project-map.js";
 import { configPath, lcmHomeDir } from "./runtime-paths.js";
 import { ensurePrivateDirectory, atomicWritePrivateFileExclusive } from "./security-files.js";
 import { selectStorageBackendForConfig, assertStorageBackendPublication } from "./storage/backend.js";
@@ -13,6 +21,11 @@ import { createStorageBackendFactory } from "./storage/factory.js";
 import { resolveStorageIdentityContext } from "./storage/identity-context.js";
 import { withPublicationAdmissionRetry, type PublicationConvergence } from "./storage/publication-convergence.js";
 import { SqliteStorageBackendFactory } from "./storage/sqlite/factory.js";
+import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
+import {
+  assertProjectStorageIdentityActive,
+  isAuthenticatedRetiredProjectIdentityFence,
+} from "./worktree-reconciliation-fence.js";
 
 export class CliProjectStorageMissingError extends Error {
   constructor() {
@@ -57,6 +70,35 @@ export async function withCliProjectStorage<T>(
         if (customBase) {
           try { canonical = realpathSync(cwd); } catch { /* Keep the established missing-path identity. */ }
         }
+        if (!customBase) {
+          // Classify a retired local project-identity fence before
+          // reconciliation runs and before any backend-specific identity
+          // resolution, independently of the selected storage backend.
+          // Reconciliation itself can fail with a generic ENOTDIR error when
+          // a sibling worktree source still targets the fenced path (it
+          // tries to open the fence file as a directory), and a PostgreSQL
+          // binding's remote-identity lookup can throw its own generic
+          // unbound-project message before a later SQLite-only check would
+          // run. Either failure would shadow this diagnostic, so classify
+          // first. This preview stays read-only: a persisted binding is the
+          // identity to authenticate, and an unmapped path is authenticated
+          // against the identity it would derive, so a fence is diagnosed
+          // without registering a project ahead of reconciliation.
+          const persisted = resolveExistingProjectIdentity(cwd, token);
+          const previewCanonical = normalizeProjectIdentityPath(cwd);
+          const preReconciliationPreview = persisted
+            ?? { id: hashProjectPath(previewCanonical), canonical: previewCanonical };
+          assertProjectStorageIdentityActive(
+            projectPathsForIdentity(preReconciliationPreview).dir,
+            preReconciliationPreview.id,
+          );
+          ensureWorktreeProjectReconciled(cwd, undefined, { _publicationLockToken: token });
+          // Re-check after reconciliation: a freshly reconciled or renewed
+          // binding must still be validated, since reconciliation can mint
+          // a new identity that the pre-check above never observed.
+          const localPreview = resolveProjectIdentity(cwd, { _publicationLockToken: token });
+          assertProjectStorageIdentityActive(projectPathsForIdentity(localPreview).dir, localPreview.id);
+        }
         const identity = customBase
           ? { id: hashProjectPath(canonical), canonical }
           : projectIdentity(cwd, config.storage, token);
@@ -67,6 +109,9 @@ export async function withCliProjectStorage<T>(
           : projectPathsForIdentity(local);
         const project = { ...paths, id: identity.id };
         const context = { project, config };
+        if (customBase) {
+          assertProjectStorageIdentityActive(paths.dir, localId);
+        }
         await options.prepare?.(context);
         if (options.create && config.storage.backend === "sqlite") {
           if (customBase) {
@@ -128,15 +173,41 @@ export async function listCliProjects(): Promise<Array<{ id: string; canonical: 
     const map = readProjectMapSnapshot(undefined, token);
     const selected = new Map<string, { id: string; canonical: string; aliases: readonly string[] }>();
     for (const [id, entry] of Object.entries(map)) {
-      const existing = resolveExistingProjectIdentity(entry.canonical, token);
+      let existing: ReturnType<typeof resolveExistingProjectIdentity>;
+      try {
+        existing = resolveExistingProjectIdentity(entry.canonical, token);
+      } catch (error) {
+        // An entry whose key no local evidence authenticates is refused by
+        // admission and reconciliation, so enumerating it would advertise a
+        // project that cannot be opened. Skip it and keep the inventory whole
+        // for every other project.
+        if (error instanceof UnauthenticatedProjectIdentityError) continue;
+        throw error;
+      }
       const local = existing ?? { id, ...entry };
+      // A successor-shaped identity resolves normally but is only openable
+      // while its retained predecessor fence authenticates it. Enumerating an
+      // unauthenticated one would advertise a project that admission and
+      // reconciliation refuse.
+      if (!isAuthenticatedProjectIdentity(local.id, resolve(local.canonical))) continue;
       if (local.id !== id && inspectExistingLcmDatabasePath(projectPathsForIdentity({id,canonical:entry.canonical}).dbPath) !== null) {
         throw new Error("Legacy worktree storage requires reconciliation before project enumeration.");
       }
       if (entry.remoteProjectId !== undefined && entry.remoteProjectId !== local.remoteProjectId) {
         throw new Error("Legacy worktree storage has a conflicting remote project binding.");
       }
-      const identity = resolveStorageIdentityContext(config.storage, local, undefined, local.canonical);
+      // Classify a retired local project-identity fence before any
+      // backend-specific identity resolution runs. Under a PostgreSQL
+      // config, resolveStorageIdentityContext throws its generic
+      // unbound-project message for any entry without a remote binding,
+      // including a fenced one; that would escape this loop and abort the
+      // whole enumeration, so a fenced project would never reach the
+      // per-project RetiredProjectIdentityError branch in the caller. A
+      // fenced entry enumerates with its own local identity instead, which
+      // keeps enumeration whole for every other project.
+      const identity = isAuthenticatedRetiredProjectIdentityFence(projectPathsForIdentity(local).dir, local.id)
+        ? local
+        : resolveStorageIdentityContext(config.storage, local, undefined, local.canonical);
       const prior = selected.get(identity.id);
       selected.set(identity.id, {
         id: identity.id,

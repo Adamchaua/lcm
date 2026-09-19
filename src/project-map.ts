@@ -1,25 +1,38 @@
 import { createHash } from "node:crypto";
 import {
+  closeSync,
+  constants,
   existsSync,
   chmodSync,
+  fstatSync,
+  lstatSync,
+  openSync,
   realpathSync,
+  readSync,
   readdirSync,
   rmSync,
   statSync,
   watch,
   type FSWatcher,
 } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { lcmHomeDir, projectsDir } from "./runtime-paths.js";
 import {
   atomicWritePrivateFile,
   atomicWritePrivateFileDurable,
+  assertPrivateDirectory,
   consumeBoundedRegularFile,
   ensurePrivateDirectory,
+  openPrivateDirectory,
+  openPrivateDirectoryIfExists,
   OWNER_ONLY_FILE_MODES,
   readBoundedRegularFile,
   readBoundedRegularFileWithStat,
+  retainedDirectoryDescriptorPath,
+  requireSupportedProcessUid,
   syncPrivateDirectory,
+  type PrivateDirectoryHandle,
+  type PrivateDirectoryWitness,
   writePrivateFileExclusive,
 } from "./security-files.js";
 import { normalizeUuidV7 } from "./machine-identity.js";
@@ -42,6 +55,7 @@ import {
   type BackendPublicationLockToken,
   type BackendPublicationRecoveryFile,
 } from "./storage/backend-publication.js";
+import { isAuthenticatedRetiredProjectIdentityFence } from "./worktree-reconciliation-fence.js";
 
 export type ProjectMapEntry = {
   canonical: string;
@@ -175,6 +189,742 @@ export function normalizeProjectIdentityPath(path: string): string {
 
 export function hashProjectPath(path: string): string {
   return createHash("sha256").update(path).digest("hex");
+}
+
+const RETIRED_PROJECT_SUCCESSOR_DOMAIN =
+  "lcm:retired-project-identity-successor:v1\0";
+
+/** Derive the stable local successor without consulting or mutating state. */
+export function retiredProjectIdentitySuccessor(
+  retiredId: string,
+  canonicalPath: string,
+): string {
+  if (!HASH_RE.test(retiredId)) {
+    throw new Error("retired project identity must be a lowercase sha256 hash");
+  }
+  if (!isAbsolute(canonicalPath)) {
+    throw new Error("retired project canonical path must be absolute");
+  }
+  return createHash("sha256")
+    .update(RETIRED_PROJECT_SUCCESSOR_DOMAIN)
+    .update(retiredId)
+    .update("\0")
+    .update(canonicalPath)
+    .digest("hex");
+}
+
+/** Recognize the only successor shape created by retired-identity renewal. */
+export function isRetiredProjectIdentitySuccessor(
+  identityId: string,
+  retiredId: string,
+  canonicalPath: string,
+): boolean {
+  return identityId === retiredProjectIdentitySuccessor(retiredId, canonicalPath);
+}
+
+/** Authenticate a successor-shaped identity with its retained predecessor fence. */
+export function isAuthenticatedRetiredProjectIdentitySuccessor(
+  identityId: string,
+  retiredId: string,
+  canonicalPath: string,
+  homeDir?: string,
+): boolean {
+  return isRetiredProjectIdentitySuccessor(identityId, retiredId, canonicalPath)
+    && isAuthenticatedRetiredProjectIdentityFence(
+      join(projectsDir(homeDir), retiredId),
+      retiredId,
+    );
+}
+
+export type PersistedRetiredProjectIdentitySuccessor = Readonly<{
+  id: string;
+  retiredId: string;
+  canonical: string;
+}>;
+
+/**
+ * Report every persisted successor-shaped identity that one entry path reaches.
+ *
+ * Renewal itself refuses aliases, but `linkLocalAlias` may add one afterwards
+ * without PostgreSQL, so a renewed entry is legitimately reachable both by its
+ * own canonical path and by a distinct alias directory. A caller that derives
+ * the expected successor from the ENTERED path recognizes only the canonical
+ * case: for an alias it derives an unrelated id, concludes the project was
+ * never renewed, and acts on the entry with no proof of renewal at all.
+ *
+ * Matching the map instead reports the entries that are actually bound to this
+ * path, each keyed by its own canonical path — the only path that can
+ * authenticate it, because that is the path renewal hashed to mint the id.
+ * `existingEventsDbPath` and `parseLocalProjectMapCompatibility` already
+ * authenticate a matched entry this way; this keeps reconciliation consistent
+ * with them.
+ */
+export function persistedRetiredProjectIdentitySuccessors(
+  map: ProjectMap,
+  path: string,
+): readonly PersistedRetiredProjectIdentitySuccessor[] {
+  const reached: PersistedRetiredProjectIdentitySuccessor[] = [];
+  for (const id of findPathMatches(map, path)) {
+    // `resolve` always yields an absolute path, so successor derivation cannot
+    // reject the entry and this stays a total, side-effect-free query.
+    const canonical = resolve(map[id].canonical);
+    const retiredId = hashProjectPath(canonical);
+    if (!isRetiredProjectIdentitySuccessor(id, retiredId, canonical)) continue;
+    reached.push({ id, retiredId, canonical });
+  }
+  return reached;
+}
+
+export type RetiredProjectIdentityRenewal = Readonly<{
+  oldId: string;
+  newId: string;
+  canonical: string;
+  changed: boolean;
+}>;
+
+type RetiredProjectIdentityRenewalOptions = Readonly<{
+  /** @internal Deterministic post-validation/pre-publication race seam. */
+  _afterValidationBeforePublicationForTesting?: () => void;
+  /** @internal Deterministic evidence-cleanup failure seam. */
+  _closeEvidenceForTesting?: (
+    kind: "fence" | "events" | "projects" | "root" | "target",
+    close: () => void,
+  ) => void;
+  /** @internal Deterministic retained-fence short-read seam. */
+  _fenceReadForTesting?: (
+    fd: number,
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number,
+  ) => number;
+  /** @internal Deterministic retained-fence metadata seam. */
+  _fenceStatForTesting?: (
+    kind: "descriptor" | "path",
+    phase: "before" | "after",
+    stat: RetainedFenceIdentity,
+  ) => RetainedFenceIdentity;
+  /** @internal Deterministic mutation seam between read and post-stat. */
+  _afterFenceReadForTesting?: () => void;
+  /** @internal Deterministic project-map snapshot read failure seam. */
+  _readMapFileForTesting?: typeof readMapFile;
+  /** @internal Observe or race the retained-root replacement boundary. */
+  _beforeMapReplaceForTesting?: (phase: "publish") => void;
+  /** @internal Deterministic writer failure after the publishing rename landed. */
+  _afterMapReplaceForTesting?: () => void;
+  /** @internal Deterministic failure after map publication and before readback. */
+  _afterMapPublicationForTesting?: () => void;
+}>;
+
+type RetainedDirectoryIdentity = Readonly<{
+  dev: bigint;
+  ino: bigint;
+  mode: bigint;
+  uid: bigint;
+  gid: bigint;
+  isDirectory: () => boolean;
+}>;
+
+type RetainedFenceIdentity = Readonly<{
+  dev: bigint;
+  ino: bigint;
+  mode: bigint;
+  uid: bigint;
+  gid: bigint;
+  nlink: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+  isFile: () => boolean;
+}>;
+
+type RetainedFenceIo = Readonly<{
+  read: NonNullable<RetiredProjectIdentityRenewalOptions["_fenceReadForTesting"]>;
+  stat: NonNullable<RetiredProjectIdentityRenewalOptions["_fenceStatForTesting"]>;
+  afterRead?: () => void;
+}>;
+
+type RetainedTargetDirectory = Readonly<{
+  fd: number;
+  path: string;
+  witness: RetainedDirectoryIdentity;
+}>;
+
+type RetainedFenceFile = Readonly<{
+  fd: number;
+  name: string;
+  expectedContent: Buffer;
+  witness: RetainedFenceIdentity;
+  io: RetainedFenceIo;
+}>;
+
+type RetiredIdentityRenewalEvidence = Readonly<{
+  target: RetainedTargetDirectory;
+  root: PrivateDirectoryHandle;
+  rootPath: string;
+  projects: PrivateDirectoryHandle;
+  projectsPath: string;
+  events?: PrivateDirectoryHandle;
+  eventsPath: string;
+  fence: RetainedFenceFile;
+  successorId: string;
+  expectedUid: number;
+}>;
+
+type MutableRetiredIdentityRenewalEvidence = {
+  -readonly [Key in keyof RetiredIdentityRenewalEvidence]?: RetiredIdentityRenewalEvidence[Key];
+};
+
+const RETAINED_DIRECTORY_FLAGS = constants.O_RDONLY
+  | constants.O_DIRECTORY
+  | constants.O_NOFOLLOW
+  | constants.O_NONBLOCK;
+const RETAINED_FILE_FLAGS = constants.O_RDONLY
+  | constants.O_NOFOLLOW
+  | constants.O_NONBLOCK;
+
+function sameRetainedDirectory(
+  left: RetainedDirectoryIdentity,
+  right: RetainedDirectoryIdentity,
+): boolean {
+  return left.isDirectory()
+    && right.isDirectory()
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.gid === right.gid;
+}
+
+function openRetainedTargetDirectory(path: string): RetainedTargetDirectory {
+  const fd = openSync(path, RETAINED_DIRECTORY_FLAGS);
+  try {
+    const witness = fstatSync(fd, { bigint: true }) as unknown as RetainedDirectoryIdentity;
+    const entry = lstatSync(path, { bigint: true }) as unknown as RetainedDirectoryIdentity;
+    if (!sameRetainedDirectory(witness, entry)) {
+      throw new Error("retired project target directory changed during admission");
+    }
+    return { fd, path, witness };
+  } catch (error) {
+    try { closeSync(fd); } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "retired project target admission and cleanup failed",
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+function assertRetainedTargetDirectory(target: RetainedTargetDirectory): void {
+  const descriptor = fstatSync(target.fd, { bigint: true }) as unknown as RetainedDirectoryIdentity;
+  const entry = lstatSync(target.path, { bigint: true }) as unknown as RetainedDirectoryIdentity;
+  if (
+    !sameRetainedDirectory(target.witness, descriptor)
+    || !sameRetainedDirectory(target.witness, entry)
+  ) {
+    throw new Error("retired project target directory changed before renewal");
+  }
+}
+
+function assertRetainedPrivateChild(
+  parent: PrivateDirectoryHandle,
+  name: string,
+  expected: PrivateDirectoryWitness,
+): void {
+  const entry = lstatSync(
+    join(retainedDirectoryDescriptorPath(parent.fd), name),
+    { bigint: true },
+  ) as unknown as RetainedDirectoryIdentity;
+  if (
+    !entry.isDirectory()
+    || entry.dev.toString(10) !== expected.dev
+    || entry.ino.toString(10) !== expected.ino
+    || Number(entry.mode & 0o7777n) !== expected.mode
+    || Number(entry.uid) !== expected.uid
+    || Number(entry.gid) !== expected.gid
+  ) {
+    throw new Error("retired project private parent changed before renewal");
+  }
+}
+
+function assertStableRetainedPrivateDirectory(
+  handle: PrivateDirectoryHandle,
+  path: string,
+  expected: PrivateDirectoryWitness,
+  expectedUid: number,
+): void {
+  const actual = assertPrivateDirectory(handle, path, undefined, expectedUid);
+  if (
+    actual.mode !== expected.mode
+    || actual.uid !== expected.uid
+    || actual.gid !== expected.gid
+    || actual.dev !== expected.dev
+    || actual.ino !== expected.ino
+  ) {
+    throw new Error("retired project private directory changed before renewal");
+  }
+}
+
+function assertRetainedChildAbsent(parent: PrivateDirectoryHandle, name: string): void {
+  try {
+    lstatSync(join(retainedDirectoryDescriptorPath(parent.fd), name));
+  } catch (error) {
+    if (isEnoent(error)) return;
+    throw error;
+  }
+  throw new Error("retired project successor storage is occupied");
+}
+
+function readRetainedFenceBytes(fence: RetainedFenceFile): Buffer {
+  const bytes = Buffer.alloc(fence.expectedContent.length);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const count = fence.io.read(
+      fence.fd,
+      bytes,
+      offset,
+      bytes.length - offset,
+      offset,
+    );
+    if (!Number.isSafeInteger(count) || count <= 0 || count > bytes.length - offset) {
+      throw new Error("retired project fence read ended before exact content was available");
+    }
+    offset += count;
+  }
+  const extra = Buffer.alloc(1);
+  const extraCount = fence.io.read(fence.fd, extra, 0, 1, bytes.length);
+  if (extraCount !== 0) {
+    throw new Error("retired project fence has trailing content");
+  }
+  return bytes;
+}
+
+function sameRetainedFence(left: RetainedFenceIdentity, right: RetainedFenceIdentity): boolean {
+  return left.isFile()
+    && right.isFile()
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.gid === right.gid
+    && left.nlink === right.nlink
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function assertRetainedFenceFile(
+  projects: PrivateDirectoryHandle,
+  fence: RetainedFenceFile,
+  expectedUid: number,
+): void {
+  const path = join(retainedDirectoryDescriptorPath(projects.fd), fence.name);
+  const descriptorBefore = fence.io.stat(
+    "descriptor",
+    "before",
+    fstatSync(fence.fd, { bigint: true }) as unknown as RetainedFenceIdentity,
+  );
+  const entryBefore = fence.io.stat(
+    "path",
+    "before",
+    lstatSync(path, { bigint: true }) as unknown as RetainedFenceIdentity,
+  );
+  const expectedSize = BigInt(fence.expectedContent.length);
+  if (
+    !sameRetainedFence(fence.witness, descriptorBefore)
+    || !sameRetainedFence(fence.witness, entryBefore)
+    || !sameRetainedFence(descriptorBefore, entryBefore)
+    || descriptorBefore.size !== expectedSize
+    || entryBefore.size !== expectedSize
+    || Number(descriptorBefore.uid) !== expectedUid
+    || !OWNER_ONLY_FILE_MODES.includes(Number(descriptorBefore.mode & 0o7777n))
+    || descriptorBefore.nlink !== 1n
+  ) {
+    throw new Error("retired project fence changed before renewal");
+  }
+  const content = readRetainedFenceBytes(fence);
+  fence.io.afterRead?.();
+  const descriptorAfter = fence.io.stat(
+    "descriptor",
+    "after",
+    fstatSync(fence.fd, { bigint: true }) as unknown as RetainedFenceIdentity,
+  );
+  const entryAfter = fence.io.stat(
+    "path",
+    "after",
+    lstatSync(path, { bigint: true }) as unknown as RetainedFenceIdentity,
+  );
+  if (
+    !content.equals(fence.expectedContent)
+    || !sameRetainedFence(descriptorBefore, descriptorAfter)
+    || !sameRetainedFence(entryBefore, entryAfter)
+    || !sameRetainedFence(descriptorAfter, entryAfter)
+    || descriptorAfter.size !== expectedSize
+    || entryAfter.size !== expectedSize
+  ) {
+    throw new Error("retired project fence changed during exact read");
+  }
+}
+
+function openRetainedFenceFile(
+  projects: PrivateDirectoryHandle,
+  oldId: string,
+  expectedUid: number,
+  options: RetiredProjectIdentityRenewalOptions,
+): RetainedFenceFile {
+  const name = basename(retiredProjectStoragePath(oldId));
+  const fd = openSync(
+    join(retainedDirectoryDescriptorPath(projects.fd), name),
+    RETAINED_FILE_FLAGS,
+  );
+  const expectedContent = Buffer.from(
+    `${JSON.stringify({ version: 1, hash: oldId, kind: "project" })}\n`,
+    "utf8",
+  );
+  const io: RetainedFenceIo = {
+    read: options._fenceReadForTesting
+      ?? ((readFd, buffer, offset, length, position) =>
+        readSync(readFd, buffer, offset, length, position)),
+    stat: options._fenceStatForTesting ?? ((_kind, _phase, stat) => stat),
+    ...(options._afterFenceReadForTesting === undefined
+      ? {}
+      : { afterRead: options._afterFenceReadForTesting }),
+  };
+  try {
+    const witness = io.stat(
+      "descriptor",
+      "before",
+      fstatSync(fd, { bigint: true }) as unknown as RetainedFenceIdentity,
+    );
+    const fence = { fd, name, expectedContent, witness, io };
+    assertRetainedFenceFile(projects, fence, expectedUid);
+    return fence;
+  } catch (error) {
+    try { closeSync(fd); } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "retired project fence admission and cleanup failed",
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+function closeRetiredIdentityRenewalEvidence(
+  evidence: MutableRetiredIdentityRenewalEvidence,
+  closeForTesting?: RetiredProjectIdentityRenewalOptions["_closeEvidenceForTesting"],
+  kinds: readonly ("fence" | "events" | "projects" | "root" | "target")[] = [
+    "fence", "events", "projects", "root", "target",
+  ],
+): unknown[] {
+  const errors: unknown[] = [];
+  const closers = [
+    ["fence", evidence.fence === undefined ? undefined : () => closeSync(evidence.fence!.fd)],
+    ["events", evidence.events === undefined ? undefined : () => evidence.events!.close()],
+    ["projects", evidence.projects === undefined ? undefined : () => evidence.projects!.close()],
+    ["root", evidence.root === undefined ? undefined : () => evidence.root!.close()],
+    ["target", evidence.target === undefined ? undefined : () => closeSync(evidence.target!.fd)],
+  ] as const;
+  for (const [kind, close] of closers) {
+    if (!kinds.includes(kind)) continue;
+    if (close === undefined) continue;
+    try {
+      if (closeForTesting === undefined) close();
+      else closeForTesting(kind, close);
+    } catch (error) { errors.push(error); }
+  }
+  return errors;
+}
+
+function openRetiredIdentityRenewalEvidence(
+  canonical: string,
+  oldId: string,
+  successorId: string,
+  options: RetiredProjectIdentityRenewalOptions,
+): RetiredIdentityRenewalEvidence {
+  const evidence: MutableRetiredIdentityRenewalEvidence = {};
+  try {
+    const expectedUid = requireSupportedProcessUid();
+    const rootPath = lcmHomeDir();
+    const projectsPath = projectsDir();
+    const eventsPath = join(rootPath, "events");
+    evidence.target = openRetainedTargetDirectory(canonical);
+    evidence.root = openPrivateDirectory(rootPath, { expectedUid });
+    evidence.projects = openPrivateDirectory(projectsPath, { expectedUid });
+    evidence.events = openPrivateDirectoryIfExists(eventsPath, { expectedUid });
+    evidence.fence = openRetainedFenceFile(
+      evidence.projects,
+      oldId,
+      expectedUid,
+      options,
+    );
+    const complete = {
+      ...evidence,
+      target: evidence.target,
+      root: evidence.root,
+      rootPath,
+      projects: evidence.projects,
+      projectsPath,
+      events: evidence.events,
+      eventsPath,
+      fence: evidence.fence,
+      successorId,
+      expectedUid,
+    } as RetiredIdentityRenewalEvidence;
+    return complete;
+  } catch (error) {
+    const cleanupErrors = closeRetiredIdentityRenewalEvidence(evidence);
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        "retired project renewal evidence admission and cleanup failed",
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+function assertRetiredIdentityRenewalEvidence(
+  evidence: RetiredIdentityRenewalEvidence,
+  requireSuccessorAbsent: boolean,
+): void {
+  assertRetainedTargetDirectory(evidence.target);
+  assertStableRetainedPrivateDirectory(
+    evidence.root,
+    evidence.rootPath,
+    evidence.root.witness,
+    evidence.expectedUid,
+  );
+  assertStableRetainedPrivateDirectory(
+    evidence.projects,
+    evidence.projectsPath,
+    evidence.projects.witness,
+    evidence.expectedUid,
+  );
+  assertRetainedPrivateChild(evidence.root, "projects", evidence.projects.witness);
+  assertRetainedFenceFile(evidence.projects, evidence.fence, evidence.expectedUid);
+  if (requireSuccessorAbsent) {
+    assertRetainedChildAbsent(evidence.projects, evidence.successorId);
+  }
+  if (evidence.events === undefined) {
+    if (requireSuccessorAbsent) assertRetainedChildAbsent(evidence.root, "events");
+  } else {
+    assertStableRetainedPrivateDirectory(
+      evidence.events,
+      evidence.eventsPath,
+      evidence.events.witness,
+      evidence.expectedUid,
+    );
+    assertRetainedPrivateChild(evidence.root, "events", evidence.events.witness);
+    if (requireSuccessorAbsent) {
+      assertRetainedChildAbsent(evidence.events, `${evidence.successorId}.db`);
+    }
+  }
+}
+
+function assertRenewableProjectEntry(
+  entry: ProjectMapEntry,
+  canonical: string,
+): void {
+  if (normalizeProjectPath(entry.canonical) !== canonical) {
+    throw new Error("retired project canonical binding changed");
+  }
+  if (entry.aliases.length !== 0) {
+    throw new Error("retired project identity renewal refuses aliases");
+  }
+  if (entry.remoteProjectId !== undefined) {
+    throw new Error("retired project identity renewal is local-only");
+  }
+}
+
+function retiredProjectStoragePath(id: string): string {
+  return join(projectsDir(), id);
+}
+
+function assertUnoccupiedRetiredProjectSuccessor(
+  map: ProjectMap,
+  successorId: string,
+): void {
+  if (map[successorId] !== undefined) {
+    throw new Error("retired project successor map identity is occupied");
+  }
+}
+
+/**
+ * Rekey one proven path-hash binding while preserving its reconciliation fence.
+ * Repeated calls recognize the same successor and return an idempotent no-op.
+ */
+export function renewRetiredProjectIdentity(
+  targetPath: string = process.cwd(),
+  options: RetiredProjectIdentityRenewalOptions = {},
+): RetiredProjectIdentityRenewal {
+  const requested = normalizeProjectPath(targetPath);
+  if (!existsSync(requested) || !statSync(requested).isDirectory()) {
+    throw new Error("retired project identity renewal requires an existing local directory");
+  }
+  // The recovery diagnostic tells the user to run this "from this project", so
+  // the invocation may come from a nested directory or a linked worktree. The
+  // map is keyed by the repository anchor that ordinary identity resolution
+  // uses, so resolve the same anchor before deriving the retired hash and
+  // looking up its map owner.
+  const canonical = normalizeProjectIdentityPath(requested);
+  const oldId = hashProjectPath(canonical);
+  const newId = retiredProjectIdentitySuccessor(oldId, canonical);
+  return withProjectMapMutationLock((publicationLockToken) => {
+    let map = loadProjectMap({
+      strict: true,
+      reload: true,
+      _publicationLockToken: publicationLockToken,
+    });
+    const owners = findPathMatches(map, canonical);
+    if (owners.size !== 1) {
+      throw new Error("retired project path must have exactly one local map owner");
+    }
+    const ownerId = [...owners][0]!;
+    const entry = map[ownerId]!;
+    assertRenewableProjectEntry(entry, canonical);
+    const idempotent = ownerId === newId;
+    if (idempotent && map[oldId] !== undefined) {
+      throw new Error("retired and successor project identities are both mapped");
+    }
+    if (!idempotent && ownerId !== oldId) {
+      throw new Error("project is not bound by its original canonical path hash");
+    }
+    if (!idempotent) assertUnoccupiedRetiredProjectSuccessor(map, newId);
+
+    const evidence = openRetiredIdentityRenewalEvidence(
+      canonical,
+      oldId,
+      newId,
+      options,
+    );
+    let primaryError: unknown;
+    let result: RetiredProjectIdentityRenewal | undefined;
+    const readRenewalMap = options._readMapFileForTesting ?? readMapFile;
+    const retainedMapWrite = (
+      phase: "publish",
+      validate: () => void,
+    ): RetainedProjectMapWrite => ({
+      parent: evidence.root,
+      beforeReplace: () => {
+        validate();
+        options._beforeMapReplaceForTesting?.(phase);
+        validate();
+      },
+    });
+    try {
+      if (readRenewalMap(projectMapPath()) === null) {
+        throw new Error("retired project map disappeared before renewal");
+      }
+      assertRetiredIdentityRenewalEvidence(evidence, !idempotent);
+      if (idempotent) {
+        result = { oldId, newId, canonical, changed: false };
+      } else {
+        options._afterValidationBeforePublicationForTesting?.();
+        map = loadProjectMap({
+          strict: true,
+          reload: true,
+          _publicationLockToken: publicationLockToken,
+        });
+        const finalOwners = findPathMatches(map, canonical);
+        if (finalOwners.size !== 1 || !finalOwners.has(oldId)) {
+          throw new Error("retired project map binding changed before renewal");
+        }
+        assertRenewableProjectEntry(map[oldId]!, canonical);
+        assertUnoccupiedRetiredProjectSuccessor(map, newId);
+        assertRetiredIdentityRenewalEvidence(evidence, true);
+        if (readMapFile(projectMapPath()) === null) {
+          throw new Error("retired project map disappeared before publication");
+        }
+
+        const renewed = cloneMap(map);
+        delete renewed[oldId];
+        renewed[newId] = { canonical, aliases: [] };
+        // The rename can expose `newId` before the writer completes its
+        // retained-parent post-check, calls `onMapPublished`, or refreshes the
+        // process cache. A reported `published` or `unknown` outcome may
+        // therefore already be visible to hooks, which resolve without this
+        // lock and can immediately materialize successor storage. Never
+        // restore `oldId` after a publication attempt: every failure before
+        // the rename leaves the retired map untouched, while every uncertain
+        // outcome must preserve the only binding hooks may have observed.
+        writeProjectMap(renewed, undefined, {
+          retainedWrite: retainedMapWrite(
+            "publish",
+            () => assertRetiredIdentityRenewalEvidence(evidence, true),
+          ),
+          onMapPublished: () => options._afterMapReplaceForTesting?.(),
+        });
+        options._afterMapPublicationForTesting?.();
+        // The atomic replace above already made `newId` the authoritative
+        // binding. Hook-side identity resolution deliberately resolves
+        // without the publication lock, so a concurrent hook that observes
+        // the published map may legitimately create the successor storage
+        // directory, the `events` directory, or `events/<newId>.db` in this
+        // window. Successor absence only proves the successor was unoccupied
+        // at the moment of the rekey, so it stays an obligation of the
+        // pre-publication validations and of the publishing write's
+        // `beforeReplace` boundary. Retained-descriptor and retained-fence
+        // authentication still run in full, so a same-UID rebinding of
+        // `.lcm`, `projects`, `events`, or the retired fence still fails
+        // closed without undoing an observable publication.
+        assertRetiredIdentityRenewalEvidence(evidence, false);
+        const readback = loadProjectMap({
+          strict: true,
+          reload: true,
+          _publicationLockToken: publicationLockToken,
+        });
+        if (
+          readback[oldId] !== undefined
+          || readback[newId] === undefined
+          || Object.keys(readback).length !== Object.keys(renewed).length
+          || !projectMapEntriesEqual(readback[newId]!, renewed[newId]!)
+        ) {
+          throw new Error("retired project identity renewal readback failed");
+        }
+        result = { oldId, newId, canonical, changed: true };
+      }
+    } catch (error) {
+      primaryError = error;
+    }
+
+    const cleanupErrors = closeRetiredIdentityRenewalEvidence(
+      evidence,
+      options._closeEvidenceForTesting,
+      ["fence", "events", "projects", "target"],
+    );
+    // A publication that passed its own readback is the authoritative
+    // binding, and a hook resolving without the publication lock may already
+    // have created the successor sidecar. Restoring the retired id because a
+    // descriptor failed to close would fence the project behind an occupied
+    // successor that every retry then refuses, so the cleanup failure is
+    // reported on its own and the renewed binding stands.
+    cleanupErrors.push(...closeRetiredIdentityRenewalEvidence(
+      evidence,
+      options._closeEvidenceForTesting,
+      ["root"],
+    ));
+    if (primaryError !== undefined) {
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [primaryError, ...cleanupErrors],
+          "retired project identity renewal and evidence cleanup failed",
+          { cause: primaryError },
+        );
+      }
+      throw primaryError;
+    }
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (cleanupErrors.length > 1) {
+      throw new AggregateError(cleanupErrors, "retired project identity evidence cleanup failed");
+    }
+    if (result === undefined) throw new Error("retired project identity renewal produced no result");
+    return result;
+  });
 }
 
 export function clearProjectMapCache(): void {
@@ -327,6 +1077,11 @@ function assertCurrentMapIsWritable(path: string): void {
   }
 }
 
+type RetainedProjectMapWrite = Readonly<{
+  parent: PrivateDirectoryHandle;
+  beforeReplace: () => void;
+}>;
+
 function writeProjectMap(
   map: ProjectMap,
   homeDir?: string,
@@ -334,18 +1089,36 @@ function writeProjectMap(
     metadataPopulated?: boolean;
     onBackupCreated?: (path: string) => void;
     onMapPublished?: () => void;
+    retainedWrite?: RetainedProjectMapWrite;
   } = {},
 ): { path: string; backupPath?: string } {
   const path = projectMapPath(homeDir);
-  ensurePrivateDirectory(dirname(path));
-  assertCurrentMapIsWritable(path);
-  const backupPath = createBackupIfNeeded(path, homeDir);
+  if (opts.retainedWrite === undefined) ensurePrivateDirectory(dirname(path));
+  else assertPrivateDirectory(
+    opts.retainedWrite.parent,
+    dirname(path),
+    opts.retainedWrite.parent.witness,
+    opts.retainedWrite.parent.witness.uid,
+  );
+  if (opts.retainedWrite === undefined) assertCurrentMapIsWritable(path);
+  const backupPath = opts.retainedWrite === undefined
+    ? createBackupIfNeeded(path, homeDir)
+    : undefined;
   if (backupPath) opts.onBackupCreated?.(backupPath);
-  atomicWritePrivateFile(path, prettyMap(map));
+  atomicWritePrivateFile(
+    path,
+    prettyMap(map),
+    {},
+    opts.retainedWrite?.parent,
+    opts.retainedWrite === undefined ? {} : { beforeReplace: opts.retainedWrite.beforeReplace },
+  );
   opts.onMapPublished?.();
+  const statPath = opts.retainedWrite === undefined
+    ? path
+    : join(retainedDirectoryDescriptorPath(opts.retainedWrite.parent.fd), basename(path));
   cache = {
     path,
-    mtimeMs: statSync(path).mtimeMs,
+    mtimeMs: statSync(statPath).mtimeMs,
     map: cloneMap(map),
     metadataPopulated: opts.metadataPopulated ?? cache?.metadataPopulated ?? false,
   };
@@ -510,6 +1283,8 @@ function loadProjectMapWithMetadata(opts: {
   strict?: boolean;
   reload?: boolean;
   homeDir?: string;
+  /** @internal Return metadata backfill in memory without publishing it. */
+  _suppressMetadataBackfill?: boolean;
   _beforeMetadataLockForTesting?: () => void;
   _beforeMetadataMutationLockForTesting?: () => void;
   _publicationLockToken?: BackendPublicationLockToken;
@@ -522,6 +1297,7 @@ function loadProjectMapWithMetadata(opts: {
 
   const populated = populateFromExistingProjectMetadata(map, opts.homeDir);
   if (populated.changed) {
+    if (opts._suppressMetadataBackfill) return populated.map;
     opts._beforeMetadataMutationLockForTesting?.();
     if (activeProjectMapMutationLocks.has(projectMapMutationLockPath(opts.homeDir))) {
       writeProjectMap(populated.map, opts.homeDir, { metadataPopulated: true });
@@ -648,6 +1424,109 @@ function existingProjectHasStoredData(hash: string): boolean {
     || existsSync(join(lcmHomeDir(), "events", `${hash}.db`));
 }
 
+/** Reject a map key that no local evidence binds to its canonical path. */
+export class UnauthenticatedProjectIdentityError extends Error {
+  constructor(readonly id: string, readonly canonical: string) {
+    super(`project map identity is not authenticated for its canonical path: ${canonical} (${id})`);
+    this.name = "UnauthenticatedProjectIdentityError";
+  }
+}
+
+/**
+ * Decide whether one map key may act as the storage identity for its path.
+ *
+ * Three grounds admit a key, and their order matters. The canonical path hash
+ * is the derivation every other code path reproduces. A renewal successor is
+ * decided solely by its retained predecessor fence: once a key has the
+ * successor shape, no other evidence may stand in for that fence, because a
+ * renewed project writes its own project metadata the first time it is opened
+ * and that metadata would otherwise re-admit a successor whose fence was lost.
+ * Only keys matching neither of the first two grounds use metadata
+ * corroboration.
+ *
+ * The metadata ground is compatibility, not a defence. A hash minted before
+ * the current path normalization does not equal hashProjectPath(canonical),
+ * and populateFromExistingProjectMetadata legitimately backfills the map from
+ * such a directory, so refusing it would reject identities this repository
+ * supports. It is not an independent trust anchor: anyone who can write
+ * map.json can usually also write projects/<id>/meta.json. What it removes is
+ * the case with no corroboration anywhere on disk, where the CLI adopted a key
+ * the hook side would never derive.
+ */
+export function isAuthenticatedProjectIdentity(
+  id: string,
+  canonical: string,
+  homeDir?: string,
+): boolean {
+  // Resolve symlinks before deriving anything. An entry reached through an
+  // alias carries its canonical path verbatim, so a symlinked canonical would
+  // otherwise authenticate the lexical path hash while the hook side derives
+  // the real target's hash.
+  //
+  // Deliberately realpath only, not the Git anchor. A legacy entry keyed by a
+  // linked worktree's own path hash is a supported shape that reconciliation
+  // still has to migrate, and anchoring here would refuse it before the
+  // legacy-storage path ever reports it.
+  const normalized = normalizeProjectPath(canonical);
+  const retiredId = hashProjectPath(normalized);
+  if (id === retiredId) return true;
+  if (isRetiredProjectIdentitySuccessor(id, retiredId, normalized)) {
+    return isAuthenticatedRetiredProjectIdentitySuccessor(id, retiredId, normalized, homeDir);
+  }
+  return projectMetadataBindsCanonical(id, normalized, homeDir);
+}
+
+/**
+ * Recognize a legacy identity corroborated by its own project metadata.
+ *
+ * The stored cwd must normalize to the same canonical path the entry claims,
+ * read through the same bounded, single-link, owner-checked reader the map
+ * backfill uses, so an unreadable or mismatched metadata file corroborates
+ * nothing. This is same-UID corroboration rather than an independent trust
+ * anchor; see isAuthenticatedProjectIdentity for what it does and does not
+ * establish.
+ */
+function projectMetadataBindsCanonical(
+  id: string,
+  canonical: string,
+  homeDir?: string,
+): boolean {
+  const dir = join(projectsDir(homeDir), id);
+  const metaPath = join(dir, "meta.json");
+  if (!existsSync(metaPath)) return false;
+  try {
+    const meta = JSON.parse(readBoundedRegularFile(metaPath, {
+      allowedRoot: dir,
+      maxBytes: 1024 * 1024,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      requireSingleLink: true,
+    })) as { cwd?: unknown };
+    return typeof meta.cwd === "string"
+      && meta.cwd.length > 0
+      && normalizeProjectPath(meta.cwd) === canonical;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Refuse a map key no derivation can produce, before it becomes an identity.
+ *
+ * A successor-shaped key deliberately passes here even when its predecessor
+ * fence is missing or tampered: admission and reconciliation already refuse it
+ * with the specific renewal diagnostic, and pre-empting them with a generic
+ * message would lose that guidance. Enumeration uses the authenticated
+ * predicate instead, so no surface presents a successor it cannot open.
+ */
+function assertDerivableProjectIdentity(id: string, canonical: string): void {
+  const normalized = normalizeProjectPath(canonical);
+  const pathHash = hashProjectPath(normalized);
+  if (id === pathHash) return;
+  if (isRetiredProjectIdentitySuccessor(id, pathHash, normalized)) return;
+  if (projectMetadataBindsCanonical(id, normalized)) return;
+  throw new UnauthenticatedProjectIdentityError(id, canonical);
+}
+
 function identityForMatches(
   map: ProjectMap,
   cwd: string,
@@ -659,9 +1538,11 @@ function identityForMatches(
   }
   if (matches.size === 0) return null;
   const id = [...matches][0];
+  const canonical = resolve(map[id].canonical);
+  assertDerivableProjectIdentity(id, canonical);
   return {
     id,
-    canonical: resolve(map[id].canonical),
+    canonical,
     ...(map[id].remoteProjectId ? { remoteProjectId: map[id].remoteProjectId } : {}),
   };
 }
@@ -677,10 +1558,13 @@ function resolveProjectIdentityUnlocked(
     readonly _beforeMetadataMutationLockForTesting?: () => void;
     /** @internal Test-only synchronization seam for missing-entry races. */
     readonly _beforeMissingIdentityLockForTesting?: () => void;
+    /** @internal Resolve against metadata backfill without publishing it. */
+    readonly _suppressMetadataBackfill?: boolean;
   } = {},
   publicationLockToken?: BackendPublicationLockToken,
 ): ProjectIdentity {
   const map = loadProjectMapWithMetadata({
+    _suppressMetadataBackfill: opts._suppressMetadataBackfill,
     _beforeMetadataLockForTesting: opts._beforeMetadataLockForTesting,
     _beforeMetadataMutationLockForTesting: opts._beforeMetadataMutationLockForTesting,
     _publicationLockToken: publicationLockToken,
@@ -698,6 +1582,7 @@ function resolveProjectIdentityUnlocked(
       current = loadProjectMapWithMetadata({
         strict: true,
         reload: true,
+        _suppressMetadataBackfill: opts._suppressMetadataBackfill,
         _publicationLockToken: publicationLockToken,
       });
     } catch (error) {
@@ -880,6 +1765,7 @@ export function showProjectMapEntry(
 function resolveCliTarget(
   opts: { canonical?: string; hash?: string },
   publicationLockToken?: BackendPublicationLockToken,
+  resolutionOpts: { readonly _suppressMetadataBackfill?: boolean } = {},
 ): { hash: string; entry: ProjectMapEntry; map: ProjectMap } {
   if (opts.canonical && opts.hash) {
     throw new Error("--canonical and --hash are mutually exclusive");
@@ -888,10 +1774,11 @@ function resolveCliTarget(
     const canonical = normalizeProjectPath(opts.canonical);
     if (!existsSync(canonical)) throw new Error(`canonical path does not exist: ${canonical}`);
     if (!statSync(canonical).isDirectory()) throw new Error(`canonical path must be an existing directory: ${canonical}`);
-    const identity = resolveProjectIdentityUnlocked(canonical, {}, publicationLockToken);
+    const identity = resolveProjectIdentityUnlocked(canonical, resolutionOpts, publicationLockToken);
     const map = loadProjectMapWithMetadata({
       strict: true,
       reload: true,
+      _suppressMetadataBackfill: resolutionOpts._suppressMetadataBackfill,
       _publicationLockToken: publicationLockToken,
     });
     return { hash: identity.id, entry: map[identity.id], map };
@@ -899,6 +1786,7 @@ function resolveCliTarget(
   const map = loadProjectMapWithMetadata({
     strict: true,
     reload: true,
+    _suppressMetadataBackfill: resolutionOpts._suppressMetadataBackfill,
     _publicationLockToken: publicationLockToken,
   });
   if (opts.hash) {
@@ -907,10 +1795,11 @@ function resolveCliTarget(
     if (!entry) throw new Error(`unknown project hash: ${opts.hash}`);
     return { hash: opts.hash, entry, map };
   }
-  const identity = resolveProjectIdentityUnlocked(process.cwd(), {}, publicationLockToken);
+  const identity = resolveProjectIdentityUnlocked(process.cwd(), resolutionOpts, publicationLockToken);
   const refreshed = loadProjectMapWithMetadata({
     strict: true,
     reload: true,
+    _suppressMetadataBackfill: resolutionOpts._suppressMetadataBackfill,
     _publicationLockToken: publicationLockToken,
   });
   return { hash: identity.id, entry: refreshed[identity.id], map: refreshed };
@@ -1166,9 +2055,17 @@ export function addProjectAlias(alias: string, opts: {
   if (!statSync(normalizedAlias).isDirectory()) throw new Error(`alias path must be an existing directory: ${normalizedAlias}`);
   return withProjectMapMutationLock((publicationLockToken) => {
     opts._afterLockForTesting?.();
-    const target = resolveCliTarget(opts, publicationLockToken);
+    const target = resolveCliTarget(opts, publicationLockToken, {
+      _suppressMetadataBackfill: true,
+    });
     assertExpectedProjectMapEntry(target.hash, target.entry, opts.expectedEntry);
     const canonical = resolve(target.entry.canonical);
+    // Refuse before any mutation. Resolution keeps metadata backfill in memory
+    // until this gate authenticates the target, so a refused link leaves the
+    // persisted map byte-identical.
+    if (!isAuthenticatedProjectIdentity(target.hash, canonical)) {
+      throw new UnauthenticatedProjectIdentityError(target.hash, canonical);
+    }
     if (normalizedAlias === canonical) {
       throw new Error(`alias matches canonical path for ${target.hash}: ${normalizedAlias}`);
     }

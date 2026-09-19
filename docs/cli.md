@@ -128,7 +128,7 @@ client for each read:
 | `lcm search <query>` | Search episodic and promoted memory |
 | `lcm grep <query>` | Search messages and summaries by exact text or regular expression; optional inclusive `--since` accepts `YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm)` with normalized UTC years 0001-9999, and malformed or out-of-range values return HTTP 400 |
 | `lcm describe <nodeId>` | Read summary or stored-memory metadata |
-| `lcm expand <nodeId>` | Expand a summary into source detail |
+| `lcm expand <nodeId>` | Traverse a summary's DAG links and list its child summaries as short snippets |
 
 When `--since` is supplied, its value is forwarded to the daemon exactly as
 provided. An empty or whitespace-only value is therefore invalid and returns
@@ -165,6 +165,9 @@ closing the temporary descriptor also fails. The ordinary replacement writer
 also retains temporary-file cleanup errors. Durable writes retain subsequent
 cleanup errors in descriptor, temporary-file, and parent-directory order.
 These diagnostics help distinguish the original failure from cleanup trouble.
+After an exclusive temporary file is opened, an identity-capture failure still
+receives exactly one close attempt. The identity error remains the primary cause
+if closing also fails, and the unauthenticated temporary name is left in place.
 
 Exclusive creation has distinct outcomes. The non-durable
 `atomicWritePrivateFileExclusive` helper preserves pre-publication failures
@@ -526,6 +529,30 @@ It does not read `meta.json` to select projects or trust unbound metadata
 directories. Missing or unsafe discovery metadata therefore does not override
 a valid binding or become a separate metadata-scan failure. Storage and schema
 failures for selected projects are still reported as described above.
+
+Discovery filters the selected binding list before assigning its denominator
+and reports `scanning project N/M` before opening each project. An exact retired
+project-identity fence is diagnosed in both dry-run and normal discovery with
+the supported `lcm project renew-retired-identity` recovery command. Dry-run
+does not renew, remove a fence, create storage, or otherwise mutate identity.
+
+Compact progress and final results preserve a sanitized, width-bounded project,
+session ID, and conversation ID. When exactly one native transcript matches the
+session, its source locator is included; ambiguous or unavailable provenance is
+omitted. Discovery resolves these locators for the whole project in bounded
+batches rather than one query per conversation, so a large project does not pay
+a per-conversation lookup. Provenance failures are isolated to the session that
+caused them: if one session's transcript metadata cannot be read, every other
+session in the same run still shows its own source locator, and only the
+unreadable session has its locator omitted. A corrupted locator that is not
+text is omitted the same way. Compaction itself never fails because provenance
+could not be read. Native TTY, verbose TTY, non-TTY, and captured ANSI output use the same
+identity formatter. Each append-only terminal line describes only that item's
+`done`, `unchanged`, `skipped`, `failed`, or `dry-run` outcome. Invocation-wide
+failures are labeled separately as `failure total`, and every mode prints a
+final summary whose Failed section lists each failed item once. A discovery
+failure contributes to the cumulative total but does not count as a processed
+session.
 
 ### Managed-daemon recovery
 

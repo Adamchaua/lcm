@@ -230,6 +230,15 @@ export interface NativeTranscriptMessageSnapshotRepository {
   ): Promise<readonly NativeTranscriptSessionMessageRecord[]>;
 }
 
+/**
+ * Maximum native sessions resolved per source-locator statement.
+ *
+ * Discovery batches its lookups so one statement stays bounded in both
+ * placeholders and returned rows regardless of how many conversations a
+ * project holds.
+ */
+export const NATIVE_SOURCE_LOCATOR_BATCH_SIZE = 100;
+
 export interface NativeTranscriptRepository {
   ingestBatch(
     input: NativeTranscriptBatchInput,
@@ -238,6 +247,18 @@ export interface NativeTranscriptRepository {
   listByNativeSession(input: {
     readonly nativeSessionId: string;
   }): Promise<NativeTranscriptRecord[]>;
+  /**
+   * Resolve one unambiguous source locator per requested native session.
+   *
+   * Backends must aggregate server-side and return at most one entry per
+   * requested session, so both the row count and the resident memory stay
+   * bounded by the request instead of by the project's transcript history.
+   * A session is omitted when it has no transcript or when its transcripts
+   * carry more than one distinct source locator.
+   */
+  listUnambiguousSourceLocators(input: {
+    readonly nativeSessionIds: readonly string[];
+  }): Promise<ReadonlyMap<string, string>>;
   listBySource(input: NativeTranscriptCheckpointKey): Promise<NativeTranscriptRecord[]>;
   listByMessage(input: {
     readonly conversationId: number;
@@ -295,6 +316,7 @@ export interface PromotedMemoryRecord {
 export interface PromotedMemoryRepository {
   insert(input: { content: string; tags?: string[]; metadata?: JsonObject; sourceSummaryId?: string; sourceProjectId?: string; sessionId?: string; depth?: number; confidence?: number }): Promise<string>;
   getById(id: string): Promise<PromotedMemoryRecord | null>;
+  findExactContent(content: string, sourceProjectId?: string): Promise<PromotedMemoryRecord | null>;
   getAll(options?: { sourceProjectId?: string; since?: string; tags?: string[] }): Promise<PromotedMemoryRecord[]>;
   listContentPrefixes(limit: number): Promise<string[]>;
   archive(id: string): Promise<void>;
@@ -302,6 +324,27 @@ export interface PromotedMemoryRepository {
   update(id: string, fields: { content?: string; confidence?: number; tags?: string[]; metadata?: JsonObject }): Promise<void>;
   findStale(options: { staleAfterDays: number; staleSurfacingWithoutUseLimit: number; sourceProjectId?: string }): Promise<Array<PromotedMemoryRecord & { surfacingCount: number; usageCount: number; daysSinceCreated: number }>>;
   revive(id: string): Promise<void>;
+}
+
+/**
+ * Serializes one project's promoted-memory deduplication decisions until the
+ * caller's transaction ends.
+ *
+ * Deduplication reads the existing candidates and then inserts when it finds
+ * none. Under READ COMMITTED neither of two concurrent transactions can see
+ * the other's uncommitted insert, so both reach the insert branch and both
+ * commit. Holding this serializer for the duration of the deciding
+ * transaction makes the second transaction wait, so its candidate read runs
+ * at a snapshot that already contains the first transaction's committed row.
+ *
+ * The grain is the project rather than the content. A finer key would let
+ * one transaction accumulate one lock per distinct content and exhaust the
+ * shared lock table on a large import, and would let two transactions take
+ * the same keys in opposite orders and deadlock. One key per project costs
+ * concurrency between unrelated contents and removes both failures.
+ */
+export interface PromotedDecisionSerializer {
+  serializeDecision(): Promise<void>;
 }
 
 export interface RecallRepository {
@@ -410,6 +453,11 @@ export interface ProjectRepositories {
 export type TransactionRepositories = ProjectRepositories & Readonly<{
   /** SQLite-private exactly-once evidence; never a canonical transfer domain. */
   migrationReceipt?: MigrationReceiptRepository;
+  /**
+   * Serializes promoted-memory deduplication decisions. Present only on
+   * backends that run concurrent root transactions on separate connections.
+   */
+  promotedDecisionSerializer?: PromotedDecisionSerializer;
 }>;
 
 export interface ProjectStorage extends ProjectRepositories {

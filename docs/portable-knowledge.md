@@ -31,7 +31,10 @@ imported from elsewhere. Import compares against that same owner scope, so an
 existing normal promotion can be merged and retains its metadata and retry
 history. A memory's origin does not grant access to another remote project.
 SQLite keeps its existing project-origin filter for this version 1 format.
-Exact content matches merge regardless of search rank on either backend.
+For PostgreSQL, owner-bound exact content matches merge even when the row is
+outside the bounded fuzzy candidate page. Repeating the same document then
+uses its stored retry identities to skip already accepted entries. SQLite keeps
+its existing source-scoped search and deduplication behavior.
 Nonidentical content still requires the configured deduplication threshold.
 
 ## Version 1 format and privacy
@@ -89,6 +92,32 @@ scrub rules. Editing an entry, moving it to a different position, or changing th
 source project makes a different import identity and invokes normal content
 deduplication. Duplicate collapse retains retry identities and existing metadata;
 canonical metadata values win conflicting keys.
+
+If another import or promotion commits a matching memory for the same project
+while an import is running, and this import's own deduplication has already
+matched that same memory, the import merges into its current stored metadata
+instead of replacing it, so the other writer's notes and retry identities
+survive rather than being overwritten. Both memories' retry identities are
+then recognized by later replays. An entry another import already committed
+just before this run observed it may still be reported as imported by this
+run; that costs no metadata and no retry identity.
+
+This protects a memory once two imports have matched it as the same memory.
+Two imports that each find no existing match for the same new content are
+also protected on PostgreSQL. The first import to reach that decision holds
+it for the rest of its transaction, so a second import running at the same
+time waits and then reads the committed memory instead of inserting a second
+copy of identical content. The second import merges into that memory exactly
+as it would have if it had matched it in the first place.
+
+This serialization is a PostgreSQL behavior. The SQLite backend runs its root
+transactions on a single connection, which already orders one import's
+decision after another's.
+
+Because an import holds this protection for its whole run, two imports into
+the same project take turns rather than running side by side, whatever
+content they carry. The second waits for the first to finish and then
+proceeds. Imports into different projects are unaffected.
 
 Successful commands exit zero. Operational failures, including failed projects
 in `export --all`, exit one. JSON output contains the requested payload; progress

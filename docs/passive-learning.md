@@ -133,6 +133,12 @@ idle restarts and converges even when a large installation revisits a sidecar
 only every 20 minutes. Until the third observation, no local `processed_at`
 checkpoint is advanced and no hook-error-ledger entry is added.
 
+When the caller already holds consumer publication admission, it forwards that
+live token through sidecar opening, missing-directory observation, and close.
+The complete parking attempt therefore reuses its already-granted admission
+without waiting on itself. A held maintenance journal continues to block
+missing-directory updates as described in the backend-publication guide.
+
 The three-observation threshold and five-minute minimum spacing are fixed
 safety constants; they are not configurable in `~/.lcm/config.json`.
 
@@ -176,6 +182,12 @@ memory recorded through a local path hash, a remote project UUID, or the manual
 The PostgreSQL project predicate still excludes memories belonging to another
 owner. SQLite keeps its existing source-project filter, so its promotion scope
 is unchanged.
+
+Promotion also performs a bounded byte-exact check inside the PostgreSQL owner
+transaction. If the exact content is outside the ranked fuzzy page, the live
+owner row is still reused and its tags and confidence are refreshed without
+creating a duplicate. Archived rows and memories owned by another project are
+excluded from this check.
 
 ### Error→Fix Correlation
 
@@ -295,6 +307,58 @@ best-effort maintenance and its promotion trigger to be skipped; the later
 restore proceeds only if its own short publication admission succeeds.
 Publication-journal errors remain fail-closed. Daemon startup and network
 requests do not retain the maintenance lock.
+
+The passive sidecar sweep applies the same boundary to orphan cleanup. For each
+sidecar that may be deleted, LCM retains publication admission while it
+authenticates the file, reads health and recent-error diagnostics, closes the
+SQLite resource, and performs the final eligibility check and removal. A local
+append cannot enter between that diagnostic snapshot and deletion. If the scan
+times out, is cancelled, loses admission, or cannot close the resource, it
+preserves the sidecar and reports it as skipped or failed. A caller that already
+owns publication admission can pass its live token through these diagnostic
+reads and cleanup without contending with itself.
+
+That orphan cleanup also enters the local append order before it takes
+publication admission. If another local append has already started, the sweep
+waits for it to finish and then scans, so a queued append completes and its
+events stay durable instead of timing out behind the sweep. A sweep whose
+caller already holds publication admission can bypass a queued tokenless
+append, because that append cannot acquire publication until the caller
+releases it, so waiting would only burn the sweep deadline. This exception
+does not bypass another frame using the same live publication token while
+that frame is still queued in tail admission: those queued frames remain
+ordered, and the later frame waits for the earlier admitted frame before it
+attempts the fail-fast local append lock. An intermediate same-token frame
+that times out or is cancelled while waiting does not release the frames
+behind it: the unresolved earlier admitted frame is carried forward, so a
+later frame still waits for it. A same-token call made after the
+earlier frame's append callback has already started does not wait: it takes
+the reentrant fast path and runs nested under the earlier frame's held
+append lock, so the two callbacks can overlap. Serializing that post-entry
+case would deadlock, since the earlier callback cannot finish while blocked
+on the nested call. The sweep still
+takes that lock and runs the append-admission phase check. Tokenless appends
+that arrive later remain queued behind the complete append tail. Be precise
+about what that phase check is: it is not the
+consumer gate, because a live caller token short-circuits the consumer lock,
+and the phase check itself permits maintenance-held as the narrow append
+capability. The exception path therefore does not refuse on its own account.
+Maintenance is still protected, but by admission exclusion rather than by this
+path: entering maintenance takes the same publication flock the caller holds,
+so a live consumer token cannot be minted while maintenance holds publication.
+The refusal described below is the one that applies to a sweep owning no
+caller admission. The sweep holds one
+retained admission from the diagnostic snapshot through the real close, the
+final eligibility check, and deletion. That admission grants no implicit append
+authority: an append started underneath the scan, such as one triggered during
+close, still queues normally and cannot write between the snapshot and the
+prune decision. Cancellation and the scan deadline are both honored before the
+scan opens anything, in which case the sidecar is reported as skipped and is
+never opened, closed, or pruned. Contention with an unrelated publication
+remains a per-sidecar error, and the sweep continues with the next sidecar.
+A sweep that owns no caller admission still refuses to run while a backend
+migration holds publication, so maintenance keeps its existing protection and
+no sidecar is deleted underneath it.
 
 - **Promoted store**: Events promoted via `deduplicateAndInsert()` into the main LCM database
   - Tagged with `source:passive-capture` and `hook:<PostToolUse|UserPromptSubmit>`

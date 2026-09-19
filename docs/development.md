@@ -1,7 +1,7 @@
 # Developing LCM
 
 LCM development uses pnpm for dependency installation and scripts. Node.js
-22.12.0 or newer remains the runtime. npm remains responsible for consumer
+25.4.0 or newer remains the runtime. npm remains responsible for consumer
 installation, tarball creation, registry checks, and publication.
 
 ## Bootstrap the verified package manager
@@ -43,13 +43,13 @@ bin directory at the front of `PATH` for nested scripts as well.
 `pnpm-lock.yaml` is authoritative. Clean development and CI installs use
 `pnpm install --frozen-lockfile`, which refuses manifest/lockfile drift. Do not
 recreate `package-lock.json`. `.npmrc` sets exact saves, isolated linking, and
-pre/post script execution. `pnpm-workspace.yaml` scopes the workspace to the
-root. Its exact overrides retain the established `read-yaml-file` 2.1.0
-resolution, keep AJV on the patched `fast-uri` 3.1.7 line without collapsing the
-separate direct 4.x parser, and hold both Express and `body-parser` on patched
-`qs` 6.16.0. Revisit the parser overrides whenever a later security release is
-required. Dependency build scripts remain limited to `esbuild` and optional
-macOS `fsevents`.
+pre/post script execution. `package.json` is the canonical source for direct,
+development, and optional peer pins; `pnpm-workspace.yaml` is the canonical
+source for workspace overrides and permitted build scripts. Those overrides
+retain the parser fixes for AJV, Express, and `body-parser` without exposing
+their build graph to consumers. Revisit the parser overrides whenever a later
+security release is required. Dependency build scripts remain limited to
+`esbuild` and optional macOS `fsevents`.
 
 Before adding a dependency, assess its exact version and transitive findings
 with `socket package score <ecosystem> <name>@<version> --json`. Add approved
@@ -73,6 +73,19 @@ pnpm run update:patterns
 checkout using the existing Node TypeScript invocation; it needs a Node
 version that supports that invocation. It is not an installed-package command.
 
+Local Vitest runs default to one worker in the main configuration and the separate
+PostgreSQL configuration. Only the exact values `CI=true` and `CI=1` retain the
+existing CI sizing. For an agent's focused run, use an explicit allocation:
+
+```bash
+pnpm exec vitest run test/vitest-worker-budget.test.ts --maxWorkers=1
+```
+
+The coordinator may assign a larger allocation within known host capacity; verify
+the effective project limits before using it. Do not set `CI` locally to bypass
+worker limits. A worker cap does not bound subprocesses created inside a test, so
+commands also need finite deadlines and ownership through descendant cleanup.
+
 Run focused tests for changed code and its direct integration boundaries
 locally. Fresh exact-head CI must pass `pnpm run test:ci` with 100% lines,
 branches, functions, and statements for every collected production TypeScript
@@ -87,6 +100,11 @@ Use the repository's [triage-fix-all-bugs skill](triage-fix-all-bugs.md) for an
 S0-frozen campaign covering every currently open native GitHub Bug issue. It
 performs inventory agreement, duplicate adjudication, and triage before handing
 accepted work to [procedural development](procedural-development.md).
+
+Use [triage-security-issues](triage-security-issues.md) for existing Dependabot,
+Code Scanning, Secret Scanning and Codex Security cloud alerts. It invokes the
+existing assessment and delivery skills after complete triage and cross-source
+grouping, with private campaign records and Daybreak Blue security workers.
 
 Use [procedural development](procedural-development.md) for a direct GitHub
 issue or a bounded inventory supplied by a caller. It defines the shared role
@@ -150,13 +168,14 @@ directory and therefore does not sweep pre-existing orphans in the ambient
 temporary root. On a host with a valid ambient `.git`, tests no longer share
 that repository identity.
 
-The two large portable-record boundary test files run in the ordered
+The portable boundary test files run in the ordered
 `unit-portable-boundaries` Vitest project after the ordinary unit project. The
 project uses `fileParallelism: false`, so Vitest admits one worker for the
-128 MiB record and 144 MiB batch fixtures even when the command enables more
-workers for other projects. This prevents those two memory-heavy files from
-overlapping with each other or with ordinary unit workers while preserving
-their exact limits and deadlines. Serial admission does not reduce the bytes
+128 MiB record and 144 MiB batch fixtures, and for the two `sqlite-portable`
+files that build migrated databases and stream whole-file digests, even when
+the command enables more workers for other projects. This prevents those
+memory- and fsync-heavy files from overlapping with each other or with
+ordinary unit workers while preserving their exact limits and deadlines. Serial admission does not reduce the bytes
 allocated by an individual test and cannot guarantee immunity from external
 CPU or memory starvation.
 
@@ -172,10 +191,10 @@ invoke `node dist/lcm.mjs ...`.
 
 Source checkouts run the SQLite diagnostic child from its TypeScript asset with
 explicit type-stripping and SQLite runtime flags. Built packages run the
-compiled JavaScript asset with the SQLite flag required by the minimum supported
-Node.js 22.12 runtime. Both launch forms use an empty child environment and do
-not inherit parent preload arguments. Current Node releases may no longer
-require these compatibility flags, but continue to accept them.
+compiled JavaScript asset with the same SQLite flag. Supported Node.js
+runtimes expose `node:sqlite` without it, so the flag is retained only because
+those runtimes still accept it. Both launch forms use an empty child
+environment and do not inherit parent preload arguments.
 
 To install the built package, use an exact tarball rather than a global link:
 

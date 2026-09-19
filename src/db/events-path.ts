@@ -2,7 +2,10 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { localProjectIdentity } from "../daemon/project.js";
 import {
+  UnauthenticatedProjectIdentityError,
   hashProjectPath,
+  isAuthenticatedRetiredProjectIdentitySuccessor,
+  isRetiredProjectIdentitySuccessor,
   normalizeProjectIdentityPath,
   normalizeProjectPath,
   resolveExistingProjectIdentity,
@@ -39,6 +42,21 @@ type ExistingEventsDbPathOptions = Readonly<{
 
 function effectiveUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+/**
+ * Authenticate an identity-evidence id against its own canonical path. A
+ * plain path-hash id always matches, exactly as before. A renewed successor
+ * id (see `retiredProjectIdentitySuccessor`) is authenticated only when the
+ * retained predecessor fence for that same retirement is genuinely present,
+ * mirroring the identical `isAuthenticatedRetiredProjectIdentityFence` proof
+ * that `parseLocalProjectMapCompatibility` already requires before it will
+ * ever hand a hook that successor id. Any other id is rejected.
+ */
+function isAuthenticatedIdentityEvidenceId(canonical: string, id: string): boolean {
+  const plainId = hashProjectPath(canonical);
+  if (id === plainId) return true;
+  return isAuthenticatedRetiredProjectIdentitySuccessor(id, plainId, canonical);
 }
 
 function identityEvidencePath(normalizedCwd: string): string {
@@ -98,7 +116,7 @@ function existingSidecarFromIdentityEvidence(
       || resolve(record.canonical) !== record.canonical
       || typeof record.id !== "string"
       || !PROJECT_ID_PATTERN.test(record.id)
-      || hashProjectPath(record.canonical) !== record.id
+      || !isAuthenticatedIdentityEvidenceId(record.canonical, record.id)
     ) {
       return undefined;
     }
@@ -124,6 +142,27 @@ export function eventsDbPath(cwd: string): string {
 }
 
 /**
+ * Resolve only an identity this probe is allowed to act on.
+ *
+ * The probe must stay usable while recovering an unavailable working
+ * directory, so a map key that no local evidence binds to the path is treated
+ * as no identity rather than as an error. The caller then falls back to the
+ * sidecar the canonical path derives, instead of opening whichever sidecar an
+ * unauthenticated key names.
+ */
+function authenticatedExistingProjectIdentity(
+  cwd: string,
+  publicationLockToken?: BackendPublicationLockToken,
+): ReturnType<typeof resolveExistingProjectIdentity> {
+  try {
+    return resolveExistingProjectIdentity(cwd, publicationLockToken);
+  } catch (error) {
+    if (error instanceof UnauthenticatedProjectIdentityError) return null;
+    throw error;
+  }
+}
+
+/**
  * Derive a sidecar path only from identity or sidecar state that already
  * exists. This must remain read-only because callers use it while recovering
  * unavailable working directories.
@@ -132,7 +171,7 @@ export function existingEventsDbPath(
   cwd: string,
   options: ExistingEventsDbPathOptions = {},
 ): string | undefined {
-  const identity = resolveExistingProjectIdentity(cwd, options.publicationLockToken);
+  const identity = authenticatedExistingProjectIdentity(cwd, options.publicationLockToken);
   const directory = eventsDir();
   const expectedUid = options._effectiveUidForTesting?.() ?? effectiveUid();
   let handle: ReturnType<typeof openPrivateDirectory>;
@@ -152,7 +191,19 @@ export function existingEventsDbPath(
     try {
       assertPrivateDirectory(handle, directory, witness);
       if (identity) {
-        result = join(directory, `${identity.id}.db`);
+        const retiredId = hashProjectPath(identity.canonical);
+        const successorUnauthenticated = isRetiredProjectIdentitySuccessor(
+          identity.id,
+          retiredId,
+          identity.canonical,
+        ) && !isAuthenticatedRetiredProjectIdentitySuccessor(
+          identity.id,
+          retiredId,
+          identity.canonical,
+        );
+        result = successorUnauthenticated
+          ? undefined
+          : join(directory, `${identity.id}.db`);
       } else {
         const evidenced = existingSidecarFromIdentityEvidence(cwd, expectedUid);
         if (evidenced) {
