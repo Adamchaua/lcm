@@ -90,6 +90,7 @@ import {
   BackendPublicationCoordinator,
   type BackendPublicationLockToken,
   type BackendMaintenanceRosterEntry,
+  type BackendMaintenanceJournal,
 } from "../storage/backend-publication.js";
 import {
   MigrationProtocolError,
@@ -145,6 +146,18 @@ function describeUnresolvable(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * donadiosolutions/lcm#1432. The exact, distinguishable reason
+ * readBackendPublicationOperabilityFact reports when a maintenance
+ * journal (terminal or not) holds the live slot -- the ONE unresolvable
+ * cause that is expected and recoverable from the durable rollback-
+ * authority artifact (see resolveRollbackOperabilityFact below). Named
+ * here, as a single source of truth, so the two sites (the producer
+ * below and the recovery fallback) cannot silently drift apart.
+ */
+const MAINTENANCE_HOLDS_LIVE_SLOT_REASON =
+  "backend maintenance holds the live publication slot; no publication journal is readable";
+
 export async function readBackendPublicationOperabilityFact(
   input: Readonly<{ homeDir?: string; lockToken?: BackendPublicationLockToken }>,
 ): Promise<OperabilityFactResolution> {
@@ -165,7 +178,7 @@ export async function readBackendPublicationOperabilityFact(
         if (maintenance !== null) {
           return {
             state: "unresolvable" as const,
-            reason: "backend maintenance holds the live publication slot; no publication journal is readable",
+            reason: MAINTENANCE_HOLDS_LIVE_SLOT_REASON,
           };
         }
         let journal;
@@ -275,6 +288,247 @@ export function deriveRollbackReportId(input: Readonly<{
   kind: "rollback" | "abandonment";
 }>): string {
   return sha256(canonicalJson(["rollback-report-v1", input.generationId, input.effectId, input.kind]));
+}
+
+// ---------------------------------------------------------------------------
+// The durable rollback-authority artifact. donadiosolutions/lcm#1432.
+//
+// NOT a MigrationReportReference-bound report, deliberately: a report
+// inherits the protocol's createdAt-within-[pending.startedAt,completedAt]
+// bound (protocol.ts:748-751), which only exists once an effect is
+// pending. This artifact must be written BEFORE enterMaintenance (step
+// 2) -- before prepare-rollback (step 7) ever begins -- so it can never
+// be bound to one. Binding it to prepare-rollback would only have
+// closed the window between step 7 and step 8, trading a large hole (any
+// crash from step 2 onward) for a smaller one (a crash between step 2
+// and step 7, where maintenance is held, no artifact yet exists, and the
+// not-yet-completed prepare-rollback effect cannot be abandoned once
+// begun) -- that trade is what this design corrects.
+//
+// Immutable, 0400, private, canonical ASCII with a trailing
+// checksumSha256 -- the same D1 discipline every other artifact this
+// file writes uses. Deterministic identity keyed on generationId ALONE:
+// no clock, fencing token, owner pid, census or delta digest, per
+// contract section 8, so a retry rewrites byte-identical content and the
+// write is idempotent for free. generationId alone is a sufficient key
+// because exactly one artifact is ever legitimate per generationId
+// across its entire lifetime: it is written once, before the ONE
+// prepare-rollback effect protocol.ts's legalEffect table permits for a
+// generationId ever exists (phase "rolling-back" is reachable from
+// "verified"/"active" through prepare-rollback only, and "rolled-back",
+// the only phase reachable from "rolling-back", is terminal with no
+// outbound transition), and every retry before that effect completes is
+// retrying that SAME resolution, never a different one.
+// ---------------------------------------------------------------------------
+
+const MAX_ROLLBACK_AUTHORITY_ARTIFACT_BYTES = 4 * 1024;
+
+export type RollbackAuthorityArtifactBody = Readonly<{
+  version: 1;
+  generationId: string;
+  /**
+   * The OperabilityFactResolution this generation's rollback resolved at
+   * step 1, before enterMaintenance archived it out of the live slot.
+   * Never "unresolvable": an unresolvable operability fact refuses
+   * before this artifact is ever written (resolveActivationAuthority's
+   * row 4), so nothing reaches the write with that state.
+   */
+  operabilityFactState: "present" | "authoritatively-absent";
+  /** Present only when operabilityFactState is "present". */
+  operabilityFactValueSha256: string | null;
+  authorityStatus: "unactivated" | "authoritative";
+  /** Present only when authorityStatus is "authoritative". */
+  epochId: string | null;
+  attemptId: string | null;
+  checksumSha256: string;
+}>;
+
+/**
+ * donadiosolutions/lcm#1432. Deliberately DIFFERENT in shape from
+ * {@link deriveRollbackReportId} above: this derives from generationId
+ * ALONE, matching the artifact's own "exactly one, ever" identity rule
+ * stated in this section's header comment.
+ */
+export function deriveRollbackAuthorityArtifactId(generationId: string): string {
+  return sha256(canonicalJson(["rollback-authority-artifact-v1", generationId]));
+}
+
+function rollbackAuthorityArtifactDirectory(homeDir: string): string {
+  return join(resolve(homeDir), ".lcm", "migration-rollback-authority");
+}
+
+function rollbackAuthorityArtifactPath(homeDir: string, generationId: string): string {
+  return join(rollbackAuthorityArtifactDirectory(homeDir), deriveRollbackAuthorityArtifactId(generationId) + ".json");
+}
+
+function rollbackAuthorityArtifactChecksum(body: Omit<RollbackAuthorityArtifactBody, "checksumSha256">): string {
+  return sha256(canonicalJson(body as unknown as Record<string, unknown>));
+}
+
+/**
+ * Writes the artifact, idempotently: a retry regenerates byte-identical
+ * content (every field is deterministic given the SAME resolved fact and
+ * authority) and this function treats an existing file with matching
+ * bytes as success. A mismatch -- two DIFFERENT resolutions colliding on
+ * one generationId, which can only mean the live fact or authority
+ * genuinely changed between writes -- throws rather than silently
+ * overwriting immutable evidence.
+ */
+export function writeRollbackAuthorityArtifact(
+  homeDir: string,
+  body: Omit<RollbackAuthorityArtifactBody, "checksumSha256">,
+): RollbackAuthorityArtifactBody {
+  const artifact: RollbackAuthorityArtifactBody = { ...body, checksumSha256: rollbackAuthorityArtifactChecksum(body) };
+  const path = rollbackAuthorityArtifactPath(homeDir, body.generationId);
+  ensurePrivateDirectory(rollbackAuthorityArtifactDirectory(homeDir));
+  try {
+    atomicWritePrivateFileDurable(path, canonicalJson(artifact), {
+      finalMode: 0o400,
+      requireAbsent: true,
+      maxExistingBytes: MAX_ROLLBACK_AUTHORITY_ARTIFACT_BYTES,
+    });
+    return artifact;
+  } catch (error) {
+    const existing = readRollbackAuthorityArtifact(homeDir, body.generationId);
+    if (existing !== null && existing.checksumSha256 === artifact.checksumSha256) return existing;
+    throw error;
+  }
+}
+
+export function readRollbackAuthorityArtifact(
+  homeDir: string,
+  generationId: string,
+): RollbackAuthorityArtifactBody | null {
+  const path = rollbackAuthorityArtifactPath(homeDir, generationId);
+  let content: string;
+  try {
+    content = Buffer.from(
+      readBoundedRegularFileWithStat(path, {
+        allowedRoot: rollbackAuthorityArtifactDirectory(homeDir),
+        maxBytes: MAX_ROLLBACK_AUTHORITY_ARTIFACT_BYTES,
+        allowedModes: [0o400],
+        requireSingleLink: true,
+      }).content,
+    ).toString("utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  const parsed = JSON.parse(content) as RollbackAuthorityArtifactBody;
+  const { checksumSha256, ...rest } = parsed;
+  if (rollbackAuthorityArtifactChecksum(rest) !== checksumSha256) {
+    throw new MigrationProtocolError("checksum-mismatch", "rollback authority artifact checksum does not match");
+  }
+  return parsed;
+}
+
+function sameOperabilityFactValue(
+  live: Readonly<{ state: "present" | "authoritatively-absent"; valueSha256?: string }>,
+  artifact: RollbackAuthorityArtifactBody,
+): boolean {
+  if (live.state !== artifact.operabilityFactState) return false;
+  if (live.state === "present") return live.valueSha256 === artifact.operabilityFactValueSha256;
+  return true;
+}
+
+/**
+ * donadiosolutions/lcm#1432. The single reader every rollback code path
+ * uses to resolve the operability fact, so the fallback-and-cross-check
+ * rule is implemented exactly once rather than once per call site:
+ *
+ * 1. A resolvable live read (present/authoritatively-absent) is used,
+ *    and cross-checked against the durable artifact when one already
+ *    exists -- disagreement refuses rather than preferring either side,
+ *    per section 15's "compared as a value, never inferred from
+ *    ordering or timing" discipline.
+ * 2. An unresolvable live read falls back to the durable artifact ONLY
+ *    when the reason is EXACTLY MAINTENANCE_HOLDS_LIVE_SLOT_REASON --
+ *    the expected, structural cause once this rollback's own
+ *    enterMaintenance has run -- never any other unresolvable cause
+ *    (lock contention, malformed journal, ...), which stays a refusal.
+ * 3. No artifact and an unresolvable live read for that expected reason
+ *    refuses: structurally this should not happen for THIS generation's
+ *    own maintenance (the artifact is always written before its
+ *    enterMaintenance call), so it can only mean the live slot is held
+ *    by something unrelated to this rollback, and there is nothing to
+ *    recover from.
+ */
+async function resolveRollbackOperabilityFact(
+  input: Readonly<{ homeDir: string; generationId: string }>,
+): Promise<Readonly<{ fact: OperabilityFactResolution; artifact: RollbackAuthorityArtifactBody | null }>> {
+  const live = await readBackendPublicationOperabilityFact({ homeDir: input.homeDir });
+  const artifact = readRollbackAuthorityArtifact(input.homeDir, input.generationId);
+  if (live.state !== "unresolvable") {
+    if (artifact !== null && !sameOperabilityFactValue(live, artifact)) {
+      return {
+        fact: {
+          state: "unresolvable",
+          reason: "the live operability fact disagrees with the durable rollback-authority artifact",
+        },
+        artifact,
+      };
+    }
+    return { fact: live, artifact };
+  }
+  if (live.reason !== MAINTENANCE_HOLDS_LIVE_SLOT_REASON) {
+    return { fact: live, artifact };
+  }
+  if (artifact === null) {
+    return {
+      fact: {
+        state: "unresolvable",
+        reason: "backend maintenance holds the live publication slot and no durable "
+          + "rollback-authority artifact exists to recover the fact from",
+      },
+      artifact: null,
+    };
+  }
+  return {
+    fact: artifact.operabilityFactState === "present"
+      ? { state: "present", valueSha256: artifact.operabilityFactValueSha256 ?? "" }
+      : { state: "authoritatively-absent" },
+    artifact,
+  };
+}
+
+/**
+ * donadiosolutions/lcm#1432. The artifact is immutable and every reader
+ * only reads it, never rewrites it -- but it is not blindly trusted
+ * either: this cross-checks the authority recomputed from a FRESH
+ * Boundary A read (independent of the archived-publication-slot problem
+ * resolveRollbackOperabilityFact exists to recover from) against the
+ * epoch/attempt the artifact recorded, and refuses rather than
+ * preferring either side when they disagree. A null artifact (the first
+ * time this generationId's rollback ever reaches this point) has nothing
+ * to check against and is not an error.
+ */
+function assertAuthorityAgreesWithArtifact(
+  authority: Exclude<ActivationAuthority, Readonly<{ status: "refused"; reason: string }>>,
+  artifact: RollbackAuthorityArtifactBody | null,
+): void {
+  if (artifact === null) return;
+  if (authority.status === "unactivated") {
+    if (artifact.authorityStatus !== "unactivated") {
+      throw new RollbackOrchestrationError(
+        "unexpected-state",
+        "freshly resolved authority is unactivated but the durable rollback-authority "
+          + "artifact recorded an authoritative epoch/attempt",
+      );
+    }
+    return;
+  }
+  // authority.status === "authoritative"
+  if (
+    artifact.authorityStatus !== "authoritative"
+    || authority.selection.epochId !== artifact.epochId
+    || authority.selection.attemptId !== artifact.attemptId
+  ) {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "freshly resolved authority disagrees with the durable rollback-authority artifact's "
+        + "recorded epoch/attempt",
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -659,10 +913,54 @@ function publishManifest(
  *    unconditional across every eligibility, which is what makes
  *    pre-write and unactivated a real "selection reversal" rather than a
  *    no-op.
- *  - Best-effort, flagged as needing review rather than presented as
- *    settled: step 12's abandonment path's explicit backend-selection
- *    reconciliation (see recoverPendingPublishRollback below).
+*  - Best-effort, flagged as needing review rather than presented as
+*    settled: step 12's abandonment path's explicit backend-selection
+*    reconciliation (see recoverPendingPublishRollback below).
+*/
+
+/**
+ * donadiosolutions/lcm#1432. True only when "existing" is a durable,
+ * non-terminal maintenance journal that matches every field THIS
+ * generationId's rollback would itself supply to enterMaintenance --
+ * meaning it can only be OUR OWN maintenance, held by a crashed prior
+ * attempt of this SAME rollback, never a different or unrelated one.
+ * Deliberately conservative: any mismatch (including roster order,
+ * compared order-invariantly below) falls through to calling
+ * enterMaintenance normally, which refuses loudly rather than this
+ * function silently adopting a maintenance it cannot prove is ours.
  */
+function maintenanceAlreadyHeldForThisAttempt(
+  existing: BackendMaintenanceJournal | null,
+  attempt: Readonly<{
+    publicationId: string;
+    generationId: string;
+    sourceSelectionSha256: string;
+    queueEvidenceSha256: string;
+    roster: readonly BackendMaintenanceRosterEntry[];
+  }>,
+): boolean {
+  if (existing === null || existing.phase !== "maintenance-held") return false;
+  return existing.publicationId === attempt.publicationId
+    && existing.generationId === attempt.generationId
+    && existing.sourceSelectionSha256 === attempt.sourceSelectionSha256
+    && existing.queueEvidenceSha256 === attempt.queueEvidenceSha256
+    && sameMaintenanceRoster(existing.roster, attempt.roster);
+}
+
+function sortedMaintenanceRoster(
+  roster: readonly BackendMaintenanceRosterEntry[],
+): readonly BackendMaintenanceRosterEntry[] {
+  return [...roster].sort((a, b) => (a.machineId < b.machineId ? -1 : a.machineId > b.machineId ? 1 : 0));
+}
+
+function sameMaintenanceRoster(
+  left: readonly BackendMaintenanceRosterEntry[],
+  right: readonly BackendMaintenanceRosterEntry[],
+): boolean {
+  return canonicalJson(sortedMaintenanceRoster(left) as unknown as readonly Record<string, unknown>[])
+    === canonicalJson(sortedMaintenanceRoster(right) as unknown as readonly Record<string, unknown>[]);
+}
+
 export async function runMigrationRollback(
   input: Readonly<RunMigrationRollbackInput>,
   deps: Readonly<RunMigrationRollbackDependencies>,
@@ -704,7 +1002,16 @@ export async function runMigrationRollback(
   // (step 2 below), never after -- see readBackendPublicationOperabilityFact's
   // own doc comment on why. Boundary A's witness resolution is read
   // alongside it so both observations describe the same instant.
-  const operabilityFact = await readBackendPublicationOperabilityFact({ homeDir: input.homeDir });
+  // donadiosolutions/lcm#1432: resolveRollbackOperabilityFact (rather
+  // than the bare live reader) so a RETRY of this same fresh/resume path
+  // -- reached after a crash anywhere from here through step 8, where
+  // enterMaintenance has already run and archived the live slot -- falls
+  // back to the durable rollback-authority artifact instead of observing
+  // "unresolvable" and refusing permanently.
+  const { fact: operabilityFact, artifact: priorAuthorityArtifact } = await resolveRollbackOperabilityFact({
+    homeDir: input.homeDir,
+    generationId: input.generationId,
+  });
   const witnessResolution = deps.resolveWitnessBindings({
     homeDir: input.homeDir,
     generationId: input.generationId,
@@ -712,6 +1019,17 @@ export async function runMigrationRollback(
   const authority = resolveActivationAuthority({ resolution: witnessResolution, operabilityFact });
   if (authority.status === "refused") {
     throw new RollbackOrchestrationError("not-eligible", authority.reason);
+  }
+  assertAuthorityAgreesWithArtifact(authority, priorAuthorityArtifact);
+  if (operabilityFact.state === "unresolvable") {
+    // Unreachable: resolveActivationAuthority's row 4 refuses (and
+    // returns above) whenever operabilityFact.state is "unresolvable".
+    // Stated as a runtime assertion, not just a comment, because the
+    // artifact write two lines below must never persist that state.
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "internal: authority resolved non-refused with an unresolvable operability fact",
+    );
   }
 
   let authoritativeContext: RollbackAuthoritativeContext | null = null;
@@ -729,19 +1047,65 @@ export async function runMigrationRollback(
     }
   }
 
+  // donadiosolutions/lcm#1432: persist the durable rollback-authority
+  // artifact BEFORE entering maintenance (step 2) -- see this artifact's
+  // own module doc comment for why it must live here rather than between
+  // steps 7 and 8. Idempotent: a retry regenerates byte-identical
+  // content (operabilityFact/authority above are unchanged from any
+  // prior write for this generationId, per the cross-check just above).
+  writeRollbackAuthorityArtifact(input.homeDir, {
+    version: 1,
+    generationId: input.generationId,
+    operabilityFactState: operabilityFact.state,
+    operabilityFactValueSha256: operabilityFact.state === "present" ? operabilityFact.valueSha256 : null,
+    authorityStatus: authority.status,
+    epochId: authority.status === "authoritative" ? authority.selection.epochId : null,
+    attemptId: authority.status === "authoritative" ? authority.selection.attemptId : null,
+  });
+
   return withBackendPublicationAppendBarrierAsync(input.homeDir, async (token) => {
     let working = current;
 
     // Step 2: enterMaintenance under the retained token.
+    //
+    // donadiosolutions/lcm#1432 (closing the same window from the other
+    // side). enterMaintenance refuses ("unresolved-publication") when a
+    // non-terminal maintenance journal already exists -- it only
+    // idempotently resumes its OWN "maintenance-entering" sub-phase, per
+    // its own doc comment and coordinator-seam-FROZEN.md section 3. A
+    // crash anywhere from here through step 8 leaves maintenance durably
+    // "maintenance-held", so a fresh retry that always calls
+    // enterMaintenance again -- as this line did before -- fails on
+    // exactly the crash window the durable rollback-authority artifact
+    // above was introduced to recover, for a DIFFERENT reason than the
+    // operability-fact one: not an unresolvable fact, but a coordinator
+    // refusal to re-enter a maintenance it (correctly) does not know is
+    // this SAME attempt's own. This file does not own backend-publication.ts
+    // and cannot teach enterMaintenance a new idempotent-resume branch,
+    // so the check is made here instead: if a held maintenance journal
+    // already matches every field THIS call would have supplied, it is
+    // adopted as-is rather than re-entered. A mismatch on any field (a
+    // genuinely different or unrelated maintenance) is deliberately left
+    // to enterMaintenance's own call below, which refuses loudly rather
+    // than this function guessing whose maintenance it is.
     const publicationId = deriveRollbackPublicationId(input.generationId);
-    const maintenanceJournal = await deps.coordinator.enterMaintenance({
+    const existingMaintenance = readBackendMaintenanceJournal(input.homeDir);
+    const maintenanceJournal = maintenanceAlreadyHeldForThisAttempt(existingMaintenance, {
       publicationId,
       generationId: input.generationId,
       sourceSelectionSha256: input.sourceSelectionSha256,
       queueEvidenceSha256: input.queueEvidenceSha256,
       roster: input.roster,
-      now: now(),
-    }, token);
+    })
+      ? existingMaintenance!
+      : await deps.coordinator.enterMaintenance({
+        publicationId,
+        generationId: input.generationId,
+        sourceSelectionSha256: input.sourceSelectionSha256,
+        queueEvidenceSha256: input.queueEvidenceSha256,
+        roster: input.roster,
+        now: now(),
+      }, token);
 
     // Step 3: acquire the fenced PostgreSQL session (Boundary F).
     const session = await deps.openFencedSession({ homeDir: input.homeDir, manifest: working });
@@ -770,12 +1134,32 @@ export async function runMigrationRollback(
         throw new RollbackOrchestrationError("not-eligible", decision.reason);
       }
 
-      // Step 7: begin prepare-rollback with a deterministic inputSha256.
-      const epochIdForInput = authority.status === "authoritative" ? authority.selection.epochId : null;
+     // Step 7: begin prepare-rollback with a deterministic inputSha256.
+     const epochIdForInput = authority.status === "authoritative" ? authority.selection.epochId : null;
+      // donadiosolutions/lcm#1432, a third independent defect found while
+      // building the resume tests this fix requires: on a "resume"
+      // (classifyMigrationRecovery's retry-idempotent action, reached
+      // when a crashed prior attempt's begin already landed durably),
+      // "working" here is the manifest AFTER that begin -- one revision
+      // past the "verified"/"active" state the crashed attempt actually
+      // computed prepareInputSha256 from. Recomputing from working.revision
+      // /working.checksumSha256 unconditionally therefore used the WRONG
+      // baseline on every resume and could never match the stored
+      // pendingEffect.inputSha256, making every resume of a pending
+      // prepare-rollback refuse permanently below -- unreachable via any
+      // committed test before this continuation added one. The correct
+      // baseline is one revision back, which working.previousManifestSha256
+      // already names exactly (it is the checksum of the immediate
+      // predecessor manifest, i.e. the pre-begin state) whenever a pending
+      // effect exists.
+      const prepareInputBaselineRevision = working.pendingEffect === null ? working.revision : working.revision - 1;
+      const prepareInputBaselineChecksumSha256 = working.pendingEffect === null
+        ? working.checksumSha256
+        : working.previousManifestSha256!;
       const prepareInputSha256 = deriveRollbackPrepareInputSha256({
         generationId: input.generationId,
-        manifestRevision: working.revision,
-        manifestChecksumSha256: working.checksumSha256,
+        manifestRevision: prepareInputBaselineRevision,
+        manifestChecksumSha256: prepareInputBaselineChecksumSha256,
         epochId: epochIdForInput,
         resourceType: session.selectionAuthority.resourceType,
         resourceKey: session.selectionAuthority.resourceKey,
@@ -1094,6 +1478,20 @@ async function runPostPrepareSequence(
  * process (the original one may have crashed or simply exited after
  * step 8), so it acquires a fresh retained token and a fresh fenced
  * session rather than reusing anything from a prior attempt.
+ *
+ * donadiosolutions/lcm#1432. This function MUST NOT call
+ * readBackendPublicationOperabilityFact directly: the original attempt's
+ * own enterMaintenance (step 2) already archived the live publication
+ * slot out of view by the time this phase is ever reached, so a live
+ * re-read here always observes the still-held maintenance journal and
+ * answers "unresolvable". resolveRollbackOperabilityFact recognizes
+ * exactly that expected cause and falls back to the durable rollback-
+ * authority artifact written before enterMaintenance ever ran; any OTHER
+ * unresolvable cause, or a disagreement between a resolvable live read
+ * and the artifact, still refuses. Boundary A is read fresh regardless
+ * (it is independent of the archived-slot problem) and its resulting
+ * authority is required to AGREE with the artifact's recorded
+ * epoch/attempt rather than being trusted on its own.
  */
 async function continueAfterPrepareRollback(
   input: Readonly<RunMigrationRollbackInput>,
@@ -1102,7 +1500,10 @@ async function continueAfterPrepareRollback(
   current: MigrationManifest,
   now: () => Date,
 ): Promise<RunMigrationRollbackOutcome> {
-  const operabilityFact = await readBackendPublicationOperabilityFact({ homeDir: input.homeDir });
+  const { fact: operabilityFact, artifact: priorAuthorityArtifact } = await resolveRollbackOperabilityFact({
+    homeDir: input.homeDir,
+    generationId: input.generationId,
+  });
   const witnessResolution = deps.resolveWitnessBindings({
     homeDir: input.homeDir,
     generationId: input.generationId,
@@ -1114,6 +1515,7 @@ async function continueAfterPrepareRollback(
       "continuing a prepared rollback: authority resolution now refuses: " + authority.reason,
     );
   }
+  assertAuthorityAgreesWithArtifact(authority, priorAuthorityArtifact);
   let authoritativeContext: RollbackAuthoritativeContext | null = null;
   if (authority.status === "authoritative") {
     authoritativeContext = await deps.resolveAuthoritativeContext({
