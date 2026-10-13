@@ -1237,7 +1237,18 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
     || action === "describe"
     || action === "expand"
   )) return false;
-  if (topLevel && action === "post-tool") return false;
+  // Installed hook entrypoints own their bounded bootstrap and publication
+  // admission policy. SessionStart bootstrap and installation own legacy-root
+  // migration, so the global preflight must not turn publication-lock
+  // contention into a hook failure before the handler runs.
+  if (topLevel && (
+    action === "post-tool"
+    || action === "restore"
+    || action === "session-end"
+    || action === "session-snapshot"
+    || action === "user-prompt"
+    || (action === "compact" && actionCommand.opts<{ hook?: boolean }>().hook === true)
+  )) return false;
   if (topLevel && action === "status") return false;
   if (topLevel && (action === "stats" || action === "doctor")) return false;
   if (topLevel && (action === "diagnose" || action === "help")) return false;
