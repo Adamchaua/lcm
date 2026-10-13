@@ -16,11 +16,13 @@ global legacy-root migration preflight, so a busy backend publication lock
 cannot fail a hook before its own handler runs. Interactive `lcm compact` and
 installation keep the preflight.
 
-- These invocations do not run legacy-root migration: `user-prompt`,
+- Legacy-root migration and the legacy-and-active home coexistence check still
+  run for SessionStart (`restore`), `session-end`, and `session-snapshot`
+  when the payload has a `session_id` (their dispatch bootstrap uses
+  `bootstrapLcmHome`), and at installation. `user-prompt`,
   `compact --hook`, and `restore`, `session-end`, or `session-snapshot`
-  without a `session_id`. Migration happens at the next SessionStart with a
-  `session_id` or at installation. The legacy-and-active home coexistence
-  check that the preflight also ran is likewise enforced only on those paths.
+  without a `session_id` skip both until the next such SessionStart or
+  installation.
 - Ordinary publication-lock contention follows each hook's own bounded policy.
   Admission fences and the pre-handler configuration load treat it as a
   best-effort outcome (exit `0`). UserPromptSubmit's durable local enqueue is
