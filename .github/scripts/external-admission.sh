@@ -10,12 +10,14 @@ fi
 EVENT_SOURCE="${EVENT_SOURCE:-}"
 EVENT_WORKFLOW_RUN_ACTION="${EVENT_WORKFLOW_RUN_ACTION:-}"
 EVENT_WORKFLOW_RUN_ID="${EVENT_WORKFLOW_RUN_ID:-}"
+EVENT_WORKFLOW_RUN_PATH="${EVENT_WORKFLOW_RUN_PATH:-}"
 EVENT_CHECK_RUN_ACTION="${EVENT_CHECK_RUN_ACTION:-}"
 EVENT_CHECK_RUN_ID="${EVENT_CHECK_RUN_ID:-}"
 
 declare -A BASE_BRANCH_CACHE=()
 BASE_BRANCH_RESULT=""
 PULL_REQUEST_EVALUATION=""
+success_description="CI and DCO passed"
 
 reset_base_branch_cache() {
   BASE_BRANCH_CACHE=()
@@ -241,6 +243,7 @@ evaluate_event_freshness() {
     "$EVENT_SOURCE" \
     "$EVENT_WORKFLOW_RUN_ACTION" \
     "$EVENT_WORKFLOW_RUN_ID" \
+    "$EVENT_WORKFLOW_RUN_PATH" \
     "$EVENT_CHECK_RUN_ACTION" \
     "$EVENT_CHECK_RUN_ID" \
     "$ci_run_id" \
@@ -320,9 +323,11 @@ validate_required_snapshot() {
     return 2
   fi
   if [[ "$EVENT_SOURCE" == workflow_run && -n "$EVENT_WORKFLOW_RUN_ID" ]]; then
-    echo "$phase workflow event ID $EVENT_WORKFLOW_RUN_ID is wake-up context only and does not authorize state; canonical CI evidence is evaluated separately." >&2
+    echo "$phase workflow event ID $EVENT_WORKFLOW_RUN_ID is wake-up context only and does not authorize state; current trusted run evidence is evaluated separately." >&2
   fi
-  freshness="$(evaluate_event_freshness "$ci_run_id" "$dco_check_run_id")" || return $?
+  freshness="$(
+    evaluate_event_freshness "$ci_run_id" "$dco_check_run_id"
+  )" || return $?
   freshness_failure="$(jq -r '.terminalFailure // empty' <<<"$freshness")"
   if [[ -n "$freshness_failure" ]]; then
     echo "$phase event freshness metadata is invalid: $freshness_failure" >&2
@@ -358,7 +363,11 @@ validate_required_snapshot() {
       "$phase CI workflow run is $ci_state; admission remains pending."
   fi
 
-  printf -v "$fingerprint_variable" '%s' "$ci_check_run_id:$dco_check_run_id:$ci_run_id"
+  printf -v "$fingerprint_variable" '%s' "$(jq -cn \
+    --arg ciCheckRunId "$ci_check_run_id" \
+    --arg dcoCheckRunId "$dco_check_run_id" \
+    --arg ciRunId "$ci_run_id" \
+    '{ciCheckRunId:$ciCheckRunId,dcoCheckRunId:$dcoCheckRunId,ciRunId:$ciRunId}')"
   return 0
 }
 
@@ -403,16 +412,8 @@ current_admission_fingerprint=""
 validate_required_snapshot "Current" current_admission_fingerprint
 if [[ "$current_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
   exit_pending \
-    "Latest trusted check changed during admission" \
-    "Trusted CI or DCO check changed during evaluation; admission remains pending."
-fi
-
-final_admission_fingerprint=""
-validate_required_snapshot "Final" final_admission_fingerprint
-if [[ "$final_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
-  exit_pending \
-    "Latest trusted check changed during final validation" \
-    "Final trusted CI or DCO check changed during evaluation; admission remains pending."
+    "CI or DCO evidence changed" \
+    "CI or DCO evidence changed; admission remains pending."
 fi
 
 final_matching_prs="$(fetch_associated_pull_requests)"
@@ -434,5 +435,13 @@ if [[ "$final_pull_request_eligible" != true ]]; then
     "Final pull request eligibility changed; admission failed."
 fi
 
-post_admission_status success "CI and DCO passed"
+final_admission_fingerprint=""
+validate_required_snapshot "Final" final_admission_fingerprint
+if [[ "$final_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
+  exit_pending \
+    "CI or DCO evidence changed" \
+    "Final CI or DCO evidence changed; admission remains pending."
+fi
+
+post_admission_status success "$success_description"
 trap - EXIT INT TERM

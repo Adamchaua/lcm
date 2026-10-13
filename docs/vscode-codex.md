@@ -180,6 +180,12 @@ legacy-root bootstrap migration before reading and dispatching the payload.
 LCM installation and session startup establish or migrate the private root;
 PostToolUse remains an observer and cannot contend on that startup boundary.
 
+The other installed hook entrypoints (restore, session-end, session-snapshot,
+user-prompt, and `compact --hook`) also skip that migration. See
+[Hook entrypoints and legacy-root migration](hook-protocol.md#hook-entrypoints-and-legacy-root-migration)
+for which invocations still migrate and how publication-lock contention is
+handled.
+
 If selected-state publication admission is blocked after a PostToolUse event
 has been durably appended, the event remains preserved locally. Missing
 publication evidence and typed private lock contention are successful

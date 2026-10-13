@@ -26,6 +26,7 @@ const WAITING_CI_RUN_STATES = new Set([
 const MAINTENANCE_BASE = /^maintenance\/[0-9]+\.[0-9]+\.x$/u;
 const WORKFLOW_RUN_ACTIONS = new Set(["requested", "in_progress", "completed"]);
 const CHECK_RUN_ACTIONS = new Set(["created", "rerequested", "completed"]);
+const CI_WORKFLOW_PATH = ".github/workflows/ci.yml";
 
 function requireArray(value, label) {
   if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
@@ -175,7 +176,7 @@ export function evaluateAdmissionChecks({
 
 export function evaluateCiActionsRun(
   run,
-  { runId, headSha, repository, workflowPath = ".github/workflows/ci.yml" },
+  { runId, headSha, repository, workflowPath = CI_WORKFLOW_PATH },
 ) {
   const trustedProvenance = run !== null
     && typeof run === "object"
@@ -240,6 +241,7 @@ export function evaluateEventFreshness({
   eventSource,
   workflowRunAction = "",
   workflowRunId = "",
+  workflowRunPath = "",
   checkRunAction = "",
   checkRunId = "",
   ciRunId,
@@ -248,6 +250,7 @@ export function evaluateEventFreshness({
   if (eventSource === "repository_dispatch") return { ready: true };
   if (eventSource === "workflow_run") {
     if (!WORKFLOW_RUN_ACTIONS.has(workflowRunAction)) return invalidFreshness();
+    if (workflowRunPath !== CI_WORKFLOW_PATH) return invalidFreshness();
     return compareFreshness(
       workflowRunId,
       ciRunId,
@@ -292,12 +295,22 @@ export function runPolicyCommand(command, args, input) {
       baseProtected: baseProtected === "true",
     }));
   }
-  if (command === "evaluate-freshness" && args.length === 7) {
-    const [eventSource, workflowRunAction, workflowRunId, checkRunAction, checkRunId, ciRunId, dcoCheckRunId] = args;
+  if (command === "evaluate-freshness" && args.length === 8) {
+    const [
+      eventSource,
+      workflowRunAction,
+      workflowRunId,
+      workflowRunPath,
+      checkRunAction,
+      checkRunId,
+      ciRunId,
+      dcoCheckRunId,
+    ] = args;
     return JSON.stringify(evaluateEventFreshness({
       eventSource,
       workflowRunAction,
       workflowRunId,
+      workflowRunPath,
       checkRunAction,
       checkRunId,
       ciRunId: ciRunId || undefined,

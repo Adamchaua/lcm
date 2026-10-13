@@ -195,6 +195,47 @@ const acceptedEventFixtures: EventFixture[] = [
 ];
 
 const rejectedEventFixtures: EventFixture[] = [
+  ...(["requested", "in_progress", "completed"] as const).map((action) =>
+    makeEventFixture(`managed Copilot ${action}`, "workflow_run", false, {
+      action,
+      workflowRun: {
+        event: "dynamic",
+        head_sha: HEAD_SHA,
+        name: "Running Copilot Code Review",
+        path: "dynamic/agents/copilot-pull-request-reviewer",
+        repository: { full_name: REPOSITORY },
+      },
+    })),
+  makeEventFixture("managed Copilot wrong dynamic path", "workflow_run", false, {
+    action: "requested",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Running Copilot Code Review",
+      path: "dynamic/agents/untrusted-review",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("managed Copilot spoofed run name", "workflow_run", false, {
+    action: "requested",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Copilot",
+      path: "dynamic/agents/copilot-pull-request-reviewer",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("repository workflow named Copilot", "workflow_run", false, {
+    action: "requested",
+    workflowRun: {
+      event: "pull_request",
+      head_sha: HEAD_SHA,
+      name: "Copilot",
+      path: ".github/workflows/copilot.yml",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
   makeEventFixture("CI wrong workflow path", "workflow_run", false, {
     workflowRun: {
       event: "pull_request",
@@ -279,7 +320,7 @@ if [[ "$*" == *"/statuses/"* ]]; then
   exit 0
 fi
 if [[ "$*" == *"/commits/"*"/pulls?per_page=100"* ]]; then
-  printf '%s\\n' '[{"number":123,"state":"open","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+  printf '%s\\n' '[{"number":123,"changed_files":1,"commits":1,"state":"open","draft":false,"user":{"id":42,"login":"contributor","type":"User"},"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature/admission","repo":{"full_name":"example/repository"}}}]'
   exit 0
 fi
 if [[ "$*" == *"/pulls/123"* ]]; then
@@ -288,10 +329,10 @@ if [[ "$*" == *"/pulls/123"* ]]; then
     exit 0
   fi
   if [[ "$FAIL_ADMISSION_COMMAND" == valid-ineligible ]]; then
-    printf '%s\\n' '{"number":123,"state":"closed","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+    printf '%s\\n' '{"number":123,"changed_files":1,"commits":1,"state":"closed","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
     exit 0
   fi
-  printf '%s\\n' '{"number":123,"state":"open","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+  printf '%s\\n' '{"number":123,"changed_files":1,"commits":1,"state":"open","draft":false,"user":{"id":42,"login":"contributor","type":"User"},"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature/admission","repo":{"full_name":"example/repository"}}}'
   exit 0
 fi
 if [[ "$*" == *"/branches/"* ]]; then
@@ -374,13 +415,17 @@ fi
 if [[ "$FAIL_ADMISSION_COMMAND" == validator-jq && "$call_count" == 10 ]]; then
   exit 72
 fi
-if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$call_count" == 22 ]]; then
-  exit 75
-fi
 if [[ "$FAIL_ADMISSION_COMMAND" == checks-ready-jq && "$1" == "-r" && "$2" == ".ready" ]]; then
   input="$(cat)"
   if [[ "$input" == *'"states"'* ]]; then
     exit 74
+  fi
+  exec /usr/bin/jq "$@" <<<"$input"
+fi
+if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$1" == "-r" && "$2" == ".ready" ]]; then
+  input="$(cat)"
+  if [[ "$input" == *'"state":"completed"'* ]]; then
+    exit 75
   fi
   exec /usr/bin/jq "$@" <<<"$input"
 fi
@@ -420,8 +465,13 @@ type AdmissionScenario =
   | "equal-dco-created"
   | "equal-dco-rerequested"
   | "equal-dco-completed"
+  | "drift-ci-check-current"
+  | "drift-dco-check-current"
+  | "drift-ci-run-current"
+  | "drift-dco-check-final"
   | "no-unique-pr"
   | "protected-main"
+  | "sensitive-looking-paths"
   | "protected-maintenance"
   | "unprotected-maintenance"
   | "invalid-or-changed-base"
@@ -442,12 +492,20 @@ function makeAdmissionPullRequest({
   draft = false,
   state = "open",
   headSha = HEAD_SHA,
+  user = { id: 42, login: "contributor", type: "User" },
+  headRef = "feature/admission",
+  headRepository = REPOSITORY,
+  changedFiles = 1,
+  commits = 1,
 } = {}) {
  return {
     number,
+   changed_files: changedFiles,
+   commits,
    state,
    draft,
-    head: { sha: headSha },
+    user,
+    head: { sha: headSha, ref: headRef, repo: { full_name: headRepository } },
     base: { ref: baseRef, repo: { full_name: baseRepository } },
   };
 }
@@ -460,6 +518,8 @@ function runAdmissionScenario(
   const ghPath = join(directory, "gh");
   const branchCallsPath = join(directory, "branch-calls.log");
   const branchRequestsPath = join(directory, "branch-requests.log");
+  const checkRunCallsPath = join(directory, "check-run-calls.log");
+  const fileCallsPath = join(directory, "file-calls.log");
   const statusLogPath = join(directory, "statuses.log");
   const headSha = "a".repeat(40);
   const ciRunId = "123";
@@ -491,12 +551,16 @@ function runAdmissionScenario(
   };
   let associatedPullRequests = [makeAdmissionPullRequest()];
   let pullRequest = makeAdmissionPullRequest();
+  const checkRuns = [ciCheckRun, dcoCheckRun];
+  let checkRunSnapshots = [checkRuns, checkRuns, checkRuns];
+  const ciRuns: Record<string, typeof ciRun> = { [ciRunId]: ciRun };
   let branchProtectionSequence = ["true"];
   let branchDeletedSuffix = "";
   let branchLookupMustNotHappen = false;
   let eventSource = "repository_dispatch";
   let eventWorkflowRunId = "";
   let eventWorkflowRunAction = "";
+  let eventWorkflowRunPath = "";
   let eventCheckRunId = "";
   let eventCheckRunAction = "";
 
@@ -505,21 +569,25 @@ function runAdmissionScenario(
       eventSource = "workflow_run";
       eventWorkflowRunId = "99";
       eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "newer-workflow-run":
       eventSource = "workflow_run";
       eventWorkflowRunId = "124";
       eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "in-progress-workflow-run":
       eventSource = "workflow_run";
       eventWorkflowRunId = "99";
       eventWorkflowRunAction = "in_progress";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "equal-in-progress-workflow-run":
       eventSource = "workflow_run";
       eventWorkflowRunId = ciRunId;
       eventWorkflowRunAction = "in_progress";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "equal-dco-created":
       eventSource = "check_run";
@@ -536,10 +604,38 @@ function runAdmissionScenario(
       eventCheckRunId = "11";
       eventCheckRunAction = "completed";
       break;
+    case "drift-ci-check-current": {
+      const changed = [{ ...ciCheckRun, id: 12 }, dcoCheckRun];
+      checkRunSnapshots = [checkRuns, changed, changed];
+      break;
+    }
+    case "drift-dco-check-current": {
+      const changed = [ciCheckRun, { ...dcoCheckRun, id: 12 }];
+      checkRunSnapshots = [checkRuns, changed, changed];
+      break;
+    }
+    case "drift-ci-run-current": {
+      const changedRunId = "124";
+      const changedCiCheck = {
+        ...ciCheckRun,
+        details_url: `https://example.test/${REPOSITORY}/actions/runs/${changedRunId}/job/456`,
+      };
+      ciRuns[changedRunId] = { ...ciRun, id: Number(changedRunId) };
+      const changed = [changedCiCheck, dcoCheckRun];
+      checkRunSnapshots = [checkRuns, changed, changed];
+      break;
+    }
+    case "drift-dco-check-final":
+      checkRunSnapshots = [checkRuns, checkRuns, [ciCheckRun, { ...dcoCheckRun, id: 12 }]];
+      break;
     case "no-unique-pr":
       associatedPullRequests = [];
       break;
     case "protected-main":
+      break;
+    case "sensitive-looking-paths":
+      pullRequest = makeAdmissionPullRequest({ changedFiles: 2 });
+      associatedPullRequests = [pullRequest];
       break;
     case "protected-maintenance":
       pullRequest = makeAdmissionPullRequest({ baseRef: "maintenance/1.4.x" });
@@ -634,6 +730,14 @@ if [[ "$endpoint" == repos/*/pulls/123 ]]; then
   printf '%s\n' "$PULL_REQUEST_JSON"
   exit 0
 fi
+if [[ "$endpoint" == repos/*/pulls/123/files?per_page=100 ]]; then
+  file_call_count=0
+  if [[ -f "$FILE_CALLS" ]]; then read -r file_call_count < "$FILE_CALLS"; fi
+  file_call_count=$((file_call_count + 1))
+  printf '%s\n' "$file_call_count" > "$FILE_CALLS"
+  printf '%s\n' '[]'
+  exit 0
+fi
   if [[ "$endpoint" == repos/*/branches/* ]]; then
   call_count=0
   if [[ -f "$BRANCH_CALLS" ]]; then read -r call_count < "$BRANCH_CALLS"; fi
@@ -663,11 +767,16 @@ fi
   exit 0
 fi
 if [[ "$endpoint" == *"check-runs?filter=latest&per_page=100" ]]; then
-  printf '%s\n' "$CHECK_RUN_PAGES_JSON"
+  check_run_call_count=0
+  if [[ -f "$CHECK_RUN_CALLS" ]]; then read -r check_run_call_count < "$CHECK_RUN_CALLS"; fi
+  check_run_call_count=$((check_run_call_count + 1))
+  printf '%s\n' "$check_run_call_count" > "$CHECK_RUN_CALLS"
+  jq -c --argjson index "$((check_run_call_count - 1))" '.[$index]' \
+    <<<"$CHECK_RUN_SNAPSHOTS_JSON"
   exit 0
 fi
 if [[ "$endpoint" == repos/*/actions/runs/* ]]; then
-  printf '%s\n' "$CI_RUN_JSON"
+  jq -c --arg run_id "\${endpoint##*/}" '.[$run_id]' <<<"$CI_RUNS_JSON"
   exit 0
 fi
 printf 'unexpected fake-gh endpoint: %s\n' "$endpoint" >&2
@@ -676,6 +785,8 @@ exit 99
     chmodSync(ghPath, 0o755);
     writeFileSync(branchCallsPath, "0\n");
     writeFileSync(branchRequestsPath, "");
+    writeFileSync(checkRunCallsPath, "0\n");
+    writeFileSync(fileCallsPath, "0\n");
     writeFileSync(statusLogPath, "");
 
     const result = spawnSync("bash", [evaluatorPath], {
@@ -688,14 +799,19 @@ exit 99
         BRANCH_LOOKUP_MUST_NOT_HAPPEN: String(branchLookupMustNotHappen),
         BRANCH_REQUESTS: branchRequestsPath,
         BRANCH_PROTECTION_SEQUENCE: branchProtectionSequence.join(","),
-        CHECK_RUN_PAGES_JSON: JSON.stringify([{ check_runs: [ciCheckRun, dcoCheckRun] }]),
-        CI_RUN_JSON: JSON.stringify(ciRun),
+        CHECK_RUN_CALLS: checkRunCallsPath,
+        CHECK_RUN_SNAPSHOTS_JSON: JSON.stringify(
+          checkRunSnapshots.map((snapshot) => [{ check_runs: snapshot }]),
+        ),
+        CI_RUNS_JSON: JSON.stringify(ciRuns),
         EVENT_HEAD_SHA: headSha,
         EVENT_SOURCE: eventSource,
         EVENT_CHECK_RUN_ACTION: eventCheckRunAction,
         EVENT_CHECK_RUN_ID: eventCheckRunId,
         EVENT_WORKFLOW_RUN_ACTION: eventWorkflowRunAction,
         EVENT_WORKFLOW_RUN_ID: eventWorkflowRunId,
+        EVENT_WORKFLOW_RUN_PATH: eventWorkflowRunPath,
+        FILE_CALLS: fileCallsPath,
         PATH: `${directory}:${process.env.PATH ?? ""}`,
         PULL_REQUEST_JSON: JSON.stringify(pullRequest),
         REPOSITORY,
@@ -709,6 +825,7 @@ exit 99
       statuses: readFileSync(statusLogPath, "utf8").trim().split("\n").filter(Boolean),
       branchCalls: Number(readFileSync(branchCallsPath, "utf8").trim()),
       branchRequests: readFileSync(branchRequestsPath, "utf8").trim().split("\n").filter(Boolean),
+      fileCalls: Number(readFileSync(fileCallsPath, "utf8").trim()),
     };
   } finally {
     rmSync(directory, { force: true, recursive: true });
@@ -759,6 +876,20 @@ describe("external admission workflow", () => {
     expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
   });
 
+  it.each([
+    "drift-ci-check-current",
+    "drift-dco-check-current",
+    "drift-ci-run-current",
+    "drift-dco-check-final",
+  ] as const)("keeps changed CI or DCO evidence pending for %s", (scenario) => {
+    const { result, statuses } = runAdmissionScenario(scenario);
+    const evidence = `${scenario}\n${result.stdout}\n${result.stderr}\n${statuses.join("\n")}`;
+    expect(result.status, evidence).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0], evidence).toBe("pending");
+    expect(statuses.at(-1), evidence).toContain("CI or DCO evidence changed");
+    expect(statuses.some((status) => status.startsWith("success\t")), evidence).toBe(false);
+  });
+
   it("terminalizes an exact head with no unique eligible pull request", () => {
     const { result, statuses } = runAdmissionScenario("no-unique-pr");
     expect(result.status).toBe(0);
@@ -784,6 +915,14 @@ describe("external admission workflow", () => {
     expect(branchCalls).toBeGreaterThan(1);
     expect(branchRequests.every((request) => request.endsWith("/branches/maintenance%2F1.4.x")))
       .toBe(true);
+  });
+
+  it("admits sensitive-looking paths with CI and DCO alone without listing files", () => {
+    const { result, statuses, fileCalls } = runAdmissionScenario("sensitive-looking-paths");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(statuses.at(-1)).toContain("CI and DCO passed");
+    expect(fileCalls).toBe(0);
   });
 
   it("terminalizes an unprotected maintenance/1.4.x pull request", () => {
@@ -925,7 +1064,19 @@ describe("external admission workflow", () => {
     }
   });
 
-  it("starts only for authenticated DCO, canonical pull-request CI, or reconciliation", () => {
+  it("revokes stale success for a trusted CI rerun before trusted checkout", () => {
+    const fixture = acceptedEventFixtures.find(({ name }) => name === "workflow_run requested");
+    expect(fixture).toBeDefined();
+    expect(simulateWorkflowFixture(fixture!)).toEqual({
+      evaluatorReached: true,
+      jobRuns: true,
+      statusWrites: 1,
+    });
+    expect(job.steps[0]?.name).toBe("Revoke stale external admission");
+    expect(job.steps[1]?.name).toBe("Check out trusted admission evaluator");
+  });
+
+  it("starts only for trusted DCO, CI, or reconciliation", () => {
     for (const value of ["DCO", "1861", "dco"]) expect(job.if).toContain(value);
     expect(job.if).toContain("github.event_name == 'repository_dispatch'");
     expect(job.if).toContain("github.event.action == 'external-admission-reconcile'");
@@ -933,6 +1084,7 @@ describe("external admission workflow", () => {
     expect(job.if).toContain("github.event.workflow_run.name == 'CI'");
     expect(job.if).toContain("github.event.workflow_run.event == 'pull_request'");
     expect(job.if).toContain("github.event.workflow_run.path == '.github/workflows/ci.yml'");
+    expect(source).not.toContain("Copilot");
     expect(job.if).toContain(
       "github.event.workflow_run.repository.full_name == github.repository",
     );
@@ -964,7 +1116,7 @@ describe("external admission workflow", () => {
       .toHaveLength(2);
   });
 
-  it("isolates rejected CI workflow runs from exact-SHA concurrency", () => {
+  it("isolates rejected workflow runs from exact-SHA concurrency", () => {
     const group = workflow.concurrency.group;
     expect(workflow.concurrency["cancel-in-progress"]).toBe(true);
     for (const condition of [
@@ -982,16 +1134,19 @@ describe("external admission workflow", () => {
     expect(group).toMatch(
       /github\.event_name == 'workflow_run'\s+&&\s+format\('workflow-run-\{0\}', github\.run_id\)/u,
     );
+    expect(group).not.toContain("Copilot");
+    expect(job.if).not.toContain("Copilot");
   });
 
   it("repeats exact-head PR, CI, and DCO validation before success", () => {
     expect(evaluator).toContain("commits/$HEAD_SHA/pulls?per_page=100");
     expect(evaluator).toContain("check-runs?filter=latest&per_page=100");
     expect(evaluator).not.toContain("/files?per_page=100");
+    expect(evaluator).not.toContain("/commits?per_page=100");
     const initial = evaluator.indexOf('validate_required_snapshot "Initial"');
     const current = evaluator.indexOf('validate_required_snapshot "Current"');
     const final = evaluator.indexOf('validate_required_snapshot "Final"');
-    const success = evaluator.indexOf('post_admission_status success "CI and DCO passed"');
+    const success = evaluator.indexOf('post_admission_status success "$success_description"');
     expect(initial).toBeGreaterThan(evaluator.indexOf('matching_prs="$(fetch_associated_pull_requests)"'));
     expect(current).toBeGreaterThan(evaluator.indexOf('current_matching_prs="$(fetch_associated_pull_requests)"'));
     expect(final).toBeGreaterThan(current);
@@ -1002,17 +1157,29 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-ci-run");
     expect(evaluator).toContain('if [[ "$EVENT_SOURCE" == workflow_run');
     expect(evaluator).toContain("EVENT_WORKFLOW_RUN_ACTION");
+    expect(evaluator).toContain("EVENT_WORKFLOW_RUN_PATH");
     expect(evaluator).toContain("EVENT_CHECK_RUN_ACTION");
     expect(evaluator).toContain("EVENT_CHECK_RUN_ID");
-    expect(evaluator).toContain('printf -v "$fingerprint_variable" \'%s\' "$ci_check_run_id:$dco_check_run_id:$ci_run_id"');
+    expect(evaluator).toContain("ciCheckRunId");
+    expect(evaluator).toContain("dcoCheckRunId");
+    expect(evaluator).toContain("ciRunId");
+    expect(evaluator).toContain(
+      "'{ciCheckRunId:$ciCheckRunId,dcoCheckRunId:$dcoCheckRunId,ciRunId:$ciRunId}'",
+    );
     expect(evaluator).toContain('validate_required_snapshot "Initial" initial_admission_fingerprint');
     expect(evaluator).toContain('validate_required_snapshot "Current" current_admission_fingerprint');
     expect(evaluator).toContain('validate_required_snapshot "Final" final_admission_fingerprint');
     expect(evaluator.match(/admission_fingerprint" != "\$initial_admission_fingerprint/gu)).toHaveLength(2);
     expect(evaluator).not.toContain('VALIDATED_ADMISSION_FINGERPRINT');
     expect(evaluator).not.toContain("classify-files");
-    expect(evaluator).not.toContain("select-admission");
-    expect(evaluator).not.toContain("admission-decision");
+    expect(evaluator).not.toContain("evaluate-file-binding");
+    expect(evaluator).not.toContain("evaluate-review-check");
+    expect(evaluator).not.toContain("evaluate-review-run");
+    expect(evaluator).not.toContain("evaluate-dependabot-pr");
+    expect(evaluator).not.toContain("evaluate-dependabot-commits");
+    expect(evaluator).not.toContain("evaluate-sensitive-admission");
+    expect(evaluator).not.toContain("/git/trees/");
+    expect(evaluator).not.toContain("/reviews");
   });
 
   it("runs each validator as a simple command and fails closed on evaluator and eligibility errors", () => {
@@ -1136,6 +1303,8 @@ describe("external admission workflow", () => {
     expect(documentation).toContain("-f event_type=external-admission-reconcile");
     expect(documentation).toContain("client_payload[head_sha]");
     expect(workflowDocumentation).toContain("CI+DCO");
+    expect(documentation).not.toMatch(/Copilot|sensitive/iu);
+    expect(workflowDocumentation).not.toMatch(/Copilot|sensitive/iu);
     for (const content of [
       source,
       policySource,
@@ -1153,5 +1322,6 @@ describe("external admission workflow", () => {
     expect(documentation).toMatch(/no user-configurable options/iu);
     expect(documentation).toMatch(/freshness lower bound/iu);
     expect(documentation).toMatch(/transient.*branch.*pending/isu);
+    expect(documentation).toMatch(/three consecutive.*CI and DCO/isu);
   });
 });

@@ -365,6 +365,8 @@ const expectedComponents = [
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
+      // #1450 keeps stable managed PATH canonicalization and direct executable
+      // admission in this existing service-manager owner.
       "^src/daemon/managed-path\\.ts$",
       "^src/daemon/supervisor\\.ts$",
     ],
@@ -620,7 +622,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(243);
+    expect(productionFiles).toHaveLength(244);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -650,10 +652,10 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(243);
+    expect(ownershipCounts.size).toBe(244);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1390/#1371 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -722,6 +724,11 @@ describe("Codecov configuration", () => {
       // identity storage refuses. The change is confined to existing files and
       // adds no component, so every touched file keeps its established owner;
       // these pins record that decision for materially changed files.
+      // #1403 keeps guarded per-project identity resolution during
+      // PostgreSQL project enumeration in this existing owner. The change
+      // is confined to existing files and adds no component, so every
+      // touched file keeps its established owner; this pin records that
+      // decision for a materially changed file.
       ["src/cli-storage.ts", "unit-cli"],
       ["src/db/events-path.ts", "unit-local-persistence"],
       ["src/identity-service.ts", "integration-postgresql-identity"],
@@ -739,6 +746,7 @@ describe("Codecov configuration", () => {
       // fencing remain installer-owned.
       ["installer/install.ts", "unit-installation"],
       // #1201 observation parser/client, allowlist and server retain daemon-core ownership.
+      // Prompt-search publication dispatch remains daemon-core-owned.
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/http-url.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
@@ -748,12 +756,17 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/describe.ts", "unit-daemon-routes"],
       ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
       ["src/daemon/routes/ingest.ts", "unit-daemon-routes"],
+      // #1371 routes the manual store through the shared deduplication
+      // decision instead of a direct insert. The route owns its input; the
+      // decision helper stays in unit-promotion.
       ["src/daemon/routes/store.ts", "unit-daemon-routes"],
       ["src/daemon/routes/status.ts", "unit-daemon-routes"],
       ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"],
       ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
       // #1148 keeps promoted created_at UTC parsing in the existing daemon
-      // routes owner; prompt-search and restore retain their route ownership.
+      // routes owner; prompt-search publication errors and restore retain their
+      // route ownership.
+      ["src/daemon/routes/prompt-search.ts", "unit-daemon-routes"],
       // #1203 adds native recall evidence without changing component topology.
       ["src/db/promoted-recall-evidence.ts", "unit-local-persistence"],
       ["src/storage/postgresql/tsquery-evidence.ts", "integration-postgresql-search"],
@@ -770,6 +783,9 @@ describe("Codecov configuration", () => {
       // search candidate recall remain owned by daemon routes.
       ["src/daemon/routes/search.ts", "unit-daemon-routes"],
       ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
+      // #1390 threads owner scope and the live backend into the promote
+      // route's deduplication call so the exact-content lookup runs; the
+      // input is route-owned and the decision helper stays in unit-promotion.
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
       ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
@@ -796,6 +812,11 @@ describe("Codecov configuration", () => {
       // both backends implement. The change is confined to existing files, so
       // every touched file keeps its established owner and the component
       // topology is unchanged; these pins record that decision.
+      // #1403 keeps the per-project unbound-binding discovery diagnostic in
+      // this existing compaction owner. The change is confined to existing
+      // files and adds no component, so every touched file keeps its
+      // established owner; this pin records that decision for a
+      // materially changed file.
       ["src/batch-compact.ts", "unit-compaction-summarization"],
       // #1353 qualifies every equality comparison in the PostgreSQL memory
       // repositories against pg_catalog so a hostile search_path cannot
@@ -825,6 +846,9 @@ describe("Codecov configuration", () => {
       // convergence, and bounded birth samples in the service-manager component.
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
+      // #1450 keeps canonical stable managed PATH construction and direct
+      // executable admission in the existing service-manager owner.
+      ["src/daemon/managed-path.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
       // #837 consumer-admission descriptor cleanup remains storage-owned.
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
@@ -849,6 +873,12 @@ describe("Codecov configuration", () => {
       ["src/migration/receipts.ts", "unit-migration-cutover"],
       ["src/migration/queue-evidence.ts", "unit-migration-cutover"],
       ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"],
+      // #1380 clears the settlement primary error once a mutate is
+      // acknowledged, so retry diagnostics report the current readback
+      // failure instead of a stale one from an earlier attempt. The change
+      // is confined to this existing file, so it keeps its established
+      // owner; this pin records that decision.
+      ["src/migration/copy-destination.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
       // #1354 supplies the promoted-memory decision serializer only from the
@@ -859,7 +889,14 @@ describe("Codecov configuration", () => {
       // #1195 checksummed packaged migration loading remains schema-owned.
       // #1306 adds the 0007 promoted-content digest migration and its
       // schema snapshot, keeping the packaged migration manifest here.
+      // #1378 adds the 0008 transfer-identity content-digest migration
+      // and its regenerated schema snapshot; ownership is unchanged.
       ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"],
+      // #1378 reads back each written record inside the same fenced
+      // transaction and stores its content fingerprint; both files keep
+      // their established owner.
+      ["src/storage/postgresql/portable-destination.ts", "integration-postgresql-portable"],
+      ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"],
       // #1306 indexes owner exact-content lookup by a generated SHA-256
       // digest, retaining the raw-equality residual it always used.
       // #1354 adds the promoted-memory decision serializer beside the
@@ -888,7 +925,11 @@ describe("Codecov configuration", () => {
       ["src/storage/sqlite/project-storage.ts", "unit-local-persistence"],
       // #1020 keeps message timestamp mapping in the existing local-persistence
       // component; conversation timestamps remain on their existing mapper.
+      // G007 keeps SQLite regex snippet redaction and Unicode bounding in this
+      // existing owner without changing the component taxonomy.
       ["src/store/conversation-store.ts", "unit-local-persistence"],
+      ["src/store/summary-store.ts", "unit-local-persistence"],
+      ["src/store/regex-snippet.ts", "unit-local-persistence"],
       ["src/db/stored-timestamp.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       // #1229 local-enqueue health-token forwarding stays hook-owned.
@@ -904,6 +945,10 @@ describe("Codecov configuration", () => {
       ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],
       // #863 expand-depth schema remains owned by MCP tools.
       ["src/mcp/tools/lcm-expand.ts", "unit-mcp"],
+      // #1371 store merge-behavior help and tool description keep their
+      // CLI and MCP owners.
+      ["src/cli-help.ts", "unit-cli"],
+      ["src/mcp/tools/lcm-store.ts", "unit-mcp"],
       // #972 search cwd client typing remains memory/retrieval-owned.
       ["src/memory/index.ts", "unit-memory-retrieval"],
       // #793 shared search-limit contract remains retrieval-owned.

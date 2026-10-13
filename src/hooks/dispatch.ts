@@ -1,5 +1,6 @@
 import { validateAndFixHooks } from "./auto-heal.js";
 import { configPath as defaultConfigPath } from "../runtime-paths.js";
+import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import {
   rethrowBackendPublicationJournalError,
 } from "./publication-fence.js";
@@ -8,6 +9,14 @@ import type { ConnectorTransport } from "../connectors/types.js";
 export const HOOK_COMMANDS = ["compact", "post-tool", "restore", "session-end", "session-snapshot", "user-prompt"] as const;
 export type HookCommand = typeof HOOK_COMMANDS[number];
 export type HookExecutionContext = Readonly<{ transport?: ConnectorTransport }>;
+
+// Event names used when the dispatch-level config load is skipped by lock
+// contention; they match the names each handler logs its own contention under.
+const HOOK_EVENT_NAMES = {
+  compact: "PreCompact",
+  restore: "SessionStart",
+  "session-end": "SessionEnd",
+} as const;
 
 export function isHookCommand(cmd: string): cmd is HookCommand {
   return (HOOK_COMMANDS as readonly string[]).includes(cmd);
@@ -76,11 +85,30 @@ export async function dispatchHook(
       : handleUserPromptSubmit(stdinText, undefined, undefined, undefined, context.transport);
   }
 
+  // Session snapshots use neither the loaded port nor the storage selection,
+  // so they must not wait on the publication lock for a config projection.
+  if (command === "session-snapshot") {
+    const { handleSessionSnapshot } = await import("./session-snapshot.js");
+    return verifiedSnapshotPort === undefined
+      ? handleSessionSnapshot(stdinText)
+      : handleSessionSnapshot(stdinText, { verifiedPort: verifiedSnapshotPort });
+  }
   const { DaemonClient } = await import("../daemon/client.js");
   const { loadHookConfig } = await import("./config.js");
   const { join } = await import("node:path");
   const { homedir } = await import("node:os");
-  const config = loadHookConfig(defaultConfigPath());
+  let config: ReturnType<typeof loadHookConfig>;
+  try {
+    config = loadHookConfig(defaultConfigPath());
+  } catch (error) {
+    // Ordinary publication-lock contention is a best-effort hook outcome, the
+    // same one each handler's own publication fence produces. Journal errors
+    // and every other failure still propagate.
+    if (!(error instanceof PrivateMutationLockContentionError)) throw error;
+    const { safeLogError } = await import("./hook-errors.js");
+    await safeLogError(HOOK_EVENT_NAMES[command], error, {});
+    return { exitCode: 0, stdout: "" };
+  }
   const port = config.daemonPort;
   const client = new DaemonClient(`http://127.0.0.1:${port}`);
 
@@ -96,12 +124,6 @@ export async function dispatchHook(
     case "session-end": {
       const { handleSessionEnd } = await import("./session-end.js");
       return handleSessionEnd(stdinText, client, port, config.storage);
-    }
-    case "session-snapshot": {
-      const { handleSessionSnapshot } = await import("./session-snapshot.js");
-      return verifiedSnapshotPort === undefined
-        ? handleSessionSnapshot(stdinText)
-        : handleSessionSnapshot(stdinText, { verifiedPort: verifiedSnapshotPort });
     }
     default:
       throw new Error(`Unknown hook command: ${command}`);
