@@ -183,4 +183,31 @@ describe("import names the unbound-project remedy", () => {
     expect(lines.some(line => line.includes(cwd))).toBe(false);
     expect(lines.join("\n")).not.toContain("ingest boom");
   });
+
+  it("prints one remedy line per project across Claude and Codex batches", async () => {
+    const unbound = plantUnboundProjectWithSessions("unbound-all", 2);
+    const codexDir = makeTmpDir("lcm-import-remedy-codex-");
+    const archived = join(codexDir, "archived_sessions");
+    mkdirSync(archived, { recursive: true });
+    writeFileSync(join(archived, "codex-0.jsonl"), JSON.stringify({
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "session_meta",
+      payload: { id: "codex-0", cwd: unbound, cli_version: "0.100.0", model_provider: "openai" },
+    }));
+    selectPostgresqlBackend();
+    const daemon = await startUnboundDaemon();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await importSessions(daemon.client, {
+      all: true,
+      provider: "all",
+      cwd: unbound,
+      _claudeProjectsDir: claudeProjectsDir,
+      _codexDir: codexDir,
+    });
+
+    expect(daemon.posts).toHaveLength(3);
+    expect(result).toMatchObject({ imported: 0, failed: 3 });
+    expect(error).toHaveBeenCalledExactlyOnceWith("  " + unbound + ": " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
+  });
 });

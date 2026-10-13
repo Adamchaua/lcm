@@ -41,8 +41,9 @@ is still processed. `lcm compact --all`, `lcm export --all`, and
 project path and the `lcm project create` or `lcm project link <project-id>`
 remedy, and exit with status 1. `lcm import --all` is session-driven rather
 than project-driven: it fails that project's sessions at ingest, counts
-them in its failed total, prints one remedy line naming the project, and
-exits 1; per-session detail prints only under `--verbose`. A project with
+them in its failed total, prints one remedy line naming the project (once
+per project across providers), and exits 1; per-session detail prints only
+under `--verbose`. A project with
 no sessions to import is never opened, so nothing is reported for it and
 the command can exit 0. This condition is specific to the PostgreSQL
 backend; SQLite has no binding to check. `lcm import --all --dry-run` contacts no

@@ -208,15 +208,13 @@ async function ingestSessionList(
   sessions: SessionEntry[],
   options: ImportOptions,
   result: ImportResult,
+  reportedProjectFailures: Set<string>,
 ): Promise<void> {
   const previousSummaries = new Map<string, string>();
   const total = sessions.length;
 
-  // Remedy lines are printed at most once per project. Claude --all reaches
-  // this function once per project while Codex sessions arrive mixed, so the
-  // set is keyed by cwd.
-  const reportedProjectFailures = new Set<string>();
-
+  // Remedy lines are printed at most once per project per import. The set is
+  // owned by importSessions and shared across every call, keyed by cwd.
   function reportProjectFailure(cwd: string, remedy: string | undefined): void {
     if (remedy === undefined || reportedProjectFailures.has(cwd)) return;
     reportedProjectFailures.add(cwd);
@@ -333,6 +331,7 @@ export async function importSessions(
   const configFile = configPath();
   selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
   const provider: ImportProvider = options.provider ?? "claude";
+  const reportedProjectFailures = new Set<string>();
   const result: ImportResult = {
     imported: 0,
     skippedEmpty: 0,
@@ -399,6 +398,7 @@ export async function importSessions(
         sessionFiles.map(f => ({ ...f, cwd, client: "claude" as const })),
         options,
         result,
+        reportedProjectFailures,
       );
     }
   }
@@ -470,7 +470,7 @@ export async function importSessions(
       });
     }
 
-    await ingestSessionList(client, codexSessions, options, result);
+    await ingestSessionList(client, codexSessions, options, result, reportedProjectFailures);
   }
 
   return result;
