@@ -126,9 +126,17 @@ class Database {
         const after = (row: IdentityLedgerRow) => row.domain > String(values[1])
           || (row.domain === String(values[1]) && row.identity_sha256 > String(values[2]));
         const order = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
-        return result([...this.identityLedger].filter(after).sort((a, b) => a.domain === b.domain
+        const page = [...this.identityLedger].filter(after).sort((a, b) => a.domain === b.domain
           ? order(a.identity_sha256, b.identity_sha256)
-          : order(a.domain, b.domain)).slice(0, Number(values[3])));
+          : order(a.domain, b.domain)).slice(0, Number(values[3]));
+        // The byte budget keeps the leading rows whose running total of
+        // octet_length(native_key) stays within it, and always admits the
+        // first row so that every page makes progress.
+        let running = 0;
+        return result(page.filter((row, index) => {
+          running += Buffer.byteLength(row.native_key);
+          return index === 0 || running <= Number(values[4]);
+        }));
       }
       const key = this.identities.get(`${values[1]}:${values[2]}`);
       return result(key === undefined ? [] : [{ native_key: key }]);
@@ -960,6 +968,64 @@ it('walks the transfer ledger in bounded keyset pages instead of one unbounded r
   const pages = db.queryLog.filter(statement => statement.includes('FROM lcm.transfer_identities WHERE run_id='));
   expect(pages.length).toBeGreaterThan(1);
   for (const page of pages) expect(page).toContain('LIMIT $4');
+  await db.query({ text: 'ROLLBACK' });
+});
+
+it('cuts a ledger page by native key bytes and continues from the last returned row', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const { writer, stream, manifest } = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  const template = db.identityLedger.find(entry => !identityDomains.has(entry.domain));
+  if (template === undefined) throw new Error('fixture missing a non-identity ledger row');
+  // Three keys of 60 MiB each: two fit the batch byte budget, the third does
+  // not. The locator keeps the identity after its first colon, so the content
+  // comparison still resolves to the canonical row. The record count stays far
+  // below maxBatchRecords, so only the byte bound can split the ledger.
+  const padding = 'p'.repeat(60 * 1024 * 1024);
+  const identity = template.native_key.slice(template.native_key.indexOf(':') + 1);
+  for (let index = 0; index < 3; index += 1) {
+    db.identityLedger.push({ ...template, identity_sha256: `synthetic-${index}`, native_key: `${padding}:${identity}` });
+  }
+  const pages: { text: string; values: unknown[] }[] = [];
+  db.beforeQuery = config => { if (config.text.includes('FROM lcm.transfer_identities WHERE run_id=')) pages.push({ text: config.text, values: [...(config.values ?? [])] }); };
+  await db.query({ text: 'BEGIN' });
+  await api.completePortableDestinationInTransaction(executor, writer, verified);
+  expect(db.run?.state).toBe('completed');
+  expect(pages.length).toBeGreaterThan(1);
+  for (const page of pages) {
+    expect(page.text).toContain('pg_catalog.octet_length(native_key)');
+    expect(page.text).toContain('LIMIT $4');
+    expect(page.values[3]).toBe(PORTABLE_LIMITS.maxBatchRecords);
+    expect(page.values[4]).toBe(PORTABLE_LIMITS.maxBatchBytes);
+  }
+  // The page that was cut resumes strictly after the last row it returned, so
+  // no padded key is skipped or read twice: the second padded row is the
+  // cursor of the continuation.
+  expect(pages.some(page => page.values[2] === 'synthetic-1')).toBe(true);
+  await db.query({ text: 'ROLLBACK' });
+});
+
+it('admits the first ledger row of a page even when its key alone exceeds the byte budget', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const { writer, stream, manifest } = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  const template = db.identityLedger.find(entry => !identityDomains.has(entry.domain));
+  if (template === undefined) throw new Error('fixture missing a non-identity ledger row');
+  const identity = template.native_key.slice(template.native_key.indexOf(':') + 1);
+  db.identityLedger.push({ ...template, identity_sha256: 'synthetic-oversized', native_key: `${'p'.repeat(PORTABLE_LIMITS.maxBatchBytes + 1)}:${identity}` });
+  await db.query({ text: 'BEGIN' });
+  boundaries.contentRows.mockClear();
+  await api.completePortableDestinationInTransaction(executor, writer, verified);
+  expect(db.run?.state).toBe('completed');
+  // The oversized key sorts last in its domain, so the byte bound cuts it off
+  // the first page and it leads the next one. Without the first-row rule that
+  // page would come back empty and end the walk before the key was compared.
+  const compared = boundaries.contentRows.mock.calls.flatMap(call => call[3] as readonly string[]);
+  expect(compared.some(locator => locator.length > PORTABLE_LIMITS.maxBatchBytes)).toBe(true);
   await db.query({ text: 'ROLLBACK' });
 });
 

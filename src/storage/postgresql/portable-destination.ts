@@ -496,13 +496,22 @@ async function verifiedCompletionState(executor:PostgreSqlQueryExecutor,authorit
  * validation, so one unbounded SELECT would make node-postgres
  * materialise the entire run, plus a second per-domain copy of it, while
  * this transaction holds the exclusive project publication lock.
+ *
+ * Each page is also bounded in bytes. native_key embeds the source locator,
+ * which is unbounded text (up to PORTABLE_LIMITS.maxRecordBytes for a
+ * native transcript checkpoint), so a page of maxBatchRecords rows could
+ * otherwise carry far more than a batch. The server keeps only the leading
+ * rows whose running octet_length(native_key) total stays within
+ * PORTABLE_LIMITS.maxBatchBytes, so over-budget keys are never returned. The
+ * first row is always admitted: one key is at most maxRecordBytes, below
+ * maxBatchBytes, so every page makes progress.
  */
 async function assertRunContentUnchanged(state:DestinationState,executor:PostgreSqlQueryExecutor,signal?:AbortSignal):Promise<void>{
   let afterDomain='';
   let afterIdentity='';
   for(;;){
     abort(signal);
-    const page=await executor.query<{domain:string;identity_sha256:string;native_key:string;content_sha256:string}>({text:'SELECT domain,identity_sha256,native_key,content_sha256 FROM lcm.transfer_identities WHERE run_id=$1 AND (domain,identity_sha256)>($2::text,$3::text) ORDER BY domain,identity_sha256 LIMIT $4',values:[state.input.runId,afterDomain,afterIdentity,PORTABLE_LIMITS.maxBatchRecords]},options(state,signal));
+    const page=await executor.query<{domain:string;identity_sha256:string;native_key:string;content_sha256:string}>({text:'SELECT domain,identity_sha256,native_key,content_sha256 FROM (SELECT domain,identity_sha256,native_key,content_sha256,pg_catalog.row_number() OVER (ORDER BY domain,identity_sha256) AS ledger_row,pg_catalog.sum(pg_catalog.octet_length(native_key)) OVER (ORDER BY domain,identity_sha256) AS ledger_bytes FROM (SELECT domain,identity_sha256,native_key,content_sha256 FROM lcm.transfer_identities WHERE run_id=$1 AND (domain,identity_sha256)>($2::text,$3::text) ORDER BY domain,identity_sha256 LIMIT $4) AS keyset_page) AS sized_page WHERE ledger_row=1 OR ledger_bytes<=$5::bigint ORDER BY domain,identity_sha256',values:[state.input.runId,afterDomain,afterIdentity,PORTABLE_LIMITS.maxBatchRecords,PORTABLE_LIMITS.maxBatchBytes]},options(state,signal));
     if(page.rows.length===0)return;
     const last=page.rows[page.rows.length-1]!;
     afterDomain=last.domain;afterIdentity=last.identity_sha256;
