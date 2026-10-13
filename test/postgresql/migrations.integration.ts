@@ -4279,7 +4279,7 @@ describe("PostgreSQL migrations and database isolation", () => {
                  EXISTS (
                    SELECT 1
                    FROM lcm.schema_migrations
-                   WHERE id = '0008_invalid_column_snapshot'
+                   WHERE id = '0009_invalid_column_snapshot'
                  ) AS applied,
                  attribute.attnotnull AS not_null
                FROM pg_catalog.pg_attribute AS attribute
