@@ -201,7 +201,27 @@ describe('PostgreSQL source failure boundaries',()=>{
     await expect(adapter.createPostgreSqlPortableSource({settings,expectedOwner:'owner',expectedIdentity:identity(),admission:'transfer'},h.dependencies as never)).rejects.toMatchObject({code:'source-invalid'});
     const verifyTransferSchema=vi.fn(async()=>({}));
     const source=await adapter.createPostgreSqlPortableSource({settings,expectedOwner:'owner',expectedIdentity:identity(),admission:'transfer'},{...h.dependencies,verifyTransferSchema} as never);
-    expect(verifyTransferSchema).toHaveBeenCalledTimes(1);expect(h.dependencies.verifyRuntimeSchema).not.toHaveBeenCalled();await source.close();
+    expect(verifyTransferSchema).toHaveBeenCalledTimes(2);expect(h.dependencies.verifyRuntimeSchema).not.toHaveBeenCalled();await source.close();
+  });
+  it.each(['runtime','transfer'] as const)('rechecks %s readiness on the snapshot session after it opens',async(admission)=>{
+    const h=dataHarness(),verifyTransferSchema=vi.fn(async(..._args:unknown[])=>({}));
+    const verify=(admission==='transfer'?verifyTransferSchema:h.dependencies.verifyRuntimeSchema) as typeof verifyTransferSchema;
+    const source=await adapter.createPostgreSqlPortableSource({settings,expectedOwner:'owner',expectedIdentity:identity(),admission},{...h.dependencies,verifyTransferSchema} as never);
+    expect(verify).toHaveBeenCalledTimes(2);
+    expect(verify.mock.calls[0]![0]).toBe(h.runtime);expect(verify.mock.calls[1]![0]).toBe(h.session);
+    expect(verify.mock.calls[0]![1]).toMatchObject({expectedOwner:'owner'});expect(verify.mock.calls[1]![1]).toMatchObject({expectedOwner:'owner'});
+    expect(verify.mock.invocationCallOrder[0]!).toBeLessThan(h.runtime.openReadOnlySnapshot.mock.invocationCallOrder[0]!);
+    expect(h.runtime.openReadOnlySnapshot.mock.invocationCallOrder[0]!).toBeLessThan(verify.mock.invocationCallOrder[1]!);
+    await source.close();
+  });
+  it.each(['runtime','transfer'] as const)('reports an in-snapshot %s readiness failure as unavailable and closes once',async(admission)=>{
+    const h=dataHarness(),verifyTransferSchema=vi.fn(async(..._args:unknown[])=>({}));
+    const verify=(admission==='transfer'?verifyTransferSchema:h.dependencies.verifyRuntimeSchema) as typeof verifyTransferSchema;
+    verify.mockResolvedValueOnce({}).mockRejectedValueOnce(new Error('password-canary'));
+    const error=await adapter.createPostgreSqlPortableSource({settings,expectedOwner:'owner',expectedIdentity:identity(),admission},{...h.dependencies,verifyTransferSchema} as never).catch((error:unknown)=>error);
+    expect(error).toMatchObject({code:'source-unavailable'});expect(JSON.stringify(error)).not.toMatch(/canary/);
+    expect(verify).toHaveBeenCalledTimes(2);expect(verify.mock.calls[1]![0]).toBe(h.session);
+    expect(h.session.close).toHaveBeenCalledTimes(1);expect(h.runtime.close).toHaveBeenCalledTimes(1);
   });
   it.each([
     ['portableSourceWitness',{database_name:'source',database_oid:1,server_address:'localhost',server_port:'5432'}],

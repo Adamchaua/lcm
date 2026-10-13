@@ -91,8 +91,10 @@ producer's responsibility to keep the source quiescent and its captures coherent
 The PostgreSQL source first admits verified TLS, PostgreSQL 18, schema,
 privileges and the existing machine/project/path binding. It then holds a
 dedicated read-only repeatable-read session. All source reads are serialized on
-that session, and closing the source rolls it back and releases it. Ordinary
-runtime transactions retain their existing mode.
+that session, and closing the source rolls it back and releases it. Catalog
+readiness is re-checked inside the read-only snapshot established when the
+session opens, so readiness evidence and exported reads share that snapshot.
+Ordinary runtime transactions retain their existing mode.
 
 A SQLite destination must be a new exclusively created file in an owner-only
 directory, or the exact generation recorded by an earlier transfer ledger.

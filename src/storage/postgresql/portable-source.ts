@@ -160,6 +160,12 @@ export async function createPostgreSqlPortableSource(options: PostgreSqlPortable
     await registeredIdentity(runtime,expectedIdentity,normalizedPath,options.signal);
     session=await runtime.openReadOnlySnapshot({projectId:expectedIdentity.id,signal:options.signal});
     if (session.identity.projectId !== expectedIdentity.id) invalid();
+    // Snapshot-session opens REPEATABLE READ READ ONLY and pins it with its pid query, so
+    // this recheck joins the snapshot used for every export read; DDL committed before the
+    // pin is caught here. The verifier only SELECTs, except transaction-local set_config
+    // calls that last until the snapshot rollback and do not affect schema-qualified SQL.
+    // Non-MVCC probes (pg_stat_ssl, current_setting) are live state; snapshotState rechecks them.
+    await verify(session,{expectedOwner:options.expectedOwner,signal:options.signal});
     await registeredIdentity(session,expectedIdentity,normalizedPath,options.signal);
     const capturedAt=await snapshotState(session,options.signal);
     const sourceWitnessSha256=await readPostgreSqlPortableWitness(session,expectedIdentity.id,options.signal);
