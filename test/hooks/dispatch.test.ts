@@ -34,6 +34,9 @@ vi.mock("../../src/daemon/client.js", () => ({
 vi.mock("../../src/hooks/config.js", () => ({
   loadHookConfig: vi.fn().mockReturnValue({ daemonPort: 3737, storage: { backend: "sqlite" }, security: { sensitivePatterns: [] } }),
 }));
+vi.mock("../../src/hooks/hook-errors.js", () => ({
+  safeLogError: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock("../../src/bootstrap.js", () => ({
   ensureBootstrapped: vi.fn().mockResolvedValue(true),
   ensureCoreEndpoint: vi.fn().mockResolvedValue({ connected: true, port: 3737 }),
@@ -42,6 +45,9 @@ vi.mock("../../src/bootstrap.js", () => ({
 import { validateAndFixHooks } from "../../src/hooks/auto-heal.js";
 import { dispatchHook, isHookCommand } from "../../src/hooks/dispatch.js";
 import { ensureBootstrapped, ensureCoreEndpoint } from "../../src/bootstrap.js";
+import { safeLogError } from "../../src/hooks/hook-errors.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 describe("HOOK_COMMANDS", () => {
   it("has an entry for every REQUIRED_HOOKS event", () => {
@@ -253,10 +259,104 @@ describe("dispatchHook", () => {
 
   it("binds snapshot dispatch to the verified port when configuration changes afterward", async () => {
     vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: true, port: 3737 });
+    vi.mocked(loadHookConfig).mockClear();
     vi.mocked(loadHookConfig).mockReturnValueOnce(configWithDaemon({ port: 9999 }));
     vi.mocked(handleSessionSnapshot).mockClear();
     await dispatchHook("session-snapshot", JSON.stringify({ session_id: "s1" }));
     expect(handleSessionSnapshot).toHaveBeenCalledWith(expect.any(String), { verifiedPort: 3737 });
+    // The unused queued value must not leak into later tests.
+    expect(loadHookConfig).not.toHaveBeenCalled();
+    vi.mocked(loadHookConfig).mockReset();
+    vi.mocked(loadHookConfig).mockReturnValue(configWithDaemon({ port: 3737 }));
+  });
+
+  it("dispatches session-snapshot without loading the publication-locked config", async () => {
+    vi.mocked(loadHookConfig).mockClear();
+    vi.mocked(loadHookConfig).mockImplementationOnce(() => {
+      throw new PrivateMutationLockContentionError("publication lock is busy");
+    });
+    vi.mocked(handleSessionSnapshot).mockClear();
+    try {
+      await expect(dispatchHook("session-snapshot", "{}")).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(loadHookConfig).not.toHaveBeenCalled();
+      expect(handleSessionSnapshot).toHaveBeenCalledWith("{}");
+    } finally {
+      vi.mocked(loadHookConfig).mockReset();
+      vi.mocked(loadHookConfig).mockReturnValue(configWithDaemon({ port: 3737 }));
+    }
+  });
+
+  it("still repairs non-Codex hook settings before dispatching session-snapshot", async () => {
+    const callOrder: string[] = [];
+    vi.mocked(validateAndFixHooks).mockImplementation(() => { callOrder.push("heal"); });
+    vi.mocked(handleSessionSnapshot).mockImplementation(async () => { callOrder.push("handler"); return { exitCode: 0, stdout: "" }; });
+    try {
+      await dispatchHook("session-snapshot", "{}");
+      expect(callOrder).toEqual(["heal", "handler"]);
+    } finally {
+      vi.mocked(validateAndFixHooks).mockReset();
+      vi.mocked(handleSessionSnapshot).mockReset();
+      vi.mocked(handleSessionSnapshot).mockResolvedValue({ exitCode: 0, stdout: "" });
+    }
+  });
+
+  describe("publication-lock contention while loading the hook config", () => {
+    const handlers = [
+      ["compact", "PreCompact", handlePreCompact],
+      ["restore", "SessionStart", handleSessionStart],
+      ["session-end", "SessionEnd", handleSessionEnd],
+    ] as const;
+
+    it.each(handlers)("returns a best-effort exit 0 for %s without calling its handler", async (cmd, event, handler) => {
+      const contention = new PrivateMutationLockContentionError("publication lock is busy");
+      vi.mocked(loadHookConfig).mockImplementationOnce(() => { throw contention; });
+      vi.mocked(handler).mockClear();
+      vi.mocked(safeLogError).mockClear();
+
+      await expect(dispatchHook(cmd, "{}")).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(safeLogError).toHaveBeenCalledWith(event, contention, {});
+    });
+
+    it.each(handlers)("awaits the contention log before returning for %s", async (cmd) => {
+      let logged = false;
+      vi.mocked(loadHookConfig).mockImplementationOnce(() => {
+        throw new PrivateMutationLockContentionError("publication lock is busy");
+      });
+      vi.mocked(safeLogError).mockImplementationOnce(async () => {
+        await new Promise(resolve => setTimeout(resolve, 5));
+        logged = true;
+      });
+
+      await dispatchHook(cmd, "{}");
+
+      expect(logged).toBe(true);
+    });
+
+    it.each(handlers)("propagates a publication journal error for %s", async (cmd, _event, handler) => {
+      const journal = new BackendPublicationJournalError("malformed-journal", "evidence is malformed");
+      vi.mocked(loadHookConfig).mockImplementationOnce(() => { throw journal; });
+      vi.mocked(handler).mockClear();
+      vi.mocked(safeLogError).mockClear();
+
+      await expect(dispatchHook(cmd, "{}")).rejects.toBe(journal);
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(safeLogError).not.toHaveBeenCalled();
+    });
+
+    it.each(handlers)("propagates an unrelated config error for %s", async (cmd, _event, handler) => {
+      const failure = new Error("config unreadable");
+      vi.mocked(loadHookConfig).mockImplementationOnce(() => { throw failure; });
+      vi.mocked(handler).mockClear();
+      vi.mocked(safeLogError).mockClear();
+
+      await expect(dispatchHook(cmd, "{}")).rejects.toBe(failure);
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(safeLogError).not.toHaveBeenCalled();
+    });
   });
 
   it("routes post-tool without calling ensureBootstrapped", async () => {

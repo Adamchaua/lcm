@@ -8,6 +8,27 @@ All hooks receive a JSON object via stdin. lcm hooks are invoked as shell comman
 lcm <hook-command> < <stdin-json>
 ```
 
+## Hook entrypoints and legacy-root migration
+
+Installed hook entrypoints (`post-tool`, `restore`, `session-end`,
+`session-snapshot`, `user-prompt`, and `compact --hook`) skip the CLI's
+global legacy-root migration preflight, so a busy backend publication lock
+cannot fail a hook before its own handler runs. Interactive `lcm compact` and
+installation keep the preflight.
+
+- These invocations do not run legacy-root migration: `user-prompt`,
+  `compact --hook`, and `restore`, `session-end`, or `session-snapshot`
+  without a `session_id`. Migration happens at the next SessionStart with a
+  `session_id` or at installation. The legacy-and-active home coexistence
+  check that the preflight also ran is likewise enforced only on those paths.
+- Ordinary publication-lock contention follows each hook's own bounded policy.
+  Admission fences and the pre-handler configuration load treat it as a
+  best-effort outcome (exit `0`). UserPromptSubmit's durable local enqueue is
+  retry-required: it exits non-zero if its append barrier stays busy past the
+  bounded wait.
+- Malformed, tampered, or unresolved publication evidence still fails closed
+  wherever a hook already rethrows it.
+
 ## Local passive-event durability
 
 Passive-event capture is an explicit offline boundary. `PostToolUse` and
