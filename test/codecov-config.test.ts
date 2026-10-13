@@ -219,6 +219,8 @@ const expectedComponents = [
       "^src/storage/portable-record\\.ts$",
       "^src/storage/portable-record-stream\\.ts$",
       "^src/storage/portable-transfer\\.ts$",
+      // #1388 keeps the bounded disk index's byte-length evidence for batched
+      // canonical reads in this existing storage-abstractions owner.
       "^src/storage/portable-index\\.ts$",
       "^src/storage/postgresql/project-storage\\.ts$",
     ],
@@ -375,8 +377,12 @@ const expectedComponents = [
     name: "Integration - PostgreSQL Portable Transfer",
     paths: [
       // #618 canonical self-provenance stays in PostgreSQL portable transfer.
+      // #1388 keeps batched canonical row reads for source creation and
+      // verification in this existing PostgreSQL portable-transfer owner.
       "^src/storage/postgresql/portable-source\\.ts$",
       "^src/storage/postgresql/portable-destination\\.ts$",
+      // #1388 keeps the batched canonical-row read helper and its collated
+      // locator comparison in the same owner.
       "^src/storage/postgresql/portable-mapping\\.ts$",
     ],
   },
@@ -627,7 +633,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(244);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1388 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -856,6 +862,13 @@ describe("Codecov configuration", () => {
       // repositories it serializes.
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
+      // #1388 batches canonical row reads for PostgreSQL portable source
+      // creation and verification. The change is confined to existing files
+      // and adds no component, so every touched file keeps its established
+      // owner; these pins record that decision for materially changed files.
+      ["src/storage/portable-index.ts", "unit-storage-abstractions"],
+      ["src/storage/postgresql/portable-source.ts", "integration-postgresql-portable"],
+      ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
       // #1101 numeric skipped-sidecar counts stay local-persistence-owned.
       // #1191 mutating sidecar scan lifetime stays local-persistence-owned.

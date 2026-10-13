@@ -306,6 +306,8 @@ component_management:
         - "^src/storage/portable-record-stream\\.ts$"
         # #618 shared canonical transfer and bounded validation index.
         - "^src/storage/portable-transfer\\.ts$"
+        # #1388 keeps the bounded disk index's byte-length evidence for batched
+        # canonical reads in this existing storage-abstractions owner.
         - "^src/storage/portable-index\\.ts$"
         - "^src/storage/postgresql/project-storage\\.ts$"
     - component_id: "unit-migration-cutover"
@@ -478,8 +480,12 @@ component_management:
       name: "Integration - PostgreSQL Portable Transfer"
       paths:
         # #618 canonical self-provenance stays in PostgreSQL portable transfer.
+        # #1388 keeps batched canonical row reads for source creation and
+        # verification in this existing PostgreSQL portable-transfer owner.
         - "^src/storage/postgresql/portable-source\\.ts$"
         - "^src/storage/postgresql/portable-destination\\.ts$"
+        # #1388 keeps the batched canonical-row read helper and its collated
+        # locator comparison in the same owner.
         - "^src/storage/postgresql/portable-mapping\\.ts$"
     - component_id: "integration-postgresql-schema"
       name: "Integration - PostgreSQL Schema"

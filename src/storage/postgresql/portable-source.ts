@@ -19,7 +19,7 @@ import type {
 import { PostgreSqlRuntime } from "./runtime.js";
 import { verifyPostgreSqlRuntimeSchema, verifyPostgreSqlTransferSchema } from "./runtime-readiness.js";
 import { PortableTransferError } from "../portable-transfer.js";
-import { createPortableIndex, type PortableIndex, type PortableIndexEntry } from "../portable-index.js";
+import { createPortableIndex, type PortableIndex } from "../portable-index.js";
 import {
   decodeCanonicalRow, listCanonicalHeaders, listConversationMessageHeaders,
   readCanonicalContentRows, readCanonicalRow,
@@ -137,6 +137,29 @@ function assertHeaderLength(length: string): void {
   if (BigInt(length) > BigInt(PORTABLE_LIMITS.maxBatchBytes)) throw new PortableStreamError("record-unrepresentable");
 }
 
+/**
+ * Splits locator picks into consecutive chunks whose aggregate SQL-measured
+ * byteLength stays within PORTABLE_LIMITS.maxBatchBytes, so one batched read
+ * never fetches more than one batch of payload. A single item at the limit
+ * still forms its own chunk (assertHeaderLength already refused anything
+ * larger). An item without a byteLength fails closed. Callers must pass a
+ * non-empty list, so the final chunk is flushed unconditionally.
+ */
+function splitByBytes<T extends {readonly byteLength?: string}>(items: readonly T[]): T[][] {
+  const budget=BigInt(PORTABLE_LIMITS.maxBatchBytes);
+  const chunks:T[][]=[];
+  let current:T[]=[];
+  let currentBytes=0n;
+  for (const item of items) {
+    if (item.byteLength === undefined) invalid();
+    const size=BigInt(item.byteLength);
+    if (current.length > 0 && currentBytes+size > budget) { chunks.push(current); current=[]; currentBytes=0n; }
+    current.push(item); currentBytes+=size;
+  }
+  chunks.push(current);
+  return chunks;
+}
+
 /** Opens one owned read-only snapshot; its identity cannot survive session replacement. */
 export async function createPostgreSqlPortableSource(options: PostgreSqlPortableSourceOptions,
   injected: PostgreSqlPortableSourceDependencies = dependencies): Promise<PortableRecordSource> {
@@ -230,21 +253,28 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     }
     yield `],"sessionId":${canonicalJson(value.sessionId)},"title":${canonicalJson(value.title)},"updatedAt":${canonicalJson(value.updatedAt)}}]`;
   };
-  const eachHeader=async (domain: PortableDomain, visit:(locator:string,byteLength:string)=>Promise<void>) => {
+  const eachHeaderPage=async (domain: PortableDomain,
+    visitPage:(headers:readonly {readonly locator:string;readonly byteLength:string}[])=>Promise<void>) => {
     let after: string | null=null;
     while (true) {
       abort(options.signal);
       const headers=await listCanonicalHeaders(session,expectedIdentity.id,domain,after,PORTABLE_LIMITS.maxBatchRecords,options.signal);
       if (headers.length === 0) break;
       if (headers.length > PORTABLE_LIMITS.maxBatchRecords) invalid();
+      let previous: string | null=after;
       for (const header of headers) {
         assertHeaderLength(header.byteLength);
-        if (header.locator === after) invalid();
-        await visit(header.locator,header.byteLength);
-        after=header.locator;
+        if (header.locator === previous) invalid();
+        previous=header.locator;
       }
+      await visitPage(headers);
+      after=previous;
     }
   };
+  const eachHeader=(domain: PortableDomain, visit:(locator:string,byteLength:string)=>Promise<void>) =>
+    eachHeaderPage(domain,async(headers) => {
+      for (const header of headers) await visit(header.locator,header.byteLength);
+    });
   await eachHeader("conversations",async (locator) => {
     const row=await queryRow("conversations",locator,options.signal);
     const record=draftConversation(row,"0");
@@ -296,10 +326,19 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
   };
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
     let count=0;
-    await eachHeader(domain,async(locator,byteLength) => {
-      const draft=await recordAt(domain,locator,0,options.signal);
-      index.add(locator,draft,byteLength);
-      count++;
+    // One batched read per byte-bounded chunk of each header page (#1388).
+    // Chunks are finished in order, and rows are consumed in header order, so
+    // occurrence allocation and index ordinals match the per-record walk.
+    await eachHeaderPage(domain,async(headers) => {
+      for (const chunk of splitByBytes(headers)) {
+        abort(options.signal);
+        const rows=await readCanonicalContentRows(session,expectedIdentity.id,domain,chunk.map(header=>header.locator),options.signal);
+        for (const header of chunk) {
+          const draft=recordFromRow(domain,rows.get(header.locator) ?? invalid(),header.locator,0);
+          index.add(header.locator,draft,header.byteLength);
+          count++;
+        }
+      }
     });
     index.finalizeDomain(domain); counts.set(domain,count);
   }
@@ -330,32 +369,6 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     if (entry === undefined) invalid();
     return checkedRecordAt(domain,entry.locator,entry.ordinal,signal);
   };
-  /**
-   * Splits an ordinal-ordered entries page into round trips whose aggregate
-   * SQL-measured bytes (per entry.byteLength, captured in the disk-backed
-   * index from the same sizeExpression readCanonicalContentRows' guard
-   * enforces; see PortableIndex.add) stay within
-   * PORTABLE_LIMITS.maxBatchBytes. A single oversized locator still forms its
-   * own one-element chunk; assertHeaderLength already refused anything
-   * larger than PORTABLE_LIMITS.maxBatchBytes during the header walk.
-   * Callers must only pass a non-empty batch (boundaryAt already refuses an
-   * empty entries page before calling this), so the final chunk is always
-   * flushed unconditionally below.
-   */
-  const chunkEntriesByBytes=(batch:readonly PortableIndexEntry[]):PortableIndexEntry[][] => {
-    const budget=BigInt(PORTABLE_LIMITS.maxBatchBytes);
-    const chunks:PortableIndexEntry[][]=[];
-    let current:PortableIndexEntry[]=[];
-    let currentBytes=0n;
-    for (const item of batch) {
-      if (item.byteLength === undefined) invalid();
-      const size=BigInt(item.byteLength);
-      if (current.length > 0 && currentBytes+size > budget) { chunks.push(current); current=[]; currentBytes=0n; }
-      current.push(item); currentBytes+=size;
-    }
-    chunks.push(current);
-    return chunks;
-  };
   const boundaryAt=async(domain:PortableDomain,nextOrdinal:number,capture:boolean,signal?:AbortSignal) => {
     let prefix=initialPrefix(domain);
     let last:BoundaryEvidence["last"]=null;
@@ -369,8 +382,8 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       // above) instead of one round trip per record. See #1388; the
       // incremental digest chain below still processes rows strictly in
       // entries' order, so boundary/ordering semantics do not change.
-      // Chunking here additionally bounds each round trip's aggregate SQL
-      // payload bytes to PORTABLE_LIMITS.maxBatchBytes: index.entries' own
+      // Chunking (splitByBytes) additionally bounds each round trip's
+      // aggregate SQL payload bytes to PORTABLE_LIMITS.maxBatchBytes: index.entries' own
       // maxBytes bound only limits JSON-stringified index metadata, not the
       // record payload readCanonicalContentRows fetches. The digest loop
       // runs immediately after each chunk's read, inside this loop, instead
@@ -378,7 +391,7 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       // Node process's peak resident payload is therefore one chunk (at
       // most PORTABLE_LIMITS.maxBatchBytes), not the whole entries page.
       abort(signal); abort(options.signal);
-      for (const chunk of chunkEntriesByBytes(entries)) {
+      for (const chunk of splitByBytes(entries)) {
         const chunkRows=await readCanonicalContentRows(session,expectedIdentity.id,domain,chunk.map(item=>item.locator),signal);
         for (const item of chunk) {
           const row=chunkRows.get(item.locator);

@@ -197,6 +197,14 @@ it("batches canonical row reads by locator instead of one query per record",asyn
   expect(found.get(locators[2]!)).toEqual({test:"payload-2"});
   expect(found.has(locators[1]!)).toBe(false);
 });
+it("compares batch locators under the C collation, exactly as the single-row read does",async()=>{
+  const single=executor([]);
+  await mapping.readCanonicalContentRows(single.db,projectId,"session-ingest",[JSON.stringify(["a"])]);
+  expect(single.query.mock.calls[0][0].text).toContain('json_build_array(r.ingest_key::text)::text COLLATE "C" = ANY($2::text[])');
+  const multi=executor([]);
+  await mapping.readCanonicalContentRows(multi.db,projectId,"promoted-memory-tags",[JSON.stringify(["a","1"])]);
+  expect(multi.query.mock.calls[0][0].text).toContain('json_build_array(r.memory_id::text, r.ordinal::text)::text COLLATE "C" = ANY($2::text[])');
+});
 it("returns an empty map without querying when there are no locators to check",async()=>{
   const {db,query}=executor([]);
   expect(await mapping.readCanonicalContentRows(db,projectId,"machines",[])).toEqual(new Map());
