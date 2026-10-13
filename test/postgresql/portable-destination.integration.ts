@@ -370,6 +370,7 @@ it('fences a project-scoped canonical writer between the completion recheck and 
     const settled={value:false};
     let drift:Promise<unknown>=Promise.resolve();
     let injected=false;
+    let sawSizes=false;
     let observed:'blocked'|'committed'|'absent'|'unreached'='unreached';
     try{
       const manifest=source.describe();
@@ -379,7 +380,13 @@ it('fences a project-scoped canonical writer between the completion recheck and 
       const spy=vi.spyOn(Client.prototype,'query').mockImplementation(function(this:Client,...args:unknown[]){
         const promise=Reflect.apply(original,this,args) as Promise<unknown>;
         const statement=(args[0] as {text?:string})?.text;
-        if(injected||typeof statement!=='string'||!statement.includes('__locator')||statement.includes('__bytes')||!statement.includes('FROM lcm.conversations r'))return promise as never;
+        if(injected||typeof statement!=='string'||!statement.includes('FROM lcm.conversations r'))return promise as never;
+        // Building the portable source also batch-reads conversations with the
+        // same payload query, before the completion transaction. Only the
+        // recheck reads sizes first, so wait for its size read and inject on
+        // the payload read that follows, inside the fence.
+        if(statement.includes('__bytes')){sawSizes=true;return promise as never;}
+        if(!sawSizes||!statement.includes('__locator'))return promise as never;
         injected=true;
         return promise.then(async result=>{
           // Passing projectId is what makes this a guarded canonical writer:
