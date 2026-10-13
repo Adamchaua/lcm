@@ -525,9 +525,10 @@ describe("deduplicateAndInsert", () => {
     // both the fuzzy and exact lookups. SQLite has no cross-project owner
     // scope, so both stay scoped to the caller's sourceProjectId. The
     // point of this test is that the exact lookup itself is not gated by
-    // backend: SQLite's is a plain indexed point query with no lexical
-    // dependency, so it still finds punctuation-only content that the
-    // (also backend-agnostic) empty fuzzy page above could not.
+    // backend: SQLite's has no lexical dependency, so it still finds
+    // punctuation-only content that the (also backend-agnostic) empty fuzzy
+    // page above could not. (PostgreSQL serves it from a content-digest
+    // index; SQLite scans the project's active rows, see #1441.)
     const expectedScope = backend === "postgresql" ? undefined : "incoming-source";
 
     await expect(deduplicateAndInsert({

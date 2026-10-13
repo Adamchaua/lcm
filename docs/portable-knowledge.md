@@ -44,8 +44,10 @@ runs after `lcm compact`) makes the same owner-scoped decision on every
 backend. A promoted summary whose exact content is already an active memory
 in scope merges into that memory, even when ranked search cannot recall it
 because the content carries no searchable terms or falls outside the
-candidate page. Earlier versions decided promotion from ranked search
-alone on every backend and could store such content twice.
+candidate page. As with import, PostgreSQL matches across the bound
+project's whole provenance while SQLite matches within its existing
+source-scoped boundary. Earlier versions decided promotion from ranked
+search alone on every backend and could store such content twice.
 
 ## Version 1 format and privacy
 
