@@ -907,6 +907,25 @@ it('refuses completion when a canonical row changed outside this run since verif
   await db.query({ text: 'ROLLBACK' });
 });
 
+it('treats repeated completion of a completed run as a no-op without rechecking content', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const { writer, stream, manifest } = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  await db.query({ text: 'BEGIN' });
+  await api.completePortableDestinationInTransaction(executor, writer, verified);
+  expect(db.run?.state).toBe('completed');
+  const messages = db.records.get('messages')!;
+  const driftedIndex = messages.findIndex(record => !identityDomains.has(record.domain));
+  if (driftedIndex === -1) throw new Error('fixture missing a messages record to drift');
+  const original = messages[driftedIndex]!;
+  messages[driftedIndex] = { ...original, value: { ...(original.value as object), tampered: true } } as typeof original;
+  await expect(api.completePortableDestinationInTransaction(executor, writer, verified)).resolves.toBeUndefined();
+  expect(db.run?.state).toBe('completed');
+  await db.query({ text: 'ROLLBACK' });
+});
+
 it('refuses completion when a canonical row this run wrote has disappeared', async () => {
   const api = await import('../../src/storage/postgresql/portable-destination.js');
   const { writer, stream, manifest } = await admitted();

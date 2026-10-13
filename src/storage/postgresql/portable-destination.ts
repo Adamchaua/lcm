@@ -566,7 +566,10 @@ async function assertDomainContentUnchanged(state:DestinationState,executor:Post
   await compare();
 }
 export async function completePortableDestinationInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<void>{
-  const {state}=await verifiedCompletionState(executor,authority,verification,signal);
+  const {state,row}=await verifiedCompletionState(executor,authority,verification,signal);
+  // The content recheck belongs to the active-to-completed transition (see
+  // readPortableCompletedRunInTransaction); repeating completion is a no-op.
+  if(row.state==='completed')return;
   await assertRunContentUnchanged(state,executor,signal);
   await executor.query({text:"UPDATE lcm.transfer_runs SET state='completed' WHERE run_id=$1",values:[state.input.runId]},options(state,signal));
 }
