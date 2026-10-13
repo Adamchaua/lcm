@@ -323,10 +323,6 @@ if [[ "$*" == *"/commits/"*"/pulls?per_page=100"* ]]; then
   printf '%s\\n' '[{"number":123,"changed_files":1,"commits":1,"state":"open","draft":false,"user":{"id":42,"login":"contributor","type":"User"},"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature/admission","repo":{"full_name":"example/repository"}}}]'
   exit 0
 fi
-if [[ "$*" == *"/pulls/123/files?per_page=100"* ]]; then
-  printf '%s\\n' '[[{"filename":"docs/external-admission.md","status":"modified"}]]'
-  exit 0
-fi
 if [[ "$*" == *"/pulls/123"* ]]; then
   if [[ "$FAIL_ADMISSION_COMMAND" == malformed-eligibility ]]; then
     printf '%s\\n' '{malformed'
@@ -419,13 +415,17 @@ fi
 if [[ "$FAIL_ADMISSION_COMMAND" == validator-jq && "$call_count" == 10 ]]; then
   exit 72
 fi
-if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$call_count" == 22 ]]; then
-  exit 75
-fi
 if [[ "$FAIL_ADMISSION_COMMAND" == checks-ready-jq && "$1" == "-r" && "$2" == ".ready" ]]; then
   input="$(cat)"
   if [[ "$input" == *'"states"'* ]]; then
     exit 74
+  fi
+  exec /usr/bin/jq "$@" <<<"$input"
+fi
+if [[ "$FAIL_ADMISSION_COMMAND" == ci-ready-jq && "$1" == "-r" && "$2" == ".ready" ]]; then
+  input="$(cat)"
+  if [[ "$input" == *'"state":"completed"'* ]]; then
+    exit 75
   fi
   exec /usr/bin/jq "$@" <<<"$input"
 fi
@@ -465,6 +465,10 @@ type AdmissionScenario =
   | "equal-dco-created"
   | "equal-dco-rerequested"
   | "equal-dco-completed"
+  | "drift-ci-check-current"
+  | "drift-dco-check-current"
+  | "drift-ci-run-current"
+  | "drift-dco-check-final"
   | "no-unique-pr"
   | "protected-main"
   | "sensitive-looking-paths"
@@ -514,8 +518,8 @@ function runAdmissionScenario(
   const ghPath = join(directory, "gh");
   const branchCallsPath = join(directory, "branch-calls.log");
   const branchRequestsPath = join(directory, "branch-requests.log");
+  const checkRunCallsPath = join(directory, "check-run-calls.log");
   const fileCallsPath = join(directory, "file-calls.log");
-  const pullCallsPath = join(directory, "pull-calls.log");
   const statusLogPath = join(directory, "statuses.log");
   const headSha = "a".repeat(40);
   const ciRunId = "123";
@@ -547,11 +551,9 @@ function runAdmissionScenario(
   };
   let associatedPullRequests = [makeAdmissionPullRequest()];
   let pullRequest = makeAdmissionPullRequest();
-  let pullRequestFiles = [[
-    { filename: ".github/workflows/ci.yml", status: "modified" },
-    { filename: "src/x.ts", status: "modified" },
-  ]];
-  let checkRuns = [ciCheckRun, dcoCheckRun];
+  const checkRuns = [ciCheckRun, dcoCheckRun];
+  let checkRunSnapshots = [checkRuns, checkRuns, checkRuns];
+  const ciRuns: Record<string, typeof ciRun> = { [ciRunId]: ciRun };
   let branchProtectionSequence = ["true"];
   let branchDeletedSuffix = "";
   let branchLookupMustNotHappen = false;
@@ -601,6 +603,30 @@ function runAdmissionScenario(
       eventSource = "check_run";
       eventCheckRunId = "11";
       eventCheckRunAction = "completed";
+      break;
+    case "drift-ci-check-current": {
+      const changed = [{ ...ciCheckRun, id: 12 }, dcoCheckRun];
+      checkRunSnapshots = [checkRuns, changed, changed];
+      break;
+    }
+    case "drift-dco-check-current": {
+      const changed = [ciCheckRun, { ...dcoCheckRun, id: 12 }];
+      checkRunSnapshots = [checkRuns, changed, changed];
+      break;
+    }
+    case "drift-ci-run-current": {
+      const changedRunId = "124";
+      const changedCiCheck = {
+        ...ciCheckRun,
+        details_url: `https://example.test/${REPOSITORY}/actions/runs/${changedRunId}/job/456`,
+      };
+      ciRuns[changedRunId] = { ...ciRun, id: Number(changedRunId) };
+      const changed = [changedCiCheck, dcoCheckRun];
+      checkRunSnapshots = [checkRuns, changed, changed];
+      break;
+    }
+    case "drift-dco-check-final":
+      checkRunSnapshots = [checkRuns, checkRuns, [ciCheckRun, { ...dcoCheckRun, id: 12 }]];
       break;
     case "no-unique-pr":
       associatedPullRequests = [];
@@ -701,14 +727,7 @@ if [[ "$endpoint" == repos/*/commits/*/pulls?per_page=100 ]]; then
   exit 0
 fi
 if [[ "$endpoint" == repos/*/pulls/123 ]]; then
-  pull_call_count=0
-  if [[ -f "$PULL_CALLS" ]]; then read -r pull_call_count < "$PULL_CALLS"; fi
-  pull_call_count=$((pull_call_count + 1))
-  printf '%s\n' "$pull_call_count" > "$PULL_CALLS"
-  pull_index=$((pull_call_count - 1))
-  pull_last_index="$(jq 'length - 1' <<<"$PULL_REQUEST_SNAPSHOTS_JSON")"
-  if (( pull_index > pull_last_index )); then pull_index="$pull_last_index"; fi
-  jq -c --argjson index "$pull_index" '.[$index]' <<<"$PULL_REQUEST_SNAPSHOTS_JSON"
+  printf '%s\n' "$PULL_REQUEST_JSON"
   exit 0
 fi
 if [[ "$endpoint" == repos/*/pulls/123/files?per_page=100 ]]; then
@@ -716,7 +735,7 @@ if [[ "$endpoint" == repos/*/pulls/123/files?per_page=100 ]]; then
   if [[ -f "$FILE_CALLS" ]]; then read -r file_call_count < "$FILE_CALLS"; fi
   file_call_count=$((file_call_count + 1))
   printf '%s\n' "$file_call_count" > "$FILE_CALLS"
-  printf '%s\n' "$PULL_REQUEST_FILES_JSON"
+  printf '%s\n' '[]'
   exit 0
 fi
   if [[ "$endpoint" == repos/*/branches/* ]]; then
@@ -748,11 +767,16 @@ fi
   exit 0
 fi
 if [[ "$endpoint" == *"check-runs?filter=latest&per_page=100" ]]; then
-  printf '%s\n' "$CHECK_RUN_PAGES_JSON"
+  check_run_call_count=0
+  if [[ -f "$CHECK_RUN_CALLS" ]]; then read -r check_run_call_count < "$CHECK_RUN_CALLS"; fi
+  check_run_call_count=$((check_run_call_count + 1))
+  printf '%s\n' "$check_run_call_count" > "$CHECK_RUN_CALLS"
+  jq -c --argjson index "$((check_run_call_count - 1))" '.[$index]' \
+    <<<"$CHECK_RUN_SNAPSHOTS_JSON"
   exit 0
 fi
 if [[ "$endpoint" == repos/*/actions/runs/* ]]; then
-  printf '%s\n' "$CI_RUN_JSON"
+  jq -c --arg run_id "\${endpoint##*/}" '.[$run_id]' <<<"$CI_RUNS_JSON"
   exit 0
 fi
 printf 'unexpected fake-gh endpoint: %s\n' "$endpoint" >&2
@@ -761,8 +785,8 @@ exit 99
     chmodSync(ghPath, 0o755);
     writeFileSync(branchCallsPath, "0\n");
     writeFileSync(branchRequestsPath, "");
+    writeFileSync(checkRunCallsPath, "0\n");
     writeFileSync(fileCallsPath, "0\n");
-    writeFileSync(pullCallsPath, "0\n");
     writeFileSync(statusLogPath, "");
 
     const result = spawnSync("bash", [evaluatorPath], {
@@ -775,8 +799,11 @@ exit 99
         BRANCH_LOOKUP_MUST_NOT_HAPPEN: String(branchLookupMustNotHappen),
         BRANCH_REQUESTS: branchRequestsPath,
         BRANCH_PROTECTION_SEQUENCE: branchProtectionSequence.join(","),
-        CHECK_RUN_PAGES_JSON: JSON.stringify([{ check_runs: checkRuns }]),
-        CI_RUN_JSON: JSON.stringify(ciRun),
+        CHECK_RUN_CALLS: checkRunCallsPath,
+        CHECK_RUN_SNAPSHOTS_JSON: JSON.stringify(
+          checkRunSnapshots.map((snapshot) => [{ check_runs: snapshot }]),
+        ),
+        CI_RUNS_JSON: JSON.stringify(ciRuns),
         EVENT_HEAD_SHA: headSha,
         EVENT_SOURCE: eventSource,
         EVENT_CHECK_RUN_ACTION: eventCheckRunAction,
@@ -786,9 +813,7 @@ exit 99
         EVENT_WORKFLOW_RUN_PATH: eventWorkflowRunPath,
         FILE_CALLS: fileCallsPath,
         PATH: `${directory}:${process.env.PATH ?? ""}`,
-        PULL_CALLS: pullCallsPath,
-        PULL_REQUEST_FILES_JSON: JSON.stringify(pullRequestFiles),
-        PULL_REQUEST_SNAPSHOTS_JSON: JSON.stringify([pullRequest]),
+        PULL_REQUEST_JSON: JSON.stringify(pullRequest),
         REPOSITORY,
         RUN_URL: "https://example.test/run/1",
         SERVER_URL: "https://example.test",
@@ -801,7 +826,6 @@ exit 99
       branchCalls: Number(readFileSync(branchCallsPath, "utf8").trim()),
       branchRequests: readFileSync(branchRequestsPath, "utf8").trim().split("\n").filter(Boolean),
       fileCalls: Number(readFileSync(fileCallsPath, "utf8").trim()),
-      pullCalls: Number(readFileSync(pullCallsPath, "utf8").trim()),
     };
   } finally {
     rmSync(directory, { force: true, recursive: true });
@@ -850,6 +874,20 @@ describe("external admission workflow", () => {
     const { result, statuses } = runAdmissionScenario("equal-dco-completed");
     expect(result.status).toBe(0);
     expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+  });
+
+  it.each([
+    "drift-ci-check-current",
+    "drift-dco-check-current",
+    "drift-ci-run-current",
+    "drift-dco-check-final",
+  ] as const)("keeps changed CI or DCO evidence pending for %s", (scenario) => {
+    const { result, statuses } = runAdmissionScenario(scenario);
+    const evidence = `${scenario}\n${result.stdout}\n${result.stderr}\n${statuses.join("\n")}`;
+    expect(result.status, evidence).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0], evidence).toBe("pending");
+    expect(statuses.at(-1), evidence).toContain("CI or DCO evidence changed");
+    expect(statuses.some((status) => status.startsWith("success\t")), evidence).toBe(false);
   });
 
   it("terminalizes an exact head with no unique eligible pull request", () => {
@@ -1125,6 +1163,9 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("ciCheckRunId");
     expect(evaluator).toContain("dcoCheckRunId");
     expect(evaluator).toContain("ciRunId");
+    expect(evaluator).toContain(
+      "'{ciCheckRunId:$ciCheckRunId,dcoCheckRunId:$dcoCheckRunId,ciRunId:$ciRunId}'",
+    );
     expect(evaluator).toContain('validate_required_snapshot "Initial" initial_admission_fingerprint');
     expect(evaluator).toContain('validate_required_snapshot "Current" current_admission_fingerprint');
     expect(evaluator).toContain('validate_required_snapshot "Final" final_admission_fingerprint');
@@ -1145,7 +1186,7 @@ describe("external admission workflow", () => {
     expect(evaluator).not.toContain("validate_or_exit");
     for (const phase of ["Initial", "Current", "Final"]) {
       expect(evaluator).toMatch(new RegExp(
-        `^validate_required_snapshot "${phase}" [a-z_]+ "\\$[a-z_]+"$`,
+        `^validate_required_snapshot "${phase}" [a-z_]+$`,
         "mu",
       ));
       expect(evaluator).not.toMatch(new RegExp(

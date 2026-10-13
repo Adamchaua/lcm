@@ -388,7 +388,7 @@ fi
 
 post_admission_status pending "Waiting for trusted CI and DCO"
 initial_admission_fingerprint=""
-validate_required_snapshot "Initial" initial_admission_fingerprint "$pull_request"
+validate_required_snapshot "Initial" initial_admission_fingerprint
 
 current_matching_prs="$(fetch_associated_pull_requests)"
 select_eligible_pr_number "$current_matching_prs"
@@ -409,10 +409,10 @@ if [[ "$current_pull_request_eligible" != true ]]; then
     "Pull request eligibility changed during evaluation; admission failed."
 fi
 current_admission_fingerprint=""
-validate_required_snapshot "Current" current_admission_fingerprint "$current_pull_request"
+validate_required_snapshot "Current" current_admission_fingerprint
 if [[ "$current_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
   exit_pending \
-    "Trusted admission evidence changed during evaluation" \
+    "CI or DCO evidence changed" \
     "CI or DCO evidence changed; admission remains pending."
 fi
 
@@ -436,10 +436,10 @@ if [[ "$final_pull_request_eligible" != true ]]; then
 fi
 
 final_admission_fingerprint=""
-validate_required_snapshot "Final" final_admission_fingerprint "$final_pull_request"
+validate_required_snapshot "Final" final_admission_fingerprint
 if [[ "$final_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
   exit_pending \
-    "Trusted admission evidence changed during final validation" \
+    "CI or DCO evidence changed" \
     "Final CI or DCO evidence changed; admission remains pending."
 fi
 
