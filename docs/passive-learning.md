@@ -265,15 +265,22 @@ unchanged. Replication is still not started by a hook, and it remains separate
 from the selected `ProjectStorage` route.
 
 Every project replicates in admitted phases rather than inside one admission
-held across the whole pass. The upload runs under one admission, the claim
-fetch under the next, each renew-and-apply under its own, and reconcile and
-prune each under their own, using the same publication check that promotion
-uses. The consumer lock is released between phases so hook appends can
-proceed instead of waiting behind a whole sweep. A daemon keeps its startup
-backend for its whole lifetime, so when the configured backend changes
-underneath it the next phase admission refuses, the daemon halts exactly as
-it does for promotion, and no further event is uploaded to a backend the
-daemon has already lost.
+held across the whole pass. The drain-lease acquisition runs under its own
+admission before the upload, then the upload runs under one admission, the
+claim fetch under the next, each renew-and-apply under its own, and reconcile
+and prune each under their own, using the same publication check that
+promotion uses. Only the cleanup lease release runs outside admission. The
+consumer lock is released between phases so hook appends can proceed instead
+of waiting behind a whole sweep. A daemon keeps its startup backend for its
+whole lifetime, so when the configured backend changes underneath it the
+first refused admission halts the daemon exactly as it does for promotion,
+and no further event is uploaded to a backend the daemon has already lost.
+A sweep that admits nothing does not halt and writes nothing to the lost
+backend: no sidecar has unprocessed events and no project passes the
+replication gates before its first phase. A project whose startup PostgreSQL
+is unhealthy is reported as a storage failure instead. The next hook run
+still replaces the daemon through the `/health` backend comparison in
+`ensureDaemon`.
 
 Each pass releases its project outbox when it finishes. The local outbox
 factory registers every repository it opens and drops one only when that

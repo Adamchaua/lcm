@@ -21,5 +21,7 @@ appends proceed between phases instead of waiting behind a whole sweep.
 
 `lcm status` now reports what replication has done under `passiveEvents`:
 whether it is enabled, when the last pass ran, and how many events were
-uploaded, applied, acknowledged, pruned, retried and quarantined. A daemon that
-has never replicated says so, which distinguishes nothing to do from never ran.
+uploaded, applied, acknowledged, pruned, retried and quarantined. `enabled`
+reports backend capability, not progress. `passes` and `lastPassAt` advance on
+every sweep, and `projects` counts passes that returned a result, so an enabled
+daemon with passes and no projects is skipping or failing.
