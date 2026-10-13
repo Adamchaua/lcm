@@ -20,7 +20,7 @@ import { createPortableIndex, type PortableIndex } from '../portable-index.js';
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlQueryOptions } from './contracts.js';
 import { buildPostgreSqlClientConfig } from './client-config.js';
 import { verifyPostgreSqlTransferSchema } from './runtime-readiness.js';
-import { assertPostgreSqlRecordCapability, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
+import { assertPostgreSqlRecordCapability, countCanonicalRows, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
 import { createPostgreSqlPortableSource, readPostgreSqlPortableWitness } from './portable-source.js';
 import { acquirePostgreSqlProjectPublicationLock } from './publication-guard.js';
 
@@ -433,12 +433,13 @@ async function canonicalVerification(state:DestinationState,manifest:PortableMan
  * this run did not write. Identity domains are excluded on purpose: their ledger
  * rows are admission-time lookups rather than writes, and machines are
  * project-linked rather than project-owned, so a ledger tally is meaningless for
- * them. The live tally pages through listCanonicalHeaders, the same visibility
- * function the verification stream reads, so the counted set is definitionally
- * the verified set. A surplus refuses as destination-unexpected-rows, kept
- * distinct from verification-failed (content mismatch) on purpose; a deficit
- * refuses as verification-failed, matching the missing-row treatment the fenced
- * per-row re-derivation in PR #1422 gives the same shape.
+ * them. The live tally is one database-side count per domain over the same scope
+ * predicate as the verification stream (countCanonicalRows). It runs only on the
+ * active-to-completed transition, not on post-commit readback, where a legitimate
+ * writer may already have added rows. A surplus refuses as
+ * destination-unexpected-rows, distinct from verification-failed (content
+ * mismatch); a deficit refuses as verification-failed. It complements the
+ * per-row recheck in PR #1422.
  */
 async function assertNoForeignCanonicalRows(executor:PostgreSqlQueryExecutor,state:DestinationState,signal?:AbortSignal):Promise<void>{
   for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.filter(domain=>!(IDENTITY_DOMAINS as readonly string[]).includes(domain))){
@@ -446,12 +447,7 @@ async function assertNoForeignCanonicalRows(executor:PostgreSqlQueryExecutor,sta
     const tally=ledger.rows[0]?.count;
     const expected=typeof tally==='string'?Number(tally):NaN;
     if(!Number.isSafeInteger(expected))fail('destination-uncertain');
-    let live=0;let after:string|null=null;
-    for(;;){
-      const page=await listCanonicalHeaders(executor,state.input.expectedIdentity.id,domain,after,PORTABLE_LIMITS.maxBatchRecords,signal);
-      if(page.length===0)break;
-      live+=page.length;after=page[page.length-1]!.locator;
-    }
+    const live=await countCanonicalRows(executor,state.input.expectedIdentity.id,domain,signal);
     if(live>expected)fail('destination-unexpected-rows');
     if(live<expected)fail('verification-failed');
   }
@@ -476,11 +472,11 @@ async function verifiedCompletionState(executor:PostgreSqlQueryExecutor,authorit
   if(!row||!runMatches(state,row,proof.manifest))fail('destination-conflict');
   const saved=await progress(state,proof.manifest.manifestSha256,signal,executor);
   if(canonicalJson(saved.checkpoints.map(checkpoint=>checkpoint.checkpointSha256))!==canonicalJson(proof.checkpoints))fail('verification-failed');
-  await assertNoForeignCanonicalRows(executor,state,signal);
   return {state,row};
 }
 export async function completePortableDestinationInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<void>{
   const {state}=await verifiedCompletionState(executor,authority,verification,signal);
+  await assertNoForeignCanonicalRows(executor,state,signal);
   await executor.query({text:"UPDATE lcm.transfer_runs SET state='completed' WHERE run_id=$1",values:[state.input.runId]},options(state,signal));
 }
 export async function readPortableCompletedRunInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<boolean>{

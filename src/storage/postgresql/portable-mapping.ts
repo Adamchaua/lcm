@@ -103,6 +103,15 @@ export async function listCanonicalHeaders(executor:PostgreSqlQueryExecutor,proj
   const result = await executor.query<{locator:string;byteLength:string}>({text:`SELECT CASE WHEN ${sizeExpression(domain,mapping)} <= $4::bigint THEN ${locatorExpression(mapping)} ELSE '' END AS locator, ${sizeExpression(domain,mapping)}::text AS "byteLength" FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ($2::text[] IS NULL OR ${keyExpression(mapping)} > $2::text[] COLLATE "C") ORDER BY ${keyExpression(mapping)} COLLATE "C" LIMIT $3`,values:[projectId,keys,limit,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-headers",projectId,signal});
   return result.rows;
 }
+/** Database-side row count over the exact scope that listCanonicalHeaders pages, oversized rows included. */
+export async function countCanonicalRows(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,signal?:AbortSignal):Promise<number> {
+  const mapping = mappingForDomain(domain);
+  const result = await executor.query<{count:string}>({text:`SELECT COUNT(*)::text AS count FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)})`,values:[projectId]},{domain:"transaction",operation:"portable-count",projectId,signal});
+  const count = result.rows[0]?.count;
+  const parsed = typeof count === "string" && /^(0|[1-9][0-9]*)$/.test(count) ? Number(count) : Number.NaN;
+  if (!Number.isSafeInteger(parsed)) fail();
+  return parsed;
+}
 /** Message closure traversal uses numeric seq, independently of opaque locator order. */
 export async function listConversationMessageHeaders(executor:PostgreSqlQueryExecutor,projectId:string,conversationId:string,afterSeq:string|null,limit:number,signal?:AbortSignal):Promise<(CanonicalHeader & {readonly seq:string})[]> {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new PortableStreamError("invalid-limit");

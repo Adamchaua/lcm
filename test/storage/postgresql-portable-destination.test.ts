@@ -12,7 +12,7 @@ import { createGeneration, createFixtureSource, postgresGeneration, MACHINE_A_UU
 
 const boundaries = vi.hoisted(() => ({
   runtime: vi.fn(), client: vi.fn(), config: vi.fn(), schema: vi.fn(), witness: vi.fn(),
-  headers: vi.fn(), row: vi.fn(), insert: vi.fn(), capability: vi.fn(), source: vi.fn(),
+  headers: vi.fn(), count: vi.fn(), row: vi.fn(), insert: vi.fn(), capability: vi.fn(), source: vi.fn(),
 }));
 vi.mock('../../src/storage/postgresql/runtime.js', () => ({ PostgreSqlRuntime: class { constructor() { return boundaries.runtime(); } } }));
 vi.mock('pg', () => ({ Client: class { constructor() { return boundaries.client(); } } }));
@@ -20,7 +20,7 @@ vi.mock('../../src/storage/postgresql/client-config.js', () => ({ buildPostgreSq
 vi.mock('../../src/storage/postgresql/runtime-readiness.js', () => ({ verifyPostgreSqlTransferSchema: boundaries.schema }));
 vi.mock('../../src/storage/postgresql/portable-mapping.js', async importOriginal => ({
   ...await importOriginal<typeof import('../../src/storage/postgresql/portable-mapping.js')>(),
-  listCanonicalHeaders: boundaries.headers, readCanonicalRow: boundaries.row,
+  listCanonicalHeaders: boundaries.headers, countCanonicalRows: boundaries.count, readCanonicalRow: boundaries.row,
   insertCanonicalRecord: boundaries.insert, assertPostgreSqlRecordCapability: boundaries.capability,
 }));
 vi.mock('../../src/storage/postgresql/portable-source.js', () => ({
@@ -186,6 +186,7 @@ beforeEach(() => {
   boundaries.schema.mockResolvedValue(undefined);
   boundaries.witness.mockResolvedValue('f'.repeat(64));
   boundaries.headers.mockImplementation(async (_executor, _project, domain: PortableDomain, after: string | null) => (db.records.get(domain) ?? []).filter(row => after === null || String(row.ordinal).padStart(8, '0') > after).slice(0, 1).map(row => ({ locator: String(row.ordinal).padStart(8, '0'), byteLength: '128' })));
+  boundaries.count.mockImplementation(async (_executor, _project, domain: PortableDomain) => (db.records.get(domain) ?? []).length);
   boundaries.row.mockImplementation(async (_executor, _project, domain: PortableDomain, locator: string) => { if(boundaries.row.mock.calls.length>10000) throw new Error('fake header runaway'); return db.records.get(domain)?.[Number(locator)]?.value; });
   boundaries.insert.mockImplementation(async (_executor, _project, record: PortableRecord, resolve: (domain: PortableDomain, identity: string) => Promise<string>) => {
     if (!identityDomains.has(record.domain)) {
@@ -900,6 +901,22 @@ it('refuses canonical rows inserted after verification with a distinct membershi
  expect(db.run?.state).toBe('completed');
  await db.query({text:'ROLLBACK'});
  expect(db.run?.state).toBe('active');
+});
+it('does not repeat the membership count when reading back a completed run',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const verified=await api.verifyPortableDestinationComplete(writer,manifest);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await db.query({text:'BEGIN'});
+ await api.completePortableDestinationInTransaction(executor,writer,verified);
+ await db.query({text:'COMMIT'});
+ // After the fence is released a legitimate writer may add canonical rows.
+ db.records.get('conversations')!.push({ordinal:999999} as never);
+ boundaries.count.mockClear();
+ await db.query({text:'BEGIN'});
+ expect(await api.readPortableCompletedRunInTransaction(executor,writer,verified)).toBe(true);
+ await db.query({text:'ROLLBACK'});
+ expect(boundaries.count).not.toHaveBeenCalled();
 });
 it('refuses canonical rows deleted after verification as failed verification',async()=>{
  const api=await import('../../src/storage/postgresql/portable-destination.js');

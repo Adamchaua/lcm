@@ -3,16 +3,11 @@
 ---
 
 Refuse to complete a PostgreSQL migration copy whose destination gained
-canonical rows after verification. Completion now holds the project
-publication fence while comparing, per non-identity domain, the live
-canonical row count against the run transfer ledger tally, so a row
-canonical row count against the run transfer-ledger tally, so a row
-canonical row count against the run transfer-ledger tally for that domain, so a row
-committed by another writer between the verification stream and the
-completion transaction refuses as destination-unexpected-rows instead of
-completing silently. A deficit against the ledger still refuses as
-verification-failed. Identity domains stay outside the tally: their ledger
-rows are admission-time lookups rather than writes, and machines are
-project-linked rather than project-owned. This lands the same fence PR
-#1422 takes, so the two PRs must sequence so only one acquisition survives
-the merge; #1422 was still open when this was written.
+canonical rows after verification. While holding the project publication
+fence, completion now compares, per non-identity domain, a database-side
+count of the destination's canonical rows with the run's transfer-ledger
+tally. A surplus refuses as `destination-unexpected-rows` and a deficit
+refuses as `verification-failed`, so a row committed by another writer
+between verification and completion no longer completes silently. Identity
+domains stay outside the comparison, and the post-commit readback of an
+already completed run does not repeat it.
