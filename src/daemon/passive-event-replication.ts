@@ -258,10 +258,16 @@ export class PassiveEventReplicationWorker {
     // Without an admission the phases run directly, as a standalone worker
     // has no publication topology to consult.
     const admit = this.dependencies.admitPhase ?? (operation => operation());
-    const lease = await this.dependencies.remote.acquireDrainLease(
-      this.options.processId,
-      this.options.leaseTtlMs,
-      signal,
+    // The lease acquisition is itself a remote write, so it runs admitted:
+    // a publication switch that lands before the pass starts must refuse
+    // before any row is written to a backend the daemon has already lost.
+    // Only the cleanup release below runs outside admission.
+    const lease = await admit(() =>
+      this.dependencies.remote.acquireDrainLease(
+        this.options.processId,
+        this.options.leaseTtlMs,
+        signal,
+      ),
     );
     if (!lease) return summary;
     const mutable = { ...summary, leaseAcquired: true };

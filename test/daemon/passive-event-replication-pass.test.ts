@@ -508,10 +508,10 @@ describe("passive-event replication pass", () => {
       });
 
       await expect(pass.run("/proj")).resolves.toMatchObject({ leaseAcquired: true });
-      // Every remote and local phase ran admitted; the lease lifecycle on
-      // either side ran outside all admissions.
+      // Every remote and local phase ran admitted, including the lease
+      // acquisition; only the cleanup release ran outside all admissions.
       expect(observed).toMatchObject({
-        acquire: false,
+        acquire: true,
         upload: true,
         claim: true,
         reconcile: true,

@@ -1331,9 +1331,10 @@ describe("PassiveEventReplicationWorker", () => {
 
   it("admits each phase separately and releases between phases", async () => {
     // The daemon pass supplies this admission so hook appends can proceed
-    // between replication phases. Every phase must run inside it, and the
-    // lease lifecycle outside it: without the boundaries a reverted worker
-    // runs everything unadmitted and this records no admissions at all.
+    // between replication phases. Every phase plus the lease acquisition
+    // must run inside it, and only the cleanup release outside it: without
+    // the boundaries a reverted worker runs everything unadmitted and this
+    // records no admissions at all.
     const events: string[] = [];
     const admitPhase = async <T>(operation: () => Promise<T>): Promise<T> => {
       events.push("enter");
@@ -1380,15 +1381,16 @@ describe("PassiveEventReplicationWorker", () => {
       applied: 1,
     });
 
-    // Upload, claim fetch, one apply, reconcile, prune: six admissions.
-    expect(events.filter(event => event === "enter")).toHaveLength(6);
-    // Every replication operation ran inside exactly one admission, and the
-    // lease lifecycle ran outside all of them.
+    // Lease acquisition, upload, renew, claim fetch, one apply, reconcile,
+    // prune: seven admissions.
+    expect(events.filter(event => event === "enter")).toHaveLength(7);
+    // Every replication operation ran inside exactly one admission, and only
+    // the cleanup lease release ran outside all of them.
     let depth = 0;
     for (const event of events) {
       if (event === "enter") depth += 1;
       else if (event === "exit") depth -= 1;
-      else if (event === "acquireDrainLease" || event === "releaseDrainLease") {
+      else if (event === "releaseDrainLease") {
         expect(depth).toBe(0);
       } else {
         expect(depth).toBe(1);
@@ -1398,7 +1400,8 @@ describe("PassiveEventReplicationWorker", () => {
     expect(events.indexOf("claimDeliveries")).toBeLessThan(events.indexOf("insertEvents"));
     expect(events.indexOf("insertEvents")).toBeLessThan(events.indexOf("claimEvents"));
     expect(events.indexOf("claimEvents")).toBeLessThan(events.indexOf("completeApplied"));
-    expect(events.indexOf("acquireDrainLease")).toBeLessThan(events.indexOf("enter"));
+    expect(events[0]).toBe("enter");
+    expect(events.indexOf("enter")).toBeLessThan(events.indexOf("acquireDrainLease"));
     expect(events.lastIndexOf("exit")).toBeLessThan(events.indexOf("releaseDrainLease"));
   });
 
@@ -1423,6 +1426,22 @@ describe("PassiveEventReplicationWorker", () => {
     // still released through the worker finally.
     expect(remote.claimEvents).not.toHaveBeenCalled();
     expect(remote.releaseDrainLease).toHaveBeenCalledOnce();
+  });
+
+  it("refuses the drain lease acquisition when admission is already stale", async () => {
+    // A publication switch that lands before the first phase must refuse
+    // the lease acquisition itself: acquiring first would write a lease row
+    // to a backend the daemon has already lost, then halt anyway (#1384).
+    const refusal = new BackendPublicationJournalError("backend-mismatch", "publication moved on");
+    const admitPhase = async <T>(): Promise<T> => {
+      throw refusal;
+    };
+    const local = localRepository();
+    const remote = remoteRepository();
+
+    await expect(worker(local, remote, { admitPhase }).runOnce()).rejects.toBe(refusal);
+    expect(remote.acquireDrainLease).not.toHaveBeenCalled();
+    expect(remote.releaseDrainLease).not.toHaveBeenCalled();
   });
 
   it("accepts an apply callback with the transaction executor contract", async () => {
