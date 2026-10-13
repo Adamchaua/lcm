@@ -519,6 +519,8 @@ detail into the migration journal or its callers.
 
 `copied` means all 22 domains have terminal checkpoints and the destination's
 actual canonical content was compared before durable transfer completion.
+That comparison runs inside the completing transaction while it holds the project
+publication fence; see [Canonical backend transfer](portable-transfer.md).
 It does not mean the separate migration verification or activation steps have
 run. SQLite remains selected, maintenance stays held, and retained or newly
 appended post-cutoff events remain available for the later workflow. Keep the
