@@ -256,6 +256,26 @@ manifest or establish crash-resumable snapshot identity. Capture a persistent
 generation through the snapshot owner when restart-resumable source evidence
 is required.
 
+### PostgreSQL completion recheck
+
+Completing a PostgreSQL run is the last step of a transfer, and it re-reads
+every record the run wrote inside the completing transaction. If any record
+changed or disappeared since verification, completion refuses with
+`verification-failed` and the run stays active. While it does this, the
+transaction holds the project's publication fence, so other writes to that
+project wait until the completion commits or rolls back. The cost grows with
+the size of the run; records are read in bounded batches, so a large run is
+slower to complete but does not load itself into memory.
+
+A run started before the upgrade that adds this check (schema migration 0008)
+carries no per-record content fingerprints and cannot complete. Copy it again
+into a fresh isolated destination.
+
+The recheck belongs to the transition into the completed state. After a run
+has completed, later legitimate edits to the project do not make its completed
+status readback fail, and completing an already completed run again does
+nothing.
+
 ## SQLite recovery archive
 
 Canonical imports write ordinary runtime data to real SQLite tables. Facts
