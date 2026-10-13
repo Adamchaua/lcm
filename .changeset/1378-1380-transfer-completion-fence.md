@@ -10,6 +10,7 @@ verified row in the window between the check and the commit. Completion reads
 the ledger in bounded pages and groups each page's rows so one read never asks
 for more than a batch worth of content, which costs a size read per group but
 keeps a large run from loading itself into memory while it holds the fence.
+Each ledger page is also bounded by the byte size of its native keys (#1461).
 Other writes to the same project wait for that completion to commit.
 
 Let installations that have already run a transfer apply the schema upgrade
