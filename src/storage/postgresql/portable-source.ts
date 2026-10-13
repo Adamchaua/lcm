@@ -390,8 +390,8 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       // of after accumulating every chunk's rows into one map first: the
       // Node process's peak resident payload is therefore one chunk (at
       // most PORTABLE_LIMITS.maxBatchBytes), not the whole entries page.
-      abort(signal); abort(options.signal);
       for (const chunk of splitByBytes(entries)) {
+        abort(signal); abort(options.signal);
         const chunkRows=await readCanonicalContentRows(session,expectedIdentity.id,domain,chunk.map(item=>item.locator),signal);
         for (const item of chunk) {
           const row=chunkRows.get(item.locator);

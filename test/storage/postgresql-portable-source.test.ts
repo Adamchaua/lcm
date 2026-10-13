@@ -490,4 +490,38 @@ describe('PostgreSQL source private scratch and authenticated prefix evidence',(
     await expect(source.verifySource({...description,boundary:{domain:'session-ingest',nextOrdinal:2,recordCount:2,prefixSha256:prefix,lastRecordSha256:last.recordSha256,lastRecordIdentitySha256:last.identitySha256}})).rejects.toMatchObject({code:'source-changed'});
     await source.close();
   });
+  it('rechecks the source signal before each completion boundary chunk when verifySource has no request signal',async()=>{
+    const h=dataHarness({'session-ingest':rows(2)}),list=h.list.getMockImplementation()!,controller=new AbortController();
+    h.list.mockImplementation(async(...args)=>(await list(...(args as Parameters<typeof list>)))
+      .map(header=>({...header,byteLength:'90000000'})));
+    const source=await adapter.createPostgreSqlPortableSource({settings,expectedOwner:'owner',expectedIdentity:identity(),signal:controller.signal},h.dependencies as never);
+    const description=source.describeSource(),batch=await source.readDomainPage(page('session-ingest'));
+    let prefix=sha(codec.canonicalJson(['lcm-portable-domain-v1',codec.PORTABLE_RECORD_SCHEMA_SHA256,'session-ingest',1]));
+    for(const record of batch.records) prefix=nextPrefix(prefix,record);
+    const last=batch.records.at(-1)!,original=h.contentRows.getMockImplementation()!;
+    const ingestCalls=()=>h.contentRows.mock.calls.filter(call=>call[2]==='session-ingest');
+    // Opening built the index and captured the boundary: two chunks each.
+    expect(ingestCalls()).toHaveLength(4);
+    // The private index shares the source signal and rejects every lookup once
+    // it is aborted, which would stop the digest loop before the next chunk
+    // regardless of boundaryAt's own checks. Replay scope evidence recorded
+    // before the abort so only boundaryAt's per-chunk abort check is observed.
+    const getScope=PortableIndex.prototype.getScope,recorded=new Map<string,string|null>();
+    vi.spyOn(PortableIndex.prototype,'getScope').mockImplementation(function(this:PortableIndex,namespace,key){
+      if (controller.signal.aborted) return recorded.get(namespace+'|'+key) as string|null;
+      for (const ordinal of ['1','2']) recorded.set(namespace+'|'+ordinal,getScope.call(this,namespace,ordinal));
+      return getScope.call(this,namespace,key);
+    });
+    h.contentRows.mockImplementation(async(...args)=>{
+      const found=await original(...args);
+      if (args[2]==='session-ingest') controller.abort();
+      return found;
+    });
+    // The two records exceed one batch budget, so the completion scan needs two
+    // chunks. Aborting the source after the first must stop the scan before
+    // the second read even though no request signal was supplied.
+    await expect(source.verifySource({...description,boundary:{domain:'session-ingest',nextOrdinal:2,recordCount:2,prefixSha256:prefix,lastRecordSha256:last.recordSha256,lastRecordIdentitySha256:last.identitySha256}})).rejects.toMatchObject({code:'aborted'});
+    expect(ingestCalls()).toHaveLength(5);
+    await source.close();
+  });
 });
