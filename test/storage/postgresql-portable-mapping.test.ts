@@ -198,7 +198,7 @@ it("batches canonical row reads by locator instead of one query per record",asyn
   ]);
   const found=await mapping.readCanonicalContentRows(db,projectId,"machines",locators);
   expect(query.mock.calls).toHaveLength(1);
-  expect(query.mock.calls[0][0].text).toContain("= ANY($2::text[])");
+  expect(query.mock.calls[0][0].text).toContain('COLLATE "C" = ANY($2::text[])');
   expect(query.mock.calls[0][0].values?.[1]).toEqual(locators);
   expect(found.size).toBe(2);
   expect(found.get(locators[0]!)).toEqual({test:"payload-0"});
@@ -229,7 +229,7 @@ it("reads canonical content sizes without projecting payload columns or bounding
   ]);
   const sizes=await mapping.readCanonicalContentSizes(db,projectId,"machines",locators);
   expect(query.mock.calls).toHaveLength(1);
-  expect(query.mock.calls[0][0].text).toContain("= ANY($2::text[])");
+  expect(query.mock.calls[0][0].text).toContain('COLLATE "C" = ANY($2::text[])');
   expect(query.mock.calls[0][0].text).toContain("octet_length");
   expect(query.mock.calls[0][0].text).not.toContain("<= $3");
   expect(query.mock.calls[0][0].values).toEqual([projectId,locators]);

@@ -145,7 +145,7 @@ export async function readCanonicalContentRows(executor:PostgreSqlQueryExecutor,
   if (locators.length>PORTABLE_LIMITS.maxBatchRecords) throw new PortableStreamError("invalid-limit");
   const mapping = mappingForDomain(domain);
   for (const locator of locators) parseLocator(locator,mapping.keys.length);
-  const result = await executor.query<Row & {__locator:string}>({text:`SELECT ${mapping.selectColumns}, ${locatorExpression(mapping)} AS __locator FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ${locatorExpression(mapping)} = ANY($2::text[]) AND ${sizeExpression(domain,mapping)} <= $3::bigint`,values:[projectId,locators,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-read-batch",projectId,signal});
+  const result = await executor.query<Row & {__locator:string}>({text:`SELECT ${mapping.selectColumns}, ${locatorExpression(mapping)} AS __locator FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ${locatorExpression(mapping)} COLLATE "C" = ANY($2::text[]) AND ${sizeExpression(domain,mapping)} <= $3::bigint`,values:[projectId,locators,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-read-batch",projectId,signal});
   const found = new Map<string,Row>();
   for (const {__locator,...row} of result.rows) found.set(__locator,row);
   return found;
@@ -175,7 +175,7 @@ export async function readCanonicalContentSizes(executor:PostgreSqlQueryExecutor
   if (locators.length>PORTABLE_LIMITS.maxBatchRecords) throw new PortableStreamError("invalid-limit");
   const mapping = mappingForDomain(domain);
   for (const locator of locators) parseLocator(locator,mapping.keys.length);
-  const result = await executor.query<{__locator:string;__bytes:string}>({text:`SELECT ${locatorExpression(mapping)} AS __locator, ${sizeExpression(domain,mapping)}::text AS __bytes FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ${locatorExpression(mapping)} = ANY($2::text[])`,values:[projectId,locators]},{domain:"transaction",operation:"portable-content-sizes",projectId,signal});
+  const result = await executor.query<{__locator:string;__bytes:string}>({text:`SELECT ${locatorExpression(mapping)} AS __locator, ${sizeExpression(domain,mapping)}::text AS __bytes FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ${locatorExpression(mapping)} COLLATE "C" = ANY($2::text[])`,values:[projectId,locators]},{domain:"transaction",operation:"portable-content-sizes",projectId,signal});
   const sizes = new Map<string,bigint>();
   for (const {__locator,__bytes} of result.rows) {
     if (!/^\d+$/u.test(__bytes)) throw new PortableStreamError("malformed-record");
