@@ -2656,7 +2656,14 @@ describe("runCli failure and alternate presentation branches", () => {
     });
   });
 
-  it("dispatches post-tool without root bootstrap migration", async () => {
+  it.each([
+    [["post-tool", "--client", "codex"], "post-tool"],
+    [["restore", "--client", "codex"], "restore"],
+    [["session-end", "--client", "codex"], "session-end"],
+    [["session-snapshot", "--client", "codex"], "session-snapshot"],
+    [["user-prompt", "--client", "codex"], "user-prompt"],
+    [["compact", "--hook", "--client", "codex"], "compact"],
+  ] as const)("dispatches hook entrypoint %j without root bootstrap migration", async (args, hook) => {
     fakeStdin.isTTY = false;
     fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
       if (event === "data") queueMicrotask(() => callback(Buffer.from(JSON.stringify({
@@ -2669,12 +2676,40 @@ describe("runCli failure and alternate presentation branches", () => {
     const contention = new PrivateMutationLockContentionError("publication lock is busy");
     const migrate = vi.fn(() => { throw contention; });
 
-    expect((await invoke(["post-tool", "--client", "codex"], {
+    expect((await invoke([...args], {
       migrate,
       sleep: async (_delayMs: number) => undefined,
     }))?.message).toBe("exit:0");
     expect(migrate).not.toHaveBeenCalled();
-    expect(state.dispatchHook).toHaveBeenCalledWith("post-tool", expect.any(String));
+    expect(state.dispatchHook).toHaveBeenCalledWith(hook, expect.any(String), ...(hook === "user-prompt" ? [expect.anything()] : []));
+  });
+
+  it("keeps the legacy-root preflight for compact without --hook", async () => {
+    fakeStdin.isTTY = true;
+    const migrate = vi.fn();
+
+    await invoke(["compact", "--dry-run"], { migrate, sleep: async (_delayMs: number) => undefined });
+
+    expect(migrate).toHaveBeenCalled();
+    expect(state.dispatchHook).not.toHaveBeenCalled();
+  });
+
+  it("keeps hook dispatch fail-closed when a hook entrypoint rejects with a journal error", async () => {
+    fakeStdin.isTTY = false;
+    fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
+      if (event === "data") queueMicrotask(() => callback(Buffer.from("{}")));
+      if (event === "end") queueMicrotask(() => callback());
+      return fakeStdin;
+    });
+    const journal = new BackendPublicationJournalError("malformed-journal", "evidence is malformed");
+    state.dispatchHook.mockRejectedValueOnce(journal);
+    const migrate = vi.fn();
+
+    await expect(runCli(["node", "lcm", "restore", "--client", "codex"], {
+      migrate,
+      sleep: async (_delayMs: number) => undefined,
+    })).rejects.toBe(journal);
+    expect(migrate).not.toHaveBeenCalled();
   });
 
   it("reports exact Codex structure and functional capture health", async () => {
