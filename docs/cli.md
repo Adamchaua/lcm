@@ -45,13 +45,14 @@ them in its failed total, prints one remedy line naming the project, and
 exits 1; per-session detail prints only under `--verbose`. A project with
 no sessions to import is never opened, so nothing is reported for it and
 the command can exit 0. This condition is specific to the PostgreSQL
-backend; SQLite has no binding to check. Under PostgreSQL,
-`lcm import --dry-run` opens each selected project without importing, so the
-preview agrees with a real run: a project that cannot be opened — an unbound
-binding, a missing remote project, or any other open failure — is reported
-as a failure and the command exits 1. Under SQLite a real run creates
-missing project storage on demand, so `--dry-run` stays a discovery preview
-and does not open storage.
+backend; SQLite has no binding to check. `lcm import --all --dry-run` contacts no
+project storage, so a clean dry-run never guarantees the following import
+will succeed; this is true of any project it cannot open, not only an
+unbound one.
+
+`lcm export --all` prints each failed project's path on its failure line and
+ends with a summary that reports the entries exported and, when any project
+failed, how many projects could not be exported.
 
 `lcm promote --all` processes the canonical paths from those bindings even when
 no local `meta.json` exists. `--verbose` reports each project's counts and

@@ -20,11 +20,10 @@ import {
 import { resolveCodexSessions } from "./codex-project-resolution.js";
 import { findAllCodexTranscripts } from "./codex-transcript.js";
 import { sanitizeTerminalText } from "./terminal-sanitize.js";
-import { listCliProjects, withCliProjectStorage } from "./cli-storage.js";
+import { listCliProjects } from "./cli-storage.js";
 import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
 import {
   TransportedUnboundProjectError,
-  StorageIdentityConfigurationError,
   UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
 } from "./storage/identity-context.js";
 
@@ -46,8 +45,6 @@ interface ImportOptions {
   _lcmDir?: string;
   /** Override ~/.codex path — used in tests only */
   _codexDir?: string;
-  /** Override per-project dry-run open validation — used in tests only */
-  _validateProjectOpen?: (cwd: string) => Promise<void>;
 }
 
 export interface ImportResult {
@@ -196,38 +193,14 @@ interface SessionEntry {
 /**
  * Map an import failure to the static unbound-project remedy.
  *
- * Matches both the in-process failure (dry-run validation opens storage
- * directly) and the daemon-transported failure (a real run fails at
- * /ingest with HTTP 409). Anything else keeps the generic diagnostic.
+ * A real run fails at /ingest with HTTP 409 when the daemon refuses an
+ * unbound PostgreSQL project; the client surfaces that as a
+ * TransportedUnboundProjectError. Anything else keeps the generic diagnostic.
  */
 function unboundImportDiagnostic(error: unknown): string | undefined {
-  if (
-    error instanceof TransportedUnboundProjectError
-    || error instanceof StorageIdentityConfigurationError
-  ) {
-    return UNBOUND_POSTGRESQL_PROJECT_MESSAGE;
-  }
-  return undefined;
-}
-
-/**
- * Validate that a dry-run session's project can actually be opened.
- *
- * Under SQLite a real run creates missing project storage on demand, so the
- * discovery preview is already accurate and nothing is opened. Under
- * PostgreSQL a real run fails unopenable projects at ingest, so the preview
- * opens each selected project (without importing) to agree with it. This
- * covers unopenable projects generally — unbound bindings, missing remote
- * projects, retired fences — not only unbound ones.
- */
-async function validateDryRunProjectOpen(cwd: string, options: ImportOptions): Promise<void> {
-  if (options._validateProjectOpen !== undefined) {
-    await options._validateProjectOpen(cwd);
-    return;
-  }
-  const config = loadDaemonConfig(configPath());
-  if (config.storage.backend === "sqlite") return;
-  await withCliProjectStorage(cwd, {}, async () => {});
+  return error instanceof TransportedUnboundProjectError
+    ? UNBOUND_POSTGRESQL_PROJECT_MESSAGE
+    : undefined;
 }
 
 async function ingestSessionList(
@@ -239,10 +212,9 @@ async function ingestSessionList(
   const previousSummaries = new Map<string, string>();
   const total = sessions.length;
 
-  // Dry-run openability per project, and per-project remedy lines printed
-  // at most once. Claude --all reaches this function once per project while
-  // Codex sessions arrive mixed, so both maps are keyed by cwd.
-  const dryRunProjectChecks = new Map<string, { open: boolean; remedy: string | undefined }>();
+  // Remedy lines are printed at most once per project. Claude --all reaches
+  // this function once per project while Codex sessions arrive mixed, so the
+  // set is keyed by cwd.
   const reportedProjectFailures = new Set<string>();
 
   function reportProjectFailure(cwd: string, remedy: string | undefined): void {
@@ -251,34 +223,8 @@ async function ingestSessionList(
     console.error(`  ${sanitizeTerminalText(cwd)}: ${remedy}`);
   }
 
-  async function dryRunProjectCheck(
-    cwd: string,
-  ): Promise<{ open: boolean; remedy: string | undefined }> {
-    const cached = dryRunProjectChecks.get(cwd);
-    if (cached !== undefined) return cached;
-    let check: { open: boolean; remedy: string | undefined };
-    try {
-      await validateDryRunProjectOpen(cwd, options);
-      check = { open: true, remedy: undefined };
-    } catch (error) {
-      check = { open: false, remedy: unboundImportDiagnostic(error) };
-    }
-    dryRunProjectChecks.set(cwd, check);
-    return check;
-  }
-
   for (const { path, sessionId, cwd, client: clientName } of sessions) {
     if (options.dryRun) {
-      const check = await dryRunProjectCheck(cwd);
-      if (!check.open) {
-        result.failed++;
-        reportProjectFailure(cwd, check.remedy);
-        if (options.verbose) {
-          console.error(`  \u274c ${sanitizeTerminalText(sessionId)}: ${check.remedy ?? "ingest failed"}`);
-        }
-        options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
-        continue;
-      }
       if (options.verbose) {
         const replayNote = options.replay ? " (would compact)" : "";
         console.error(`  [dry-run] ${sessionId}${replayNote}`);

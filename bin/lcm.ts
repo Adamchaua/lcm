@@ -4202,6 +4202,7 @@ export async function runCli(
       }
 
       if (all) console.error(`\n  Total: ${total} entries exported`);
+      if (all && failures > 0) console.error(`  Failed: ${failures} ${failures === 1 ? "project" : "projects"} could not be exported`);
       if (failures > 0) exit(1);
     });
 

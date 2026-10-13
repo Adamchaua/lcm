@@ -10,7 +10,6 @@ import { clearProjectMapCache, hashProjectPath, normalizeProjectPath, projectMap
 import {
   STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
   STORAGE_IDENTITY_REQUIRED_UNBOUND_REASON,
-  StorageIdentityConfigurationError,
   UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
 } from "../src/storage/identity-context.js";
 import * as configModule from "../src/daemon/config.js";
@@ -20,7 +19,7 @@ import { clearWorktreeReconciliationCache } from "../src/worktree-reconciliation
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 
-describe("import dry-run agrees with the real run for unopenable projects", () => {
+describe("import names the unbound-project remedy", () => {
   let home: string;
   let claudeProjectsDir: string;
   let server: Server | undefined;
@@ -33,7 +32,7 @@ describe("import dry-run agrees with the real run for unopenable projects", () =
   }
 
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "lcm-import-agreement-"));
+    home = mkdtempSync(join(tmpdir(), "lcm-import-remedy-"));
     vi.stubEnv("HOME", home);
     vi.stubEnv("USERPROFILE", home);
     mkdirSync(join(home, ".lcm"), { mode: PRIVATE_DIRECTORY_MODE });
@@ -47,7 +46,7 @@ describe("import dry-run agrees with the real run for unopenable projects", () =
     clearProjectMapCache();
     clearGitProjectAnchorCache();
     clearWorktreeReconciliationCache();
-    claudeProjectsDir = makeTmpDir("lcm-import-agreement-claude-");
+    claudeProjectsDir = makeTmpDir("lcm-import-remedy-claude-");
   });
 
   afterEach(async () => {
@@ -110,28 +109,13 @@ describe("import dry-run agrees with the real run for unopenable projects", () =
     return { client: new DaemonClient("http://127.0.0.1:" + address.port), posts };
   }
 
-  it("fails the same sessions dry and real for an unbound PostgreSQL project", async () => {
+  it("prints one remedy line naming the unbound PostgreSQL project on a real run", async () => {
     const unbound = plantUnboundProjectWithSessions("unbound", 2);
     selectPostgresqlBackend();
-    const dry = await startUnboundDaemon();
+    const daemon = await startUnboundDaemon();
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
-    const dryResult = await importSessions(dry.client, {
-      all: true,
-      provider: "claude",
-      dryRun: true,
-      verbose: true,
-      _claudeProjectsDir: claudeProjectsDir,
-    });
-
-    expect(dry.posts).toEqual([]);
-    expect(dryResult).toMatchObject({ imported: 0, failed: 2 });
-    const dryLines = error.mock.calls.map(call => String(call[0]));
-    expect(dryLines.filter(line => line === ("  " + unbound + ": " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE))).toHaveLength(1);
-
-    error.mockClear();
-    const real = await startUnboundDaemon();
-    const realResult = await importSessions(real.client, {
+    const result = await importSessions(daemon.client, {
       all: true,
       provider: "claude",
       dryRun: false,
@@ -139,93 +123,49 @@ describe("import dry-run agrees with the real run for unopenable projects", () =
       _claudeProjectsDir: claudeProjectsDir,
     });
 
-    expect(real.posts).toHaveLength(2);
-    expect(realResult).toMatchObject({ imported: 0, failed: 2 });
-    const realLines = error.mock.calls.map(call => String(call[0]));
-    expect(realLines.filter(line => line === ("  " + unbound + ": " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE))).toHaveLength(1);
-
-    // The preview agrees with the real run instead of counting the
-    // unopenable project's sessions as importable.
-    expect({ imported: dryResult.imported, failed: dryResult.failed }).toEqual({
-      imported: realResult.imported,
-      failed: realResult.failed,
-    });
-  });
-
-  it("counts the same sessions imported dry and real under SQLite", async () => {
-    const cwd = join(home, "sqlite-project");
-    mkdirSync(cwd, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-    const canonical = normalizeProjectPath(cwd);
-    const projectDir = join(claudeProjectsDir, cwdToProjectHash(canonical));
-    mkdirSync(projectDir, { recursive: true });
-    writeFileSync(join(projectDir, "a.jsonl"), "");
-    writeFileSync(join(projectDir, "b.jsonl"), "");
-    const lcmDir = makeTmpDir("lcm-import-agreement-lcm-");
-    mkdirSync(join(lcmDir, "projects", "valid"), { recursive: true });
-    writeFileSync(
-      join(lcmDir, "projects", "valid", "meta.json"),
-      JSON.stringify({ cwd: canonical }),
-    );
-    const resolving = { post: vi.fn(async () => ({ ingested: 1, totalTokens: 10 })) };
-
-    const dryResult = await importSessions(resolving as unknown as DaemonClient, {
-      all: true,
-      provider: "claude",
-      dryRun: true,
-      _claudeProjectsDir: claudeProjectsDir,
-      _lcmDir: lcmDir,
-    });
-    expect(resolving.post).not.toHaveBeenCalled();
-    const realResult = await importSessions(resolving as unknown as DaemonClient, {
-      all: true,
-      provider: "claude",
-      dryRun: false,
-      _claudeProjectsDir: claudeProjectsDir,
-      _lcmDir: lcmDir,
-    });
-
-    expect(resolving.post).toHaveBeenCalledTimes(2);
-    expect({ imported: dryResult.imported, failed: dryResult.failed }).toEqual({ imported: 2, failed: 0 });
-    expect({ imported: realResult.imported, failed: realResult.failed }).toEqual({ imported: 2, failed: 0 });
-  });
-  it("imports dry-run sessions when the injected open validation succeeds", async () => {
-    const cwd = "/validated/project";
-    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
-    mkdirSync(projectDir, { recursive: true });
-    writeFileSync(join(projectDir, "session.jsonl"), "");
-    const validate = vi.fn(async (_cwd: string) => undefined);
-    const client = { post: vi.fn(async () => { throw new Error("must not ingest"); }) };
-    const result = await importSessions(client as unknown as DaemonClient, {
-      cwd,
-      dryRun: true,
-      _claudeProjectsDir: claudeProjectsDir,
-      _validateProjectOpen: validate,
-    });
-    expect(validate).toHaveBeenCalledExactlyOnceWith(cwd);
-    expect(client.post).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ imported: 1, failed: 0 });
-  });
-  it("fails dry-run sessions without a project line when validation fails generically", async () => {
-    const cwd = "/broken/project";
-    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
-    mkdirSync(projectDir, { recursive: true });
-    writeFileSync(join(projectDir, "session.jsonl"), "");
-    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const client = { post: vi.fn(async () => ({ ingested: 1, totalTokens: 1 })) };
-    const result = await importSessions(client as unknown as DaemonClient, {
-      cwd,
-      dryRun: true,
-      verbose: true,
-      _claudeProjectsDir: claudeProjectsDir,
-      _validateProjectOpen: async () => { throw new Error("storage boom"); },
-    });
-    expect(result).toMatchObject({ imported: 0, failed: 1 });
+    expect(daemon.posts).toHaveLength(2);
+    expect(result).toMatchObject({ imported: 0, failed: 2 });
     const lines = error.mock.calls.map(call => String(call[0]));
-    expect(lines).toContain("  \u274c session: ingest failed");
-    expect(lines.some(line => line.includes(cwd))).toBe(false);
-    expect(lines.join("\n")).not.toContain("storage boom");
+    expect(lines.filter(line => line === ("  " + unbound + ": " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE))).toHaveLength(1);
+    expect(lines.filter(line => line === ("  \u274c session-0: " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE))).toHaveLength(1);
+    expect(lines.filter(line => line === ("  \u274c session-1: " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE))).toHaveLength(1);
   });
-  it("keeps the generic diagnostic for real-run ingest failures", async () => {
+
+  it("prints the project remedy without per-session detail when not verbose", async () => {
+    const unbound = plantUnboundProjectWithSessions("quiet-unbound", 2);
+    selectPostgresqlBackend();
+    const daemon = await startUnboundDaemon();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await importSessions(daemon.client, {
+      all: true,
+      provider: "claude",
+      _claudeProjectsDir: claudeProjectsDir,
+    });
+
+    expect(result).toMatchObject({ imported: 0, failed: 2 });
+    expect(error).toHaveBeenCalledExactlyOnceWith("  " + unbound + ": " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
+  });
+
+  it("contacts no project storage on a dry run", async () => {
+    plantUnboundProjectWithSessions("unbound-dry", 2);
+    selectPostgresqlBackend();
+    const daemon = await startUnboundDaemon();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await importSessions(daemon.client, {
+      all: true,
+      provider: "claude",
+      dryRun: true,
+      _claudeProjectsDir: claudeProjectsDir,
+    });
+
+    expect(daemon.posts).toEqual([]);
+    expect(result).toMatchObject({ imported: 2, failed: 0 });
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  it("keeps the generic diagnostic for other real-run ingest failures", async () => {
     const cwd = "/failing/project";
     const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
     mkdirSync(projectDir, { recursive: true });
@@ -242,23 +182,5 @@ describe("import dry-run agrees with the real run for unopenable projects", () =
     expect(lines).toContain("  \u274c session: ingest failed");
     expect(lines.some(line => line.includes(cwd))).toBe(false);
     expect(lines.join("\n")).not.toContain("ingest boom");
-  });
-  it("prints the project remedy without per-session detail for quiet dry-run failures", async () => {
-    const cwd = "/quiet-unbound/project";
-    const projectDir = join(claudeProjectsDir, cwdToProjectHash(cwd));
-    mkdirSync(projectDir, { recursive: true });
-    writeFileSync(join(projectDir, "session.jsonl"), "");
-    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const client = { post: vi.fn(async () => ({ ingested: 1, totalTokens: 1 })) };
-    const result = await importSessions(client as unknown as DaemonClient, {
-      cwd,
-      dryRun: true,
-      _claudeProjectsDir: claudeProjectsDir,
-      _validateProjectOpen: async () => {
-        throw new StorageIdentityConfigurationError("unbound in test");
-      },
-    });
-    expect(result).toMatchObject({ imported: 0, failed: 1 });
-    expect(error).toHaveBeenCalledExactlyOnceWith("  " + cwd + ": " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
   });
 });

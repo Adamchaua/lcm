@@ -1218,11 +1218,14 @@ describe("runCli registration and help dispatch", () => {
     ];
     state.exportError = new StorageIdentityConfigurationError("SECRET_CANARY postgresql://private SQL");
     const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     expect((await invoke(["export", "--all"]))?.message).toBe("exit:1");
     const text = stderr.mock.calls.flat().join(" ");
     expect(text).toContain("/first: " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
     expect(text).toContain("/second: " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
     expect(text).not.toContain("SECRET_CANARY");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Total: 0 entries exported"));
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Failed: 2 projects could not be exported"));
   });
 
   it("routes executable failures to the supplied top-level handler", async () => {
@@ -3999,6 +4002,10 @@ describe("selected-backend operational CLI acceptance", () => {
     expect(new Set(outputs).size).toBe(3);
     expect([...stderr.mock.calls, ...error.mock.calls].flat().join(" ")).not.toContain("SECRET_CANARY");
     expect(error).toHaveBeenCalledWith(expect.stringContaining("Total: 2 entries exported"));
+    // Bug #1466: the failing project's path is on its failure line and the
+    // summary reports the failed-project count next to the successes.
+    expect(stderr.mock.calls.flat().join(" ")).toContain("/same/name: Export failed for a selected project.");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Failed: 1 project could not be exported"));
     expect(stdout).not.toHaveBeenCalled();
     expect(log).not.toHaveBeenCalled();
   });
