@@ -125,6 +125,14 @@ and normalized path to match the local identity context. Publication or
 identity drift fails before any project repository is returned and never
 causes a SQLite fallback.
 
+Each witness is classified under the publication lock before strict admission:
+an empty journal slot is absent, a version-2 journal that is not completed or
+does not target PostgreSQL is a mismatch carrying the journal's recorded phase
+and target, and a version-3 maintenance journal or a failed read or admission
+is unresolvable. Only a completed PostgreSQL journal that also passes strict
+admission is present. Every non-present outcome fails the open with the same
+initialization error.
+
 This coordination uses the existing `lcm.fenced_leases` table and advisory
 namespace. Chore #408 adds no schema object, `MAINTAIN` privilege, full-table
 lock, schema-creation privilege, ownership transfer, or broad future-object
