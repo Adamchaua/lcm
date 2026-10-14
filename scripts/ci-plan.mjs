@@ -74,6 +74,12 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
     pattern: /^src\/memory\/index\.ts$/u,
     tests: Object.freeze(["test/memory/search-type-contract.test.ts"]),
   }),
+  // Codecov ownership fragments the contract test reads from disk.
+  Object.freeze({
+    name: "codecov-ownership",
+    pattern: /^test\/codecov-ownership\//u,
+    tests: Object.freeze(["test/codecov-config.test.ts"]),
+  }),
 ]);
 
 // The PostgreSQL conformance harness exercises the packed CLI and daemon in a
