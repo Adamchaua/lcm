@@ -332,6 +332,8 @@ component_management:
         # The #763 manifest and #816 checkpoint negative-zero taxonomies remain storage-abstractions-owned.
         - "^src/storage/portable-record-stream\\.ts$"
         # #618 shared canonical transfer and bounded validation index.
+        # #1426 adds the destination-unexpected-rows error code to the closed
+        # transfer error vocabulary; ownership is unchanged.
         - "^src/storage/portable-transfer\\.ts$"
         - "^src/storage/portable-index\\.ts$"
         - "^src/storage/postgresql/project-storage\\.ts$"
@@ -518,6 +520,9 @@ component_management:
         # #1378 re-derives each written record's canonical content
         # fingerprint inside the completion transaction, batched via a
         # new readCanonicalContentRows; ownership is unchanged.
+        # #1426 counts canonical rows the run did not write before completion
+        # and refuses surplus rows in the destination and mapping files; both
+        # keep their established owner.
         - "^src/storage/postgresql/portable-source\\.ts$"
         - "^src/storage/postgresql/portable-destination\\.ts$"
         - "^src/storage/postgresql/portable-mapping\\.ts$"
