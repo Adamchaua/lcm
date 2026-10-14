@@ -56,6 +56,7 @@ const config: ResolvedPostgreSqlConfig = {
     connectionTimeoutMs: 10_000,
     idleTimeoutMs: 30_000,
     statementTimeoutMs: 60_000,
+    snapshotIdleTimeoutMs: 300_000,
     migrationRole: "lcm_migrator",
     url: "postgresql://runtime:canary-password@db.example/lcm",
     caFile: "/private/canary-ca.pem",
@@ -278,6 +279,7 @@ describe("PostgreSQL storage backend factory", () => {
       connectionTimeoutMs: config.postgresql.connectionTimeoutMs,
       idleTimeoutMs: config.postgresql.idleTimeoutMs,
       statementTimeoutMs: config.postgresql.statementTimeoutMs,
+      snapshotIdleTimeoutMs: config.postgresql.snapshotIdleTimeoutMs,
     });
     expect(captured).not.toBe(config.postgresql);
     expect(events).toEqual(["readiness:lcm_migrator"]);

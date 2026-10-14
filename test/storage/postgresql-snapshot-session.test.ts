@@ -1,8 +1,13 @@
+import { EventEmitter } from "node:events";
 import type { Client, Pool, PoolClient, QueryResult, QueryResultRow } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
-import { PostgreSqlSnapshotSession, type PostgreSqlSnapshotOptions } from "../../src/storage/postgresql/snapshot-session.js";
-import type { PostgreSqlQueryOptions } from "../../src/storage/postgresql/contracts.js";
+import {
+  DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS,
+  PostgreSqlSnapshotSession,
+  type PostgreSqlSnapshotOptions,
+} from "../../src/storage/postgresql/snapshot-session.js";
+import type { PostgreSqlConnectionSettings, PostgreSqlQueryOptions } from "../../src/storage/postgresql/contracts.js";
 
 const options = { domain: "transaction", operation: "snapshot", projectId: "project" } as const;
 function result(rows: QueryResultRow[] = []): QueryResult<QueryResultRow> {
@@ -14,12 +19,23 @@ function deferred<T>() {
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
-function fixture(handler: (text: string) => Promise<QueryResult<QueryResultRow>> = async () => result(), backendPid: unknown = 1234) {
+function fixture(
+  handler: (text: string) => Promise<QueryResult<QueryResultRow>> = async () => result(),
+  backendPid: unknown = 1234,
+  settingsOverrides: Partial<Omit<PostgreSqlConnectionSettings, "url" | "caFile">> = {},
+) {
   const statements: string[] = [];
+  const configs: { text: string; values?: unknown[] }[] = [];
   let active: { callback: (error: Error | null, value?: QueryResult<QueryResultRow>) => void } | undefined;
-  const query = vi.fn((input: string | { text: string; callback?: (error: Error | null, value?: QueryResult<QueryResultRow>) => void }) => {
+  const query = vi.fn((input: string | {
+    text: string;
+    values?: unknown[];
+    callback?: (error: Error | null, value?: QueryResult<QueryResultRow>) => void;
+  }) => {
     const text = typeof input === "string" ? input : input.text;
+    const values = typeof input === "object" ? input.values : undefined;
     statements.push(text);
+    configs.push({ text, values });
     const execute = text.includes("pg_backend_pid") ? Promise.resolve(result([{ pid: backendPid }])) : handler(text);
     if (typeof input === "object" && input.callback) {
       const callback = input.callback;
@@ -30,7 +46,15 @@ function fixture(handler: (text: string) => Promise<QueryResult<QueryResultRow>>
     return execute;
   });
   const release = vi.fn();
-  const connect = vi.fn(async () => ({ query, release }) as unknown as PoolClient);
+  // A real EventEmitter, not a plain object, so the transport's
+  // client.on("error", ...)/removeListener("error", ...) calls behave
+  // exactly like the real pg PoolClient (which extends EventEmitter).
+  // Shared across connect() calls in one fixture: sequential sessions on
+  // the same fixture register and deregister their own listener on it,
+  // exactly like reopening a session on the same recycled backend would.
+  const clientEvents = new EventEmitter();
+  const connect = vi.fn(async () => Object.assign(clientEvents, { query, release }) as unknown as PoolClient);
+  const emitClientError = (error: unknown): void => { clientEvents.emit("error", error); };
   const end = vi.fn(async () => undefined);
   const cancel = vi.fn(async () => {
     active?.callback(new Error("cancelled private query"));
@@ -39,12 +63,13 @@ function fixture(handler: (text: string) => Promise<QueryResult<QueryResultRow>>
   const runtime = new PostgreSqlRuntime({
     url: "postgresql://secret", caFile: "/unused", poolMax: 2,
     connectionTimeoutMs: 100, idleTimeoutMs: 100, statementTimeoutMs: 100,
+    ...settingsOverrides,
   }, {
     buildConfig: () => ({ ssl: true }),
     createPool: () => ({ connect, end, on: vi.fn() }) as unknown as Pool,
     createClient: () => ({ connect: async () => undefined, query: cancel, end: async () => undefined }) as unknown as Client,
   });
-  return { runtime, query, connect, release, end, cancel, statements };
+  return { runtime, query, connect, release, end, cancel, statements, configs, clientEvents, emitClientError };
 }
 
 describe("dedicated PostgreSQL snapshot session", () => {
@@ -314,6 +339,175 @@ describe("dedicated PostgreSQL snapshot session", () => {
     expect(second.identity.backendPid).toBe(first.identity.backendPid);
     expect(second.identity.sessionId).not.toBe(first.identity.sessionId);
     await second.close();
+    await f.runtime.close();
+  });
+
+  it("applies the default snapshotIdleTimeoutMs as SET LOCAL via parameterized set_config when unset", async () => {
+    const f = fixture();
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    const setConfigCalls = f.configs.filter((call) => call.text.includes("idle_in_transaction_session_timeout"));
+    expect(setConfigCalls).toHaveLength(1);
+    expect(setConfigCalls[0]!.values).toEqual([`${DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS}ms`]);
+    expect(setConfigCalls[0]!.text).toContain("set_config");
+    expect(setConfigCalls[0]!.text).toContain("$1::pg_catalog.text");
+    expect(setConfigCalls[0]!.text).toContain("true");
+    expect(setConfigCalls[0]!.text).not.toContain(`${DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS}`);
+    // set_config runs after BEGIN and before the backend-identity query.
+    const beginIndex = f.statements.indexOf("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const setConfigIndex = f.statements.findIndex((text) => text.includes("idle_in_transaction_session_timeout"));
+    // The exact identity-query text (distinct from queryClient's internal,
+    // per-call cancellation-tracking "SELECT pg_backend_pid() AS pid" probe,
+    // which lacks the pg_catalog. prefix and precedes every real query).
+    const pidIndex = f.statements.indexOf("SELECT pg_catalog.pg_backend_pid() AS pid");
+    expect(beginIndex).toBeGreaterThanOrEqual(0);
+    expect(setConfigIndex).toBeGreaterThan(beginIndex);
+    expect(pidIndex).toBeGreaterThan(setConfigIndex);
+    await session.close();
+    await f.runtime.close();
+  });
+
+  it("honors an explicit snapshotIdleTimeoutMs override from runtime settings", async () => {
+    const f = fixture(undefined, 1234, { snapshotIdleTimeoutMs: 1_500 });
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    const setConfigCalls = f.configs.filter((call) => call.text.includes("idle_in_transaction_session_timeout"));
+    expect(setConfigCalls).toHaveLength(1);
+    expect(setConfigCalls[0]!.values).toEqual(["1500ms"]);
+    await session.close();
+    await f.runtime.close();
+  });
+
+  it.each([0, -1, 1.5, 3_600_001, Number.NaN, Number.POSITIVE_INFINITY])(
+    "fails closed for invalid snapshotIdleTimeoutMs %s without ever opening the transaction",
+    async (invalid) => {
+      const f = fixture(undefined, 1234, { snapshotIdleTimeoutMs: invalid });
+      await expect(f.runtime.openReadOnlySnapshot({ projectId: "project" }))
+        .rejects.toMatchObject({ code: "STORAGE_INITIALIZATION_FAILED" });
+      expect(f.statements).not.toContain("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      expect(f.statements.some((text) => text.includes("idle_in_transaction_session_timeout"))).toBe(false);
+      await f.runtime.close();
+    },
+  );
+
+  it("rejects snapshotIdleTimeoutMs of exactly 0, since PostgreSQL treats 0 as disabling the bound", async () => {
+    const f = fixture(undefined, 1234, { snapshotIdleTimeoutMs: 0 });
+    await expect(f.runtime.openReadOnlySnapshot({ projectId: "project" }))
+      .rejects.toMatchObject({ code: "STORAGE_INITIALIZATION_FAILED" });
+    await f.runtime.close();
+  });
+
+  it("fails closed when set_config itself fails, leaving no usable snapshot at the statement-scale bound", async () => {
+    const f = fixture(async (text) => {
+      if (text.includes("idle_in_transaction_session_timeout")) throw new Error("private set_config driver failure");
+      return result();
+    });
+    await expect(f.runtime.openReadOnlySnapshot({ projectId: "project" }))
+      .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
+    expect(f.statements).toContain("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    expect(f.statements.some((text) => text.includes("idle_in_transaction_session_timeout"))).toBe(true);
+    // The real identity query never runs; only queryClient's internal,
+    // per-call cancellation-tracking probe (a different, shorter statement
+    // lacking the pg_catalog. prefix) precedes BEGIN and set_config.
+    expect(f.statements).not.toContain("SELECT pg_catalog.pg_backend_pid() AS pid");
+    await f.runtime.close();
+  });
+
+  it("marks the session destroyed and skips ROLLBACK when a query fails with 25P03", async () => {
+    const f = fixture(async (text) => {
+      if (text === "SELECT idle-killed") throw Object.assign(new Error("terminating connection due to idle-in-transaction timeout"), { code: "25P03" });
+      return result();
+    });
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    await expect(session.query({ text: "SELECT idle-killed" }, options))
+      .rejects.toMatchObject({ sqlState: "25P03" });
+    await session.close();
+    expect(f.statements).not.toContain("ROLLBACK");
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+    await f.runtime.close();
+  });
+
+  it("captures an async client failure via the checkout listener and skips ROLLBACK on close", async () => {
+    // idle_in_transaction_session_timeout fires with no query in flight: on
+    // the real driver the FATAL arrives as an 'error' event on the checked-
+    // out client, not as a query rejection. The runtime's checkout listener
+    // must observe it, mark the session destroyed immediately, and never
+    // let it become an unhandled process error.
+    const f = fixture();
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    expect(f.clientEvents.listenerCount("error")).toBe(1);
+    f.emitClientError(Object.assign(
+      new Error("terminating connection due to idle-in-transaction timeout"), { code: "25P03" },
+    ));
+    await session.close();
+    expect(f.statements).not.toContain("ROLLBACK");
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+    await f.runtime.close();
+  });
+
+  it("reattaches the captured async sqlState to a later query that fails without one", async () => {
+    const f = fixture(async (text) => {
+      if (text === "SELECT after-kill") {
+        throw new Error("Client has encountered a connection error and is not queryable");
+      }
+      return result();
+    });
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    f.emitClientError(Object.assign(
+      new Error("terminating connection due to idle-in-transaction timeout"), { code: "25P03" },
+    ));
+    // The listener already marked the session destroyed; the driver's own
+    // "not queryable" rejection for the next query carries no code at all,
+    // but the session reattaches the earlier captured diagnostic so the
+    // caller still sees the real, retryable failure instead of a generic
+    // code-free one.
+    await expect(session.query({ text: "SELECT after-kill" }, options))
+      .rejects.toMatchObject({ sqlState: "25P03", retryable: true });
+    await session.close();
+    expect(f.statements).not.toContain("ROLLBACK");
+    await f.runtime.close();
+  });
+
+  it("keeps the first captured sqlState across multiple async failures on the same session", async () => {
+    const f = fixture(async (text) => {
+      if (text === "SELECT late") throw new Error("Connection terminated unexpectedly");
+      return result();
+    });
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    f.emitClientError(Object.assign(
+      new Error("terminating connection due to idle-in-transaction timeout"), { code: "25P03" },
+    ));
+    // The socket-end message that typically follows the FATAL carries no
+    // code; it must not overwrite the real diagnostic already captured.
+    f.emitClientError(new Error("Connection terminated unexpectedly"));
+    await expect(session.query({ text: "SELECT late" }, options))
+      .rejects.toMatchObject({ sqlState: "25P03", retryable: true });
+    await session.close();
+    await f.runtime.close();
+  });
+
+  it("does not reattach a captured code that is not termination-shaped", async () => {
+    // pg never actually emits a client 'error' event carrying an
+    // unrelated code such as 40001 in practice (those are query-class
+    // rejections, not out-of-band connection events), but the reattach
+    // gate must still refuse to launder a hypothetical one into a false
+    // termination diagnostic on a later, otherwise-undiagnosed rejection.
+    const f = fixture(async (text) => {
+      if (text === "SELECT late") throw new Error("Client has encountered a connection error and is not queryable");
+      return result();
+    });
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    f.emitClientError(Object.assign(new Error("serialization failure"), { code: "40001" }));
+    const error = await session.query({ text: "SELECT late" }, options).catch((e: unknown) => e);
+    expect(error).toMatchObject({ sqlState: null });
+    await session.close();
+    await f.runtime.close();
+  });
+
+  it("removes the async-failure listener from the client on release", async () => {
+    const f = fixture();
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    expect(f.clientEvents.listenerCount("error")).toBe(1);
+    await session.close();
+    expect(f.clientEvents.listenerCount("error")).toBe(0);
     await f.runtime.close();
   });
 

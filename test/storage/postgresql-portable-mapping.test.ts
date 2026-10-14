@@ -43,6 +43,28 @@ describe("PostgreSQL portable native mapping", () => {
     expect(query.mock.calls[1][0].text).toContain("token_count::text");
     await expect(mapping.listCanonicalHeaders(db,projectId,"messages",null,501)).rejects.toThrow();
   });
+  it("counts canonical rows database-side over the scope the header stream pages", async () => {
+    const {db, query} = executor([{count:"0"}]);
+    const signal = new AbortController().signal;
+    for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+      expect(await mapping.countCanonicalRows(db,projectId,domain,signal)).toBe(0);
+      await mapping.listCanonicalHeaders(db,projectId,domain,null,1);
+      const [count, headers] = query.mock.calls.slice(-2).map(call => (call as unknown as [{text:string;values:unknown[]}])[0]);
+      expect(headers!.text).toContain(count!.text.slice(count!.text.indexOf(" FROM ")));
+      expect(count!.text).toMatch(/^SELECT COUNT\(\*\)::text AS count FROM /);
+      expect(count!.text).not.toMatch(/octet_length|row_to_json|LIMIT|ORDER BY/);
+      expect(count!.values).toEqual([projectId]);
+    }
+    const options = (query.mock.calls[0] as unknown as [unknown, {operation:string;domain:string;projectId:string;signal:AbortSignal}])[1];
+    expect(options).toEqual({domain:"transaction",operation:"portable-count",projectId,signal});
+  });
+  it("parses counts exactly and refuses non-canonical results", async () => {
+    expect(await mapping.countCanonicalRows(executor([{count:"12"}]).db,projectId,"messages")).toBe(12);
+    for (const rows of [[], [{}], [{count:7}], [{count:""}], [{count:"-1"}], [{count:"01"}], [{count:"1.5"}], [{count:"9007199254740993"}]])
+      await expect(mapping.countCanonicalRows(executor(rows).db,projectId,"messages")).rejects.toMatchObject({code:"record-unrepresentable"});
+    const db = {query: vi.fn(async () => { throw new Error("driver"); })} as unknown as PostgreSqlQueryExecutor;
+    await expect(mapping.countCanonicalRows(db,projectId,"messages")).rejects.toThrow("driver");
+  });
   it("refuses nonrepresentable memory UUID and empty content before SQL", async () => {
     const {db, query} = executor([]);
     const record = createPortableRecord({domain:"promoted-memories",ordinal:0,context:{projectIdentity:{scope:"shared",projectId}},value:{memoryId:"legacy-memory",content:"",metadata:{},sourceProjectId:null,sourceSummaryId:null,sessionId:null,depth:0,confidence:1,createdAt:timestamp,archivedAt:null}});

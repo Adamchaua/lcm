@@ -137,6 +137,8 @@ component_management:
         # transcript metadata admission here.
         - "^src/daemon/auth\\.ts$"
         - "^src/daemon/client\\.ts$"
+        # #1410 adds the validated, persisted snapshotIdleTimeoutMs
+        # PostgreSQL tuning key here.
         - "^src/daemon/config\\.ts$"
         - "^src/daemon/content-fence\\.ts$"
         # #1413 keeps the typed unbound-project 409 reason discriminator in
@@ -328,10 +330,17 @@ component_management:
         - "^src/storage/index\\.ts$"
         # Curated portable package API remains storage-abstractions-owned.
         - "^src/storage/portable\\.ts$"
+        # #1410 adds the optional, non-serialized PortableStreamError cause
+        # here.
         - "^src/storage/portable-record\\.ts$"
         # The #763 manifest and #816 checkpoint negative-zero taxonomies remain storage-abstractions-owned.
+        # #1410 forwards the source's close cause here. #1442 classifies a
+        # read-path source-unavailable as retryable only when the source
+        # adapter marked it retryable, so the stream stays backend-neutral.
         - "^src/storage/portable-record-stream\\.ts$"
         # #618 shared canonical transfer and bounded validation index.
+        # #1426 adds the destination-unexpected-rows error code to the closed
+        # transfer error vocabulary; ownership is unchanged.
         - "^src/storage/portable-transfer\\.ts$"
         - "^src/storage/portable-index\\.ts$"
         - "^src/storage/postgresql/project-storage\\.ts$"
@@ -467,6 +476,8 @@ component_management:
       name: "Unit - Diagnostics"
       paths:
         - "^src/diagnose\\.ts$"
+        # #1410 threads snapshotIdleTimeoutMs into the diagnostics probe's
+        # connection settings here.
         # #619 retains authenticated daemon pool observations across probe failures.
         - "^src/storage/diagnostics\\.ts$"
         - "^src/storage/diagnostic-renderer\\.ts$"
@@ -502,24 +513,39 @@ component_management:
         # The #700 caller/factory-shutdown signal composition and facade cleanup remain PostgreSQL-runtime-owned.
         - "^src/daemon/staged-postgresql\\.ts$"
         - "^src/storage/postgresql/client-config\\.ts$"
+        # #1410 adds the optional snapshotIdleTimeoutMs connection setting
+        # here.
         - "^src/storage/postgresql/contracts\\.ts$"
+        # #1410 adds the snapshot-local termination predicate, covering a
+        # captured async-diagnostic reattachment shape, here.
         - "^src/storage/postgresql/errors\\.ts$"
+        # #1410 threads snapshotIdleTimeoutMs through resolved connection
+        # settings here.
         # #1402 keeps the publication witness classification in this
         # existing PostgreSQL-runtime owner.
         - "^src/storage/postgresql/factory\\.ts$"
         - "^src/storage/postgresql/index\\.ts$"
+        # #1410 attaches the snapshot checkout's async-failure listener and
+        # resolves the snapshot idle bound here. #1424 gives query and
+        # transaction checkouts the same observer.
         - "^src/storage/postgresql/runtime\\.ts$"
+        # #1410 separates the snapshot's idle-in-transaction bound from
+        # statementTimeoutMs and captures its async FATAL diagnostic here.
         - "^src/storage/postgresql/snapshot-session\\.ts$"
         - "^src/storage/postgresql\\.ts$"
     - component_id: "integration-postgresql-portable"
       name: "Integration - PostgreSQL Portable Transfer"
       paths:
         # #618 canonical self-provenance stays in PostgreSQL portable transfer.
+        # #1410 narrows session-close tolerance to a real snapshot-
+        # termination diagnostic here. #1442 marks a genuine termination
+        # retryable on the source-unavailable it raises.
         # #1378 re-derives each written record's canonical content
         # fingerprint inside the completion transaction, batched via a
         # new readCanonicalContentRows; ownership is unchanged.
-        # #1416 re-runs the schema verifier inside the export snapshot;
-        # portable-source.ts keeps its established owner.
+        # #1426 counts canonical rows the run did not write before completion
+        # and refuses surplus rows in the destination and mapping files; both
+        # keep their established owner.
         - "^src/storage/postgresql/portable-source\\.ts$"
         - "^src/storage/postgresql/portable-destination\\.ts$"
         - "^src/storage/postgresql/portable-mapping\\.ts$"
