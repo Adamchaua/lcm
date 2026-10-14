@@ -92,6 +92,7 @@ describe("CI plan classification", () => {
     expect(graphInvisibleTests(".changeset/x.md")).toEqual([...GRAPH_INVISIBLE_INPUTS[1].tests]);
     expect(graphInvisibleTests("test/timezone-fixture.test.ts")).toEqual(["test/timezone-fixture-runner.test.ts"]);
     expect(graphInvisibleTests("src/memory/index.ts")).toEqual(["test/memory/search-type-contract.test.ts"]);
+    expect(graphInvisibleTests("test/codecov-ownership/1403-unbound-enumeration.yml")).toEqual(["test/codecov-config.test.ts"]);
     expect(graphInvisibleTests("src/memory/other.ts")).toEqual([]);
     expect(graphInvisibleTests("package.json")).toEqual([]);
     expect(graphInvisibleTests("docs-old/x.md")).toEqual([]);
@@ -376,6 +377,8 @@ describe("graph-invisible input table completeness", () => {
     "spawned-tests": [/"run", "test\/timezone-fixture\.test\.ts"/u],
     // A source file resolved for the TypeScript compiler API rather than imported.
     "compiled-sources": [/resolve\(process\.cwd\(\), "src\/[^"]+\.ts"\)/u],
+    // Ownership fragments read from disk by the Codecov contract test.
+    "codecov-ownership": [/join\(projectRoot, "test", "codecov-ownership"\)/u],
   };
 
   function* testFiles(directory: string): Generator<string> {
