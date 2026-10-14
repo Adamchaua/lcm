@@ -888,22 +888,22 @@ export type ActivationArtifactReadDependencies = Readonly<{
 }>;
 
 /**
-  * Read back a previously published recovery-material record by its identity
-  * digest. Returns null only for an attributed absence (a genuinely missing
-  * file); a permission-denied or otherwise unresolvable read throws rather
-  * than being reported as "nothing here yet". A multi-link stored file --
-  * the post-link crash state publishActivationArtifact's own retry
-  * converges out of -- is reported as unresolvable here, never silently
-  * repaired: reads never mutate, so converging that state is the writer
-  * retry's job, not this reader's.
-  *
-  * The artifact directory is opened and authenticated first (no-follow, so
-  * a symlinked directory is refused) and re-asserted after the read, so a
-  * swapped directory cannot redirect it. The parsed record must also hash
-  * to the requested identity digest; a record stored under another name is
-  * an ActivationArtifactIdentityMismatchError, never returned.
-  */
- export function readActivationArtifact(
+ * Read back a previously published recovery-material record by its identity
+ * digest. Returns null only for an attributed absence (a genuinely missing
+ * file); a permission-denied or otherwise unresolvable read throws rather
+ * than being reported as "nothing here yet". A multi-link stored file --
+ * the post-link crash state publishActivationArtifact's own retry
+ * converges out of -- is reported as unresolvable here, never silently
+ * repaired: reads never mutate, so converging that state is the writer
+ * retry's job, not this reader's.
+ *
+ * The artifact directory is opened and authenticated first (no-follow, so
+ * a symlinked directory is refused) and re-asserted after the read, so a
+ * swapped directory cannot redirect it. The parsed record must also hash
+ * to the requested identity digest; a record stored under another name is
+ * an ActivationArtifactIdentityMismatchError, never returned.
+ */
+export function readActivationArtifact(
   input: Readonly<{ homeDir?: string; identityDigest: string }>,
   dependencies: ActivationArtifactReadDependencies = {},
 ): ActivationArtifactRecoveryMaterial | null {

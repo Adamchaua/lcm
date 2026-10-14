@@ -85,20 +85,30 @@ import {
  * coordinator already runs.
  *
  * Dispatch resume versus a fresh prepare correctly. This function never
- * calls prepare() a second time on top of a publication that is already in
- * flight. It always calls coordinator.recoverPending first, with a resume
- * disposition: verified at source, recoverPending reads the one on-disk
- * publication journal this coordinator tracks and returns null only when
- * none exists, driving anything it does find to completion (or through an
- * in-progress abort) instead. A null result, or a result whose
- * publicationId does not match this call's own (a leftover terminal
- * journal from an unrelated prior generation -- see
- * BackendPublicationCoordinator#prepare's own existing-journal handling,
- * which archives exactly that shape before creating a fresh one), is what
- * triggers this function's own fresh prepare-then-resume dispatch. A
- * mismatched non-terminal journal is a genuine collision this function
- * refuses rather than silently driving forward on another generation's
- * behalf; see ActivationPublicationStatus's publication-collision member.
+ * calls prepare() on top of a publication that is already in flight, and it
+ * calls coordinator.recoverPending only for a journal of its own
+ * publicationId. The order is:
+ *
+ * 1. A repeated localProjectId or remoteProjectId is refused
+ *    (duplicate-publication-input) before any I/O.
+ * 2. Unlocked read-only peeks: the maintenance journal first, and the
+ *    version-2 publication journal only when there is no maintenance
+ *    journal. A peek that throws is publication-unresolvable.
+ * 3. A non-terminal version-3 maintenance journal is maintenance-in-flight;
+ *    the coordinator is not called. A non-terminal version-2 journal of a
+ *    different publicationId is publication-collision, returned with that
+ *    journal; recoverPending is not called and the other generation is
+ *    never driven forward.
+ * 4. Lease fences are asserted for every project, except when the journal
+ *    is of this publicationId and already terminal (its fences are already
+ *    released).
+ * 5. A version-2 journal of this publicationId is driven with
+ *    recoverPending({ disposition: "resume" }, lockToken) and its result is
+ *    reported.
+ * 6. Every other case (no journal, a terminal version-3 maintenance
+ *    journal, or a terminal journal of another publicationId) is a fresh
+ *    prepare then resume under the same lockToken. recoverPending is not
+ *    called; prepare archives a terminal journal itself.
  *
  * What this does and does not guarantee, stated plainly rather than left
  * to be assumed (the lifetime question: what is checked once here that
@@ -221,11 +231,16 @@ export type ActivationPublicationStatus =
   | "publication-unresolvable"
   | "maintenance-in-flight";
 
-/** Attributed dispatch result. journal is populated whenever the
- * coordinator was actually invoked and returned one (including a
- * publication-collision journal belonging to the colliding generation,
- * included for the caller's own diagnosis); fenceChecks always carries
- * every project's individual lease assertion, regardless of outcome. */
+/** Attributed dispatch result. journal is set when the coordinator returned
+ * one (completed or aborted) and for a publication-collision, where it is
+ * the colliding generation's journal for the caller's diagnosis. It is null
+ * for duplicate-publication-input, publication-unresolvable,
+ * maintenance-in-flight and the fence and artifact refusals. fenceChecks
+ * lists one lease assertion per project only when the lease loop ran. It is
+ * empty for the refusals that precede it (duplicate-publication-input,
+ * publication-unresolvable, maintenance-in-flight and a peeked
+ * publication-collision) and when a terminal journal of this
+ * publicationId is reported without assertions. */
 export type ActivationPublicationResult = Readonly<{
   status: ActivationPublicationStatus;
   detail: string;
