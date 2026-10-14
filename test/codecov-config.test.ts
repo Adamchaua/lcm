@@ -379,10 +379,14 @@ const expectedComponents = [
       // #618 canonical self-provenance stays in PostgreSQL portable transfer.
       // #1388 keeps batched canonical row reads for source creation and
       // verification in this existing PostgreSQL portable-transfer owner.
+      // #1388 header pages cut by aggregate locator bytes in SQL keep the
+      // source's short-page cursor walk in this same owner.
       "^src/storage/postgresql/portable-source\\.ts$",
       "^src/storage/postgresql/portable-destination\\.ts$",
       // #1388 keeps the batched canonical-row read helper and its collated
       // locator comparison in the same owner.
+      // #1388 keeps the aggregate-header-bound (running locator bytes in
+      // SQL, first row always kept) in this same owner.
       "^src/storage/postgresql/portable-mapping\\.ts$",
     ],
   },
@@ -885,6 +889,8 @@ describe("Codecov configuration", () => {
       // creation and verification. The change is confined to existing files
       // and adds no component, so every touched file keeps its established
       // owner; these pins record that decision for materially changed files.
+      // #1388 also bounds each multi-row header page by aggregate locator
+      // bytes in SQL; the pins below cover that follow-up for the same owner.
       ["src/storage/portable-index.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/portable-source.ts", "integration-postgresql-portable"],
       ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"],

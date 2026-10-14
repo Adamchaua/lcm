@@ -3,11 +3,13 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
-import { Client, Query } from 'pg';
+import { Client, Query, type QueryConfig } from 'pg';
 import { createPortableRecordStream, PORTABLE_RECORD_DOMAIN_ORDER, type PortableRecordStream } from '../../src/storage/portable-record-stream.js';
 import { runPortableTransfer } from '../../src/storage/portable-transfer.js';
 import { createPostgreSqlPortableSource } from '../../src/storage/postgresql/portable-source.js';
 import { createPostgreSqlPortableDestination } from '../../src/storage/postgresql/portable-destination.js';
+import { listCanonicalHeaders } from '../../src/storage/postgresql/portable-mapping.js';
+import type { PostgreSqlQueryExecutor, PostgreSqlQueryOptions } from '../../src/storage/postgresql/contracts.js';
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase, type PostgreSqlTestDatabase } from './harness.js';
 import { seedPortablePostgreSql, grantPortablePostgreSql, PORTABLE_POSTGRESQL_FIXTURE } from './portable-fixture.js';
 
@@ -16,7 +18,7 @@ import { openSqlitePortableSource, sqlitePortableFileSha256 } from '../../src/st
 import { PostgreSqlRuntime } from '../../src/storage/postgresql/runtime.js';
 import { PostgreSqlPromotedMemoryRepository } from '../../src/storage/postgresql/memory-repositories.js';
 import { openSqlitePortableDestination } from '../../src/storage/sqlite/portable-destination.js';
-import { canonicalSha256 } from '../../src/storage/portable-record.js';
+import { canonicalSha256, PORTABLE_LIMITS } from '../../src/storage/portable-record.js';
 import { exportKnowledge, type ExportDocument } from '../../src/portable-knowledge.js';
 import { hashProjectPath } from '../../src/project-map.js';
 import { withSelectedPostgreSqlProject, restoreRuntimeGrants } from './operational-fixture.js';
@@ -491,3 +493,47 @@ it('revalidates project identity after acquiring the completion fence',async()=>
     }
   }));
 },120000);
+
+describe('PostgreSQL canonical source header pages',()=>{
+  it('cuts a multi-row header page by aggregate locator bytes in SQL and resumes without gaps or repeats (#1388)',async()=>{
+    await withPostgreSqlTestDatabase('portable-header-bound',async db=>{
+      const {projectId,machineId}=await seedPortablePostgreSql(db.migrator,{identityOnly:true});
+      // Five checkpoints whose only unbounded key column holds about 1 KiB each.
+      await db.migrator.query({text:`INSERT INTO lcm.ingest_checkpoints (project_id, machine_id, client_name, source_locator)
+        SELECT $1::uuid, $2::uuid, 'codex', chr(97 + i) || repeat('x', 1023) FROM generate_series(0, 4) AS i`,values:[projectId,machineId]},context);
+      const captured:QueryConfig<unknown[]>[]=[];
+      const recording:PostgreSqlQueryExecutor={query:(config:QueryConfig<unknown[]>,options:PostgreSqlQueryOptions)=>{captured.push(config);return db.migrator.query(config,options);}} as PostgreSqlQueryExecutor;
+      // Locators are PostgreSQL json text, which separates elements with ", ".
+      const expected=['a','b','c','d','e'].map(letter=>`["${machineId}", "codex", "${letter}${'x'.repeat(1023)}"]`);
+      // At the production bound the five ~1 KiB locators form one page in C order.
+      const full=await listCanonicalHeaders(recording,projectId,'native-transcript-checkpoints',null,500);
+      expect(full.map(header=>header.locator)).toEqual(expected);
+      expect(captured).toHaveLength(1);
+      expect(captured[0]!.values).toEqual([projectId,null,500,String(PORTABLE_LIMITS.maxBatchBytes)]);
+      // Every locator key column is a btree primary-key member, so PostgreSQL
+      // caps each key near 2.7 KiB and real rows cannot reach the 144 MiB
+      // aggregate. Prove the cut with the exact production SQL text and its
+      // bound parameter set to two locators: the third row of the ordered
+      // scan then exceeds the running sum, while a single row always fits.
+      const budget=Buffer.byteLength(expected[0]!)+Buffer.byteLength(expected[1]!);
+      const sql=captured[0]!.text;
+      const run=async(after:string|null,bound:number)=>(await db.migrator.query<{locator:string;byteLength:string}>({text:sql,values:[projectId,after===null?null:JSON.parse(after),500,String(bound)]},context)).rows;
+      const pages:string[][]=[];
+      for(let after:string|null=null;;){
+        const rows=await run(after,budget);
+        if(rows.length===0)break;
+        pages.push(rows.map(row=>row.locator));
+        after=rows.at(-1)!.locator;
+      }
+      expect(pages).toEqual([[expected[0],expected[1]],[expected[2],expected[3]],[expected[4]]]);
+      // Below every row's own size the single-row semantics are unchanged: the
+      // locator is suppressed, the real size still travels, and the empty
+      // locators add nothing to the running sum, so no row is hidden.
+      const suppressed=await run(null,1);
+      expect(suppressed.map(row=>row.locator)).toEqual(['','','','','']);
+      expect(suppressed.map(row=>row.byteLength)).toEqual(full.map(header=>header.byteLength));
+      expect(suppressed.every(row=>BigInt(row.byteLength)>1n)).toBe(true);
+      expect(await run(null,budget).then(rows=>rows.length)).toBe(2);
+    });
+  },60000);
+});

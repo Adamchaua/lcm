@@ -491,6 +491,8 @@ component_management:
         # #618 canonical self-provenance stays in PostgreSQL portable transfer.
         # #1388 keeps batched canonical row reads for source creation and
         # verification in this existing PostgreSQL portable-transfer owner.
+        # #1388 header pages cut by aggregate locator bytes in SQL keep the
+        # source's short-page cursor walk in this same owner.
         # #1378 re-derives each written record's canonical content
         # fingerprint inside the completion transaction, batched via a
         # new readCanonicalContentRows; ownership is unchanged.
@@ -498,6 +500,8 @@ component_management:
         - "^src/storage/postgresql/portable-destination\\.ts$"
         # #1388 keeps the batched canonical-row read helper and its collated
         # locator comparison in the same owner.
+        # #1388 keeps the aggregate-header-bound (running locator bytes in
+        # SQL, first row always kept) in this same owner.
         - "^src/storage/postgresql/portable-mapping\\.ts$"
     - component_id: "integration-postgresql-schema"
       name: "Integration - PostgreSQL Schema"

@@ -397,6 +397,24 @@ describe('PostgreSQL source private scratch and authenticated prefix evidence',(
     expect(small.contentRows.mock.calls.filter(call=>call[2]==='session-ingest').map(call=>call[3].length)).toEqual([3,3]);
     await smallSource.close();
   });
+  it('walks byte-cut header pages exactly once in order while still asking for full pages (#1388)',async()=>{
+    const h=dataHarness({'session-ingest':rows(5)}),list=h.list.getMockImplementation()!;
+    // listCanonicalHeaders bounds a page by aggregate locator bytes in SQL, so
+    // a page can be shorter than the record bound while rows remain. Emulate a
+    // backend that cuts every page after two headers.
+    h.list.mockImplementation(async(...args)=>(await list(...(args as Parameters<typeof list>))).slice(0,2));
+    const source=await open(h);
+    const calls=h.list.mock.calls.filter(call=>call[2]==='session-ingest');
+    expect(calls.every(call=>call[4]===codec.PORTABLE_LIMITS.maxBatchRecords)).toBe(true);
+    // Each cursor is the last locator of the previous short page; the final page is empty.
+    expect(calls.map(call=>call[3])).toEqual([null,'["1"]','["3"]','["4"]']);
+    const build=h.contentRows.mock.calls.filter(call=>call[2]==='session-ingest').slice(0,3).map(call=>call[3]);
+    expect(build).toEqual([['["0"]','["1"]'],['["2"]','["3"]'],['["4"]']]);
+    const batch=await source.readDomainPage(page('session-ingest'));
+    expect(batch.complete).toBe(true);
+    expect(batch.records.map(record=>record.value.sessionId)).toEqual(rows(5).map(row=>row.session_id));
+    await source.close();
+  });
   it('splits a build-pass header page whose rows together exceed the batch budget',async()=>{
     const rows2=['1','2'].map(ingest_key=>({ingest_key,session_id:ingest_key,message_count:'1',completed_at:timestamp}));
     const big=dataHarness({'session-ingest':rows2}),list=big.list.getMockImplementation()!;

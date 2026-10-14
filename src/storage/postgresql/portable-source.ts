@@ -258,6 +258,9 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     let after: string | null=null;
     while (true) {
       abort(options.signal);
+      // A page may hold fewer headers than the record bound while rows remain:
+      // listCanonicalHeaders also cuts a page by aggregate locator bytes (#1388).
+      // Resuming after the last returned locator therefore skips nothing.
       const headers=await listCanonicalHeaders(session,expectedIdentity.id,domain,after,PORTABLE_LIMITS.maxBatchRecords,options.signal);
       if (headers.length === 0) break;
       if (headers.length > PORTABLE_LIMITS.maxBatchRecords) invalid();
