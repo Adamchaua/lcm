@@ -1,0 +1,12 @@
+references: ["#1388", "PR #1439"]
+rationale: >-
+  #1388 batches PostgreSQL portable canonical reads: header pages are bounded
+  by record count and by aggregate locator bytes in SQL, the build pass and
+  boundaryAt read rows in byte-bounded batches through the shared, collated
+  readCanonicalContentRows, and the disk index keeps each header's byte length
+  for boundary chunking. The change is confined to existing files and adds no
+  component, so each file keeps its established owner.
+pins:
+  - ["src/storage/portable-index.ts", "unit-storage-abstractions"]
+  - ["src/storage/postgresql/portable-source.ts", "integration-postgresql-portable"]
+  - ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"]

@@ -1146,8 +1146,12 @@ recognized active storage backend, the PID file, process liveness, and exact
 `/stats/pool` then verify authenticated access; the entrypoint identity is
 checked through authenticated health, while pool diagnostics omit paths. An
 occupied port with missing or unverifiable identity is rejected rather than
-trusted. Daemons that predate backend identity are recognized as SQLite-only,
-so selecting PostgreSQL cannot silently reuse an existing SQLite process.
+trusted. Daemons through 1.4.3 omit the backend from `/health` and are
+recognized as SQLite-only, so selecting PostgreSQL cannot silently reuse an
+existing SQLite process. A newer daemon that omits the backend is treated as
+unknown: LCM does not reuse it, does not replace it without authentication,
+and `lcm daemon restart` refuses it. Admission is blocked with the
+storage-backend warning until you stop that daemon yourself.
 The PID, PID-file, and listener observations in this admission check are
 consistency evidence for a responsive managed service; they are never offline
 authority to signal or replace a process.

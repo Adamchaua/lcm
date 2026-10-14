@@ -227,6 +227,14 @@ it("batches canonical row reads by locator instead of one query per record",asyn
   expect(found.get(locators[2]!)).toEqual({test:"payload-2"});
   expect(found.has(locators[1]!)).toBe(false);
 });
+it("compares batch locators under the C collation, exactly as the single-row read does",async()=>{
+  const single=executor([]);
+  await mapping.readCanonicalContentRows(single.db,projectId,"session-ingest",[JSON.stringify(["a"])]);
+  expect(single.query.mock.calls[0][0].text).toContain('json_build_array(r.ingest_key::text)::text COLLATE "C" = ANY($2::text[])');
+  const multi=executor([]);
+  await mapping.readCanonicalContentRows(multi.db,projectId,"promoted-memory-tags",[JSON.stringify(["a","1"])]);
+  expect(multi.query.mock.calls[0][0].text).toContain('json_build_array(r.memory_id::text, r.ordinal::text)::text COLLATE "C" = ANY($2::text[])');
+});
 it("returns an empty map without querying when there are no locators to check",async()=>{
   const {db,query}=executor([]);
   expect(await mapping.readCanonicalContentRows(db,projectId,"machines",[])).toEqual(new Map());
@@ -390,6 +398,27 @@ it("suppresses oversized locator output in SQL while returning the measured row 
   expect(query.mock.calls[1][0].text).toContain("<= $5::bigint THEN json_build_array(");
   expect(query.mock.calls[1][0].text).toContain("ELSE '' END AS locator");
   expect(query.mock.calls[1][0].values).toEqual([projectId,"1",null,1,"150994944"]);
+});
+
+it("bounds a multi-row header page by aggregate locator bytes in SQL while always keeping its first row (#1388)",async()=>{
+  const {db,query}=executor([]);
+  await mapping.listCanonicalHeaders(db,projectId,"project-aliases",JSON.stringify(["m","/p"]),500);
+  const {text,values}=query.mock.calls[0][0];
+  expect(values).toEqual([projectId,["m","/p"],500,"150994944"]);
+  // The scan stops at the page limit before the window sees any row, in the
+  // same C-collated key order the window then accumulates over.
+  expect(text).toContain('ORDER BY ARRAY[r.machine_id::text COLLATE "C", r.normalized_path::text COLLATE "C"] COLLATE "C" LIMIT $3) sized WINDOW page_order AS (ORDER BY ARRAY[sized.machine_id::text COLLATE "C", sized.normalized_path::text COLLATE "C"] COLLATE "C" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)');
+  // Running projected-locator bytes cut the page against the shared batch
+  // budget; an oversized row still projects '' and adds nothing to the sum.
+  expect(text).toContain("row_number() OVER page_order AS page_row");
+  expect(text).toContain("sum(octet_length(CASE WHEN sized.byte_length <= $4::bigint THEN json_build_array(sized.machine_id::text, sized.normalized_path::text)::text ELSE '' END)) OVER page_order AS page_bytes");
+  expect(text).toContain("WHERE page.page_row = 1 OR page.page_bytes <= $4::bigint ORDER BY page.page_row");
+  // The projected row size is measured once per scanned row, inside the limited scan.
+  expect(text.split("row_to_json(portable_row)")).toHaveLength(2);
+  expect(text).toContain("AS byte_length FROM lcm.project_aliases r JOIN lcm.machines m ON m.machine_id = r.machine_id WHERE (r.project_id = $1::uuid)");
+  // The conversation closure keeps its one-row reads without the aggregate window.
+  await mapping.listConversationMessageHeaders(db,projectId,"1",null,1);
+  expect(query.mock.calls[1][0].text).not.toContain("OVER");
 });
 
 it("rejects IDs already owned by another project before any native insertion",async()=>{

@@ -1,0 +1,10 @@
+references: ["#1394"]
+rationale: >-
+  #1394 stops treating a health response that omits its storage backend as a
+  SQLite claim (client.ts inference, lifecycle.ts fail-closed refusal,
+  publication-convergence.ts exact comparison); the change is confined to
+  existing files, so each keeps its established owner.
+pins:
+  - ["src/daemon/client.ts", "unit-daemon-core"]
+  - ["src/daemon/lifecycle.ts", "integration-service-managers"]
+  - ["src/storage/publication-convergence.ts", "unit-storage-abstractions"]

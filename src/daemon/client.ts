@@ -15,7 +15,8 @@ import { isStagedPostgreSqlHealth } from "./staged-postgresql.js";
 export type DaemonHealth = {
   status: string;
   version: string;
-  storageBackend: StorageBackend;
+  /** Absent when the daemon did not report a recognized backend identity. */
+  storageBackend?: StorageBackend;
   uptime: number;
   pid: number;
   entrypoint?: string;
@@ -72,6 +73,32 @@ export function parseDaemonObservation(statusCode: number, value: unknown): Daem
 type DaemonHealthResponse = Omit<DaemonHealth, "storageBackend"> & {
   storageBackend?: StorageBackend;
 };
+
+// #230 added storageBackend to /health after the last published release, so
+// every release through 1.4.3 omits it and was SQLite-only.
+const LAST_PRE_IDENTITY_RELEASE = [1, 4, 3] as const;
+
+/**
+ * Backend a daemon claims through /health. An omitted field is a SQLite claim
+ * only for a strict release version that predates backend identity; any other
+ * absence or unrecognized value is unknown.
+ */
+export function inferredHealthStorageBackend(
+  health: { storageBackend?: unknown; version?: unknown },
+): StorageBackend | undefined {
+  if (health.storageBackend === "sqlite" || health.storageBackend === "postgresql") {
+    return health.storageBackend;
+  }
+  if (health.storageBackend !== undefined || typeof health.version !== "string") return undefined;
+  const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/u.exec(health.version);
+  if (match === null) return undefined;
+  const parts = [match[1], match[2], match[3]].map(Number);
+  if (!parts.every((part) => Number.isSafeInteger(part))) return undefined;
+  for (const [index, limit] of LAST_PRE_IDENTITY_RELEASE.entries()) {
+    if (parts[index]! !== limit) return parts[index]! < limit ? "sqlite" : undefined;
+  }
+  return "sqlite";
+}
 
 export type DaemonRequestOptions = Readonly<{
   signal?: AbortSignal;
@@ -134,8 +161,9 @@ export class DaemonClient {
       ) {
         return null;
       }
-      // Daemons predating backend identity were necessarily SQLite-only.
-      return { ...health, storageBackend: health.storageBackend ?? "sqlite" };
+      const { storageBackend: _reported, ...rest } = health;
+      const storageBackend = inferredHealthStorageBackend(health);
+      return storageBackend === undefined ? rest : { ...rest, storageBackend };
     } catch (error) {
       if (isAbortError(error)) throw error;
       return null;
