@@ -388,6 +388,14 @@ export type MigrationSearchProbeSourceEntry = Readonly<{ ordinal: number; identi
 export const MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE = 25;
 
 /**
+ * How many search results the probe examines for the candidate's own
+ * message. The result list is ranked, and a sampled message can share its
+ * content with many others, so the candidate's own row is not always first.
+ * 50 is the repository's default page and well inside its 1000 cap.
+ */
+const SEARCH_PROBE_RESULT_WINDOW = 50;
+
+/**
  * The step 5 ordered-listing probe now runs through the real repository
  * (PostgreSqlConversationRepository.listConversations, the exact production
  * read path -- not hand-written SQL that would only re-test a copy of the
@@ -662,7 +670,10 @@ export async function runSearchSelfMatchProbe(
     }
     const expectedNativeKey = identityResult.rows[0]!.native_key;
     const results = await repository.searchMessages({
-      query: candidate.content, mode: "full_text" as const, limit: 1,
+      // A candidate whose own message ranks below this window is reported
+      // as not confirmed. That miss leaves the probe not-run, which refuses
+      // eligibility (fail closed); it is never counted as a pass.
+      query: candidate.content, mode: "full_text" as const, limit: SEARCH_PROBE_RESULT_WINDOW,
     });
     if (results.some((result) => String(result.messageId) === expectedNativeKey)) {
       return { ran: true, chosenOrdinal: candidate.ordinal, notRunReason: null };

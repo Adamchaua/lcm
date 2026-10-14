@@ -2880,6 +2880,40 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     expect(result.report.activationEligible).toBe(true);
   }, 15000);
 
+  it("kAKbI: confirms a candidate whose own message ranks below the first search result", async () => {
+    // The candidate's own message is the third ranked row. A one-row
+    // window would see only message 1 and leave the probe not-run on a
+    // healthy destination, so the probe reads a wider fixed window.
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const searchRow = (messageId: number) => ({
+      message_id: messageId, conversation_id: 1, role: "user", snippet: "match",
+      created_at: "2026-01-01T00:00:00.000Z", rank: 1, match_phase: 0,
+    });
+    const runtime = fakeRuntime({
+      searchRows: [searchRow(1), searchRow(2), searchRow(3)],
+      transferIdentities: [{ identitySha256: fakeHash("message-identity-default"), nativeKey: JSON.stringify(["3"]) }],
+    });
+    const result = await verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-search-window" }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+    );
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: true });
+    expect(result.report.activationEligible).toBe(true);
+  }, 15000);
+
+  it("kAKbI: a candidate whose own message is outside the window stays not-run rather than passing", async () => {
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const runtime = fakeRuntime({
+      transferIdentities: [{ identitySha256: fakeHash("message-identity-default"), nativeKey: JSON.stringify(["999"]) }],
+    });
+    const result = await verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-search-window-miss" }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+    );
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+    expect(result.report.activationEligible).toBe(false);
+  }, 15000);
+
   it("round-2 P1 red case: a listing mismatch alongside a not-run search probe retains the mismatch and still refuses eligibility", async () => {
     // The compound case the owner explicitly did not want handled by
     // suppression: a genuine listing drift and a broken search path in
