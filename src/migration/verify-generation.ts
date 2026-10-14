@@ -12,11 +12,13 @@ import {
 } from "../storage/postgresql/portable-source.js";
 import { PostgreSqlConversationRepository } from "../storage/postgresql/conversation-repository.js";
 import { PostgreSqlLexicalSearchRepository } from "../storage/postgresql/lexical-search-repository.js";
+import { mappingForDomain } from "../storage/postgresql/portable-mapping.js";
 import { probePostgreSqlPortableDestination } from "../storage/postgresql/portable-destination.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
 import {
   PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_LIMITS, canonicalJson as portableCanonicalJson,
+  derivePortableConversationIdentity,
   PORTABLE_RECORD_SCHEMA_SHA256,
   type PortableDomain, type PortableRecord,
 } from "../storage/portable-record.js";
@@ -319,24 +321,13 @@ function truncateToMillisecondIso(value: string): string {
 /** One source "conversations" record's public-listing-relevant projection, in canonical order. */
 export type MigrationPublicListingSourceEntry = Readonly<{
   createdAt: string;
+  /** The record's own portable identity digest (fingerprint plus occurrence ordinal). */
   identitySha256: string;
   /**
-   * Round-4 P2: the destination's native listConversations() read has
-   * no field in common with the source's portable identitySha256 --
-   * they are different identity spaces, the same shape as the search
-   * probe's correlation problem, and adding the destination-native
-   * conversationId into this digest would compare a value one side can
-   * never produce, closing nothing. title, unlike conversationId, is a
-   * plain scalar copied verbatim by the copy (see
-   * portable-mapping.ts's fields("... title ...") with no transform,
-   * and portable-source.ts's canonicalJson(value.title) on the read
-   * side), so it exists unchanged on both the source's canonical record
-   * and the destination's row. Folding it into both sides distinguishes
-   * two destination rows sharing a millisecond whenever their titles
-   * differ, without any ledger correlation and without adding a query.
-   * It is still a probe, not a proof: two same-millisecond
-   * conversations that also share a title remain indistinguishable by
-   * this check alone.
+   * The conversation title, a plain scalar the copy writes verbatim. The
+   * listing compares it together with the identity, as a pair, so two
+   * conversations that trade titles are told apart even when they share a
+   * millisecond.
    */
   title: string | null;
 }>;
@@ -380,7 +371,10 @@ const SEARCH_PROBE_RESULT_WINDOW = 50;
  * (PostgreSqlConversationRepository.listConversations, the exact production
  * read path -- not hand-written SQL that would only re-test a copy of the
  * ordering logic) and is compared against expectedOrder, derived from the
- * source's own canonical records during step 1 rather than assumed. A
+ * source's own canonical records during step 1 rather than assumed. Each
+ * listed row is paired with the portable identity of its header (see
+ * readDestinationConversationIdentities), so the comparison is on
+ * [identity, title] pairs rather than on timestamps alone. A
  * mismatch is recorded as a sample-class mismatch on the public-listing
  * pseudo-domain; a clean probe contributes nothing (equality is not itself
  * evidence worth persisting). Full parity with every public repository
@@ -420,49 +414,109 @@ function compareTieOrderTitle(left: string | null, right: string | null): number
   return left < right ? -1 : 1;
 }
 
+/**
+ * What the listing comparison uses for a destination row whose header could
+ * not be read back by its conversation id. It is not a digest, so it equals
+ * no source identity and the row shows up as a sample mismatch.
+ */
+const UNCORRELATED_LISTING_IDENTITY = "uncorrelated-destination-row";
+
+/**
+ * The portable identity of every destination conversation, keyed by its
+ * native conversation id (a join key only, never an identity component).
+ * Headers are read from the public conversation columns with the same
+ * microsecond to_char projection the portable mapping uses, so the shared
+ * derivation sees the timestamps the copy wrote; a JavaScript Date from the
+ * repository cannot carry them. No ledger table is read. The occurrence
+ * ordinal is not stored on the row: a source header that appears n times
+ * has occurrence ordinals 0..n-1 (the closure ranking only permutes that
+ * range), so numbering the identical headers 0..n-1 here yields the same
+ * identity multiset. Rows are numbered in conversation id order only so the
+ * result does not vary between runs; any order yields the same pairs
+ * because identical headers carry the same title.
+ */
+async function readDestinationConversationIdentities(
+  executor: PostgreSqlRuntime, projectId: string, signal?: AbortSignal,
+): Promise<ReadonlyMap<string, string>> {
+  const mapping = mappingForDomain("conversations");
+  const result = await executor.query<{
+    conversation_id: string; session_id: string; title: string | null;
+    bootstrapped_at: string | null; created_at: string; updated_at: string;
+  }>({
+    text: `SELECT ${mapping.selectColumns} FROM ${mapping.table} r WHERE r.project_id = $1::uuid ORDER BY r.conversation_id`,
+    values: [projectId],
+  }, { domain: "factory", operation: "verifyGenerationListingIdentity", signal });
+  const nextOrdinalByFingerprint = new Map<string, number>();
+  const identities = new Map<string, string>();
+  for (const row of result.rows) {
+    const header = [row.session_id, row.title, row.bootstrapped_at, row.created_at, row.updated_at] as const;
+    const { conversationFingerprint } = derivePortableConversationIdentity([...header, 0]);
+    const occurrenceOrdinal = nextOrdinalByFingerprint.get(conversationFingerprint) ?? 0;
+    nextOrdinalByFingerprint.set(conversationFingerprint, occurrenceOrdinal + 1);
+    identities.set(row.conversation_id, derivePortableConversationIdentity([...header, occurrenceOrdinal]).identitySha256);
+  }
+  return identities;
+}
+
+type ListingPair = readonly [identitySha256: string, title: string | null];
+type ListingGroup = Readonly<{ createdAt: string; startOrdinal: number; pairs: readonly ListingPair[] }>;
+
+function compareListingPairs(left: ListingPair, right: ListingPair): number {
+  if (left[0] !== right[0]) return left[0] < right[0] ? -1 : 1;
+  return compareTieOrderTitle(left[1], right[1]);
+}
+
+/**
+ * Groups consecutive entries sharing a millisecond-truncated createdAt and
+ * sorts each group's [identity, title] pairs, so the two sides compare as
+ * multisets and the independent tie-break keys (the source's identity order,
+ * the destination's conversation id order) cannot disagree.
+ */
+function buildListingGroups(entries: readonly MigrationPublicListingSourceEntry[]): ListingGroup[] {
+  const groups: Array<{ createdAt: string; startOrdinal: number; pairs: ListingPair[] }> = [];
+  entries.forEach((entry, index) => {
+    const last = groups[groups.length - 1];
+    const pair: ListingPair = [entry.identitySha256, entry.title];
+    if (last && last.createdAt === entry.createdAt) last.pairs.push(pair);
+    else groups.push({ createdAt: entry.createdAt, startOrdinal: index, pairs: [pair] });
+  });
+  for (const group of groups) group.pairs.sort(compareListingPairs);
+  return groups;
+}
+
+function listingGroupsAgree(left: ListingGroup, right: ListingGroup): boolean {
+  return left.createdAt === right.createdAt && left.pairs.length === right.pairs.length
+    && left.pairs.every((pair, index) => compareListingPairs(pair, right.pairs[index]!) === 0);
+}
+
 export async function runOrderedListingProbe(
   executor: PostgreSqlRuntime, projectId: string,
   expectedOrder: readonly MigrationPublicListingSourceEntry[], signal?: AbortSignal,
 ): Promise<{ mismatch: MigrationVerificationMismatch | null; publicListingSha256: string }> {
   const repository = new PostgreSqlConversationRepository(executor, projectId);
   const rows = await repository.listConversations();
+  const identities = await readDestinationConversationIdentities(executor, projectId, signal);
   const actualEntries = rows.map((row) => ({
-    createdAt: truncateToMillisecondIso(row.createdAt.toISOString()), title: row.title,
+    createdAt: truncateToMillisecondIso(row.createdAt.toISOString()),
+    identitySha256: identities.get(String(row.conversationId)) ?? UNCORRELATED_LISTING_IDENTITY,
+    title: row.title,
   }));
-  // Round-4: group both sides by truncated createdAt and compare titles
-  // within each group as a canonically sorted multiset, not
+  // Both sides are grouped by millisecond-truncated createdAt and compared
+  // within each group as a sorted multiset of [identity, title] pairs, never
   // positionally. listConversations() ties by the destination-native
-  // conversation_id (assigned in the source's canonical sessionId-first
-  // stream order), while expectedOrder ties by portable identitySha256
-  // -- independent keys that routinely disagree on same-second pairs,
-  // since SQLite's created_at is second-precision and
-  // getOrCreateConversation runs per session start. A positional
-  // comparison reported a mismatch on a correctly copied project
-  // whenever those two independent tie-breaks happened to disagree,
-  // roughly half the time a tie exists -- round-4 candidate-review-4's
-  // P1, found independently by two reviewers. Grouping removes that
-  // false positive while still catching a real content change: a
-  // substitution or replacement inside a tie group changes the sorted
-  // multiset. It cannot catch a permutation *within* one tie group --
-  // two same-second conversations with their titles swapped with each
-  // other -- because telling that apart needs the intended pairing,
-  // which needs a correlation this probe deliberately does not add
-  // (the root ruled out correlating this through the transfer ledger).
-  type ListingGroup = Readonly<{ createdAt: string; startOrdinal: number; titles: readonly (string | null)[] }>;
-  function buildListingGroups(entries: readonly { createdAt: string; title: string | null }[]): ListingGroup[] {
-    const groups: Array<{ createdAt: string; startOrdinal: number; titles: (string | null)[] }> = [];
-    entries.forEach((entry, index) => {
-      const last = groups[groups.length - 1];
-      if (last && last.createdAt === entry.createdAt) last.titles.push(entry.title);
-      else groups.push({ createdAt: entry.createdAt, startOrdinal: index, titles: [entry.title] });
-    });
-    for (const group of groups) group.titles.sort(compareTieOrderTitle);
-    return groups;
-  }
+  // conversation_id while the source ties by portable identity, independent
+  // keys that routinely disagree on same-millisecond rows; a positional
+  // comparison flagged correctly copied projects. The pair multiset is blind
+  // to that order yet still catches a swap: two conversations that trade
+  // titles change their pairs, and a destination row that no longer carries
+  // a source identity changes the multiset. The source identity is the real
+  // portable identity and the destination one comes from the shared
+  // derivation over the header the copy wrote, so the two spaces agree
+  // without any ledger correlation.
   const actualGroups = buildListingGroups(actualEntries);
   const expectedGroups = buildListingGroups(expectedOrder);
   const digestOfGroups = (groups: readonly ListingGroup[]): string => sha256Hex(portableCanonicalJson(
-    ["lcm-migration-verification-public-listing-v1", groups.map((group) => [group.createdAt, group.titles])],
+    ["lcm-migration-verification-public-listing-v2", groups.map((group) => [group.createdAt, group.pairs])],
   ));
   const publicListingSha256 = digestOfGroups(actualGroups);
   const expectedSha256 = digestOfGroups(expectedGroups);
@@ -485,20 +539,16 @@ export async function runOrderedListingProbe(
       },
     };
   }
-  // The first tie-group where the two sides diverge -- a different
-  // createdAt at this group position, a different tie-group size, or
-  // the same createdAt with a differing sorted title multiset --
-  // clamped so a group-count difference still names a real source
-  // record rather than indexing past the end of whichever side ran out
-  // first. The named record is that group's first entry in canonical
-  // (identitySha256-tiebreak) order, the same "concrete record
-  // responsible" naming this class used before grouping existed.
+  // The first group where the two sides diverge -- a different createdAt
+  // at this group position, a different group size, or the same createdAt
+  // with differing pairs -- clamped so a group-count difference still names
+  // a real source record rather than indexing past the end of whichever
+  // side ran out first. The named record is that group's first entry in
+  // canonical (identitySha256) order.
   let groupIndex = 0;
   while (
     groupIndex < expectedGroups.length && groupIndex < actualGroups.length
-    && expectedGroups[groupIndex]!.createdAt === actualGroups[groupIndex]!.createdAt
-    && expectedGroups[groupIndex]!.titles.length === actualGroups[groupIndex]!.titles.length
-    && expectedGroups[groupIndex]!.titles.every((title, index) => title === actualGroups[groupIndex]!.titles[index])
+    && listingGroupsAgree(expectedGroups[groupIndex]!, actualGroups[groupIndex]!)
   ) groupIndex += 1;
   const divergentGroup = expectedGroups[Math.min(groupIndex, expectedGroups.length - 1)]!;
   const ordinal = divergentGroup.startOrdinal;

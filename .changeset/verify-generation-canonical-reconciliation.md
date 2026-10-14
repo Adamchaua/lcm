@@ -16,7 +16,10 @@ full public-probe coverage; the persisted report records all three as
 (the two coverage vectors are independent, so a genuine listing-ordering
 mismatch is never discarded just because the unrelated search probe could
 not evaluate that pass), so eligibility is provable from the artifact
-rather than assumed. A report with mismatches is still persisted in full
+rather than assumed. Both coverage vectors are earned, not declared: a class
+or probe is marked as run only when the comparisons behind it completed in
+that pass, so a comparison that was never invoked leaves its bit false and
+the report ineligible. A report with mismatches is still persisted in full
 as operator evidence, but requires explicit abort and a new generation
 rather than an in-place retry.
 Reconciliation now includes a sequence self-consistency bound (an identity
@@ -25,8 +28,10 @@ a copied row, distinguishing a privilege gap from a genuinely never-called
 sequence rather than collapsing both into the same refusal), and the
 step-5 public reads run two probes through the real PostgreSQL repository
 paths: an ordered-listing probe compared against the source's own canonical
-ordering, and a search self-match probe that finds a sampled message by its
-own content through `lcm.search_v1`, sampled from a fixed-size early
+entries as identity and title pairs per millisecond (so two conversations
+that trade titles inside one millisecond are caught), and a search
+self-match probe that finds a sampled message by its own content through
+`lcm.search_v1`, sampled from a fixed-size early
 slice of the source's canonical order rather than the whole domain. If no
 sampled message can be found this way, the search probe is marked not-run
 in `publicProbeCoverage` and activation eligibility is refused for that

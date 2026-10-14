@@ -12,7 +12,9 @@ import * as portableDestination from "../../src/storage/postgresql/portable-dest
 import * as manifestStoreModule from "../../src/migration/manifest-store.js";
 import * as copySourceModule from "../../src/migration/copy-source.js";
 import * as runtimeReadiness from "../../src/storage/postgresql/runtime-readiness.js";
-import { PORTABLE_RECORD_DOMAIN_ORDER, canonicalJson, type PortableDomain } from "../../src/storage/portable-record.js";
+import {
+  PORTABLE_RECORD_DOMAIN_ORDER, canonicalJson, derivePortableConversationIdentity, type PortableDomain,
+} from "../../src/storage/portable-record.js";
 import type { PortableCheckpoint } from "../../src/storage/portable-record-stream.js";
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
 import {
@@ -31,6 +33,7 @@ import {
   MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE,
   MIGRATION_SAMPLE_EMPTY_SOURCE_IDENTITY_SHA256,
   reconcileCounts,
+  runOrderedListingProbe,
   SEQUENCE_BACKED_IDENTITY_COLUMN,
   sortMismatches,
   sortMismatchTotals,
@@ -180,16 +183,25 @@ function checkpoint(domain: PortableDomain, recordCount: number, prefixSha256: s
   } as PortableCheckpoint;
 }
 
-function fakeConversationRecord(createdAt: string, identitySeed: string, title: string | null = null) {
+/** The real portable identity a source conversation record carries, from the same shared derivation the driver uses. */
+function conversationIdentity(
+  sessionId: string, createdAt: string, title: string | null = null, occurrenceOrdinal = 0,
+  updatedAt: string = createdAt, bootstrappedAt: string | null = null,
+) {
+  return derivePortableConversationIdentity([sessionId, title, bootstrappedAt, createdAt, updatedAt, occurrenceOrdinal]);
+}
+
+function fakeConversationRecord(createdAt: string, identitySeed: string, title: string | null = null, occurrenceOrdinal = 0) {
+  const { conversationFingerprint, identitySha256 } = conversationIdentity(identitySeed, createdAt, title, occurrenceOrdinal);
   return {
     version: 1, domain: "conversations" as const, domainVersion: 1, ordinal: 0, order: [],
-    identitySha256: fakeHash(`identity-${identitySeed}`),
+    identitySha256,
     dependencies: [],
     value: {
-      conversationFingerprint: fakeHash(`fingerprint-${identitySeed}`), occurrenceOrdinal: 0,
+      conversationFingerprint, occurrenceOrdinal,
       sessionId: identitySeed, createdAt, title, bootstrappedAt: null, updatedAt: createdAt,
     },
-    recordSha256: fakeHash(`record-${identitySeed}`),
+    recordSha256: fakeHash("record-" + identitySeed),
   };
 }
 
@@ -397,6 +409,8 @@ function fakeSession(overrides: {
 function fakeRuntime(overrides: {
   session?: ReturnType<typeof fakeSession>;
   conversationsRows?: ReadonlyArray<Record<string, unknown>>;
+  /** The portable-projection header rows (microsecond text); derived from conversationsRows when absent. */
+  conversationHeaderRows?: ReadonlyArray<Record<string, unknown>>;
   searchRows?: ReadonlyArray<Record<string, unknown>>;
   transferRunId?: string | null;
   transferRunState?: string;
@@ -423,6 +437,19 @@ function fakeRuntime(overrides: {
   return {
     health: vi.fn(async () => ({ status: "healthy", backend: "postgresql", tls: true, serverMajorVersion: 18, serverEncoding: "UTF8" })),
     query: vi.fn(async (config: { text: string; values?: readonly unknown[] }) => {
+      if (config.text.includes("lcm.conversations") && config.text.includes("to_char(")) {
+        // The listing probe's identity read: the portable mapping's
+        // microsecond projection, as text. Derived from the repository rows
+        // (milliseconds padded to six digits) unless a test supplies finer ones.
+        const microseconds = (value: unknown) => (typeof value === "string" ? value.replace(/[.](\d{3})Z$/u, ".$1000Z") : value);
+        return {
+          rows: overrides.conversationHeaderRows ?? (overrides.conversationsRows ?? []).map((row) => ({
+            ...row, conversation_id: String(row.conversation_id),
+            bootstrapped_at: microseconds(row.bootstrapped_at), created_at: microseconds(row.created_at),
+            updated_at: microseconds(row.updated_at),
+          })),
+        };
+      }
       if (config.text.includes("lcm.conversations")) return { rows: overrides.conversationsRows ?? [] };
       if (config.text.includes("lcm.schema_migrations")) {
         // Round-1 P2: migrationsSha256 now witnesses the destination's
@@ -964,7 +991,7 @@ describe("readLedgerMismatches", () => {
 describe("streamSourceCheckpoints: dependency edge capture", () => {
   it("captures every record's declared dependencies without a second source read", async () => {
     const dependentRecord = {
-      ...fakeConversationRecord("2026-01-01T00:00:00.000Z", "edge-capture-source"),
+      ...fakeConversationRecord("2026-01-01T00:00:00.000000Z", "edge-capture-source"),
       dependencies: [{ domain: "project" as const, identitySha256: fakeHash("edge-capture-parent") }],
     };
     const stream = fakeStream({ conversations: 1 }, [dependentRecord]);
@@ -2575,7 +2602,7 @@ describe("verifyMigrationGeneration: public listing probe", () => {
     // divergence is at ordinal 1 (the destination's "second" row is
     // missing), so the sampled record is the source's "second" entry --
     // never a hash of the two aggregate probe digests.
-    const secondRecordIdentitySha256 = fakeHash("identity-second");
+    const secondRecordIdentitySha256 = conversationIdentity("second", "2026-01-02T00:00:00.222000Z").identitySha256;
     expect(result.report.mismatches).toEqual([
       {
         domain: "public-listing", class: "sample",
@@ -2620,30 +2647,27 @@ describe("verifyMigrationGeneration: public listing probe", () => {
   }, 15000);
 
   it("round-4 candidate-review-4 P1 red case: a healthy copy whose tie-break order disagrees between source and destination is not a mismatch", async () => {
-    // The false positive both reviewers found: "beta" sorts before
-    // "alpha" by identitySha256 (fakeHash("identity-beta") <
-    // fakeHash("identity-alpha")), so expectedOrder is [beta, alpha].
-    // The destination lists same-millisecond ties by its own native
-    // conversation_id, assigned in copy order -- here, alpha was
-    // copied first, so the destination returns [alpha, beta], the
-    // reverse of expectedOrder. Nothing is wrong: both titles are
-    // exactly where the copy put them, just in a different tie order,
-    // because the two sides' tie-breaks are independent keys. A
-    // positional comparison reported this as a public-listing mismatch
-    // for a project that copied correctly; the grouped-multiset
-    // comparison must not.
+    // The false positive both reviewers found: the source breaks a
+    // same-millisecond tie by portable identity, the destination by its own
+    // native conversation_id (assigned in copy order). The destination here
+    // lists the two rows in the reverse of the source's identity order, so
+    // a positional comparison would flag a copy that is correct; the
+    // grouped multiset of [identity, title] pairs must not.
     stubDestinationPrimitives();
-    const conversationsRecords = [
-      fakeConversationRecord("2026-01-01T00:00:00.111000Z", "alpha", "Alpha Title"),
-      fakeConversationRecord("2026-01-01T00:00:00.111000Z", "beta", "Beta Title"),
-    ];
+    const createdAt = "2026-01-01T00:00:00.111000Z";
+    const alpha = { session: "alpha", title: "Alpha Title" };
+    const beta = { session: "beta", title: "Beta Title" };
+    const identityOf = (entry: typeof alpha) => conversationIdentity(entry.session, createdAt, entry.title).identitySha256;
+    const sourceOrder = [alpha, beta].sort((left, right) => (identityOf(left) < identityOf(right) ? -1 : 1));
+    const destinationOrder = [...sourceOrder].reverse();
+    const conversationsRecords = [alpha, beta].map((entry) => fakeConversationRecord(createdAt, entry.session, entry.title));
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
     const copySource = fakeCopySource({ recordCounts, conversationsRecords });
     const runtime = fakeRuntime({
-      conversationsRows: [
-        { conversation_id: "1", session_id: "alpha", title: "Alpha Title", bootstrapped_at: null, created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z" },
-        { conversation_id: "2", session_id: "beta", title: "Beta Title", bootstrapped_at: null, created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z" },
-      ],
+      conversationsRows: destinationOrder.map((entry, index) => ({
+        conversation_id: String(index + 1), session_id: entry.session, title: entry.title, bootstrapped_at: null,
+        created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z",
+      })),
     });
     const result = await verifyMigrationGeneration(
       baseInput({ homeDir: "/tmp/lcm-verify-probe-healthy-tie-order" }),
@@ -2651,6 +2675,119 @@ describe("verifyMigrationGeneration: public listing probe", () => {
     );
     expect(result.report.mismatches.some((mismatch) => mismatch.domain === "public-listing")).toBe(false);
   }, 15000);
+
+  describe("listing identity (#1417)", () => {
+    const createdAt = "2026-01-01T00:00:00.111000Z";
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const destinationRow = (
+      id: number, session: string, title: string | null, created: string = "2026-01-01T00:00:00.111Z",
+    ) => ({
+      conversation_id: String(id), session_id: session, title, bootstrapped_at: null, created_at: created, updated_at: created,
+    });
+    async function listingMismatch(
+      conversationsRecords: ReadonlyArray<ReturnType<typeof fakeConversationRecord>>,
+      runtimeOverrides: Parameters<typeof fakeRuntime>[0],
+    ) {
+      stubDestinationPrimitives();
+      const result = await inspectMigrationVerification(
+        baseInput({ homeDir: "/tmp/lcm-verify-listing-identity" }),
+        dependenciesFor(fakeCopySource({ recordCounts, conversationsRecords }), fakeRuntime(runtimeOverrides)),
+      );
+      return result.mismatches.filter((mismatch) => mismatch.domain === "public-listing");
+    }
+
+    it("flags two sessions that traded titles inside one millisecond, which the title multiset alone cannot see", async () => {
+      const mismatches = await listingMismatch(
+        [fakeConversationRecord(createdAt, "session-a", "Alpha"), fakeConversationRecord(createdAt, "session-b", "Beta")],
+        { conversationsRows: [destinationRow(1, "session-a", "Beta"), destinationRow(2, "session-b", "Alpha")] },
+      );
+      expect(mismatches).toHaveLength(1);
+      expect(mismatches[0]).toMatchObject({ domain: "public-listing", class: "sample" });
+    });
+
+    it("flags a public read path that returns another row's title for a correctly copied header", async () => {
+      // The identity read sees the right headers; only the repository's
+      // listing (the public read path under test) hands back swapped titles.
+      const mismatches = await listingMismatch(
+        [fakeConversationRecord(createdAt, "session-a", "Alpha"), fakeConversationRecord(createdAt, "session-b", "Beta")],
+        {
+          conversationsRows: [destinationRow(1, "session-a", "Beta"), destinationRow(2, "session-b", "Alpha")],
+          conversationHeaderRows: [
+            destinationRow(1, "session-a", "Alpha", "2026-01-01T00:00:00.111000Z"),
+            destinationRow(2, "session-b", "Beta", "2026-01-01T00:00:00.111000Z"),
+          ],
+        },
+      );
+      expect(mismatches).toHaveLength(1);
+    });
+
+    it("accepts the same identity and title pairs listed in the opposite tie order", async () => {
+      const mismatches = await listingMismatch(
+        [fakeConversationRecord(createdAt, "session-a", "Alpha"), fakeConversationRecord(createdAt, "session-b", "Beta")],
+        { conversationsRows: [destinationRow(1, "session-b", "Beta"), destinationRow(2, "session-a", "Alpha")] },
+      );
+      expect(mismatches).toEqual([]);
+    });
+
+    it("numbers identical headers 0..n-1 so two indistinguishable conversations match the source's ordinals", async () => {
+      const mismatches = await listingMismatch(
+        [
+          fakeConversationRecord(createdAt, "twin", "Same", 0), fakeConversationRecord(createdAt, "twin", "Same", 1),
+          fakeConversationRecord(createdAt, "twin", "Same", 2),
+        ],
+        { conversationsRows: [destinationRow(1, "twin", "Same"), destinationRow(2, "twin", "Same"), destinationRow(3, "twin", "Same")] },
+      );
+      expect(mismatches).toEqual([]);
+    });
+
+    it("flags a destination that is missing one of several identical headers", async () => {
+      const mismatches = await listingMismatch(
+        [fakeConversationRecord(createdAt, "twin", "Same", 0), fakeConversationRecord(createdAt, "twin", "Same", 1)],
+        { conversationsRows: [destinationRow(1, "twin", "Same")] },
+      );
+      expect(mismatches).toHaveLength(1);
+    });
+
+    it("matches a nonzero-microsecond timestamp through the to_char projection, not through a Date", async () => {
+      const fine = "2026-01-01T00:00:00.111456Z";
+      const records = [fakeConversationRecord(fine, "fine", "Fine")];
+      // The repository's Date only carries the millisecond; the identity
+      // read supplies the microseconds the fingerprint needs.
+      const exact = await listingMismatch(records, {
+        conversationsRows: [destinationRow(1, "fine", "Fine")],
+        conversationHeaderRows: [destinationRow(1, "fine", "Fine", fine)],
+      });
+      expect(exact).toEqual([]);
+      // Deriving the identity from the Date's zero-padded microseconds would
+      // disagree with the source here; the headers are what the copy wrote.
+      const padded = await listingMismatch(records, { conversationsRows: [destinationRow(1, "fine", "Fine")] });
+      expect(padded).toHaveLength(1);
+    });
+
+    it("flags a listed row whose header cannot be read back by its conversation id", async () => {
+      const mismatches = await listingMismatch(
+        [fakeConversationRecord(createdAt, "session-a", "Alpha")],
+        { conversationsRows: [destinationRow(1, "session-a", "Alpha")], conversationHeaderRows: [] },
+      );
+      expect(mismatches).toHaveLength(1);
+    });
+
+    it("digests the sorted identity and title pairs per millisecond group under the v2 tag", async () => {
+      stubDestinationPrimitives();
+      const records = [fakeConversationRecord(createdAt, "session-a", "Alpha"), fakeConversationRecord(createdAt, "session-b", null)];
+      const probe = await runOrderedListingProbe(
+        fakeRuntime({ conversationsRows: [destinationRow(1, "session-a", "Alpha"), destinationRow(2, "session-b", null)] }) as never,
+        projectId,
+        records.map((record) => ({ createdAt: "2026-01-01T00:00:00.111Z", identitySha256: record.identitySha256, title: record.value.title })),
+      );
+      const pairs = records.map((record) => [record.identitySha256, record.value.title] as const)
+        .sort((left, right) => (left[0] < right[0] ? -1 : 1));
+      expect(probe.mismatch).toBeNull();
+      expect(probe.publicListingSha256).toBe(createHash("sha256").update(canonicalJson(
+        ["lcm-migration-verification-public-listing-v2", [["2026-01-01T00:00:00.111Z", pairs]]],
+      ), "utf8").digest("hex"));
+    });
+  });
 
   it("round-4 candidate-review-4 P1: a tie group mixing a null title with a real one sorts null first on both sides", async () => {
     // Exercises compareTieOrderTitle's explicit null placement inside

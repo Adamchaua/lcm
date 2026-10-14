@@ -587,7 +587,15 @@ mismatch. The persisted report carries both facts directly, so this is
 provable from the artifact itself rather than assumed by a reader. Its
 `classCoverage` field records, for every defined reconciliation class,
 whether that class ran this pass; its `activationEligible` field is
-`true` only when every class ran **and** the report is clean. A report can
+`true` only when every class ran, both public probes ran **and** the report
+is clean.
+
+"Ran" is earned, not declared. Each class and probe is marked as run only
+when the comparisons behind it returned during this pass (a completion
+receipt per comparison group), so a comparison that was never invoked leaves
+its class marked not run, the report is still written, and it is not
+activation-eligible. The receipts are plain identifiers and carry no time,
+duration or ordering, so the report stays deterministic. A report can
 therefore be clean -- zero recorded mismatches -- and still not be
 activation-eligible, because a class that never ran produces no mismatches
 for the same reason an unplugged smoke detector never sounds. Every reconciliation class this driver defines is now implemented
@@ -654,18 +662,23 @@ failures that byte-for-byte content equality cannot see:
   production read paths, never a hand-written re-implementation of either.
   The ordered-listing probe runs `PostgreSqlConversationRepository`'s
   production read and compares the result against the source's own
-  canonical `(createdAt, identitySha256)` ordering captured while
-  streaming the source, grouped by truncated `createdAt` with each
-  group's titles compared as a canonically sorted multiset rather than
-  positionally: the destination lists same-`createdAt` ties by its own
-  native row id, an independent key from the source's tie-break, so a
-  positional comparison would flag a correctly copied project whenever
-  those two tie-breaks happened to disagree, which is routine at
-  second-precision timestamps. A repository bug in filtering, ordering,
-  row count, or a substituted/replaced record within a tie group still
-  shows up here even when the underlying copied bytes are otherwise
-  correct; a permutation of two same-second conversations' titles with
-  each other is the one case this probe cannot see. The search self-match
+  canonical `(createdAt, identitySha256, title)` entries captured while
+  streaming the source. Entries are grouped by `createdAt` truncated to the
+  millisecond, and each group's `[identity, title]` pairs are compared as a
+  sorted multiset rather than positionally: the destination lists
+  same-millisecond ties by its own native row id, an independent key from
+  the source's tie-break, so a positional comparison would flag a correctly
+  copied project whenever those two tie-breaks happened to disagree. Each
+  destination row's identity is the conversation's portable identity,
+  derived by the same function the portable record uses from the
+  conversation's own columns, read with the same microsecond text
+  projection the portable export uses (a JavaScript date would drop the
+  sub-millisecond digits the identity is computed from). Identical
+  conversation headers are numbered `0` to `n-1`, which matches the source's
+  occurrence ordinals as a set. No transfer-ledger table is read. A
+  repository bug in filtering, ordering, row count or titles, a
+  substituted record, or two conversations that traded titles inside one
+  millisecond all change a group's pairs and show up here. The search self-match
   probe runs `PostgreSqlLexicalSearchRepository.searchMessages` against
   `lcm.search_v1`, walking a small, seeded pool of source message
   candidates until one candidate's own content produces a non-empty
@@ -700,8 +713,9 @@ failures that byte-for-byte content equality cannot see:
   check whose job is to catch `search_v1` configuration drift rather
   than to sample the domain exhaustively.
 
-  The ordered-listing probe's own `ran` state and the search probe's own
-  `ran` state are tracked independently (`publicProbeCoverage`, one
+  The ordered-listing probe's own `ran` state (it completed) and the search
+  probe's own `ran` state (a correlated self-match was confirmed) are tracked
+  independently (`publicProbeCoverage`, one
   entry per probe), never folded into a single `sample`-class coverage
   bit: a genuine listing-ordering mismatch stays recorded as evidence
   exactly when the listing probe ran, regardless of whether the search
@@ -874,7 +888,8 @@ use grows with the size of the project and is not capped by a setting.
   public-listing comparison, plus a small fixed pool of message candidates
   for the search probe.
 - **Public listing.** The complete result of the destination's conversation
-  listing, which the probe reads in one call, and the entries derived from it.
+  listing, which the probe reads in one call, one header row per destination
+  conversation read to derive its identity, and the entries derived from them.
 
 Both sides are held concurrently, so peak memory is roughly proportional to
 the number of records plus dependency edges on the source and on the
