@@ -490,6 +490,8 @@ component_management:
         # #1378 re-derives each written record's canonical content
         # fingerprint inside the completion transaction, batched via a
         # new readCanonicalContentRows; ownership is unchanged.
+        # #1416 re-runs the schema verifier inside the export snapshot;
+        # portable-source.ts keeps its established owner.
         - "^src/storage/postgresql/portable-source\\.ts$"
         - "^src/storage/postgresql/portable-destination\\.ts$"
         - "^src/storage/postgresql/portable-mapping\\.ts$"

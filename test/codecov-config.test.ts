@@ -627,7 +627,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(244);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1390/#1371 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1390/#1371/#1416 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -864,6 +864,9 @@ describe("Codecov configuration", () => {
       // #1378 adds the 0008 transfer-identity content-digest migration
       // and its regenerated schema snapshot; ownership is unchanged.
       ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"],
+      // #1416 re-runs the schema verifier inside the export snapshot;
+      // the file keeps its established owner.
+      ["src/storage/postgresql/portable-source.ts", "integration-postgresql-portable"],
       // #1378 reads back each written record inside the same fenced
       // transaction and stores its content fingerprint; both files keep
       // their established owner.
