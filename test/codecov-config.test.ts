@@ -44,7 +44,19 @@ const expectedComponents = [
     // #1283 keeps renewal admission and bounded compact rendering CLI-owned.
     // #1132 keeps foreground PID publication at the CLI boundary.
     // #1233 keeps publication-contention restart recovery at the CLI boundary.
-    paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$", "^src/cli-storage\\.ts$"],
+    paths: [
+      // #1413 keeps the unbound-project remedy for promote and import, and
+      // #1466 keeps per-project export failure attribution and the failed
+      // project count, in this existing CLI owner.
+      "bin/",
+      "src/cli/",
+      // #1393 keeps the project subcommand synopsis listing
+      // renew-retired-identity in this existing CLI owner.
+      "^src/cli-help\\.ts$",
+      // #1430 keeps the bound-identity split for project enumeration in
+      // this existing owner.
+      "^src/cli-storage\\.ts$",
+    ],
   },
   {
     component_id: "unit-installation",
@@ -118,6 +130,8 @@ const expectedComponents = [
       "^src/daemon/client\\.ts$",
       "^src/daemon/config\\.ts$",
       "^src/daemon/content-fence\\.ts$",
+      // #1413 keeps the typed unbound-project 409 reason discriminator in
+      // this existing daemon-core owner.
       "^src/daemon/http-url\\.ts$",
       "^src/daemon/invocation-coordinator\\.ts$",
       "^src/daemon/cancellation\\.ts$",
@@ -125,6 +139,8 @@ const expectedComponents = [
       "^src/daemon/project-queue\\.ts$",
       "^src/daemon/publication-queue\\.ts$",
       // #1270/#1283 keep renewed hook identity selection daemon-core-owned.
+      // #1430 keeps the bound-identity split for hook identity resolution
+      // in this existing daemon-core owner.
       "^src/daemon/project\\.ts$",
       // #1106 keeps periodic transcript metadata admission daemon-core-owned.
       // Monotonic proxy startup polling remains daemon-core-owned.
@@ -157,6 +173,8 @@ const expectedComponents = [
     name: "Unit - Daemon Routes",
     // #1230 keeps route project close on the live request token.
     // #1247 keeps local queue preparation, acknowledgement, and cleanup route-owned.
+    // #1413 keeps the storage-identity-required reason discriminator on the
+    // unbound-project and machine-identity 409 responses route-owned.
     paths: ["src/daemon/routes/"],
   },
   {
@@ -212,6 +230,9 @@ const expectedComponents = [
       "^src/storage/errors\\.ts$",
       "^src/storage/factory\\.ts$",
       "^src/storage/home-lock-topology\\.ts$",
+      // #1413 keeps the typed unbound-project transport error and 409
+      // reason constants, and #1430 the bound-identity overloads, in this
+      // existing storage-abstractions owner.
       "^src/storage/identity-context\\.ts$",
       "^src/storage/index\\.ts$",
       // Curated portable package API remains storage-abstractions-owned.
@@ -253,6 +274,8 @@ const expectedComponents = [
       // admission stay within this import owner.
       "^src/codex-transcript\\.ts$",
       "^src/import-summary\\.ts$",
+      // #1413 keeps the unbound-project remedy for import in this existing
+      // import owner.
       "^src/import\\.ts$",
       "^src/transcript-provider\\.ts$",
       "^src/transcript\\.ts$",
@@ -279,6 +302,8 @@ const expectedComponents = [
     // #1283 keeps structured retired-fence discovery in this component.
     paths: [
       // #618 authenticated batch discovery remains within this compaction owner.
+      // #1413 keeps the compact --all message separating enumeration failure
+      // from per-project open failures in this existing compaction owner.
       "^src/batch-compact\\.ts$",
       "^src/compaction\\.ts$",
       "^src/large-files\\.ts$",
@@ -308,6 +333,7 @@ const expectedComponents = [
       // existing component; no taxonomy, status, or policy change.
       // #1270/#1283 retain exact fence classification and local successor
       // renewal in this existing project/worktree owner.
+      // #1430 keeps the bound project identity type in this existing owner.
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
@@ -627,7 +653,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(244);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1390/#1371/#1402/#1407/#1411/#1419/#1426 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1390/#1371/#1402/#1407/#1411/#1419/#1393/#1413/#1430/#1466/#1426 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -665,6 +691,11 @@ describe("Codecov configuration", () => {
       // #978 keeps compact replacement runtime-digest admission CLI-owned.
       // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
       // #1201 keeps diagnostic identity admission CLI-owned.
+      // #1413 keeps the unbound-project remedy for promote and import, and
+      // #1466 keeps per-project export failure attribution and the failed
+      // project count, in this existing CLI owner. Both are confined to
+      // existing files and add no component, so this pin records that
+      // decision for a materially changed file.
       ["bin/lcm.ts", "unit-cli"],
       ["src/config-manager.ts", "unit-configuration-security"],
       ["src/private-mutation-lock.ts", "unit-configuration-security"],
@@ -689,6 +720,7 @@ describe("Codecov configuration", () => {
       // terminal bounding that retains this owner, as in #1195 and #1203.
       ["src/terminal-sanitize.ts", "unit-configuration-security"],
       // #1049 keeps project metadata owner and single-link admission here.
+      // #1430 keeps the bound project identity type in this existing owner.
       ["src/project-map.ts", "unit-project-worktrees"],
       // #1356/#1357 authenticate the project-map key before it becomes a
       // storage identity, suppress alias-time metadata backfill until that
@@ -701,7 +733,16 @@ describe("Codecov configuration", () => {
       // is confined to existing files and adds no component, so every
       // touched file keeps its established owner; this pin records that
       // decision for a materially changed file.
+      // #1430 keeps the bound-identity split for project enumeration in this
+      // existing owner. The change is confined to existing files and adds no
+      // component, so this pin records that decision for a materially
+      // changed file.
       ["src/cli-storage.ts", "unit-cli"],
+      // #1393 keeps the project subcommand synopsis listing
+      // renew-retired-identity in this existing CLI owner; the change adds
+      // no component, so this pin records the decision for a materially
+      // changed file.
+      ["src/cli-help.ts", "unit-cli"],
       ["src/db/events-path.ts", "unit-local-persistence"],
       ["src/identity-service.ts", "integration-postgresql-identity"],
       // #889 keeps private import metadata publication in this owner.
@@ -720,8 +761,12 @@ describe("Codecov configuration", () => {
       // #1201 observation parser/client, allowlist and server retain daemon-core ownership.
       // Prompt-search publication dispatch remains daemon-core-owned.
       ["src/daemon/client.ts", "unit-daemon-core"],
+      // #1413 keeps the typed unbound-project 409 reason discriminator in
+      // this existing daemon-core owner.
       ["src/daemon/http-url.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
+      // #1430 keeps the bound-identity split for hook identity resolution in
+      // this existing daemon-core owner.
       ["src/daemon/project.ts", "unit-daemon-core"],
       // Compact forwards current operation tokens; SQLite validates handle admission.
       ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
@@ -743,9 +788,16 @@ describe("Codecov configuration", () => {
       ["src/db/promoted-recall-evidence.ts", "unit-local-persistence"],
       ["src/storage/postgresql/tsquery-evidence.ts", "integration-postgresql-search"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
+      // #1413 keeps the typed unbound-project transport error and 409 reason
+      // constants, and #1430 the bound-identity overloads, in this existing
+      // storage-abstractions owner. The change adds no component, so this pin
+      // records that decision for a materially changed file.
+      ["src/storage/identity-context.ts", "unit-storage-abstractions"],
       ["src/storage/sqlite/repositories.ts", "unit-local-persistence"],
       ["src/storage/postgresql/lexical-search-repository.ts", "integration-postgresql-search"],
       ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
+      // #1413 keeps the storage-identity-required reason discriminator on the
+      // unbound-project and machine-identity 409 responses route-owned.
       ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
       // #833 passive-event identity admission remains route-owned.
       // #1158 keeps passive PostgreSQL promotion route behavior here; its
@@ -775,6 +827,8 @@ describe("Codecov configuration", () => {
       // sanitizer. This is a material change that retains its existing owner,
       // as in #1195 and #1203.
       ["src/daemon/safe-error.ts", "unit-daemon-core"],
+      // #1413 keeps the unbound-project remedy for import in this existing
+      // import owner.
       ["src/import.ts", "unit-transcripts-import"],
       // #1358 also drops the redundant residual scrub pass for strings the
       // first pass left unchanged, which retains this existing owner.
@@ -789,6 +843,8 @@ describe("Codecov configuration", () => {
       // files and adds no component, so every touched file keeps its
       // established owner; this pin records that decision for a
       // materially changed file.
+      // #1413 keeps the compact --all message separating enumeration failure
+      // from per-project open failures in this existing compaction owner.
       ["src/batch-compact.ts", "unit-compaction-summarization"],
       // #1353 qualifies every equality comparison in the PostgreSQL memory
       // repositories against pg_catalog so a hostile search_path cannot

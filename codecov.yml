@@ -18,15 +18,22 @@ component_management:
         # #1233 keeps publication-contention restart recovery at the CLI boundary.
         # #1283 keeps retired-identity renewal CLI admission and bounded
         # compact progress rendering in the existing CLI component.
+        # #1413 keeps the unbound-project remedy for promote and import, and
+        # #1466 keeps per-project export failure attribution and the failed
+        # project count, in this existing CLI owner.
         # #1371 keeps the store merge-behavior help text CLI-owned.
         - "bin/"
         - "src/cli/"
+        # #1393 keeps the project subcommand synopsis listing
+        # renew-retired-identity in this existing CLI owner.
         - "^src/cli-help\\.ts$"
         # #1356/#1357 keep CLI admission of an authenticated project-map
         # identity, and the unauthenticated marker that project list and
         # project show now print, in this existing owner.
         # #1403 keeps guarded per-project identity resolution during
         # project enumeration in this existing owner.
+        # #1430 keeps the bound-identity split for project enumeration in
+        # this existing owner.
         - "^src/cli-storage\\.ts$"
     - component_id: "unit-installation"
       name: "Unit - Installation"
@@ -132,6 +139,8 @@ component_management:
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
         - "^src/daemon/content-fence\\.ts$"
+        # #1413 keeps the typed unbound-project 409 reason discriminator in
+        # this existing daemon-core owner.
         - "^src/daemon/http-url\\.ts$"
         - "^src/daemon/invocation-coordinator\\.ts$"
         - "^src/daemon/cancellation\\.ts$"
@@ -139,6 +148,8 @@ component_management:
         - "^src/daemon/project-queue\\.ts$"
         - "^src/daemon/publication-queue\\.ts$"
         # #1270/#1283 keep renewed hook identity selection daemon-core-owned.
+        # #1430 keeps the bound-identity split for hook identity resolution
+        # in this existing daemon-core owner.
         - "^src/daemon/project\\.ts$"
         # Monotonic proxy startup polling remains daemon-core-owned.
         - "^src/daemon/proxy-manager\\.ts$"
@@ -198,6 +209,8 @@ component_management:
         # #1203 keeps evidence-based prompt scoring and debug output route-owned.
         # #1230 keeps route project close on the live request token.
         # #1247 keeps local queue preparation, acknowledgement, and cleanup route-owned.
+        # #1413 keeps the storage-identity-required reason discriminator on
+        # the unbound-project and machine-identity 409 responses route-owned.
         # #1390 keeps the promote route's owner-scoped, backend-aware
         # deduplication input route-owned; the decision stays in unit-promotion.
         # #1371 routes the manual store through that same deduplication
@@ -308,6 +321,9 @@ component_management:
         - "^src/storage/errors\\.ts$"
         - "^src/storage/factory\\.ts$"
         - "^src/storage/home-lock-topology\\.ts$"
+        # #1413 keeps the typed unbound-project transport error and 409
+        # reason constants, and #1430 the bound-identity overloads, in this
+        # existing storage-abstractions owner.
         - "^src/storage/identity-context\\.ts$"
         - "^src/storage/index\\.ts$"
         # Curated portable package API remains storage-abstractions-owned.
@@ -355,6 +371,8 @@ component_management:
         # admission stay within this import owner.
         - "^src/codex-transcript\\.ts$"
         - "^src/import-summary\\.ts$"
+        # #1413 keeps the unbound-project remedy for import in this existing
+        # import owner.
         - "^src/import\\.ts$"
         - "^src/transcript-provider\\.ts$"
         - "^src/transcript\\.ts$"
@@ -384,6 +402,8 @@ component_management:
         # item progress in this existing compaction component.
         # #1403 keeps the per-project unbound-binding discovery diagnostic
         # in this existing compaction owner.
+        # #1413 keeps the compact --all message separating enumeration failure
+        # from per-project open failures in this existing compaction owner.
         - "^src/batch-compact\\.ts$"
         - "^src/compaction\\.ts$"
         - "^src/large-files\\.ts$"
@@ -420,6 +440,7 @@ component_management:
         # a key is admitted only as the canonical path hash, a fenced
         # renewal successor, or a legacy hash its own metadata corroborates;
         # alias refusal also suppresses metadata backfill until authentication.
+        # #1430 keeps the bound project identity type in this existing owner.
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"
         # #1044 keeps the existing owner; no taxonomy, status, or policy change.
