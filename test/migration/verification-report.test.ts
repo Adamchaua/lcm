@@ -375,6 +375,18 @@ describe("createMigrationVerificationReport / parseMigrationVerificationReport",
     const report = createMigrationVerificationReport(baseInput());
     expectReportError(() => parseMigrationVerificationReport({ ...report, body: "bad" }), "malformed-record");
   });
+  it("rejects a body carrying an extra key even when the rest of the report is intact", () => {
+    const report = createMigrationVerificationReport(baseInput());
+    expectReportError(() => parseMigrationVerificationReport({
+      ...report, body: { ...report.body, unexpected: true },
+    }), "malformed-record");
+  });
+  it("rejects a body whose version is not 1 instead of coercing it", () => {
+    const report = createMigrationVerificationReport(baseInput());
+    expectReportError(() => parseMigrationVerificationReport({
+      ...report, body: { ...report.body, version: 2 },
+    }), "invalid-input");
+  });
   it("rejects mismatches or mismatchTotals that are not arrays", () => {
     const report = createMigrationVerificationReport(baseInput());
     expectReportError(() => parseMigrationVerificationReport({ ...report, mismatches: "bad" }), "invalid-input");

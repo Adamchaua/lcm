@@ -631,6 +631,13 @@ export function createMigrationVerificationReport(
   });
 }
 
+const MIGRATION_VERIFICATION_REPORT_BODY_KEYS = [
+  "bindingSha256", "canonicalDelta", "censusVector", "classCoverage", "destinationIdentity",
+  "destinationSchemaWitness", "generationId", "manifestChecksumSha256", "manifestRevision",
+  "projectMapWitnessSha256", "publicProbeCoverage", "publicProbeSha256", "queueClassificationWitness",
+  "reconciliationOutcomeDigestSha256", "sampleParameters", "sourceWitness", "targetGenerationId", "version",
+] as const;
+
 export function parseMigrationVerificationReport(value: unknown): MigrationVerificationReport {
   const record = assertExactObject(
     value,
@@ -646,7 +653,10 @@ export function parseMigrationVerificationReport(value: unknown): MigrationVerif
   ) {
     reportError("invalid-input", "verification report is invalid");
   }
-  if (!isRecord(record.body)) reportError("malformed-record", "verification report body is invalid");
+  // The body is rebuilt field by field below, which would silently drop an
+  // unknown key or coerce a different version; require the canonical shape first.
+  const rawBody = assertExactObject(record.body, MIGRATION_VERIFICATION_REPORT_BODY_KEYS, "verification report body");
+  if (rawBody.version !== 1) reportError("invalid-input", "verification report body version is invalid");
   const body = createMigrationVerificationReportBody({
     generationId: (record.body as RecordValue).generationId as string,
     targetGenerationId: (record.body as RecordValue).targetGenerationId as string,
