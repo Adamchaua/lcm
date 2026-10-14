@@ -39,7 +39,11 @@ export type ActivationRestartCheckReason =
   | "stale-pid-file"
   | "backend-matches"
   | "backend-stale"
-  | "health-unreachable";
+  | "health-unreachable"
+  /** /health answered, but its body.pid is missing, not a number, or not the
+   * pid named by the pid file, so the answer cannot be attributed to that
+   * daemon. */
+  | "health-pid-mismatch";
 
 /** Attributed three-valued verification result. Never collapse to boolean. */
 export type ActivationRestartCheckResult = Readonly<{
@@ -71,6 +75,9 @@ export type ActivationRestartCheckDependencies = Readonly<{
   readPidFile?: (pidFilePath: string) => number | null;
   /** Override process-liveness detection. */
   isProcessAlive?: (pid: number) => boolean;
+  /** Override the signal-sending primitive used by the default liveness
+   * probe. Defaults to process.kill. Only ESRCH means the process is gone. */
+  killProcess?: (pid: number, signal: number) => void;
   /** Override the fetch implementation used to probe `/health`. */
   fetchFn?: typeof globalThis.fetch;
 }>;
@@ -104,18 +111,25 @@ function defaultReadPidFile(pidFilePath: string): number | null {
   return isPositiveInteger(pid) ? pid : null;
 }
 
-function defaultIsProcessAlive(pid: number): boolean {
+function defaultIsProcessAlive(
+  pid: number,
+  killProcess: (pid: number, signal: number) => void,
+): boolean {
   try {
-    process.kill(pid, 0);
+    killProcess(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // Only ESRCH proves the process is gone. EPERM (a live process owned by
+    // another user) and every other failure leave the process alive so the
+    // /health step decides.
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 
 type HealthProbe =
   | Readonly<{ kind: "observed"; backend: StorageBackend }>
-  | Readonly<{ kind: "unreachable"; detail: string }>;
+  | Readonly<{ kind: "unreachable"; detail: string }>
+  | Readonly<{ kind: "pid-mismatch"; detail: string }>;
 
 /**
  * Probe `/health` unauthenticated. The daemon reports its own startup
@@ -124,9 +138,15 @@ type HealthProbe =
  * as "unreachable" here as long as the body names a recognized backend.
  * Only a network failure, a timeout, or a body that does not name a
  * recognized backend counts as "the daemon did not answer".
+ *
+ * The body must also report the pid named by the pid file: `/health` sends
+ * `pid: process.pid` on every response, so a missing, non-numeric or
+ * different pid means the listener on this port is not the daemon the pid
+ * file names, and its backend is not accepted.
  */
 async function probeDaemonHealth(
   port: number,
+  expectedPid: number,
   fetchFn: typeof globalThis.fetch,
   timeoutMs: number,
 ): Promise<HealthProbe> {
@@ -139,6 +159,13 @@ async function probeDaemonHealth(
       ? (body as { storageBackend?: unknown }).storageBackend
       : undefined;
     if (typeof backend === "string" && (STORAGE_BACKENDS as readonly string[]).includes(backend)) {
+      const reportedPid = (body as { pid?: unknown }).pid;
+      if (reportedPid !== expectedPid) {
+        return {
+          kind: "pid-mismatch",
+          detail: "the /health response reported pid " + String(reportedPid) + " instead of " + String(expectedPid),
+        };
+      }
       return { kind: "observed", backend: backend as StorageBackend };
     }
     return {
@@ -178,7 +205,8 @@ export async function checkActivationRestartAdmission(
   dependencies: ActivationRestartCheckDependencies = {},
 ): Promise<ActivationRestartCheckResult> {
   const readPidFile = dependencies.readPidFile ?? defaultReadPidFile;
-  const isProcessAlive = dependencies.isProcessAlive ?? defaultIsProcessAlive;
+  const killProcess = dependencies.killProcess ?? ((pid: number, signal: number) => process.kill(pid, signal));
+  const isProcessAlive = dependencies.isProcessAlive ?? ((pid: number) => defaultIsProcessAlive(pid, killProcess));
   const fetchFn = dependencies.fetchFn ?? globalThis.fetch;
   const timeoutMs = input.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS;
   const { selectedBackend, pidFilePath, port } = input;
@@ -206,7 +234,17 @@ export async function checkActivationRestartAdmission(
     );
   }
 
-  const probe = await probeDaemonHealth(port, fetchFn, timeoutMs);
+  const probe = await probeDaemonHealth(port, pid, fetchFn, timeoutMs);
+  if (probe.kind === "pid-mismatch") {
+    return buildResult(
+      "unresolvable",
+      "health-pid-mismatch",
+      `pid ${pid} is running but /health on port ${port} cannot be attributed to it: ${probe.detail}`,
+      pid,
+      null,
+      selectedBackend,
+    );
+  }
   if (probe.kind === "unreachable") {
     return buildResult(
       "unresolvable",

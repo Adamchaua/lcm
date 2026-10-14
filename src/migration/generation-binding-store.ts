@@ -1,4 +1,4 @@
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fsyncSync, lstatSync, readdirSync, unlinkSync } from "node:fs";
 import { canonicalJson, sha256 } from "../storage/portable-record.js";
 import {
@@ -92,6 +92,15 @@ import {
  * accepted as a match; anything that fails that parse is treated exactly
  * like a whole-record mismatch is for a selection -- a conflict, never a
  * silent reuse.
+ *
+ * What the store cannot check (#1435). The witness preimage is not an input
+ * to this module, so it cannot recompute the digest from kind, epochId and
+ * attemptId: any well-formed 64-hex witnessChecksumSha256 is accepted as the
+ * storage key. The reconciler's comparison above (the stored record's
+ * embedded witnessChecksumSha256 against the key that named the file) only
+ * catches a record stored under the wrong name. Proving a checksum is the
+ * digest of its preimage is the obligation of the side that mints the
+ * witness.
  *
  * Idempotency and the crash window, restated for both writers together.
  * Recording the exact same binding a second time is the ordinary recovery
@@ -601,6 +610,7 @@ function completeInterruptedScratchUnlink(
   scratchPath: string,
   publishedPath: string,
   publishedIdentity: BoundedFileResult,
+  expectedUid: number | undefined,
 ): bigint | undefined {
   let current;
   try {
@@ -626,8 +636,15 @@ function completeInterruptedScratchUnlink(
     // propagates raw rather than being swallowed, mirroring
     // consumeBoundedRegularFile's identical ENOENT-after-unlink handling
     // in security-files.ts.
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return publishedLinkCount(publishedPath);
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  // Make the removal of the twin's directory entry durable before the
+  // caller reports reuse. Open and fsync failures propagate raw.
+  const directoryHandle = openPrivateDirectory(dirname(scratchPath), { expectedUid });
+  try {
+    fsyncSync(directoryHandle.fd);
+  } finally {
+    directoryHandle.close();
   }
   return publishedLinkCount(publishedPath);
 }
@@ -740,7 +757,7 @@ function reconcileWriterScratchTwin(
   }
   if (twinPath === undefined) return unresolvable();
 
-  const publishedNlink = completeInterruptedScratchUnlink(twinPath, path, finalOutcome.value);
+  const publishedNlink = completeInterruptedScratchUnlink(twinPath, path, finalOutcome.value, expectedUid);
   if (publishedNlink === undefined) return "absent";
   if (publishedNlink !== 1n) return unresolvable();
 

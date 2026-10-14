@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 import type { ActivationLeasePublicationGuard } from "../../src/migration/activation-lease.js";
 import {
+  ActivationArtifactIdentityMismatchError,
   ActivationArtifactPresenceUnresolvableError,
+  publishActivationArtifact,
   type ActivationArtifactRecoveryMaterial,
 } from "../../src/migration/activation-artifact-store.js";
 import {
@@ -13,10 +15,19 @@ import {
   type ActivationPublicationCoordinator,
   type ActivationPublicationInput,
 } from "../../src/migration/activation-publication.js";
-import type {
-  BackendPublicationJournal,
-  BackendPublicationLockToken,
-  BackendPublicationRecoveryFile,
+import {
+  BackendPublicationCoordinator,
+  backendPublicationHistoryDirectory,
+  backendPublicationJournalPath,
+  backendPublicationMaterialWitness,
+  readBackendMaintenanceJournal,
+  readBackendPublicationJournal,
+  withBackendPublicationConsumerLockAsync,
+  type BackendMaintenanceJournal,
+  type BackendPublicationDriver,
+  type BackendPublicationJournal,
+  type BackendPublicationLockToken,
+  type BackendPublicationRecoveryFile,
 } from "../../src/storage/backend-publication.js";
 
 const PUBLICATION_ID = "publication-a";
@@ -197,7 +208,9 @@ describe("driveActivationPublication", () => {
     const guard = fakeGuard({});
     const journal = baseJournal({ phase: "completed" });
     const coordinator = fakeCoordinator({ recoverPending: vi.fn(async () => journal) });
-    const result = await driveActivationPublication(guard, coordinator, baseInput({ projects: [] }));
+    const result = await driveActivationPublication(guard, coordinator, baseInput({ projects: [] }), {
+      readPublicationJournal: () => journal,
+    });
     expect(result.status).toBe("completed");
     expect(result.fenceChecks).toEqual([]);
     expect(guard.read).not.toHaveBeenCalled();
@@ -209,7 +222,9 @@ describe("driveActivationPublication", () => {
     const recoverPending = vi.fn(async () => journal);
     const coordinator = fakeCoordinator({ recoverPending });
     const input = baseInput();
-    const result = await driveActivationPublication(guard, coordinator, input);
+    const result = await driveActivationPublication(guard, coordinator, input, {
+      readPublicationJournal: () => baseJournal({ phase: "guarded" }),
+    });
     expect(result).toMatchObject({ status: "completed", journal });
     expect(recoverPending).toHaveBeenCalledWith({ disposition: "resume" }, input.lockToken);
   });
@@ -218,7 +233,9 @@ describe("driveActivationPublication", () => {
     const guard = fakeGuard({ "remote-a": "satisfied" });
     const journal = baseJournal({ phase: "aborted", publicationId: PUBLICATION_ID });
     const coordinator = fakeCoordinator({ recoverPending: vi.fn(async () => journal) });
-    const result = await driveActivationPublication(guard, coordinator, baseInput());
+    const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+      readPublicationJournal: () => baseJournal({ phase: "aborting" }),
+    });
     expect(result).toMatchObject({ status: "aborted", journal });
   });
 
@@ -226,9 +243,12 @@ describe("driveActivationPublication", () => {
     const guard = fakeGuard({ "remote-a": "satisfied" });
     const journal = baseJournal({ publicationId: "other-publication", phase: "guarded" });
     const coordinator = fakeCoordinator({ recoverPending: vi.fn(async () => journal) });
-    const result = await driveActivationPublication(guard, coordinator, baseInput());
+    const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+      readPublicationJournal: () => journal,
+    });
     expect(result.status).toBe("publication-collision");
     expect(result.journal).toEqual(journal);
+    expect(coordinator.recoverPending).not.toHaveBeenCalled();
     expect(coordinator.prepare).not.toHaveBeenCalled();
     expect(coordinator.resume).not.toHaveBeenCalled();
   });
@@ -241,7 +261,6 @@ describe("driveActivationPublication", () => {
     const prepare = vi.fn(async () => prepared);
     const resume = vi.fn(async () => resumed);
     const coordinator = fakeCoordinator({
-      recoverPending: vi.fn(async () => stale),
       prepare,
       resume,
     });
@@ -250,7 +269,7 @@ describe("driveActivationPublication", () => {
       guard,
       coordinator,
       baseInput(),
-      { readArtifact: () => artifact },
+      { readArtifact: () => artifact, readPublicationJournal: () => stale },
     );
     expect(result).toMatchObject({ status: "completed", journal: resumed });
     expect(prepare).toHaveBeenCalled();
@@ -261,7 +280,6 @@ describe("driveActivationPublication", () => {
     const stale = baseJournal({ publicationId: "other-publication", phase: "aborted" });
     const resumed = baseJournal({ phase: "completed" });
     const coordinator = fakeCoordinator({
-      recoverPending: vi.fn(async () => stale),
       prepare: vi.fn(async () => baseJournal({ phase: "prepared" })),
       resume: vi.fn(async () => resumed),
     });
@@ -270,7 +288,7 @@ describe("driveActivationPublication", () => {
       guard,
       coordinator,
       baseInput(),
-      { readArtifact: () => artifact },
+      { readArtifact: () => artifact, readPublicationJournal: () => stale },
     );
     expect(result).toMatchObject({ status: "completed", journal: resumed });
   });
@@ -369,7 +387,7 @@ describe("driveActivationPublication", () => {
       { readArtifact: () => artifact },
     );
     expect(result).toMatchObject({ status: "completed", journal: resumed });
-    expect(recoverPending).toHaveBeenCalledWith({ disposition: "resume" }, input.lockToken);
+    expect(recoverPending).not.toHaveBeenCalled();
     expect(prepare).toHaveBeenCalledWith(
       expect.objectContaining({
         publicationId: artifact.publicationId,
@@ -408,3 +426,345 @@ describe("driveActivationPublication", () => {
     expect(result.status).toBe("artifact-missing");
   });
 });
+
+describe("driveActivationPublication: journal gate (#1443)", () => {
+  const MACHINE = "018f0b5d-1234-7abc-8def-1234567890ab";
+
+  function maintenanceJournal(phase: BackendMaintenanceJournal["phase"]): BackendMaintenanceJournal {
+    return {
+      version: 3,
+      publicationId: "migration-generation-1",
+      sourceBackend: "sqlite",
+      targetBackend: null,
+      phase,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      generationId: "generation-1",
+      sourceSelectionSha256: EVIDENCE_A,
+      queueEvidenceSha256: EVIDENCE_B,
+      roster: [],
+      selectedGenerationId: null,
+      terminalEvidenceSha256: null,
+      abortEvidenceSha256: null,
+      checksumSha256: "9".repeat(64),
+    };
+  }
+
+  /** A faithful coordinator double: recoverPending records that it ran and
+   * drives any journal it is given to completed, as #resumeUnlocked does. A
+   * double that returned the journal unchanged would pass on the broken base. */
+  function drivingCoordinator(journal: BackendPublicationJournal | null) {
+    const recoverPending = vi.fn(async () => (journal === null ? null : { ...journal, phase: "completed" as const }));
+    return fakeCoordinator({ recoverPending });
+  }
+
+  function realHome(): string {
+    const value = mkdtempSync(join(tmpdir(), "lcm-activation-publication-real-"));
+    mkdirSync(join(value, ".lcm"), { mode: 0o700 });
+    roots.push(value);
+    return value;
+  }
+
+  function realCoordinatorFor(homeDir: string) {
+    const material = artifactMaterial();
+    const state = backendPublicationMaterialWitness({ source: material.source, target: material.target });
+    const targetState = backendPublicationMaterialWitness({ source: material.target, target: material.target });
+    let observed = state;
+    const driver: BackendPublicationDriver = {
+      observeLocalState: async () => observed,
+      publishProjectMap: async ({ permit }) => {
+        permit.assertActive();
+        observed = { ...observed, projectMap: targetState.projectMap };
+        return targetState.projectMap;
+      },
+      publishConfig: async ({ permit }) => {
+        permit.assertActive();
+        observed = { ...observed, config: targetState.config };
+        return targetState.config;
+      },
+      restoreConfig: async () => state.config,
+      restoreProjectMap: async () => state.projectMap,
+    };
+    return new BackendPublicationCoordinator({ homeDir, driver });
+  }
+
+  function spyOn(real: BackendPublicationCoordinator) {
+    return {
+      recoverPending: vi.fn((options, token) => real.recoverPending(options, token)),
+      prepare: vi.fn((input, token) => real.prepare(input, token)),
+      resume: vi.fn((token) => real.resume(token)),
+    } satisfies ActivationPublicationCoordinator;
+  }
+
+  async function holdMaintenance(homeDir: string): Promise<BackendMaintenanceJournal> {
+    return realCoordinatorFor(homeDir).enterMaintenance({
+      publicationId: "migration-generation-1",
+      generationId: "generation-1",
+      sourceSelectionSha256: EVIDENCE_A,
+      queueEvidenceSha256: EVIDENCE_B,
+      roster: [{ machineId: MACHINE, queueCutoff: "0000000000000000012", evidenceSha256: EVIDENCE_A }],
+      now: new Date("2026-09-19T00:00:00.000Z"),
+    });
+  }
+
+  it.each([
+    ["localProjectId", { localProjectId: "local-a", remoteProjectId: "remote-b", evidenceSha256: EVIDENCE_B }],
+    ["remoteProjectId", { localProjectId: "local-b", remoteProjectId: "remote-a", evidenceSha256: EVIDENCE_B }],
+    ["both ids with differing evidence", { localProjectId: "local-a", remoteProjectId: "remote-a", evidenceSha256: EVIDENCE_B }],
+  ])("refuses duplicate-publication-input for a repeated %s before any I/O", async (_label, second) => {
+    const guard = fakeGuard({ "remote-a": "satisfied", "remote-b": "satisfied" });
+    const coordinator = fakeCoordinator();
+    const readMaintenanceJournal = vi.fn(() => null);
+    const readPublicationJournal = vi.fn(() => null);
+    const readArtifact = vi.fn(() => null);
+    const input = baseInput({
+      projects: [
+        { localProjectId: "local-a", remoteProjectId: "remote-a", evidenceSha256: EVIDENCE_A },
+        second,
+      ],
+    });
+    const result = await driveActivationPublication(guard, coordinator, input, {
+      readMaintenanceJournal,
+      readPublicationJournal,
+      readArtifact,
+    });
+    expect(result).toMatchObject({ status: "duplicate-publication-input", journal: null, fenceChecks: [] });
+    expect(guard.read).not.toHaveBeenCalled();
+    expect(readMaintenanceJournal).not.toHaveBeenCalled();
+    expect(readPublicationJournal).not.toHaveBeenCalled();
+    expect(readArtifact).not.toHaveBeenCalled();
+    expect(coordinator.recoverPending).not.toHaveBeenCalled();
+  });
+
+  it("refuses duplicate inputs even when an earlier completed publication exists for this id", async () => {
+    const guard = fakeGuard({ "remote-a": "satisfied" });
+    const coordinator = drivingCoordinator(baseJournal({ phase: "completed" }));
+    const duplicate = { localProjectId: "local-a", remoteProjectId: "remote-a", evidenceSha256: EVIDENCE_A };
+    const result = await driveActivationPublication(
+      guard,
+      coordinator,
+      baseInput({ projects: [duplicate, duplicate] }),
+      { readPublicationJournal: () => baseJournal({ phase: "completed" }) },
+    );
+    expect(result.status).toBe("duplicate-publication-input");
+    expect(coordinator.recoverPending).not.toHaveBeenCalled();
+  });
+
+  it("reports publication-unresolvable, never absent, when the maintenance journal peek throws", async () => {
+    const guard = fakeGuard({ "remote-a": "satisfied" });
+    const coordinator = fakeCoordinator();
+    const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+      readMaintenanceJournal: () => { throw new Error("unsafe storage"); },
+    });
+    expect(result).toMatchObject({ status: "publication-unresolvable", journal: null, fenceChecks: [] });
+    expect(result.detail).toContain("unsafe storage");
+    expect(guard.read).not.toHaveBeenCalled();
+    expect(coordinator.recoverPending).not.toHaveBeenCalled();
+    expect(coordinator.prepare).not.toHaveBeenCalled();
+  });
+
+  it("reports publication-unresolvable when the version-2 journal peek throws", async () => {
+    const guard = fakeGuard({ "remote-a": "satisfied" });
+    const coordinator = fakeCoordinator();
+    const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+      readPublicationJournal: () => { throw new Error("checksum mismatch"); },
+    });
+    expect(result).toMatchObject({ status: "publication-unresolvable", journal: null, fenceChecks: [] });
+    expect(coordinator.recoverPending).not.toHaveBeenCalled();
+    expect(guard.read).not.toHaveBeenCalled();
+  });
+
+  it.each(["maintenance-entering", "maintenance-held", "selection-prepared"] as const)(
+    "refuses with maintenance-in-flight for a version-3 journal in phase %s, without any coordinator call",
+    async (phase) => {
+      const guard = fakeGuard({ "remote-a": "satisfied" });
+      const coordinator = fakeCoordinator();
+      const readPublicationJournal = vi.fn(() => null);
+      const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+        readMaintenanceJournal: () => maintenanceJournal(phase),
+        readPublicationJournal,
+      });
+      expect(result).toMatchObject({ status: "maintenance-in-flight", journal: null, fenceChecks: [] });
+      expect(result.detail).toContain(phase);
+      expect(guard.read).not.toHaveBeenCalled();
+      expect(readPublicationJournal).not.toHaveBeenCalled();
+      expect(coordinator.recoverPending).not.toHaveBeenCalled();
+      expect(coordinator.prepare).not.toHaveBeenCalled();
+    },
+  );
+
+  it("refuses a real held version-3 journal through the default peek and leaves its bytes unchanged", async () => {
+    const homeDir = realHome();
+    await holdMaintenance(homeDir);
+    const journalPath = backendPublicationJournalPath(homeDir);
+    const before = readFileSync(journalPath, "utf8");
+    const coordinator = fakeCoordinator();
+    const result = await driveActivationPublication(
+      fakeGuard({ "remote-a": "satisfied" }),
+      coordinator,
+      baseInput({ homeDir }),
+    );
+    expect(result).toMatchObject({ status: "maintenance-in-flight", journal: null, fenceChecks: [] });
+    expect(readFileSync(journalPath, "utf8")).toBe(before);
+    expect(coordinator.recoverPending).not.toHaveBeenCalled();
+  });
+
+  it("prepares and resumes a fresh publication over a real terminal selection-completed version-3 journal", async () => {
+    const homeDir = realHome();
+    const held = await holdMaintenance(homeDir);
+    const real = realCoordinatorFor(homeDir);
+    const prepared = await real.prepareMaintenanceSelection({
+      expectedChecksumSha256: held.checksumSha256,
+      generationId: "generation-1",
+      targetBackend: "postgresql",
+      terminalEvidenceSha256: EVIDENCE_B,
+    });
+    await real.completeMaintenanceSelection({
+      expectedChecksumSha256: prepared.checksumSha256,
+      generationId: "generation-1",
+      terminalEvidenceSha256: EVIDENCE_B,
+    });
+    expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-completed");
+    const artifact = artifactMaterial();
+    const published = publishActivationArtifact({ homeDir, material: artifact });
+    const coordinator = spyOn(real);
+    const result = await withBackendPublicationConsumerLockAsync(homeDir, (lockToken) =>
+      driveActivationPublication(
+        fakeGuard({ "remote-a": "satisfied" }),
+        coordinator,
+        baseInput({ homeDir, lockToken, identityDigest: published.identityDigest }),
+      ));
+    expect(result.status).toBe("completed");
+    expect(result.journal?.publicationId).toBe(PUBLICATION_ID);
+    expect(result.fenceChecks).toHaveLength(1);
+    expect(coordinator.recoverPending).not.toHaveBeenCalled();
+    expect(coordinator.prepare).toHaveBeenCalledTimes(1);
+    expect(coordinator.resume).toHaveBeenCalledTimes(1);
+    expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+    expect(readBackendPublicationJournal(homeDir)?.phase).toBe("completed");
+    expect(readdirSync(backendPublicationHistoryDirectory(homeDir)).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("treats a terminal maintenance-aborted version-3 journal as the same fresh dispatch, with leases asserted", async () => {
+    const guard = fakeGuard({ "remote-a": "satisfied" });
+    const prepare = vi.fn(async () => baseJournal({ phase: "prepared" }));
+    const resume = vi.fn(async () => baseJournal({ phase: "completed" }));
+    const coordinator = fakeCoordinator({ prepare, resume });
+    const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+      readMaintenanceJournal: () => maintenanceJournal("maintenance-aborted"),
+      readPublicationJournal: () => { throw new Error("must not be read after a terminal version-3 journal"); },
+      readArtifact: () => artifactMaterial(),
+    });
+    expect(result.status).toBe("completed");
+    expect(guard.read).toHaveBeenCalledTimes(1);
+    expect(coordinator.recoverPending).not.toHaveBeenCalled();
+    expect(prepare).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not drive an unrelated in-flight version-2 journal: collision without recoverPending", async () => {
+    const guard = fakeGuard({ "remote-a": "satisfied" });
+    const unrelated = baseJournal({ publicationId: "other-publication", phase: "guarded" });
+    const coordinator = drivingCoordinator(unrelated);
+    const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+      readPublicationJournal: () => unrelated,
+    });
+    expect(result).toMatchObject({ status: "publication-collision", journal: unrelated, fenceChecks: [] });
+    expect(guard.read).not.toHaveBeenCalled();
+    expect(coordinator.recoverPending).not.toHaveBeenCalled();
+    expect(coordinator.prepare).not.toHaveBeenCalled();
+  });
+
+  it("treats an unrelated terminal version-2 journal as a fresh dispatch without recoverPending", async () => {
+    const guard = fakeGuard({ "remote-a": "satisfied" });
+    const stale = baseJournal({ publicationId: "other-publication", phase: "aborted" });
+    const coordinator = fakeCoordinator({
+      prepare: vi.fn(async () => baseJournal({ phase: "prepared" })),
+      resume: vi.fn(async () => baseJournal({ phase: "completed" })),
+    });
+    const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+      readPublicationJournal: () => stale,
+      readArtifact: () => artifactMaterial(),
+    });
+    expect(result.status).toBe("completed");
+    expect(guard.read).toHaveBeenCalledTimes(1);
+    expect(coordinator.recoverPending).not.toHaveBeenCalled();
+  });
+
+  it.each(["completed", "aborted"] as const)(
+    "returns the %s result for a terminal journal of this publication without asserting leases",
+    async (phase) => {
+      const guard = fakeGuard({});
+      const terminal = baseJournal({ phase });
+      const coordinator = fakeCoordinator({ recoverPending: vi.fn(async () => terminal) });
+      const input = baseInput();
+      const result = await driveActivationPublication(guard, coordinator, input, {
+        readPublicationJournal: () => terminal,
+      });
+      expect(result).toMatchObject({ status: phase, journal: terminal, fenceChecks: [] });
+      expect(guard.read).not.toHaveBeenCalled();
+      expect(coordinator.recoverPending).toHaveBeenCalledWith({ disposition: "resume" }, input.lockToken);
+    },
+  );
+
+  it("resumes a non-terminal journal of this publication under the retained token after asserting leases", async () => {
+    const guard = fakeGuard({ "remote-a": "satisfied" });
+    const inFlight = baseJournal({ phase: "guarded" });
+    const driven = baseJournal({ phase: "completed" });
+    const recoverPending = vi.fn(async () => driven);
+    const coordinator = fakeCoordinator({ recoverPending });
+    const input = baseInput();
+    const result = await driveActivationPublication(guard, coordinator, input, {
+      readPublicationJournal: () => inFlight,
+    });
+    expect(result).toMatchObject({ status: "completed", journal: driven });
+    expect(result.fenceChecks).toHaveLength(1);
+    expect(recoverPending).toHaveBeenCalledWith({ disposition: "resume" }, input.lockToken);
+  });
+
+  it("refuses a non-terminal journal of this publication when its lease is not satisfied", async () => {
+    const guard = fakeGuard({ "remote-a": "absent" });
+    const coordinator = fakeCoordinator();
+    const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+      readPublicationJournal: () => baseJournal({ phase: "guarded" }),
+    });
+    expect(result.status).toBe("fence-unsatisfied");
+    expect(coordinator.recoverPending).not.toHaveBeenCalled();
+  });
+
+  it("reports a collision when recoverPending finds a different in-flight journal than the peek showed", async () => {
+    const guard = fakeGuard({ "remote-a": "satisfied" });
+    const raced = baseJournal({ publicationId: "raced-publication", phase: "guarded" });
+    const coordinator = fakeCoordinator({ recoverPending: vi.fn(async () => raced) });
+    const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+      readPublicationJournal: () => baseJournal({ phase: "guarded" }),
+    });
+    expect(result).toMatchObject({ status: "publication-collision", journal: raced });
+  });
+
+  it("falls through to a fresh dispatch when the journal vanished between the peek and recoverPending", async () => {
+    const guard = fakeGuard({ "remote-a": "satisfied" });
+    const coordinator = fakeCoordinator({
+      recoverPending: vi.fn(async () => null),
+      prepare: vi.fn(async () => baseJournal({ phase: "prepared" })),
+      resume: vi.fn(async () => baseJournal({ phase: "completed" })),
+    });
+    const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+      readPublicationJournal: () => baseJournal({ phase: "guarded" }),
+      readArtifact: () => artifactMaterial(),
+    });
+    expect(result.status).toBe("completed");
+    expect(coordinator.prepare).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps an artifact identity digest mismatch from the reader to artifact-identity-mismatch", async () => {
+    const guard = fakeGuard({ "remote-a": "satisfied" });
+    const coordinator = fakeCoordinator();
+    const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+      readArtifact: () => { throw new ActivationArtifactIdentityMismatchError("digest does not match"); },
+    });
+    expect(result).toMatchObject({ status: "artifact-identity-mismatch", journal: null });
+    expect(result.detail).toContain("digest does not match");
+    expect(coordinator.prepare).not.toHaveBeenCalled();
+  });
+});
+

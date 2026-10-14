@@ -244,7 +244,7 @@ describe("checkActivationRestartAdmission", () => {
     const readPidFile = () => 4242;
     const isProcessAlive = (pid: number) => pid === 4242;
     const fetchFn = (async () =>
-      new Response(JSON.stringify({ status: "ok", storageBackend: "postgresql" }), { status: 200 })) as typeof globalThis.fetch;
+      new Response(JSON.stringify({ status: "ok", storageBackend: "postgresql", pid: 4242 }), { status: 200 })) as typeof globalThis.fetch;
     const result = await checkActivationRestartAdmission(
       { selectedBackend: "postgresql", pidFilePath: "/unused", port: 1 },
       { readPidFile, isProcessAlive, fetchFn },
@@ -257,6 +257,81 @@ describe("checkActivationRestartAdmission", () => {
       observedBackend: "postgresql",
       selectedBackend: "postgresql",
     });
+  });
+
+  it("is unresolvable with health-pid-mismatch when /health reports a different pid than the pid file", async () => {
+    const readPidFile = () => 4242;
+    const isProcessAlive = () => true;
+    const fetchFn = (async () =>
+      new Response(JSON.stringify({ storageBackend: "sqlite", pid: 4243 }), { status: 200 })) as typeof globalThis.fetch;
+    const result = await checkActivationRestartAdmission(
+      { selectedBackend: "sqlite", pidFilePath: "/unused", port: 7 },
+      { readPidFile, isProcessAlive, fetchFn },
+    );
+    expect(result).toEqual({
+      status: "unresolvable",
+      reason: "health-pid-mismatch",
+      detail: expect.stringContaining("4243"),
+      pid: 4242,
+      observedBackend: null,
+      selectedBackend: "sqlite",
+    });
+  });
+
+  it.each([
+    ["missing", { storageBackend: "sqlite" }],
+    ["non-number", { storageBackend: "sqlite", pid: "4242" }],
+  ])("is unresolvable with health-pid-mismatch when the /health pid is %s", async (_label, body) => {
+    const fetchFn = (async () => new Response(JSON.stringify(body), { status: 200 })) as typeof globalThis.fetch;
+    const result = await checkActivationRestartAdmission(
+      { selectedBackend: "sqlite", pidFilePath: "/unused", port: 7 },
+      { readPidFile: () => 4242, isProcessAlive: () => true, fetchFn },
+    );
+    expect(result.status).toBe("unresolvable");
+    expect(result.reason).toBe("health-pid-mismatch");
+    expect(result.observedBackend).toBeNull();
+  });
+
+  it("treats only ESRCH from the default liveness probe as a dead process", async () => {
+    const calls: Array<[number, number]> = [];
+    const killProcess = (pid: number, signal: number): void => {
+      calls.push([pid, signal]);
+      throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+    };
+    const result = await checkActivationRestartAdmission(
+      { selectedBackend: "sqlite", pidFilePath: "/unused", port: 7 },
+      { readPidFile: () => 4242, killProcess },
+    );
+    expect(result.status).toBe("satisfied");
+    expect(result.reason).toBe("stale-pid-file");
+    expect(calls).toEqual([[4242, 0]]);
+  });
+
+  it.each(["EPERM", "EINVAL", undefined])(
+    "treats a %s failure from the default liveness probe as an alive process and lets /health decide",
+    async (code) => {
+      const killProcess = (): void => {
+        throw Object.assign(new Error("denied"), { code });
+      };
+      const fetchFn = (async () =>
+        new Response(JSON.stringify({ storageBackend: "postgresql", pid: 4242 }), { status: 200 })) as typeof globalThis.fetch;
+      const result = await checkActivationRestartAdmission(
+        { selectedBackend: "sqlite", pidFilePath: "/unused", port: 7 },
+        { readPidFile: () => 4242, killProcess, fetchFn },
+      );
+      expect(result.status).toBe("unsatisfied");
+      expect(result.reason).toBe("backend-stale");
+    },
+  );
+
+  it("treats a successful default liveness probe as an alive process", async () => {
+    const fetchFn = (async () =>
+      new Response(JSON.stringify({ storageBackend: "sqlite", pid: 4242 }), { status: 200 })) as typeof globalThis.fetch;
+    const result = await checkActivationRestartAdmission(
+      { selectedBackend: "sqlite", pidFilePath: "/unused", port: 7 },
+      { readPidFile: () => 4242, killProcess: () => undefined, fetchFn },
+    );
+    expect(result.reason).toBe("backend-matches");
   });
 
   it("uses an injected isProcessAlive override to attribute a stale pid file", async () => {

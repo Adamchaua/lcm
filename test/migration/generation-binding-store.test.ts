@@ -72,7 +72,6 @@ function homeWithoutLcmRoot(): string {
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
-const HASH_C = "c".repeat(64);
 const GENERATION_ID = "generation-1";
 
 function selectionBinding(
@@ -202,7 +201,6 @@ describe("recordMigrationSelectionBinding: synchronous return", () => {
       binding: selectionBinding(),
     });
     expect(result).toBeUndefined();
-    expect(result instanceof Promise).toBe(false);
   });
 });
 
@@ -216,7 +214,6 @@ describe("recordMigrationWitnessBinding: synchronous return", () => {
       binding: witnessBinding(),
     });
     expect(result).toBeUndefined();
-    expect(result instanceof Promise).toBe(false);
   });
 });
 
@@ -724,6 +721,17 @@ describe("recordMigrationWitnessBinding: durable write, per-witness keying and f
     const stored = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
     expect(stored.generationId).toBe(GENERATION_ID);
     expect(stored.binding).toEqual(binding);
+  });
+
+  it("accepts any well-formed witnessChecksumSha256 as the storage key (the store cannot authenticate the preimage; #1435" +
+    " characterization)", () => {
+    const homeDir = home();
+    const unrelatedKey = "d".repeat(64);
+    const binding = witnessBinding({ epochId: "epoch-unrelated", attemptId: "attempt-unrelated", witnessChecksumSha256: unrelatedKey });
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding });
+    const path = migrationWitnessBindingPath(homeDir, GENERATION_ID, unrelatedKey);
+    const stored = JSON.parse(readFileSync(path, "utf8")) as { binding: { witnessChecksumSha256: string } };
+    expect(stored.binding.witnessChecksumSha256).toBe(unrelatedKey);
   });
 
   it("reuses an identical rewrite under the same witnessChecksumSha256 without rewriting the file", () => {
@@ -1895,3 +1903,132 @@ describe("publishedLinkCount: internal branch coverage (#1444)", () => {
     ).toThrow(boom);
   });
 });
+
+describe("reconcileWriterScratchTwin: containing-directory durability after the scratch unlink (#1452)", () => {
+  /** Record, in order, every scratch unlink and every fsync of the store directory. */
+  function trackUnlinkAndDirectoryFsync(
+    store: string,
+    scratchPath: string,
+    callback: () => void,
+    hooks: { afterUnlink?: () => void; unlinkReplacement?: (path: string) => void } = {},
+  ): string[] {
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpenSync = nodeFs.openSync as (path: string, flags: unknown, mode?: unknown) => number;
+    const originalFsyncSync = nodeFs.fsyncSync as (fd: number) => void;
+    const originalUnlinkSync = nodeFs.unlinkSync as (path: string) => void;
+    const pathByFd = new Map<number, string>();
+    const events: string[] = [];
+    withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
+      const fd = mode === undefined ? originalOpenSync(path, flags) : originalOpenSync(path, flags, mode);
+      pathByFd.set(fd, path);
+      return fd;
+    }) as never, () => withPatchedFs("fsyncSync", ((fd: number) => {
+      if (pathByFd.get(fd) === store) events.push("fsync-store");
+      originalFsyncSync(fd);
+    }) as never, () => withPatchedFs("unlinkSync", ((path: string) => {
+      if (path === scratchPath) {
+        events.push("unlink-scratch");
+        hooks.unlinkReplacement?.(path);
+      }
+      originalUnlinkSync(path);
+    }) as never, callback)));
+    return events;
+  }
+
+  it("fsyncs the store directory after the scratch twin is unlinked and before reporting reuse", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const { scratchPath } = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", cleanBytes);
+    const events = trackUnlinkAndDirectoryFsync(migrationGenerationBindingDirectory(homeDir, GENERATION_ID), scratchPath, () => {
+      recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding });
+    });
+    expect(events).toEqual(["unlink-scratch", "fsync-store"]);
+  });
+
+  it("still fsyncs the store directory when the unlink itself reports ENOENT", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const { scratchPath } = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", cleanBytes);
+    const events = trackUnlinkAndDirectoryFsync(
+      migrationGenerationBindingDirectory(homeDir, GENERATION_ID),
+      scratchPath,
+      () => {
+        recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding });
+      },
+      { unlinkReplacement: (path) => rmSync(path, { force: true }) },
+    );
+    expect(events).toEqual(["unlink-scratch", "fsync-store"]);
+  });
+
+  it("does not fsync the store directory when the scratch inode does not match and nothing is unlinked", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const { scratchPath } = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", cleanBytes);
+    const decoyPath = scratchPath + ".decoy-swap";
+    writeFileSync(decoyPath, "unrelated", { mode: 0o600 });
+    const realLstatSync = (createRequire(import.meta.url)("node:fs") as { lstatSync: (p: string, o?: unknown) => unknown }).lstatSync;
+    const events = trackUnlinkAndDirectoryFsync(migrationGenerationBindingDirectory(homeDir, GENERATION_ID), scratchPath, () => {
+      expect(() =>
+        withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+          if (path === scratchPath) return realLstatSync(decoyPath, options);
+          return realLstatSync(path, options);
+        }) as never, () => recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding })),
+      ).toThrow(MigrationBindingUnresolvableError);
+    });
+    expect(events).toEqual([]);
+  });
+
+  it("propagates a raw directory fsync failure instead of reporting reuse", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const { scratchPath } = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", cleanBytes);
+    const store = migrationGenerationBindingDirectory(homeDir, GENERATION_ID);
+    const boom = Object.assign(new Error("synthetic directory fsync failure"), { code: "EIO" });
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpenSync = nodeFs.openSync as (path: string, flags: unknown, mode?: unknown) => number;
+    const originalFsyncSync = nodeFs.fsyncSync as (fd: number) => void;
+    const originalUnlinkSync = nodeFs.unlinkSync as (path: string) => void;
+    const pathByFd = new Map<number, string>();
+    let unlinked = false;
+    expect(() =>
+      withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
+        const fd = mode === undefined ? originalOpenSync(path, flags) : originalOpenSync(path, flags, mode);
+        pathByFd.set(fd, path);
+        return fd;
+      }) as never, () => withPatchedFs("fsyncSync", ((fd: number) => {
+        if (unlinked && pathByFd.get(fd) === store) throw boom;
+        originalFsyncSync(fd);
+      }) as never, () => withPatchedFs("unlinkSync", ((path: string) => {
+        originalUnlinkSync(path);
+        if (path === scratchPath) unlinked = true;
+      }) as never, () => recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding })))),
+    ).toThrow(boom);
+  });
+
+  it("propagates a raw failure to open the store directory after the unlink", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const { scratchPath } = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", cleanBytes);
+    const store = migrationGenerationBindingDirectory(homeDir, GENERATION_ID);
+    const boom = Object.assign(new Error("synthetic directory open failure"), { code: "EMFILE" });
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpenSync = nodeFs.openSync as (path: string, flags: unknown, mode?: unknown) => number;
+    const originalUnlinkSync = nodeFs.unlinkSync as (path: string) => void;
+    let unlinked = false;
+    expect(() =>
+      withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
+        if (unlinked && path === store) throw boom;
+        return mode === undefined ? originalOpenSync(path, flags) : originalOpenSync(path, flags, mode);
+      }) as never, () => withPatchedFs("unlinkSync", ((path: string) => {
+        originalUnlinkSync(path);
+        if (path === scratchPath) unlinked = true;
+      }) as never, () => recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }))),
+    ).toThrow(boom);
+  });
+});
+

@@ -9,6 +9,9 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  renameSync,
+  copyFileSync,
+  symlinkSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -1305,6 +1308,7 @@ describe("readActivationArtifact: failure attribution", () => {
     const homeDir = home();
     const material = buildMaterial(homeDir, "pub-1");
     const boom = new Error("unexpected failure with no fs error code");
+    publishActivationArtifact({ homeDir, material });
     expect(() =>
       readActivationArtifact(
         { homeDir, identityDigest: computeActivationArtifactIdentityDigest(material) },
@@ -1405,3 +1409,235 @@ describe("reconcileArtifactScratchTwin: vanishing scan candidate", () => {
     ).toThrow(ActivationArtifactPresenceUnresolvableError);
   });
 });
+
+describe("reconcileArtifactScratchTwin: containing-directory durability after the scratch unlink (#1452)", () => {
+  /** Record, in order, every scratch unlink and every fsync of the store directory. */
+  function trackUnlinkAndDirectoryFsync(
+    store: string,
+    scratchPath: string,
+    callback: () => void,
+    hooks: { afterUnlink?: () => void; unlinkReplacement?: (path: string) => void } = {},
+  ): string[] {
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpenSync = nodeFs.openSync as (path: string, flags: unknown, mode?: unknown) => number;
+    const originalFsyncSync = nodeFs.fsyncSync as (fd: number) => void;
+    const originalUnlinkSync = nodeFs.unlinkSync as (path: string) => void;
+    const pathByFd = new Map<number, string>();
+    const events: string[] = [];
+    withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
+      const fd = mode === undefined ? originalOpenSync(path, flags) : originalOpenSync(path, flags, mode);
+      pathByFd.set(fd, path);
+      return fd;
+    }) as never, () => withPatchedFs("fsyncSync", ((fd: number) => {
+      if (pathByFd.get(fd) === store) events.push("fsync-store");
+      originalFsyncSync(fd);
+    }) as never, () => withPatchedFs("unlinkSync", ((path: string) => {
+      if (path === scratchPath) {
+        events.push("unlink-scratch");
+        hooks.unlinkReplacement?.(path);
+      }
+      originalUnlinkSync(path);
+    }) as never, callback)));
+    return events;
+  }
+
+  it("fsyncs the store directory after the scratch twin is unlinked and before reporting reuse", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const events = trackUnlinkAndDirectoryFsync(activationArtifactDirectory(homeDir), scratchPath, () => {
+      expect(publishActivationArtifact({ homeDir, material }).outcome).toBe("reused");
+    });
+    expect(events).toEqual(["unlink-scratch", "fsync-store"]);
+  });
+
+  it("still fsyncs the store directory when the unlink itself reports ENOENT", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const events = trackUnlinkAndDirectoryFsync(
+      activationArtifactDirectory(homeDir),
+      scratchPath,
+      () => {
+        expect(publishActivationArtifact({ homeDir, material }).outcome).toBe("reused");
+      },
+      { unlinkReplacement: (path) => rmSync(path, { force: true }) },
+    );
+    expect(events).toEqual(["unlink-scratch", "fsync-store"]);
+  });
+
+  it("does not fsync the store directory when the scratch inode does not match and nothing is unlinked", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const decoyPath = scratchPath + ".decoy-swap";
+    writeFileSync(decoyPath, "unrelated", { mode: 0o600 });
+    const realLstatSync = (createRequire(import.meta.url)("node:fs") as { lstatSync: (p: string, o?: unknown) => unknown }).lstatSync;
+    const events = trackUnlinkAndDirectoryFsync(activationArtifactDirectory(homeDir), scratchPath, () => {
+      expect(() =>
+        withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+          if (path === scratchPath) return realLstatSync(decoyPath, options);
+          return realLstatSync(path, options);
+        }) as never, () => publishActivationArtifact({ homeDir, material })),
+      ).toThrow(ActivationArtifactPresenceUnresolvableError);
+    });
+    expect(events).toEqual([]);
+  });
+
+  it("propagates a raw directory fsync failure instead of reporting reuse", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const store = activationArtifactDirectory(homeDir);
+    const boom = Object.assign(new Error("synthetic directory fsync failure"), { code: "EIO" });
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpenSync = nodeFs.openSync as (path: string, flags: unknown, mode?: unknown) => number;
+    const originalFsyncSync = nodeFs.fsyncSync as (fd: number) => void;
+    const originalUnlinkSync = nodeFs.unlinkSync as (path: string) => void;
+    const pathByFd = new Map<number, string>();
+    let unlinked = false;
+    expect(() =>
+      withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
+        const fd = mode === undefined ? originalOpenSync(path, flags) : originalOpenSync(path, flags, mode);
+        pathByFd.set(fd, path);
+        return fd;
+      }) as never, () => withPatchedFs("fsyncSync", ((fd: number) => {
+        if (unlinked && pathByFd.get(fd) === store) throw boom;
+        originalFsyncSync(fd);
+      }) as never, () => withPatchedFs("unlinkSync", ((path: string) => {
+        originalUnlinkSync(path);
+        if (path === scratchPath) unlinked = true;
+      }) as never, () => publishActivationArtifact({ homeDir, material })))),
+    ).toThrow(boom);
+  });
+
+  it("propagates a raw failure to open the store directory after the unlink", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const store = activationArtifactDirectory(homeDir);
+    const boom = Object.assign(new Error("synthetic directory open failure"), { code: "EMFILE" });
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpenSync = nodeFs.openSync as (path: string, flags: unknown, mode?: unknown) => number;
+    const originalUnlinkSync = nodeFs.unlinkSync as (path: string) => void;
+    let unlinked = false;
+    expect(() =>
+      withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
+        if (unlinked && path === store) throw boom;
+        return mode === undefined ? originalOpenSync(path, flags) : originalOpenSync(path, flags, mode);
+      }) as never, () => withPatchedFs("unlinkSync", ((path: string) => {
+        originalUnlinkSync(path);
+        if (path === scratchPath) unlinked = true;
+      }) as never, () => publishActivationArtifact({ homeDir, material }))),
+    ).toThrow(boom);
+  });
+});
+
+
+describe("readActivationArtifact: authenticated directory and identity digest (#1443)", () => {
+  function storedFixture(homeDir: string) {
+    const material = buildMaterial(homeDir, "pub-1");
+    const published = publishActivationArtifact({ homeDir, material });
+    return { material, published };
+  }
+
+  it("refuses a symlinked artifact directory that redirects the read to another private directory", () => {
+    const realHome = home();
+    const { published } = storedFixture(realHome);
+    const attackerHome = home();
+    symlinkSync(activationArtifactDirectory(realHome), activationArtifactDirectory(attackerHome));
+    expect(() => readActivationArtifact({ homeDir: attackerHome, identityDigest: published.identityDigest })).toThrow(
+      ActivationArtifactPresenceUnresolvableError,
+    );
+  });
+
+  it("refuses an artifact directory with an untrusted mode", () => {
+    const homeDir = home();
+    const { published } = storedFixture(homeDir);
+    chmodSync(activationArtifactDirectory(homeDir), 0o755);
+    expect(() => readActivationArtifact({ homeDir, identityDigest: published.identityDigest })).toThrow(
+      ActivationArtifactPresenceUnresolvableError,
+    );
+  });
+
+  it("reports an absent artifact file inside an existing artifact directory as null", () => {
+    const homeDir = home();
+    const { published } = storedFixture(homeDir);
+    const other = published.identityDigest === HASH_A ? HASH_B : HASH_A;
+    expect(readActivationArtifact({ homeDir, identityDigest: other })).toBeNull();
+  });
+
+  it("reports an absent private LCM root as an absent artifact", () => {
+    const homeDir = homeWithoutLcmRoot();
+    expect(readActivationArtifact({ homeDir, identityDigest: HASH_A })).toBeNull();
+  });
+
+  it("refuses when the artifact directory is replaced while the file is being read", () => {
+    const homeDir = home();
+    const { published } = storedFixture(homeDir);
+    const directory = activationArtifactDirectory(homeDir);
+    expect(() =>
+      readActivationArtifact(
+        { homeDir, identityDigest: published.identityDigest },
+        {
+          readWithStat: (path: string, options: BoundedFileOptions) => {
+            const result = readBoundedRegularFileWithStat(path, options);
+            renameSync(directory, directory + ".moved");
+            mkdirSync(directory, { mode: 0o700 });
+            return result;
+          },
+        },
+      ),
+    ).toThrow(ActivationArtifactPresenceUnresolvableError);
+  });
+
+  it("refuses a valid record stored under a file name that is not its identity digest", () => {
+    const homeDir = home();
+    const { published } = storedFixture(homeDir);
+    const wrongDigest = published.identityDigest === HASH_A ? HASH_B : HASH_A;
+    copyFileSync(published.path, activationArtifactPath(homeDir, wrongDigest));
+    chmodSync(activationArtifactPath(homeDir, wrongDigest), 0o600);
+    expect(() => readActivationArtifact({ homeDir, identityDigest: wrongDigest })).toThrow(
+      ActivationArtifactIdentityMismatchError,
+    );
+  });
+
+  it("closes the directory descriptor after a successful read and after a refused read", () => {
+    const homeDir = home();
+    const { published } = storedFixture(homeDir);
+    const wrongDigest = published.identityDigest === HASH_A ? HASH_B : HASH_A;
+    copyFileSync(published.path, activationArtifactPath(homeDir, wrongDigest));
+    chmodSync(activationArtifactPath(homeDir, wrongDigest), 0o600);
+    const store = activationArtifactDirectory(homeDir);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpenSync = nodeFs.openSync as (path: string, flags: unknown, mode?: unknown) => number;
+    const originalCloseSync = nodeFs.closeSync as (fd: number) => void;
+    const open = new Set<number>();
+    withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
+      const fd = mode === undefined ? originalOpenSync(path, flags) : originalOpenSync(path, flags, mode);
+      if (path === store) open.add(fd);
+      return fd;
+    }) as never, () => withPatchedFs("closeSync", ((fd: number) => {
+      open.delete(fd);
+      originalCloseSync(fd);
+    }) as never, () => {
+      expect(readActivationArtifact({ homeDir, identityDigest: published.identityDigest })).not.toBeNull();
+      expect(open.size).toBe(0);
+      expect(() => readActivationArtifact({ homeDir, identityDigest: wrongDigest })).toThrow(
+        ActivationArtifactIdentityMismatchError,
+      );
+      expect(open.size).toBe(0);
+    }));
+  });
+});
+

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   chmodSync,
   mkdirSync,
@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { projectsDir } from "../../src/runtime-paths.js";
+import { lcmHomeDir, projectsDir } from "../../src/runtime-paths.js";
 import { projectMapPath, clearProjectMapCache } from "../../src/project-map.js";
 import { checkActivationProjectCoverage } from "../../src/migration/activation-coverage.js";
 
@@ -20,6 +20,7 @@ afterEach(() => {
     try { chmodSync(root, 0o700); } catch { /* best-effort */ }
     try { chmodSync(join(root, ".lcm"), 0o700); } catch { /* best-effort */ }
     try { chmodSync(join(root, ".lcm", "projects"), 0o700); } catch { /* best-effort */ }
+    try { chmodSync(join(root, ".lcm", "events"), 0o700); } catch { /* best-effort */ }
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -45,6 +46,13 @@ function projectDir(homeDir: string, hash: string): string {
 /** Give a project directory real stored data (a db.sqlite file). */
 function withStoredData(dir: string): void {
   writeFileSync(join(dir, "db.sqlite"), "sqlite-bytes");
+}
+
+/** Give a hash real stored data in the events directory (<hash>.db only). */
+function withEventsData(homeDir: string, hash: string): void {
+  const dir = join(lcmHomeDir(homeDir), "events");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(dir, hash + ".db"), "events-bytes");
 }
 
 /** Write a real, valid map.json covering exactly the given hashes. Each
@@ -170,6 +178,138 @@ describe("checkActivationProjectCoverage", () => {
     expect(result.reason).toBe("projects-directory-unresolvable");
     expect(result.coveredProjectCount).toBe(0);
     expect(result.uncoveredProjectDirectories).toEqual([]);
+  });
+
+  it("is unsatisfied for an events-only project (no projects/<hash> directory) with no map entry", () => {
+    const homeDir = home();
+    withEventsData(homeDir, HASH_A);
+    writeMap(homeDir, []);
+    const result = checkActivationProjectCoverage({ homeDir });
+    expect(result.status).toBe("unsatisfied");
+    expect(result.reason).toBe("uncovered-project-directories");
+    expect(result.coveredProjectCount).toBe(0);
+    expect(result.uncoveredProjectDirectories).toEqual([
+      { hash: HASH_A, detail: "project hash " + HASH_A + " has stored data but no current project-map entry covers it" },
+    ]);
+  });
+
+  it("counts an events-only project covered by the map", () => {
+    const homeDir = home();
+    withEventsData(homeDir, HASH_A);
+    writeMap(homeDir, [HASH_A]);
+    const result = checkActivationProjectCoverage({ homeDir });
+    expect(result).toEqual({
+      status: "satisfied",
+      reason: "complete-coverage",
+      detail: expect.any(String),
+      coveredProjectCount: 1,
+      uncoveredProjectDirectories: [],
+    });
+  });
+
+  it("treats a project directory without db.sqlite as having stored data when events/<hash>.db exists", () => {
+    const homeDir = home();
+    projectDir(homeDir, HASH_A);
+    withEventsData(homeDir, HASH_A);
+    writeMap(homeDir, []);
+    const result = checkActivationProjectCoverage({ homeDir });
+    expect(result.status).toBe("unsatisfied");
+    expect(result.uncoveredProjectDirectories).toEqual([
+      { hash: HASH_A, detail: expect.stringContaining(HASH_A) },
+    ]);
+  });
+
+  it("counts a hash once when it has both db.sqlite and an events database", () => {
+    const homeDir = home();
+    withStoredData(projectDir(homeDir, HASH_A));
+    withEventsData(homeDir, HASH_A);
+    writeMap(homeDir, [HASH_A]);
+    const result = checkActivationProjectCoverage({ homeDir });
+    expect(result.status).toBe("satisfied");
+    expect(result.coveredProjectCount).toBe(1);
+  });
+
+  it("ignores events entries that are not <hash>.db files", () => {
+    const homeDir = home();
+    withEventsData(homeDir, HASH_A);
+    const events = join(lcmHomeDir(homeDir), "events");
+    writeFileSync(join(events, ".machine-sequence.sqlite"), "x");
+    writeFileSync(join(events, HASH_B + ".db-wal"), "x");
+    writeFileSync(join(events, "short.db"), "x");
+    writeMap(homeDir, [HASH_A]);
+    const result = checkActivationProjectCoverage({ homeDir });
+    expect(result.status).toBe("satisfied");
+    expect(result.coveredProjectCount).toBe(1);
+  });
+
+  it("resolves the events directory against the supplied homeDir, not the ambient home", () => {
+    const homeDir = home();
+    const readEventsDirectoryEntries = vi.fn(() => [] as never[]);
+    writeMap(homeDir, []);
+    checkActivationProjectCoverage({ homeDir }, { readEventsDirectoryEntries });
+    expect(readEventsDirectoryEntries).toHaveBeenCalledWith(join(lcmHomeDir(homeDir), "events"));
+  });
+
+  it("is unresolvable with events-directory-unresolvable when the events directory cannot be listed (injected)", () => {
+    const homeDir = home();
+    withStoredData(projectDir(homeDir, HASH_A));
+    writeMap(homeDir, [HASH_A]);
+    const boom = Object.assign(new Error("permission denied"), { code: "EACCES" });
+    const result = checkActivationProjectCoverage(
+      { homeDir },
+      { readEventsDirectoryEntries: () => { throw boom; } },
+    );
+    expect(result.status).toBe("unresolvable");
+    expect(result.reason).toBe("events-directory-unresolvable");
+    expect(result.coveredProjectCount).toBe(0);
+    expect(result.uncoveredProjectDirectories).toEqual([]);
+  });
+
+  it("is unresolvable with events-directory-unresolvable for a genuinely unreadable events directory", () => {
+    const homeDir = home();
+    withEventsData(homeDir, HASH_A);
+    writeMap(homeDir, [HASH_A]);
+    const events = join(lcmHomeDir(homeDir), "events");
+    chmodSync(events, 0o000);
+    try {
+      const result = checkActivationProjectCoverage({ homeDir });
+      expect(result.status).toBe("unresolvable");
+      expect(result.reason).toBe("events-directory-unresolvable");
+    } finally {
+      chmodSync(events, 0o700);
+    }
+  });
+
+  it("is unresolvable with events-file-unresolvable when events/<hash>.db cannot be examined (listable but not searchable events directory)", () => {
+    const homeDir = home();
+    withEventsData(homeDir, HASH_A);
+    writeMap(homeDir, [HASH_A]);
+    const events = join(lcmHomeDir(homeDir), "events");
+    chmodSync(events, 0o400);
+    try {
+      const result = checkActivationProjectCoverage({ homeDir });
+      expect(result.status).toBe("unresolvable");
+      expect(result.reason).toBe("events-file-unresolvable");
+      expect(result.detail).toContain(HASH_A);
+    } finally {
+      chmodSync(events, 0o700);
+    }
+  });
+
+  it("keeps project-directory-unresolvable when db.sqlite cannot be examined even if the events database exists", () => {
+    const homeDir = home();
+    const dir = projectDir(homeDir, HASH_A);
+    withStoredData(dir);
+    withEventsData(homeDir, HASH_A);
+    writeMap(homeDir, [HASH_A]);
+    chmodSync(dir, 0o000);
+    try {
+      const result = checkActivationProjectCoverage({ homeDir });
+      expect(result.status).toBe("unresolvable");
+      expect(result.reason).toBe("project-directory-unresolvable");
+    } finally {
+      chmodSync(dir, 0o700);
+    }
   });
 
   it("is unresolvable when one specific project directory cannot be read (genuine EACCES fixture)", () => {

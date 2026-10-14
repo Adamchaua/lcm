@@ -80,6 +80,7 @@ export type ActivationQuiescenceReason =
   | "quiescence-observed"
   | "maintenance-journal-absent"
   | "maintenance-journal-unresolvable"
+  | "maintenance-not-held"
   | "roster-not-single-machine"
   | "machine-identity-unavailable"
   | "roster-row-absent";
@@ -248,6 +249,15 @@ export async function checkActivationWriterQuiescence(
       return buildResult("unsatisfied", "maintenance-journal-absent", journalOutcome.detail, null);
     }
     const journal: BackendMaintenanceJournal = journalOutcome.value;
+
+    if (journal.phase !== "maintenance-held") {
+      return buildResult(
+        "unsatisfied",
+        "maintenance-not-held",
+        `the maintenance journal is in phase ${journal.phase}; writer quiescence is only attributable while maintenance is held (phase maintenance-held)`,
+        null,
+      );
+    }
 
     if (journal.roster.length !== 1) {
       return buildResult(

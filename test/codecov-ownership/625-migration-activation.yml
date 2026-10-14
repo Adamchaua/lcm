@@ -4,7 +4,11 @@ rationale: >-
   admission, quiescence, coverage, artifact store, PostgreSQL activation
   lease, publication step and generation-binding writer) under src/migration/,
   so they stay in the directory-level migration cutover owner; no topology
-  change.
+  change. Also covers the review-thread hardening of those modules (#1443
+  threads, #1452 thread): publication journal gate, artifact directory and
+  digest authentication, scratch-twin directory durability, restart pid
+  attribution, events-database coverage and the maintenance-held quiescence
+  check.
 pins:
   - ["src/migration/activation-absence.ts", "unit-migration-cutover"]
   - ["src/migration/activation-artifact-store.ts", "unit-migration-cutover"]

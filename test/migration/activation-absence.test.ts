@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, openSync, closeSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, openSync, closeSync, rmSync, writeFileSync } from "node:fs";
 import { open as openAsync } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

@@ -77,6 +77,35 @@ function registerMachine(homeDir: string, machineId: string): void {
   finalizeMachineIdentity(pending, machineId, "Test Machine", homeDir);
 }
 
+/** Drive a freshly entered (maintenance-held) journal to a later phase. */
+async function advanceMaintenance(
+  homeDir: string,
+  phase: "maintenance-aborted" | "selection-prepared" | "selection-completed",
+): Promise<void> {
+  const subject = coordinator(homeDir);
+  const held = subject.inspectMaintenance()!;
+  if (phase === "maintenance-aborted") {
+    await subject.abortMaintenance({
+      expectedChecksumSha256: held.checksumSha256,
+      sourceSelectionSha256: HASH_A,
+      abortEvidenceSha256: HASH_B,
+    });
+    return;
+  }
+  const prepared = await subject.prepareMaintenanceSelection({
+    expectedChecksumSha256: held.checksumSha256,
+    generationId: "generation-1",
+    targetBackend: "postgresql",
+    terminalEvidenceSha256: HASH_B,
+  });
+  if (phase === "selection-prepared") return;
+  await subject.completeMaintenanceSelection({
+    expectedChecksumSha256: prepared.checksumSha256,
+    generationId: "generation-1",
+    terminalEvidenceSha256: HASH_B,
+  });
+}
+
 /**
  * checkActivationWriterQuiescence requires an already-active append-barrier
  * lockToken (see the module's precondition). Every test acquires that
@@ -138,6 +167,38 @@ describe("checkActivationWriterQuiescence", () => {
       reason: "roster-not-single-machine",
       quiescenceFence: null,
     });
+  });
+
+  it.each(["maintenance-aborted", "selection-prepared", "selection-completed"] as const)(
+    "is unsatisfied with maintenance-not-held when the journal is in phase %s, even for a matching one-machine roster",
+    async (phase) => {
+      const homeDir = home();
+      registerMachine(homeDir, MACHINE_A);
+      await enterMaintenanceWithRoster(homeDir, [
+        { machineId: MACHINE_A, queueCutoff: "0000000000000000012", evidenceSha256: HASH_A },
+      ]);
+      await advanceMaintenance(homeDir, phase);
+      expect(coordinator(homeDir).inspectMaintenance()?.phase).toBe(phase);
+      const result = await checkUnderBarrier(homeDir);
+      expect(result).toMatchObject({
+        status: "unsatisfied",
+        reason: "maintenance-not-held",
+        quiescenceFence: null,
+      });
+      expect(result.detail).toContain(phase);
+    },
+  );
+
+  it("checks the maintenance phase before the roster test", async () => {
+    const homeDir = home();
+    registerMachine(homeDir, MACHINE_A);
+    await enterMaintenanceWithRoster(homeDir, [
+      { machineId: MACHINE_A, queueCutoff: "0000000000000000012", evidenceSha256: HASH_A },
+      { machineId: MACHINE_B, queueCutoff: "0000000000000000013", evidenceSha256: HASH_B },
+    ]);
+    await advanceMaintenance(homeDir, "maintenance-aborted");
+    const result = await checkUnderBarrier(homeDir);
+    expect(result.reason).toBe("maintenance-not-held");
   });
 
   it("is unresolvable when this machine has no registered identity", async () => {

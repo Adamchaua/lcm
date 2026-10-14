@@ -1,4 +1,8 @@
 import {
+  isTerminalBackendMaintenancePhase,
+  readBackendMaintenanceJournal,
+  readBackendPublicationJournal,
+  type BackendMaintenanceJournal,
   type BackendPublicationJournal,
   type BackendPublicationLockToken,
   type BackendPublicationRecoveryMaterial,
@@ -15,6 +19,7 @@ import {
 import {
   readActivationArtifact,
   ActivationArtifactPresenceUnresolvableError,
+  ActivationArtifactIdentityMismatchError,
   type ActivationArtifactProjectRecord,
   type ActivationArtifactRecoveryMaterial,
 } from "./activation-artifact-store.js";
@@ -188,6 +193,13 @@ export type ActivationPublicationDependencies = Readonly<{
   readArtifact?: (
     input: Readonly<{ homeDir?: string; identityDigest: string }>,
   ) => ActivationArtifactRecoveryMaterial | null;
+  /** Override the read-only version-3 maintenance journal peek. Defaults to
+   * readBackendMaintenanceJournal. It returns null both for no journal and
+   * for a valid version-2 journal. */
+  readMaintenanceJournal?: (homeDir?: string) => BackendMaintenanceJournal | null;
+  /** Override the read-only version-2 publication journal peek. Defaults to
+   * readBackendPublicationJournal. */
+  readPublicationJournal?: (homeDir?: string) => BackendPublicationJournal | null;
 }>;
 
 export type ActivationPublicationFenceCheck = Readonly<{
@@ -204,7 +216,10 @@ export type ActivationPublicationStatus =
   | "fence-unresolvable"
   | "artifact-missing"
   | "artifact-unresolvable"
-  | "artifact-identity-mismatch";
+  | "artifact-identity-mismatch"
+  | "duplicate-publication-input"
+  | "publication-unresolvable"
+  | "maintenance-in-flight";
 
 /** Attributed dispatch result. journal is populated whenever the
  * coordinator was actually invoked and returned one (including a
@@ -242,6 +257,11 @@ function projectCoverageKey(
  * confirmed, which is a caller-wiring bug this function refuses rather
  * than silently publishing an unrelated project set.
  */
+function hasDuplicateProject(projects: readonly ActivationPublicationProjectInput[]): boolean {
+  return new Set(projects.map((project) => project.localProjectId)).size !== projects.length
+    || new Set(projects.map((project) => project.remoteProjectId)).size !== projects.length;
+}
+
 function sameProjectCoverage(
   artifactProjects: readonly ActivationArtifactProjectRecord[],
   inputProjects: readonly ActivationPublicationProjectInput[],
@@ -264,42 +284,99 @@ export async function driveActivationPublication(
   dependencies: ActivationPublicationDependencies = {},
 ): Promise<ActivationPublicationResult> {
   const readArtifact = dependencies.readArtifact ?? readActivationArtifact;
+  const readMaintenanceJournal = dependencies.readMaintenanceJournal ?? readBackendMaintenanceJournal;
+  const readPublicationJournal = dependencies.readPublicationJournal ?? readBackendPublicationJournal;
 
   const fenceChecks: ActivationPublicationFenceCheck[] = [];
-  for (const project of input.projects) {
-    const assertion = await assertActivationLeaseFence(guard, {
-      projectId: project.remoteProjectId,
-      publicationId: input.publicationId,
-      targetBackend: input.targetBackend,
-      evidenceSha256: project.evidenceSha256,
-      signal: input.signal,
-    });
-    fenceChecks.push({
-      localProjectId: project.localProjectId,
-      remoteProjectId: project.remoteProjectId,
-      assertion,
-    });
+
+  // Caller-wiring refusal first, before any I/O: a repeated local or remote
+  // project id (normalizeProjects rejects the same shape for the artifact).
+  if (hasDuplicateProject(input.projects)) {
+    return buildResult(
+      "duplicate-publication-input",
+      "the covered projects repeat a localProjectId or a remoteProjectId; each project must appear exactly once",
+      null,
+      fenceChecks,
+    );
   }
 
-  const unresolvable = fenceChecks.find((check) => check.assertion.status === "unresolvable");
-  if (unresolvable !== undefined) {
+  // Read-only peeks, unlocked: the journal file is single, and every path
+  // below that mutates or reports success re-enters the coordinator under
+  // the retained token, which asserts it. A stale peek therefore fails
+  // closed (prepare refuses a non-terminal journal) rather than mutating.
+  let maintenance: BackendMaintenanceJournal | null;
+  let existing: BackendPublicationJournal | null = null;
+  try {
+    maintenance = readMaintenanceJournal(input.homeDir);
+    if (maintenance === null) existing = readPublicationJournal(input.homeDir);
+  } catch (error) {
     return buildResult(
-      "fence-unresolvable",
-      "the fenced lease for project " + unresolvable.remoteProjectId + " could not be attributed: " +
-        unresolvable.assertion.detail,
+      "publication-unresolvable",
+      "the live backend publication journal could not be read: " + (error as Error).message,
       null,
       fenceChecks,
     );
   }
-  const unsatisfied = fenceChecks.find((check) => check.assertion.status === "unsatisfied");
-  if (unsatisfied !== undefined) {
+  if (maintenance !== null && !isTerminalBackendMaintenancePhase(maintenance.phase)) {
     return buildResult(
-      "fence-unsatisfied",
-      "the fenced lease for project " + unsatisfied.remoteProjectId + " is not active and matching: " +
-        unsatisfied.assertion.detail,
+      "maintenance-in-flight",
+      "the backend is held for migration maintenance (journal phase " + maintenance.phase + "); " +
+        "version-2 publication can only follow a terminal maintenance phase (selection-completed or maintenance-aborted)",
       null,
       fenceChecks,
     );
+  }
+  const existingTerminal = existing !== null && (existing.phase === "completed" || existing.phase === "aborted");
+  if (existing !== null && existing.publicationId !== input.publicationId && !existingTerminal) {
+    return buildResult(
+      "publication-collision",
+      "an unrelated backend publication (" + existing.publicationId + ") is already in flight at phase " +
+        existing.phase + "; this coordinator tracks exactly one publication journal at a time and " +
+        "refuses to drive a different generation's journal forward",
+      existing,
+      fenceChecks,
+    );
+  }
+  const sameIdJournal = existing !== null && existing.publicationId === input.publicationId;
+
+  // A terminal journal of this publication has already released its fences,
+  // so its result is reported without requiring active leases.
+  if (!(sameIdJournal && existingTerminal)) {
+    for (const project of input.projects) {
+      const assertion = await assertActivationLeaseFence(guard, {
+        projectId: project.remoteProjectId,
+        publicationId: input.publicationId,
+        targetBackend: input.targetBackend,
+        evidenceSha256: project.evidenceSha256,
+        signal: input.signal,
+      });
+      fenceChecks.push({
+        localProjectId: project.localProjectId,
+        remoteProjectId: project.remoteProjectId,
+        assertion,
+      });
+    }
+
+    const unresolvable = fenceChecks.find((check) => check.assertion.status === "unresolvable");
+    if (unresolvable !== undefined) {
+      return buildResult(
+        "fence-unresolvable",
+        "the fenced lease for project " + unresolvable.remoteProjectId + " could not be attributed: " +
+          unresolvable.assertion.detail,
+        null,
+        fenceChecks,
+      );
+    }
+    const unsatisfied = fenceChecks.find((check) => check.assertion.status === "unsatisfied");
+    if (unsatisfied !== undefined) {
+      return buildResult(
+        "fence-unsatisfied",
+        "the fenced lease for project " + unsatisfied.remoteProjectId + " is not active and matching: " +
+          unsatisfied.assertion.detail,
+        null,
+        fenceChecks,
+      );
+    }
   }
 
   // Every covered project's fence was independently confirmed active and
@@ -307,42 +384,44 @@ export async function driveActivationPublication(
   // lifetime analysis: that confirmation does not survive the awaits
   // below, and the coordinator's own acquireAll step independently
   // re-checks the same fences at the moment it actually consumes them.
-  const recovered = await coordinator.recoverPending({ disposition: "resume" }, input.lockToken);
-  if (recovered !== null && recovered.publicationId === input.publicationId) {
-    return buildResult(
-      recovered.phase === "aborted" ? "aborted" : "completed",
-      "the existing backend publication journal for " + recovered.publicationId + " was driven to phase " +
-        recovered.phase,
-      recovered,
-      fenceChecks,
-    );
-  }
-  if (recovered !== null && recovered.phase !== "completed" && recovered.phase !== "aborted") {
-    return buildResult(
-      "publication-collision",
-      "an unrelated backend publication (" + recovered.publicationId + ") is already in flight at phase " +
-        recovered.phase + "; this coordinator tracks exactly one publication journal at a time and " +
-        "refuses to drive a different generation's journal forward",
-      recovered,
-      fenceChecks,
-    );
+  if (sameIdJournal) {
+    const recovered = await coordinator.recoverPending({ disposition: "resume" }, input.lockToken);
+    if (recovered !== null && recovered.publicationId === input.publicationId) {
+      return buildResult(
+        recovered.phase === "aborted" ? "aborted" : "completed",
+        "the existing backend publication journal for " + recovered.publicationId + " was driven to phase " +
+          recovered.phase,
+        recovered,
+        fenceChecks,
+      );
+    }
+    if (recovered !== null && recovered.phase !== "completed" && recovered.phase !== "aborted") {
+      return buildResult(
+        "publication-collision",
+        "an unrelated backend publication (" + recovered.publicationId + ") is already in flight at phase " +
+          recovered.phase + "; this coordinator tracks exactly one publication journal at a time and " +
+          "refuses to drive a different generation's journal forward",
+        recovered,
+        fenceChecks,
+      );
+    }
   }
 
-  // No journal for this publicationId exists: either recoverPending found
-  // nothing at all, or it found (and left alone) a terminal journal
-  // belonging to an unrelated prior generation -- prepare() below reads
-  // and archives that terminal journal itself before creating a fresh
-  // one, exactly as the coordinator's own prepare() already does for any
-  // terminal existing journal. This is a fresh dispatch, never a second
-  // prepare() on top of one already in flight: recoverPending above
-  // already proved there is no such in-flight journal for this
-  // publicationId.
+  // Fresh dispatch: there is no journal, or only a terminal journal that
+  // prepare() archives itself before writing the new one (an unrelated
+  // terminal version-2 journal, or a terminal selection-completed /
+  // maintenance-aborted version-3 maintenance journal). recoverPending is
+  // never called here: it cannot resume a version-3 journal, and a fresh
+  // prepare under the retained token re-reads the journal itself.
   let artifact: ActivationArtifactRecoveryMaterial | null;
   try {
     artifact = readArtifact({ homeDir: input.homeDir, identityDigest: input.identityDigest });
   } catch (error) {
     if (error instanceof ActivationArtifactPresenceUnresolvableError) {
       return buildResult("artifact-unresolvable", error.message, null, fenceChecks);
+    }
+    if (error instanceof ActivationArtifactIdentityMismatchError) {
+      return buildResult("artifact-identity-mismatch", error.message, null, fenceChecks);
     }
     throw error;
   }

@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fsyncSync, lstatSync, readdirSync, unlinkSync } from "node:fs";
 import {
   type BackendPublicationProjectRecord,
@@ -9,11 +9,13 @@ import { canonicalJson, canonicalSha256 } from "../storage/portable-record.js";
 import {
   OWNER_ONLY_FILE_MODES,
   PRIVATE_FILE_MODE,
+  assertPrivateDirectory,
   atomicWritePrivateFileDurable,
   ensurePrivateDirectory,
   isOwnerOnlyFileMode,
   isPrivateFileCollisionFailure,
   openPrivateDirectory,
+  openPrivateDirectoryIfExists,
   readBoundedRegularFileWithStat,
   type BoundedFileResult,
   type PrivateDirectoryHandle,
@@ -659,6 +661,7 @@ function completeInterruptedScratchUnlink(
   scratchPath: string,
   publishedPath: string,
   publishedIdentity: BoundedFileResult,
+  expectedUid: number | undefined,
 ): bigint | undefined {
   let current;
   try {
@@ -677,8 +680,15 @@ function completeInterruptedScratchUnlink(
   try {
     unlinkSync(scratchPath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return publishedLinkCount(publishedPath);
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  // Make the removal of the twin's directory entry durable before the
+  // caller reports reuse. Open and fsync failures propagate raw.
+  const directoryHandle = openPrivateDirectory(dirname(scratchPath), { expectedUid });
+  try {
+    fsyncSync(directoryHandle.fd);
+  } finally {
+    directoryHandle.close();
   }
   return publishedLinkCount(publishedPath);
 }
@@ -762,7 +772,7 @@ function reconcileArtifactScratchTwin(
   }
   if (twinPath === undefined) return unresolvable();
 
-  const publishedNlink = completeInterruptedScratchUnlink(twinPath, path, finalOutcome.value);
+  const publishedNlink = completeInterruptedScratchUnlink(twinPath, path, finalOutcome.value, expectedUid);
   if (publishedNlink === undefined) return { kind: "absent" };
   if (publishedNlink !== 1n) return unresolvable();
 
@@ -886,6 +896,12 @@ export type ActivationArtifactReadDependencies = Readonly<{
   * converges out of -- is reported as unresolvable here, never silently
   * repaired: reads never mutate, so converging that state is the writer
   * retry's job, not this reader's.
+  *
+  * The artifact directory is opened and authenticated first (no-follow, so
+  * a symlinked directory is refused) and re-asserted after the read, so a
+  * swapped directory cannot redirect it. The parsed record must also hash
+  * to the requested identity digest; a record stored under another name is
+  * an ActivationArtifactIdentityMismatchError, never returned.
   */
  export function readActivationArtifact(
   input: Readonly<{ homeDir?: string; identityDigest: string }>,
@@ -899,35 +915,60 @@ export type ActivationArtifactReadDependencies = Readonly<{
   const expectedUid = dependencies.expectedUid ?? currentUid();
   const readWithStat = dependencies.readWithStat ?? readBoundedRegularFileWithStat;
 
-  let outcome;
+  let handle: PrivateDirectoryHandle | undefined;
   try {
-    outcome = attributeNullableRead<BoundedFileResult>(
-      () => readWithStat(path, {
-        allowedRoot: directory,
-        maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
-        expectedUid,
-        allowedModes: [PRIVATE_FILE_MODE],
-        requireSingleLink: true,
-      }),
-    );
+    handle = openPrivateDirectoryIfExists(directory, { expectedUid });
   } catch (error) {
-    if (isMultipleHardLinksError(error)) {
+    throw new ActivationArtifactPresenceUnresolvableError(
+      "cannot authenticate the activation artifact directory " + directory + ": " + (error as Error).message,
+      { cause: error },
+    );
+  }
+  if (handle === undefined) return null;
+  try {
+    let outcome;
+    try {
+      outcome = attributeNullableRead<BoundedFileResult>(
+        () => readWithStat(path, {
+          allowedRoot: directory,
+          maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
+          expectedUid,
+          allowedModes: [PRIVATE_FILE_MODE],
+          requireSingleLink: true,
+        }),
+      );
+    } catch (error) {
+      if (isMultipleHardLinksError(error)) {
+        throw new ActivationArtifactPresenceUnresolvableError(
+          "activation artifact at " + path +
+            " has multiple hard links and cannot be authenticated by a read; retry publication to converge the interrupted durable write",
+        );
+      }
+      throw error;
+    }
+    if (outcome.kind === "unresolvable") {
       throw new ActivationArtifactPresenceUnresolvableError(
-        "activation artifact at " + path +
-          " has multiple hard links and cannot be authenticated by a read; retry publication to converge the interrupted durable write",
+        "cannot determine whether an activation artifact exists at " + path + ": " + outcome.detail,
       );
     }
-    throw error;
+    const material = outcome.kind === "absent" ? null : parseActivationArtifactMaterial(outcome.value.content, path);
+    try {
+      assertPrivateDirectory(handle, directory, handle.witness, expectedUid);
+    } catch (error) {
+      throw new ActivationArtifactPresenceUnresolvableError(
+        "the activation artifact directory " + directory + " changed during the read: " + (error as Error).message,
+        { cause: error },
+      );
+    }
+    if (material !== null && computeActivationArtifactIdentityDigest(material) !== input.identityDigest) {
+      throw new ActivationArtifactIdentityMismatchError(
+        "the activation artifact stored at " + path + " does not hash to identity digest " + input.identityDigest,
+      );
+    }
+    return material;
+  } finally {
+    handle.close();
   }
-  if (outcome.kind === "unresolvable") {
-    throw new ActivationArtifactPresenceUnresolvableError(
-      "cannot determine whether an activation artifact exists at " + path + ": " + outcome.detail,
-    );
-  }
-  if (outcome.kind === "absent") {
-    return null;
-  }
-  return parseActivationArtifactMaterial(outcome.value.content, path);
 }
 
 export type ActivationArtifactCaptureDependencies = Readonly<{

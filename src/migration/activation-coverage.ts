@@ -1,6 +1,6 @@
 import { readdirSync, statSync, type Dirent } from "node:fs";
 import { join } from "node:path";
-import { projectsDir } from "../runtime-paths.js";
+import { lcmHomeDir, projectsDir } from "../runtime-paths.js";
 import { withProjectMapReconciliationLock } from "../project-map.js";
 import type { BackendPublicationLockToken } from "../storage/backend-publication.js";
 import { attributeNullableRead } from "./activation-absence.js";
@@ -56,7 +56,9 @@ export type ActivationCoverageReason =
   | "complete-coverage"
   | "uncovered-project-directories"
   | "projects-directory-unresolvable"
-  | "project-directory-unresolvable";
+  | "project-directory-unresolvable"
+  | "events-directory-unresolvable"
+  | "events-file-unresolvable";
 
 /** A physical project directory with stored data but no covering
  * project-map entry. */
@@ -103,9 +105,15 @@ export type ActivationCoverageDependencies = Readonly<{
    * directory; see the test suite for the explicit note on why injection
    * is used there instead of a real fixture. */
   readProjectDirectoryEntries?: (root: string) => readonly Dirent[];
+  /** Override listing the events directory's entries (<lcm home>/events).
+   * Defaults to readdirSync(root, { withFileTypes: true }). Separate from
+   * readProjectDirectoryEntries so each directory's read failure is
+   * attributed to its own reason. */
+  readEventsDirectoryEntries?: (root: string) => readonly Dirent[];
 }>;
 
 const PROJECT_HASH_RE = /^[a-f0-9]{64}$/;
+const EVENTS_DATABASE_RE = /^([a-f0-9]{64})\.db$/;
 
 function buildResult(
   status: ActivationCoverageStatus,
@@ -133,6 +141,14 @@ function projectDatabasePath(root: string, hash: string): string {
  * module doc comment above for the two project-map traps this reconciles
  * against and why the locked snapshot seam is required rather than
  * optional.
+ *
+ * A project hash has stored data when projects/<hash>/db.sqlite or
+ * events/<hash>.db exists (the same two files project-map.ts's
+ * existingProjectHasStoredData consults, resolved here against the given
+ * home rather than the ambient one). Hashes are the union of the projects
+ * directory's hash-named directories and the events directory's
+ * <hash>.db files, so an events-only project, which has no projects/<hash>
+ * directory, is still checked.
  */
 export function checkActivationProjectCoverage(
   input: ActivationCoverageInput = {},
@@ -140,8 +156,11 @@ export function checkActivationProjectCoverage(
 ): ActivationCoverageResult {
   const readProjectDirectoryEntries = dependencies.readProjectDirectoryEntries
     ?? ((root: string): readonly Dirent[] => readdirSync(root, { withFileTypes: true }));
+  const readEventsDirectoryEntries = dependencies.readEventsDirectoryEntries
+    ?? ((root: string): readonly Dirent[] => readdirSync(root, { withFileTypes: true }));
   return withProjectMapReconciliationLock((map) => {
     const root = projectsDir(input.homeDir);
+    const eventsRoot = join(lcmHomeDir(input.homeDir), "events");
     const entriesOutcome = attributeNullableRead(() => readProjectDirectoryEntries(root));
     if (entriesOutcome.kind === "unresolvable") {
       return buildResult("unresolvable", "projects-directory-unresolvable", entriesOutcome.detail, 0, []);
@@ -151,11 +170,26 @@ export function checkActivationProjectCoverage(
     // trivially complete (there is nothing to be uncovered).
     const entries = entriesOutcome.kind === "absent" ? [] : entriesOutcome.value;
 
+    const eventsOutcome = attributeNullableRead(() => readEventsDirectoryEntries(eventsRoot));
+    if (eventsOutcome.kind === "unresolvable") {
+      return buildResult("unresolvable", "events-directory-unresolvable", eventsOutcome.detail, 0, []);
+    }
+    // "absent" means the events directory does not exist yet: no events-only
+    // project data can exist under this home.
+    const eventEntries = eventsOutcome.kind === "absent" ? [] : eventsOutcome.value;
+
+    const hashes = new Set<string>();
+    for (const entry of entries) {
+      if (entry.isDirectory() && PROJECT_HASH_RE.test(entry.name)) hashes.add(entry.name);
+    }
+    for (const entry of eventEntries) {
+      const match = EVENTS_DATABASE_RE.exec(entry.name);
+      if (match !== null) hashes.add(match[1]!);
+    }
+
     const uncovered: UncoveredProjectDirectory[] = [];
     let coveredProjectCount = 0;
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !PROJECT_HASH_RE.test(entry.name)) continue;
-      const hash = entry.name;
+    for (const hash of hashes) {
       const statOutcome = attributeNullableRead(() => statSync(projectDatabasePath(root, hash)));
       if (statOutcome.kind === "unresolvable") {
         return buildResult(
@@ -166,16 +200,28 @@ export function checkActivationProjectCoverage(
           [],
         );
       }
-      // "absent" means this hash directory exists but has no db.sqlite yet
-      // (an uninitialized or fully-drained project): nothing there for a
-      // backend-selection change to leave uncovered.
-      if (statOutcome.kind === "absent") continue;
+      // "absent" means this hash has no db.sqlite (an uninitialized,
+      // fully-drained or events-only project); its events database, if any,
+      // still counts as stored data.
+      if (statOutcome.kind === "absent") {
+        const eventsStat = attributeNullableRead(() => statSync(join(eventsRoot, hash + ".db")));
+        if (eventsStat.kind === "unresolvable") {
+          return buildResult(
+            "unresolvable",
+            "events-file-unresolvable",
+            `cannot determine whether project ${hash} has an events database: ${eventsStat.detail}`,
+            0,
+            [],
+          );
+        }
+        if (eventsStat.kind === "absent") continue;
+      }
       if (Object.hasOwn(map, hash)) {
         coveredProjectCount += 1;
       } else {
         uncovered.push({
           hash,
-          detail: `project directory ${hash} has stored data but no current project-map entry covers it`,
+          detail: `project hash ${hash} has stored data but no current project-map entry covers it`,
         });
       }
     }
