@@ -761,6 +761,12 @@ export function parseMigrationActivationWitness(value: unknown): MigrationActiva
     }
   } else if (postEpochDelta === null || (record.rollbackMode !== "pre-write" && record.rollbackMode !== "post-write")) {
     witnessError("invalid-input", "rollback witness is missing required evidence");
+  } else if (record.rollbackMode === "pre-write" && postEpochCensus === null) {
+    // classifyMigrationRollbackMode only ever returns "pre-write" from a
+    // supplied census, so this pair cannot come from the constructor. A
+    // "post-write" witness without a census stays legal: a changed delta
+    // alone is sufficient evidence of a write.
+    witnessError("invalid-input", "pre-write rollback witness is missing its post-epoch census");
   }
   const payload = {
     version: 1 as const,

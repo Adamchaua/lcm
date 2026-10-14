@@ -723,6 +723,34 @@ describe("MigrationActivationWitness", () => {
       "invalid-input",
     );
   });
+  it("rejects a hand-built pre-write rollback payload without a census, but accepts post-write without one", () => {
+    const e = epoch(0);
+    const a = attempt({ epochId: e.epochId, deltaSeed: 0, censusSeed: 0 });
+    const preWriteWithoutCensus = {
+      version: 1 as const,
+      kind: "rollback" as const,
+      epochId: e.epochId,
+      attemptId: a.attemptId,
+      censusMatchVerdict: true,
+      postEpochDelta: canonicalDelta(0),
+      postEpochCensus: null,
+      rollbackMode: "pre-write" as const,
+    };
+    expectWitnessError(
+      () => parseMigrationActivationWitness({
+        ...preWriteWithoutCensus, checksumSha256: migrationWitnessSha256(preWriteWithoutCensus),
+      }),
+      "invalid-input",
+    );
+    // A changed delta alone is sufficient evidence of a write, so the
+    // constructor legitimately produces a post-write witness with no census.
+    const postWrite = createMigrationActivationWitness({
+      kind: "rollback", epoch: e, attempt: a,
+      postEpochDelta: canonicalDelta(1), postEpochCensus: null, rollbackMode: "post-write",
+    });
+    expect(postWrite.postEpochCensus).toBeNull();
+    expect(parseMigrationActivationWitness(postWrite)).toEqual(postWrite);
+  });
   it("parses postEpochDelta and postEpochCensus payloads on a rollback witness", () => {
     const e = epoch(0);
     const a = attempt({ epochId: e.epochId, deltaSeed: 0, censusSeed: 0 });
