@@ -2772,6 +2772,22 @@ describe("verifyMigrationGeneration: public listing probe", () => {
       expect(mismatches).toHaveLength(1);
     });
 
+    it("orders rows that share the uncorrelated identity by title, so the digest does not depend on listing order", async () => {
+      stubDestinationPrimitives();
+      const rowsFor = (titles: ReadonlyArray<string | null>) => titles.map((title, index) => destinationRow(index + 1, "orphan", title));
+      const digestFor = async (titles: ReadonlyArray<string | null>) => (await runOrderedListingProbe(
+        fakeRuntime({ conversationsRows: rowsFor(titles), conversationHeaderRows: [] }) as never,
+        projectId,
+        [{ createdAt: "2026-01-01T00:00:00.111Z", identitySha256: "a".repeat(64), title: null }],
+      ));
+      const forward = await digestFor([null, "A", "B"]);
+      const backward = await digestFor(["B", "A", null]);
+      const shuffled = await digestFor(["A", null, "B"]);
+      expect(forward.mismatch).not.toBeNull();
+      expect(backward.publicListingSha256).toBe(forward.publicListingSha256);
+      expect(shuffled.publicListingSha256).toBe(forward.publicListingSha256);
+    });
+
     it("digests the sorted identity and title pairs per millisecond group under the v2 tag", async () => {
       stubDestinationPrimitives();
       const records = [fakeConversationRecord(createdAt, "session-a", "Alpha"), fakeConversationRecord(createdAt, "session-b", null)];
@@ -2789,11 +2805,10 @@ describe("verifyMigrationGeneration: public listing probe", () => {
     });
   });
 
-  it("round-4 candidate-review-4 P1: a tie group mixing a null title with a real one sorts null first on both sides", async () => {
-    // Exercises compareTieOrderTitle's explicit null placement inside
-    // an actual multi-entry tie group (a single-entry group's sort
-    // never invokes the comparator at all), on both the expected and
-    // actual sides, for a healthy copy that must not be flagged.
+  it("round-4 candidate-review-4 P1: a tie group mixing a null title with a real one is not flagged for a healthy copy", async () => {
+    // A multi-entry tie group where one title is null and the other is
+    // real, listed by the destination in the reverse of the source's
+    // order, for a healthy copy that must not be flagged.
     stubDestinationPrimitives();
     const conversationsRecords = [
       fakeConversationRecord("2026-01-01T00:00:00.111000Z", "untitled"),
