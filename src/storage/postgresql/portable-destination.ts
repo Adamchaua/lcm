@@ -459,7 +459,8 @@ async function canonicalVerification(state:DestinationState,manifest:PortableMan
  * this run did not write. Identity domains are excluded on purpose: their ledger
  * rows are admission-time lookups rather than writes, and machines are
  * project-linked rather than project-owned, so a ledger tally is meaningless for
- * them. The live tally is one database-side count per domain over the same scope
+ * them. The live tally issues two database-side counts per tallied domain: the
+ * ledger tally and the live canonical count, the latter over the same scope
  * predicate as the verification stream (countCanonicalRows). It runs only on the
  * active-to-completed transition, not on post-commit readback, where a legitimate
  * writer may already have added rows. A surplus refuses as

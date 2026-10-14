@@ -627,7 +627,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(244);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1390/#1371 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1390/#1371/#1426 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -853,6 +853,9 @@ describe("Codecov configuration", () => {
       ["src/migration/copy-destination.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
+      // #1426 adds the destination-unexpected-rows error code to the closed
+      // transfer error vocabulary; the file keeps its established owner.
+      ["src/storage/portable-transfer.ts", "unit-storage-abstractions"],
       // #1354 supplies the promoted-memory decision serializer only from the
       // PostgreSQL transaction scope. A component path regex already matched
       // this file, but the owner list had never named it.
@@ -867,6 +870,8 @@ describe("Codecov configuration", () => {
       // #1378 reads back each written record inside the same fenced
       // transaction and stores its content fingerprint; both files keep
       // their established owner.
+      // #1426 counts canonical rows the run did not write before completion
+      // and refuses surplus rows in both files; they keep their owner.
       ["src/storage/postgresql/portable-destination.ts", "integration-postgresql-portable"],
       ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"],
       // #1306 indexes owner exact-content lookup by a generated SHA-256
