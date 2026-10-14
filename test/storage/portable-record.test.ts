@@ -11,6 +11,7 @@ import {
   canonicalSha256,
   comparePortableOrder,
   createPortableRecord,
+  derivePortableConversationIdentity,
   parsePortableRecord,
   serializePortableRecord,
   sha256,
@@ -915,6 +916,21 @@ describe("portable record public seam", () => {
     expect(representativeValues.conversations.conversationFingerprint).toBe(conversationFingerprint);
     expect(representativeValues.messages.conversationIdentitySha256).toBe(conversationIdentitySha256);
     expect(representativeValues["message-parts"].messageIdentitySha256).toBe(messageIdentitySha256);
+  });
+
+  it("derives a conversation fingerprint and identity from header fields exactly as the record does", () => {
+    expect(derivePortableConversationIdentity(conversationOrder)).toEqual({
+      conversationFingerprint, identitySha256: conversationIdentitySha256,
+    });
+    const record = create("conversations", { ...representativeValues.conversations, occurrenceOrdinal: 3 });
+    expect(derivePortableConversationIdentity([...conversationOrder.slice(0, 5), 3] as never).identitySha256)
+      .toBe(record.identitySha256);
+    // The ordinal alone separates identical headers, and a Date is not a stand-in for microsecond text.
+    expect(record.identitySha256).not.toBe(conversationIdentitySha256);
+    expect(derivePortableConversationIdentity([
+      SESSION_ID, CONVERSATION_TITLE, null, "2026-08-13T12:34:56.123457Z", CONVERSATION_UPDATED_AT, 0,
+    ]).conversationFingerprint).not.toBe(conversationFingerprint);
+    expectCode(() => derivePortableConversationIdentity(["", null, null, TIMESTAMP, TIMESTAMP, 0]), "malformed-record");
   });
 
   it.each(PORTABLE_RECORD_DOMAIN_ORDER)("creates a frozen canonical %s record", (domain) => {

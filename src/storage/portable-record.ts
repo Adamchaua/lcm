@@ -2009,6 +2009,25 @@ function conversationIdentityFromOrder(order: CanonicalConversationOrder): strin
   return identitySha256("conversations", [conversationFingerprintFromOrder(order), order[5]]);
 }
 
+/**
+ * The fingerprint and portable identity a conversation record gets from its
+ * header fields and occurrence ordinal. This is the derivation the record
+ * constructor and the record validator apply, exported so that a caller
+ * holding only header fields (a verification read of a copied destination)
+ * derives identities the same way instead of keeping a second copy of the
+ * rule. Timestamps may be six-digit microsecond text, which is what keeps
+ * sub-millisecond precision in the fingerprint; a JavaScript Date cannot.
+ */
+export function derivePortableConversationIdentity(
+  order: PortableRawConversationOrder,
+): Readonly<{ conversationFingerprint: string; identitySha256: string }> {
+  const canonical = normalizeConversationOrder(order, "raw");
+  return Object.freeze({
+    conversationFingerprint: conversationFingerprintFromOrder(canonical),
+    identitySha256: conversationIdentityFromOrder(canonical),
+  });
+}
+
 function messageIdentityFromOrder(order: CanonicalMessageOrder): string {
   return identitySha256("messages", [
     conversationIdentityFromOrder(order.slice(0, 6) as unknown as CanonicalConversationOrder),
