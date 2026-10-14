@@ -756,6 +756,7 @@ describe("daemon server", () => {
     const store = await storeResponse.json() as Record<string, unknown>;
     expect(store).toEqual({
       code: "STORAGE_IDENTITY_REQUIRED",
+      reason: "unbound-postgresql-project",
       storageBackend: "postgresql",
       error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
     });
@@ -786,6 +787,7 @@ describe("daemon server", () => {
       const identityRequired = await response.json() as Record<string, unknown>;
       expect(identityRequired).toEqual({
         code: "STORAGE_IDENTITY_REQUIRED",
+        reason: "unbound-postgresql-project",
         storageBackend: "postgresql",
         error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
       });
@@ -805,6 +807,7 @@ describe("daemon server", () => {
       const identityRequired = await response.json() as Record<string, unknown>;
       expect(identityRequired).toEqual({
         code: "STORAGE_IDENTITY_REQUIRED",
+        reason: "machine-identity-unavailable",
         error: "Machine identity is unavailable. "
           + "Run `lcm machine show` for recovery guidance.",
         storageBackend: "postgresql",

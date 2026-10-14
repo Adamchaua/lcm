@@ -213,6 +213,9 @@ export function settings(
     connectionTimeoutMs: overrides.connectionTimeoutMs ?? 2_000,
     idleTimeoutMs: overrides.idleTimeoutMs ?? 1_000,
     statementTimeoutMs: overrides.statementTimeoutMs ?? 5_000,
+    ...(overrides.snapshotIdleTimeoutMs === undefined
+      ? {}
+      : { snapshotIdleTimeoutMs: overrides.snapshotIdleTimeoutMs }),
   };
 }
 

@@ -1578,6 +1578,21 @@ describe("portable record public seam", () => {
     expect(unsafeCode.stack).not.toContain("/secret/error-code");
   });
 
+  it("attaches an optional cause for callers, without ever including it in JSON", () => {
+    const cause = new Error("private underlying storage cause");
+    const error = new PortableStreamError("source-unavailable", { retryable: true, cause });
+    expect(error.cause).toBe(cause);
+    expect(error.toJSON()).toEqual({
+      name: "PortableStreamError",
+      code: "source-unavailable",
+      retryable: true,
+      message: "Portable record stream error: source-unavailable",
+    });
+    expect(JSON.stringify(error)).not.toContain("private underlying storage cause");
+    expect(JSON.parse(JSON.stringify(error))).not.toHaveProperty("cause");
+    expect(new PortableStreamError("source-unavailable").cause).toBeUndefined();
+  });
+
   it("covers canonical scalar, container, and comparator rejection branches", () => {
     expect(canonicalJson(true)).toBe("true");
     expect(canonicalJson(false)).toBe("false");

@@ -2786,6 +2786,72 @@ describe("portable record stream public seam", () => {
     await unavailableStream.close();
   });
 
+  it("keeps a source-reported retryable source-unavailable read retryable and forwards its cause, unlike other source-reported codes", async () => {
+    // The stream is backend-neutral: it trusts the retryable flag the source
+    // adapter set on its own source-unavailable PortableStreamError (for
+    // PostgreSQL an idle-in-transaction kill or connection termination) and
+    // forwards the adapter's already-sanitized cause. It does not inspect
+    // the cause. Every other source-reported code is recoded to
+    // non-retryable source-invalid.
+    const readFailure = async (failure: PortableStreamError): Promise<unknown> => {
+      const source = new FakePortableSource();
+      const stream = await createPortableRecordStream(source);
+      source.readFailure = failure;
+      try {
+        await stream.readBatch({
+          domain: "messages",
+          maxRecords: 1,
+          maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+        });
+      } catch (error) {
+        return error;
+      } finally {
+        await stream.close();
+      }
+      throw new Error("source read unexpectedly succeeded");
+    };
+
+    const adapterCause = new Error("sanitized adapter cause");
+    const retryable = await readFailure(
+      new PortableStreamError("source-unavailable", { cause: adapterCause, retryable: true }),
+    );
+    expectSanitizedError(retryable, "source-unavailable");
+    expect(retryable).toMatchObject({ retryable: true });
+    expect((retryable as PortableStreamError).cause).toBe(adapterCause);
+
+    // A source-unavailable the adapter marked non-retryable (for example
+    // permission-denied) must fail fast, not retry indefinitely just
+    // because the adapter used the source-unavailable code. An omitted
+    // flag defaults to non-retryable.
+    for (const failure of [
+      new PortableStreamError("source-unavailable", { cause: adapterCause, retryable: false }),
+      new PortableStreamError("source-unavailable", { cause: adapterCause }),
+    ]) {
+      const error = await readFailure(failure);
+      expectSanitizedError(error, "source-invalid");
+      expect(error).toMatchObject({ retryable: false });
+    }
+
+    // A different source-reported code (source-changed) still recodes to
+    // non-retryable source-invalid, as before this change.
+    const changedSource = new FakePortableSource();
+    const changedStream = await createPortableRecordStream(changedSource);
+    changedSource.readFailure = new PortableStreamError("source-changed", { cause: new Error("unused") });
+    try {
+      await changedStream.readBatch({
+        domain: "messages",
+        maxRecords: 1,
+        maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+      });
+      throw new Error("changed-source read unexpectedly succeeded");
+    } catch (error) {
+      expectSanitizedError(error, "source-invalid");
+      expect(error).toMatchObject({ retryable: false });
+      expect((error as PortableStreamError).cause).toBeUndefined();
+    }
+    await changedStream.close();
+  });
+
   it("returns a rejected Promise instead of throwing synchronously for a pre-aborted read", async () => {
     const source = new FakePortableSource();
     const stream = await createPortableRecordStream(source);
@@ -2848,6 +2914,20 @@ describe("portable record stream public seam", () => {
     }
     expect(source.close).toHaveBeenCalledTimes(1);
     await expectAsyncCode(() => stream.readBatch({ domain: "messages", maxRecords: 1, maxBytes: PORTABLE_LIMITS.maxBatchBytes }), "closed");
+  });
+
+  it("forwards the source's own close cause instead of discarding it", async () => {
+    const source = new FakePortableSource();
+    const stream = await createPortableRecordStream(source);
+    const closeCause = new Error("private underlying storage close cause");
+    source.closeFailure = new PortableStreamError("source-unavailable", { cause: closeCause });
+    try {
+      await stream.close();
+      throw new Error("close unexpectedly succeeded");
+    } catch (error) {
+      expectSanitizedError(error, "source-unavailable");
+      expect((error as PortableStreamError).cause).toBe(closeCause);
+    }
   });
 
   it("keeps public batches, checkpoints, manifests, and verifications deeply immutable", async () => {
