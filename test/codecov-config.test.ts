@@ -653,7 +653,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(244);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1390/#1371/#1393/#1413/#1430/#1466 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1390/#1371/#1402/#1407/#1411/#1419/#1393/#1413/#1430/#1466 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -882,6 +882,11 @@ describe("Codecov configuration", () => {
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
       // #1307 explicit-only retained append admission for non-append mutation
       // participants stays storage-abstractions-owned.
+      // #1402 keeps the publication-lock wrapper that classifies unresolved
+      // publication state in this existing owner. The change is confined to
+      // this existing file and adds no component, so it keeps its established
+      // owner; this pin records that decision for a materially changed file.
+      ["src/storage/backend.ts", "unit-storage-abstractions"],
       // #1347 lets a caller that already holds publication admission skip the
       // in-process append tail wait while still taking the append file lock
       // and the maintenance-phase check, and chains an admitted frame behind
@@ -890,6 +895,11 @@ describe("Codecov configuration", () => {
       // confined to this existing file, so it keeps its established owner
       // and the component topology is unchanged; this pin records that
       // decision.
+      // #1411 keeps lock-token origin tracking and the refusal of
+      // synchronous-origin tokens at asynchronous coordinator seams in this
+      // existing owner; #1407 is its test and documentation debt. The change
+      // adds no component, so the file keeps its established owner and this
+      // pin records that decision for a materially changed file.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       // #1229 local outbox diagnostic admission stays local-event-storage-owned.
       ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"],
@@ -913,7 +923,16 @@ describe("Codecov configuration", () => {
       // PostgreSQL transaction scope. A component path regex already matched
       // this file, but the owner list had never named it.
       ["src/storage/postgresql/project-storage.ts", "unit-storage-abstractions"],
+      // #1402 keeps the publication witness classification in this existing
+      // PostgreSQL-runtime owner. The change adds no component, so the file
+      // keeps its established owner; this pin records that decision for a
+      // materially changed file.
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
+      // #1419 keeps the fence-mismatch versus invalid-row distinction in this
+      // existing PostgreSQL-coordination owner. The change adds no component,
+      // so the file keeps its established owner; this pin records that
+      // decision for a materially changed file.
+      ["src/storage/postgresql/publication-guard.ts", "integration-postgresql-coordination"],
       // #1195 checksummed packaged migration loading remains schema-owned.
       // #1306 adds the 0007 promoted-content digest migration and its
       // schema snapshot, keeping the packaged migration manifest here.
