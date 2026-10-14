@@ -115,6 +115,9 @@ const expectedComponents = [
     name: "Unit - Daemon Core",
     paths: [
       "^src/daemon/auth\\.ts$",
+      // #1394 keeps the health storage-backend inference, which no longer
+      // treats an omitted backend as a SQLite claim for releases after
+      // 1.4.3, in this existing daemon-core owner.
       "^src/daemon/client\\.ts$",
       "^src/daemon/config\\.ts$",
       "^src/daemon/content-fence\\.ts$",
@@ -206,6 +209,7 @@ const expectedComponents = [
       // publication, exact replay, and descriptor-bound durability flushes.
       "^src/storage/backend-publication\\.ts$",
       // #910 keeps shared publication retry deadlines monotonic in this owner.
+      // #1394 keeps its exact storage-backend health comparison in this owner.
       "^src/storage/publication-convergence\\.ts$",
       "^src/storage/capabilities\\.ts$",
       "^src/storage/contracts\\.ts$",
@@ -347,6 +351,8 @@ const expectedComponents = [
       // keeps unscoped detached PID publication lifecycle-owned.
       // #1233 keeps publication-contention managed restart recovery lifecycle-owned.
       "^src/daemon/lifecycle-scope\\.ts$",
+      // #1394 keeps fail-closed handling of a daemon that omits its storage
+      // backend in this existing lifecycle owner.
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
       // #1450 keeps stable managed PATH canonicalization and direct executable
@@ -627,7 +633,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(244);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1390/#1371 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1390/#1371/#1394 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -719,6 +725,9 @@ describe("Codecov configuration", () => {
       ["installer/install.ts", "unit-installation"],
       // #1201 observation parser/client, allowlist and server retain daemon-core ownership.
       // Prompt-search publication dispatch remains daemon-core-owned.
+      // #1394 keeps the health storage-backend inference in this existing
+      // owner. The change is confined to existing files and adds no
+      // component, so every touched file keeps its established owner.
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/http-url.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
@@ -817,6 +826,8 @@ describe("Codecov configuration", () => {
       // #944/#950/#966 keep typed daemon-tmp diagnostics, authenticated restart
       // convergence, and bounded birth samples in the service-manager component.
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
+      // #1394 keeps fail-closed handling of a daemon that omits its storage
+      // backend in this existing lifecycle owner.
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
       // #1450 keeps canonical stable managed PATH construction and direct
       // executable admission in the existing service-manager owner.

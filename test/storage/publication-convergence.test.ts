@@ -75,6 +75,11 @@ describe("publication convergence", () => {
     })).resolves.toBeUndefined();
     await expect(capturePublicationIdentity({
       port: 3737, expectedVersion: "1.0.0", expectedStorageBackend: "sqlite",
+      expectedEntrypoint: "/opt/lcm.mjs", expectedRuntimeDigest: "a".repeat(64),
+      deps: deps({ fetch: healthFetch(42, { storageBackend: undefined }) }),
+    })).resolves.toBeUndefined();
+    await expect(capturePublicationIdentity({
+      port: 3737, expectedVersion: "1.0.0", expectedStorageBackend: "sqlite",
       expectedEntrypoint: "/different", expectedRuntimeDigest: identity.runtimeDigest,
       deps: deps(),
     })).resolves.toBeUndefined();
@@ -382,23 +387,13 @@ describe("publication convergence", () => {
     }, healthMismatch)).rejects.toBe(contention);
     expect(healthMismatchAttempts).toBe(1);
     expect(sleeps).toEqual([]);
-    const sqliteDefault = createPublicationConvergence({
-      port: 3737,
-      identity,
-      deps: deps({ fetch: healthFetch(42, { storageBackend: undefined }), platform: undefined, sleep: async () => undefined }),
-    });
-    let sqliteAttempts = 0;
-    await expect(withPublicationAdmissionRetry(() => {
-      sqliteAttempts += 1;
-      if (sqliteAttempts === 1) throw contention;
-      return undefined;
-    }, sqliteDefault)).resolves.toBeUndefined();
   });
 
   it.each([
     ["pid", { pid: 43 }],
     ["version", { version: "2.0.0" }],
     ["storage backend", { storageBackend: "postgresql" }],
+    ["missing storage backend", { storageBackend: undefined }],
     ["entrypoint", { entrypoint: "/different.mjs" }],
     ["runtime digest", { runtimeDigest: "b".repeat(64) }],
     ["missing entrypoint", { entrypoint: undefined }],

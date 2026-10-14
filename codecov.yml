@@ -129,6 +129,9 @@ component_management:
         # admission, #1050 bounded preliminary serialization, and #1106 periodic
         # transcript metadata admission here.
         - "^src/daemon/auth\\.ts$"
+        # #1394 keeps the health storage-backend inference, which no longer
+        # treats an omitted backend as a SQLite claim for releases after
+        # 1.4.3, in this existing daemon-core owner.
         - "^src/daemon/client\\.ts$"
         - "^src/daemon/config\\.ts$"
         - "^src/daemon/content-fence\\.ts$"
@@ -296,6 +299,7 @@ component_management:
         # frames early.
         - "^src/storage/backend-publication\\.ts$"
         # #910 keeps shared publication retry deadlines monotonic in this owner.
+        # #1394 keeps its exact storage-backend health comparison in this owner.
         - "^src/storage/publication-convergence\\.ts$"
         - "^src/storage/capabilities\\.ts$"
         # #1203 retains the required recall evidence envelope in shared contracts.
@@ -463,6 +467,8 @@ component_management:
         # #1132 keeps unscoped detached PID publication lifecycle-owned.
         # #1233 keeps publication-contention managed restart recovery lifecycle-owned.
         - "^src/daemon/lifecycle-scope\\.ts$"
+        # #1394 keeps fail-closed handling of a daemon that omits its storage
+        # backend in this existing lifecycle owner.
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"
         # #1450 keeps stable managed PATH canonicalization and direct executable
