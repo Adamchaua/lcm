@@ -10,7 +10,7 @@ import { PortableTransferError } from '../../src/storage/portable-transfer.js';
 import * as mapping from '../../src/storage/postgresql/portable-mapping.js';
 import { createPortableRecordStream, PORTABLE_RECORD_DOMAIN_ORDER, serializePortableRecord, type PortableDomain } from '../../src/storage/portable-record-stream.js';
 import type { StorageIdentityContext } from '../../src/storage/contracts.js';
-import { PostgreSqlStorageOperationError } from '../../src/storage/postgresql/errors.js';
+import { isPostgreSqlSnapshotTerminationError, PostgreSqlStorageOperationError } from '../../src/storage/postgresql/errors.js';
 
 const projectId = '01990000-0000-7000-8000-000000000001';
 const machineId = '01990000-0000-7000-8000-000000000002';
@@ -356,6 +356,35 @@ describe('PostgreSQL source failure boundaries',()=>{
     const error=await source2.close().catch((e:unknown)=>e);
     expect(error).toMatchObject({code:'source-unavailable'});
     expect((error as {cause?:unknown}).cause).toBe(notQueryable);
+  });
+  it.each([
+    ['a normalized 25P03 idle-in-transaction kill',()=>new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'25P03',true),true],
+    ['a normalized 57P01 shutdown',()=>new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'57P01',true),true],
+    ['a normalized message-only torn connection',()=>new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},null,true),true],
+    ['a raw 25P03 driver error',()=>Object.assign(new Error('raw secret'),{code:'25P03'}),true],
+    ['a raw torn-connection driver error',()=>new Error('Connection terminated unexpectedly'),true],
+    ['a normalized 42501 permission-denied failure',()=>new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'42501',false),false],
+    ['a normalized generic not-queryable failure',()=>new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},null,false),false],
+    ['a raw unrelated driver error',()=>new Error('raw secret'),false],
+  ])('marks a readDomainPage source-unavailable retryable only for genuine termination: %s',async(_name,makeFailure,retryable)=>{
+    const h=dataHarness(),source=await open(h),failure=makeFailure();
+    h.read.mockRejectedValue(failure);
+    const error=await source.readDomainPage(page('project')).catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable',retryable});
+    expect((error as codec.PortableStreamError).retryable).toBe(isPostgreSqlSnapshotTerminationError(failure));
+    expect(JSON.stringify(error)).not.toContain('raw secret');
+    await source.close();
+  });
+  it('lets the generic stream retry a PostgreSQL termination and fail fast on a non-transient source failure',async()=>{
+    const retry=dataHarness(),retrySource=await open(retry),retryStream=await createPortableRecordStream(retrySource);
+    retry.read.mockRejectedValue(new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'25P03',true));
+    const retryError=await retryStream.readBatch({domain:'project',maxRecords:1,maxBytes:150994944}).catch((e:unknown)=>e);
+    expect(retryError).toMatchObject({code:'source-unavailable',retryable:true});
+
+    const denied=dataHarness(),deniedSource=await open(denied),deniedStream=await createPortableRecordStream(deniedSource);
+    denied.read.mockRejectedValue(new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'42501',false));
+    const deniedError=await deniedStream.readBatch({domain:'project',maxRecords:1,maxBytes:150994944}).catch((e:unknown)=>e);
+    expect(deniedError).toMatchObject({code:'source-invalid',retryable:false});
   });
   it('drives the generic stream close-cause-forwarding true arm through the real PostgreSQL source, not a synthetic double',async()=>{
     // portable-record-stream.ts's own close() forwards error.cause only

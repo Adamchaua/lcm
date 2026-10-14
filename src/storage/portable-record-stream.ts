@@ -10,7 +10,6 @@ import {
   serializePortableRecord,
   sha256,
 } from "./portable-record.js";
-import { isPostgreSqlSnapshotTerminationError } from "./postgresql/errors.js";
 import type {
   PortableDomain,
   PortableRecord,
@@ -854,15 +853,14 @@ async function readSourcePage(
     checkAbort(input.signal);
     if (error instanceof PortableStreamError) {
       // A source-unavailable PortableStreamError is preserved as retryable
-      // only when its cause genuinely indicates a PostgreSQL connection
-      // termination or idle-in-transaction kill (25P03/08xxx/57P0x, or a
-      // message-only torn connection that survives normalization as
-      // retryable with no sqlState). safeError's fallback branch also
-      // reports source-unavailable for a non-transient storage failure it
-      // does not otherwise recognize (for example permission-denied); that
-      // must still fail fast as source-invalid, exactly like every other
-      // source-reported code, not retry indefinitely.
-      if (error.code === "source-unavailable" && isPostgreSqlSnapshotTerminationError(error.cause)) {
+      // only when the source adapter itself marked it retryable (for
+      // PostgreSQL: a genuine connection termination or idle-in-transaction
+      // kill). An adapter reports source-unavailable with retryable false
+      // for a non-transient failure it does not otherwise recognize (for
+      // example permission-denied); that must still fail fast as
+      // source-invalid, exactly like every other source-reported code, not
+      // retry indefinitely.
+      if (error.code === "source-unavailable" && error.retryable) {
         sourceFailure("source-unavailable", error.cause);
       }
       sourceFailure("source-invalid");

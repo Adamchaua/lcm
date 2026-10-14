@@ -313,9 +313,9 @@ component_management:
         # here.
         - "^src/storage/portable-record\\.ts$"
         # The #763 manifest and #816 checkpoint negative-zero taxonomies remain storage-abstractions-owned.
-        # #1410 classifies a read-path source-unavailable as retryable only
-        # when its cause is a genuine PostgreSQL connection termination or
-        # idle kill, and forwards the source's close cause, here.
+        # #1410 forwards the source's close cause here. #1442 classifies a
+        # read-path source-unavailable as retryable only when the source
+        # adapter marked it retryable, so the stream stays backend-neutral.
         - "^src/storage/portable-record-stream\\.ts$"
         # #618 shared canonical transfer and bounded validation index.
         - "^src/storage/portable-transfer\\.ts$"
@@ -507,7 +507,8 @@ component_management:
       paths:
         # #618 canonical self-provenance stays in PostgreSQL portable transfer.
         # #1410 narrows session-close tolerance to a real snapshot-
-        # termination diagnostic here.
+        # termination diagnostic here. #1442 marks a genuine termination
+        # retryable on the source-unavailable it raises.
         # #1378 re-derives each written record's canonical content
         # fingerprint inside the completion transaction, batched via a
         # new readCanonicalContentRows; ownership is unchanged.

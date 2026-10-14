@@ -221,9 +221,9 @@ const expectedComponents = [
       // #1410 adds the optional, non-serialized PortableStreamError cause
       // here.
       "^src/storage/portable-record\\.ts$",
-      // #1410 classifies a read-path source-unavailable as retryable only
-      // when its cause is a genuine PostgreSQL connection termination or
-      // idle kill, and forwards the source's close cause, here.
+      // #1410 forwards the source's close cause here. #1442 classifies a
+      // read-path source-unavailable as retryable only when the source
+      // adapter marked it retryable, so the stream stays backend-neutral.
       "^src/storage/portable-record-stream\\.ts$",
       "^src/storage/portable-transfer\\.ts$",
       "^src/storage/portable-index\\.ts$",
@@ -402,7 +402,8 @@ const expectedComponents = [
     paths: [
       // #618 canonical self-provenance stays in PostgreSQL portable transfer.
       // #1410 narrows session-close tolerance to a real snapshot-
-      // termination diagnostic here.
+      // termination diagnostic here. #1442 marks a genuine termination
+      // retryable on the source-unavailable it raises.
       "^src/storage/postgresql/portable-source\\.ts$",
       "^src/storage/postgresql/portable-destination\\.ts$",
       "^src/storage/postgresql/portable-mapping\\.ts$",

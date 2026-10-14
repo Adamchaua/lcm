@@ -76,8 +76,12 @@ function safeError(error: unknown): PortableStreamError {
   // StorageOperationError never carries connection strings, credentials or
   // raw driver detail such as internalQuery/host). A raw, unnormalized
   // error is never attached: that is the leak path.
+  // retryable marks a genuine connection termination or idle-in-transaction
+  // kill so the backend-neutral stream can retry it without knowing
+  // PostgreSQL SQLSTATE semantics.
   return new PortableStreamError("source-unavailable", {
     cause: error instanceof StorageOperationError ? error : undefined,
+    retryable: isPostgreSqlSnapshotTerminationError(error),
   });
 }
 function invalid(): never { throw new PortableStreamError("source-invalid"); }

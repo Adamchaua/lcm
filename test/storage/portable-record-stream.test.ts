@@ -2,7 +2,6 @@ import { validatePortableTransferBatch } from "../../src/storage/portable-transf
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import * as portableRecordStream from "../../src/storage/portable-record-stream.js";
-import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 import {
   PORTABLE_LIMITS,
   PORTABLE_RECORD_DOMAIN_ORDER,
@@ -2787,90 +2786,51 @@ describe("portable record stream public seam", () => {
     await unavailableStream.close();
   });
 
-  it("keeps a source-reported source-unavailable read retryable and forwards its cause, unlike other source-reported codes", async () => {
-    // A mid-transfer idle-kill (PostgreSQL 25P03) arrives here as a
-    // PortableStreamError already classified "source-unavailable" by the
-    // adapter, carrying the already-normalized, already-sanitized
-    // PostgreSqlStorageOperationError as cause. It must stay retryable
-    // "source-unavailable", not be recoded to non-retryable
-    // "source-invalid" the way every other source-reported code is.
-    const idleKillCause = new PostgreSqlStorageOperationError(
-      "STORAGE_OPERATION_FAILED",
-      { domain: "transaction", operation: "snapshot", projectId: "project" },
-      "25P03",
-      true,
-    );
-    const idleKillSource = new FakePortableSource();
-    const idleKillStream = await createPortableRecordStream(idleKillSource);
-    idleKillSource.readFailure = new PortableStreamError("source-unavailable", { cause: idleKillCause });
-    try {
-      await idleKillStream.readBatch({
-        domain: "messages",
-        maxRecords: 1,
-        maxBytes: PORTABLE_LIMITS.maxBatchBytes,
-      });
-      throw new Error("idle-kill read unexpectedly succeeded");
-    } catch (error) {
-      expectSanitizedError(error, "source-unavailable");
-      expect(error).toMatchObject({ retryable: true });
-      expect((error as PortableStreamError).cause).toBe(idleKillCause);
-    }
-    await idleKillStream.close();
+  it("keeps a source-reported retryable source-unavailable read retryable and forwards its cause, unlike other source-reported codes", async () => {
+    // The stream is backend-neutral: it trusts the retryable flag the source
+    // adapter set on its own source-unavailable PortableStreamError (for
+    // PostgreSQL an idle-in-transaction kill or connection termination) and
+    // forwards the adapter's already-sanitized cause. It does not inspect
+    // the cause. Every other source-reported code is recoded to
+    // non-retryable source-invalid.
+    const readFailure = async (failure: PortableStreamError): Promise<unknown> => {
+      const source = new FakePortableSource();
+      const stream = await createPortableRecordStream(source);
+      source.readFailure = failure;
+      try {
+        await stream.readBatch({
+          domain: "messages",
+          maxRecords: 1,
+          maxBytes: PORTABLE_LIMITS.maxBatchBytes,
+        });
+      } catch (error) {
+        return error;
+      } finally {
+        await stream.close();
+      }
+      throw new Error("source read unexpectedly succeeded");
+    };
 
-    // A source-unavailable whose cause is a non-transient, non-transport
-    // storage failure (for example permission-denied: a real sqlState that
-    // is not a connection termination) must still fail fast, not retry
-    // indefinitely just because the adapter used the source-unavailable
-    // code.
-    const permissionDeniedSource = new FakePortableSource();
-    const permissionDeniedStream = await createPortableRecordStream(permissionDeniedSource);
-    const permissionDeniedCause = new PostgreSqlStorageOperationError(
-      "STORAGE_OPERATION_FAILED",
-      { domain: "transaction", operation: "snapshot", projectId: "project" },
-      "42501",
-      false,
+    const adapterCause = new Error("sanitized adapter cause");
+    const retryable = await readFailure(
+      new PortableStreamError("source-unavailable", { cause: adapterCause, retryable: true }),
     );
-    permissionDeniedSource.readFailure = new PortableStreamError("source-unavailable", { cause: permissionDeniedCause });
-    try {
-      await permissionDeniedStream.readBatch({
-        domain: "messages",
-        maxRecords: 1,
-        maxBytes: PORTABLE_LIMITS.maxBatchBytes,
-      });
-      throw new Error("permission-denied read unexpectedly succeeded");
-    } catch (error) {
+    expectSanitizedError(retryable, "source-unavailable");
+    expect(retryable).toMatchObject({ retryable: true });
+    expect((retryable as PortableStreamError).cause).toBe(adapterCause);
+
+    // A source-unavailable the adapter marked non-retryable (for example
+    // permission-denied) must fail fast, not retry indefinitely just
+    // because the adapter used the source-unavailable code. An omitted
+    // flag defaults to non-retryable.
+    for (const failure of [
+      new PortableStreamError("source-unavailable", { cause: adapterCause, retryable: false }),
+      new PortableStreamError("source-unavailable", { cause: adapterCause }),
+    ]) {
+      const error = await readFailure(failure);
       expectSanitizedError(error, "source-invalid");
       expect(error).toMatchObject({ retryable: false });
     }
-    await permissionDeniedStream.close();
-
-    // A source-unavailable whose cause survived normalization as a
-    // message-only torn connection (no sqlState, but retryable) is also
-    // preserved: this is the shape a live idle-kill's later "not
-    // queryable"-adjacent rejection takes after PostgreSqlSnapshotSession
-    // reattaches its captured diagnostic and marks it retryable.
-    const tornConnectionSource = new FakePortableSource();
-    const tornConnectionStream = await createPortableRecordStream(tornConnectionSource);
-    const tornConnectionCause = new PostgreSqlStorageOperationError(
-      "STORAGE_OPERATION_FAILED",
-      { domain: "transaction", operation: "snapshot", projectId: "project" },
-      null,
-      true,
-    );
-    tornConnectionSource.readFailure = new PortableStreamError("source-unavailable", { cause: tornConnectionCause });
-    try {
-      await tornConnectionStream.readBatch({
-        domain: "messages",
-        maxRecords: 1,
-        maxBytes: PORTABLE_LIMITS.maxBatchBytes,
-      });
-      throw new Error("torn-connection read unexpectedly succeeded");
-    } catch (error) {
-      expectSanitizedError(error, "source-unavailable");
-      expect(error).toMatchObject({ retryable: true });
-      expect((error as PortableStreamError).cause).toBe(tornConnectionCause);
-    }
-    await tornConnectionStream.close();
 
     // A different source-reported code (source-changed) still recodes to
     // non-retryable source-invalid, as before this change.
