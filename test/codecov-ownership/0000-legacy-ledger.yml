@@ -64,12 +64,13 @@ references:
   - "#1413"
   - "#1430"
   - "#1466"
+  - "#1426"
 rationale: >-
   Pins and provenance recorded before the per-decision fragment layout;
   every comment below names the issue or decision that pinned the files
   that follow it. The baseline classification appendix pins every other
   production file to the unique owner codecov.yml gave it at migration
-  base 8b8b85e571269879886f8d7886610211ef1b36fd; those are not issue decisions.
+  base 9789a12a588cfcf20a51f513fe08160bb69c16f7; those are not issue decisions.
 # #792 keeps grep session filtering and #794 grep-since validation in the
 # existing route component. #862 keeps recent limit validation, #863
 # keeps expand depth validation in the same daemon-routes component.
@@ -328,6 +329,9 @@ pins:
   - ["src/migration/copy-destination.ts", "unit-migration-cutover"]
   - ["src/storage/contracts.ts", "unit-storage-abstractions"]
   - ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"]
+  # #1426 adds the destination-unexpected-rows error code to the closed
+  # transfer error vocabulary; the file keeps its established owner.
+  - ["src/storage/portable-transfer.ts", "unit-storage-abstractions"]
   # #1354 supplies the promoted-memory decision serializer only from the
   # PostgreSQL transaction scope. A component path regex already matched
   # this file, but the owner list had never named it.
@@ -351,6 +355,8 @@ pins:
   # #1378 reads back each written record inside the same fenced
   # transaction and stores its content fingerprint; both files keep
   # their established owner.
+  # #1426 counts canonical rows the run did not write before completion
+  # and refuses surplus rows in both files; they keep their owner.
   - ["src/storage/postgresql/portable-destination.ts", "integration-postgresql-portable"]
   - ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"]
   # #1306 indexes owner exact-content lookup by a generated SHA-256
@@ -411,7 +417,7 @@ pins:
   - ["src/retrieval.ts", "unit-memory-retrieval"]
   # ---- Baseline classification appendix ----
   # Every production file not pinned above, with the unique owner codecov.yml
-  # assigned it at migration base 8b8b85e571269879886f8d7886610211ef1b36fd. Owner copied, not decided.
+  # assigned it at migration base 9789a12a588cfcf20a51f513fe08160bb69c16f7. Owner copied, not decided.
   - ["installer/dry-run-deps.ts", "unit-installation"]
   - ["installer/uninstall.ts", "unit-installation"]
   - ["src/bootstrap.ts", "unit-installation"]
@@ -504,7 +510,6 @@ pins:
   - ["src/storage/native-transcripts.ts", "unit-transcripts-import"]
   - ["src/storage/portable-index.ts", "unit-storage-abstractions"]
   - ["src/storage/portable-record.ts", "unit-storage-abstractions"]
-  - ["src/storage/portable-transfer.ts", "unit-storage-abstractions"]
   - ["src/storage/portable.ts", "unit-storage-abstractions"]
   - ["src/storage/postgresql.ts", "integration-postgresql-runtime"]
   - ["src/storage/postgresql/client-config.ts", "integration-postgresql-runtime"]

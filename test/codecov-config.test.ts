@@ -128,6 +128,8 @@ const expectedComponents = [
     paths: [
       "^src/daemon/auth\\.ts$",
       "^src/daemon/client\\.ts$",
+      // #1410 adds the validated, persisted snapshotIdleTimeoutMs
+      // PostgreSQL tuning key here.
       "^src/daemon/config\\.ts$",
       "^src/daemon/content-fence\\.ts$",
       // #1413 keeps the typed unbound-project 409 reason discriminator in
@@ -237,7 +239,12 @@ const expectedComponents = [
       "^src/storage/index\\.ts$",
       // Curated portable package API remains storage-abstractions-owned.
       "^src/storage/portable\\.ts$",
+      // #1410 adds the optional, non-serialized PortableStreamError cause
+      // here.
       "^src/storage/portable-record\\.ts$",
+      // #1410 forwards the source's close cause here. #1442 classifies a
+      // read-path source-unavailable as retryable only when the source
+      // adapter marked it retryable, so the stream stays backend-neutral.
       "^src/storage/portable-record-stream\\.ts$",
       "^src/storage/portable-transfer\\.ts$",
       "^src/storage/portable-index\\.ts$",
@@ -361,7 +368,16 @@ const expectedComponents = [
   {
     component_id: "unit-diagnostics",
     name: "Unit - Diagnostics",
-    paths: ["^src/diagnose\\.ts$", "^src/storage/diagnostics\\.ts$", "^src/storage/diagnostic-renderer\\.ts$", "^src/storage/diagnostic-project\\.ts$", "^src/storage/postgresql/diagnostics\\.ts$", "src/doctor/"],
+    paths: [
+      "^src/diagnose\\.ts$",
+      // #1410 threads snapshotIdleTimeoutMs into the diagnostics probe's
+      // connection settings here.
+      "^src/storage/diagnostics\\.ts$",
+      "^src/storage/diagnostic-renderer\\.ts$",
+      "^src/storage/diagnostic-project\\.ts$",
+      "^src/storage/postgresql/diagnostics\\.ts$",
+      "src/doctor/",
+    ],
   },
   {
     component_id: "integration-service-managers",
@@ -387,11 +403,22 @@ const expectedComponents = [
     paths: [
       "^src/daemon/staged-postgresql\\.ts$",
       "^src/storage/postgresql/client-config\\.ts$",
+      // #1410 adds the optional snapshotIdleTimeoutMs connection setting
+      // here.
       "^src/storage/postgresql/contracts\\.ts$",
+      // #1410 adds the snapshot-local termination predicate, covering a
+      // captured async-diagnostic reattachment shape, here.
       "^src/storage/postgresql/errors\\.ts$",
+      // #1410 threads snapshotIdleTimeoutMs through resolved connection
+      // settings here.
       "^src/storage/postgresql/factory\\.ts$",
       "^src/storage/postgresql/index\\.ts$",
+      // #1410 attaches the snapshot checkout's async-failure listener and
+      // resolves the snapshot idle bound here. #1424 gives query and
+      // transaction checkouts the same observer.
       "^src/storage/postgresql/runtime\\.ts$",
+      // #1410 separates the snapshot's idle-in-transaction bound from
+      // statementTimeoutMs and captures its async FATAL diagnostic here.
       "^src/storage/postgresql/snapshot-session\\.ts$",
       "^src/storage/postgresql\\.ts$",
     ],
@@ -401,6 +428,9 @@ const expectedComponents = [
     name: "Integration - PostgreSQL Portable Transfer",
     paths: [
       // #618 canonical self-provenance stays in PostgreSQL portable transfer.
+      // #1410 narrows session-close tolerance to a real snapshot-
+      // termination diagnostic here. #1442 marks a genuine termination
+      // retryable on the source-unavailable it raises.
       "^src/storage/postgresql/portable-source\\.ts$",
       "^src/storage/postgresql/portable-destination\\.ts$",
       "^src/storage/postgresql/portable-mapping\\.ts$",

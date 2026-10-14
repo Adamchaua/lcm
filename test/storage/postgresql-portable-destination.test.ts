@@ -12,7 +12,7 @@ import { createGeneration, createFixtureSource, postgresGeneration, MACHINE_A_UU
 
 const boundaries = vi.hoisted(() => ({
   runtime: vi.fn(), client: vi.fn(), config: vi.fn(), schema: vi.fn(), witness: vi.fn(),
-  headers: vi.fn(), row: vi.fn(), insert: vi.fn(), capability: vi.fn(), source: vi.fn(), contentRows: vi.fn(),
+  headers: vi.fn(), count: vi.fn(), row: vi.fn(), insert: vi.fn(), capability: vi.fn(), source: vi.fn(), contentRows: vi.fn(),
   contentSizes: vi.fn(),
 }));
 vi.mock('../../src/storage/postgresql/runtime.js', () => ({ PostgreSqlRuntime: class { constructor() { return boundaries.runtime(); } } }));
@@ -21,7 +21,7 @@ vi.mock('../../src/storage/postgresql/client-config.js', () => ({ buildPostgreSq
 vi.mock('../../src/storage/postgresql/runtime-readiness.js', () => ({ verifyPostgreSqlTransferSchema: boundaries.schema }));
 vi.mock('../../src/storage/postgresql/portable-mapping.js', async importOriginal => ({
   ...await importOriginal<typeof import('../../src/storage/postgresql/portable-mapping.js')>(),
-  listCanonicalHeaders: boundaries.headers, readCanonicalRow: boundaries.row,
+  listCanonicalHeaders: boundaries.headers, countCanonicalRows: boundaries.count, readCanonicalRow: boundaries.row,
   insertCanonicalRecord: boundaries.insert, assertPostgreSqlRecordCapability: boundaries.capability,
   readCanonicalContentRows: boundaries.contentRows, readCanonicalContentSizes: boundaries.contentSizes,
 }));
@@ -54,6 +54,7 @@ class Database {
   lock = true;
   isolation: Row[] = [{ isolation: 'read committed', readonly: 'off' }];
   cas = true;
+  ledgerTallyFailure = false;
   extraRuns = false;
   commitFailure: 'before' | 'after' | undefined;
   rollbackFailure = false;
@@ -116,6 +117,13 @@ class Database {
       if (text.includes('prior_checkpoint_sha256=$3')) return result(rows.filter(row => row.prior === values[2]));
       if (text.includes('checkpoint_sha256=$3')) return result(rows.filter(row => row.checkpoint_sha256 === values[2]));
       return result(rows.sort((a, b) => b.next_ordinal - a.next_ordinal).slice(0, 1));
+    }
+    if (text.startsWith('SELECT COUNT(*) AS count FROM lcm.transfer_identities')) {
+      if (this.ledgerTallyFailure) return result([{ count: 7 }]);
+      const prefix = `${values[1]}:`;
+      let tallied = 0;
+      for (const key of this.identities.keys()) if (key.startsWith(prefix)) tallied++;
+      return result([{ count: String(tallied) }]);
     }
     if (text.includes('FROM lcm.transfer_identities')) {
       if (text.includes('ORDER BY domain,identity_sha256')) {
@@ -205,6 +213,7 @@ beforeEach(() => {
   boundaries.schema.mockResolvedValue(undefined);
   boundaries.witness.mockResolvedValue('f'.repeat(64));
   boundaries.headers.mockImplementation(async (_executor, _project, domain: PortableDomain, after: string | null) => (db.records.get(domain) ?? []).filter(row => after === null || String(row.ordinal).padStart(8, '0') > after).slice(0, 1).map(row => ({ locator: String(row.ordinal).padStart(8, '0'), byteLength: '128' })));
+  boundaries.count.mockImplementation(async (_executor, _project, domain: PortableDomain) => (db.records.get(domain) ?? []).length);
   boundaries.row.mockImplementation(async (_executor, _project, domain: PortableDomain, locator: string) => {
     if (boundaries.row.mock.calls.length > 10000) throw new Error('fake header runaway');
     const records = db.records.get(domain) ?? [];
@@ -984,7 +993,7 @@ it('walks the transfer ledger in bounded keyset pages instead of one unbounded r
   db.queryLog.length = 0;
   await api.completePortableDestinationInTransaction(executor, writer, verified);
   expect(db.run?.state).toBe('completed');
-  const pages = db.queryLog.filter(statement => statement.includes('FROM lcm.transfer_identities WHERE run_id='));
+  const pages = db.queryLog.filter(statement => statement.includes('FROM lcm.transfer_identities WHERE run_id=') && !statement.startsWith('SELECT COUNT(*)'));
   expect(pages.length).toBeGreaterThan(1);
   for (const page of pages) expect(page).toContain('LIMIT $4');
   await db.query({ text: 'ROLLBACK' });
@@ -1008,7 +1017,7 @@ it('cuts a ledger page by native key bytes and continues from the last returned 
     db.identityLedger.push({ ...template, identity_sha256: `synthetic-${index}`, native_key: `${padding}:${identity}` });
   }
   const pages: { text: string; values: unknown[] }[] = [];
-  db.beforeQuery = config => { if (config.text.includes('FROM lcm.transfer_identities WHERE run_id=')) pages.push({ text: config.text, values: [...(config.values ?? [])] }); };
+  db.beforeQuery = config => { if (config.text.includes('FROM lcm.transfer_identities WHERE run_id=') && !config.text.startsWith('SELECT COUNT(*)')) pages.push({ text: config.text, values: [...(config.values ?? [])] }); };
   await db.query({ text: 'BEGIN' });
   await api.completePortableDestinationInTransaction(executor, writer, verified);
   expect(db.run?.state).toBe('completed');
@@ -1176,8 +1185,81 @@ it('binds completion proofs to the writer, matching run and exact terminal prefi
  await expect(api.completePortableDestinationInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'destination-conflict'});
  db.run={...saved,manifest_sha256:'0'.repeat(64)};await expect(api.completePortableDestinationInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'destination-conflict'});
  db.run={...saved,state:'invalid'};await expect(api.readPortableCompletedRunInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'destination-conflict'});
- db.run=saved;expect(await api.readPortableCompletedRunInTransaction(executor,writer,proof)).toBe(false);
- db.receipts.pop();await expect(api.completePortableDestinationInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'verification-failed'});
+db.run=saved;expect(await api.readPortableCompletedRunInTransaction(executor,writer,proof)).toBe(false);
+db.receipts.pop();await expect(api.completePortableDestinationInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'verification-failed'});
+});
+it('refuses canonical rows inserted after verification with a distinct membership code',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const verified=await api.verifyPortableDestinationComplete(writer,manifest);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await db.query({text:'BEGIN'});
+ // A second writer commits a canonical row after the verification stream closed:
+ // no ledger entry names it, so the checkpoint recheck cannot see it.
+ db.records.get('conversations')!.push({ordinal:999999} as never);
+ await expect(api.completePortableDestinationInTransaction(executor,writer,verified)).rejects.toMatchObject({code:'destination-unexpected-rows'});
+ expect(db.run?.state).toBe('active');
+ expect(db.queryLog.some(sql=>sql.includes('pg_advisory_xact_lock('))).toBe(true);
+ db.records.get('conversations')!.pop();
+ await api.completePortableDestinationInTransaction(executor,writer,verified);
+ expect(db.run?.state).toBe('completed');
+ await db.query({text:'ROLLBACK'});
+ expect(db.run?.state).toBe('active');
+});
+it('does not repeat the membership count when reading back a completed run',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const verified=await api.verifyPortableDestinationComplete(writer,manifest);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await db.query({text:'BEGIN'});
+ await api.completePortableDestinationInTransaction(executor,writer,verified);
+ await db.query({text:'COMMIT'});
+ // After the fence is released a legitimate writer may add canonical rows.
+ db.records.get('conversations')!.push({ordinal:999999} as never);
+ boundaries.count.mockClear();
+ await db.query({text:'BEGIN'});
+ expect(await api.readPortableCompletedRunInTransaction(executor,writer,verified)).toBe(true);
+ await db.query({text:'ROLLBACK'});
+ expect(boundaries.count).not.toHaveBeenCalled();
+});
+it('refuses canonical rows deleted after verification as failed verification',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const verified=await api.verifyPortableDestinationComplete(writer,manifest);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await db.query({text:'BEGIN'});
+ const removed=db.records.get('conversations')!.pop()!;
+ await expect(api.completePortableDestinationInTransaction(executor,writer,verified)).rejects.toMatchObject({code:'verification-failed'});
+ expect(db.run?.state).toBe('active');
+ db.records.get('conversations')!.push(removed);
+ await api.completePortableDestinationInTransaction(executor,writer,verified);
+ expect(db.run?.state).toBe('completed');
+ await db.query({text:'ROLLBACK'});
+});
+it('excludes identity domains from the completion membership tally',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const verified=await api.verifyPortableDestinationComplete(writer,manifest);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await db.query({text:'BEGIN'});
+ // Identity ledger rows are admission-time lookups rather than writes, and
+ // machines are project-linked rather than project-owned: extra identity rows
+ // must not refuse a completion whose non-identity tally still matches.
+ db.records.get('machines')!.push({ordinal:999999} as never);
+ await api.completePortableDestinationInTransaction(executor,writer,verified);
+ expect(db.run?.state).toBe('completed');
+ await db.query({text:'ROLLBACK'});
+});
+it('refuses an unreadable ledger tally without trusting it',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const verified=await api.verifyPortableDestinationComplete(writer,manifest);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await db.query({text:'BEGIN'});
+ db.ledgerTallyFailure=true;
+ await expect(api.completePortableDestinationInTransaction(executor,writer,verified)).rejects.toMatchObject({code:'destination-uncertain'});
+ expect(db.run?.state).toBe('active');
+ await db.query({text:'ROLLBACK'});
 });
 it.each(['missing','tls','version','encoding','close','primary-close'] as const)('fails a read-only target probe safely on %s',async fault=>{
  boundaries.runtime.mockReturnValue({query:db.query.bind(db),transaction:async(fn:(executor:unknown)=>unknown)=>fn({query:db.query.bind(db)}),close:async()=>{if(fault.includes('close'))throw new Error('private close');}});

@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import type {
   Client,
   Pool,
@@ -24,7 +25,10 @@ import {
   REQUIRED_POSTGRESQL_SERVER_ENCODING,
   REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
 } from "../../src/storage/postgresql/migrations.js";
-import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
+import {
+  PostgreSqlCommitOutcomeUnknownError,
+  PostgreSqlStorageOperationError,
+} from "../../src/storage/postgresql/errors.js";
 import { POSTGRESQL_SEARCH_CONFIGURATION_SHA256 } from "../../src/storage/postgresql/search-configuration.js";
 
 function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
@@ -136,7 +140,7 @@ function fixtures(
     }
     return queryImplementation?.(input) ?? result([]);
   });
-  const poolClient = { query, release } as unknown as PoolClient;
+  const poolClient = Object.assign(new EventEmitter(), { query, release }) as unknown as PoolClient;
   const connect = vi.fn(async () => poolClient);
   const end = vi.fn(async () => undefined);
   const pool = {
@@ -2717,5 +2721,315 @@ describe("PostgreSQL diagnostic runtime telemetry", () => {
     expect(query.mock.calls.length).toBeGreaterThan(2);
     for (const [, options] of query.mock.calls) expect(options.signal).toBe(signal);
     await fixture.runtime.close();
+  });
+});
+
+describe("PostgreSQL runtime asynchronous failure on a checked-out client", () => {
+  const NOT_QUERYABLE = "Client has encountered a connection error and is not queryable";
+
+  function idleKill(code: string | null = "25P03"): Error {
+    return Object.assign(
+      new Error("terminating connection due to idle-in-transaction timeout"),
+      code === null ? {} : { code, severity: "FATAL" },
+    );
+  }
+
+  /** A pooled client double whose queries reject once an async 'error' fired. */
+  function killable(onQuery?: (input: unknown) => unknown) {
+    let dead = false;
+    const f = fixtures((input) => {
+      if (dead) throw new Error(NOT_QUERYABLE);
+      return onQuery?.(input);
+    });
+    f.poolClient.on("error", () => { dead = true; });
+    return f;
+  }
+
+  const options = { domain: "transaction", operation: "idleKill" } as const;
+
+  it("handles an async error emitted while the transaction callback is idle", async () => {
+    const f = killable();
+    const error = await f.runtime.transaction(async (transaction) => {
+      expect(f.poolClient.listenerCount("error")).toBe(2);
+      f.poolClient.emit("error", idleKill());
+      await transaction.query({ text: "SELECT 1" }, { domain: "transaction", operation: "afterKill" });
+      return "unreachable";
+    }, options).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PostgreSqlStorageOperationError);
+    expect(error).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      operation: "afterKill",
+      sqlState: "25P03",
+      retryable: true,
+    });
+    expect((error as Error).name).toBe("StorageOperationError");
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledTimes(1);
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(1);
+  });
+
+  it("does not reattach an ungated or absent async SQLSTATE to the next rejection", async () => {
+    for (const code of ["42501", null]) {
+      const f = killable();
+      const error = await f.runtime.transaction(async (transaction) => {
+        f.poolClient.emit("error", idleKill(code));
+        await transaction.query({ text: "SELECT 1" }, { domain: "transaction", operation: "afterKill" });
+      }, options).catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ operation: "afterKill", sqlState: null, retryable: false });
+      expect(f.release).toHaveBeenCalledWith(true);
+      expect(f.poolClient.listenerCount("error")).toBe(1);
+    }
+  });
+
+  it("keeps the first captured diagnostic when later async errors carry none", async () => {
+    const f = killable();
+    const error = await f.runtime.transaction(async (transaction) => {
+      f.poolClient.emit("error", idleKill("57P01"));
+      f.poolClient.emit("error", idleKill(null));
+      await transaction.query({ text: "SELECT 1" }, { domain: "transaction", operation: "afterKill" });
+    }, options).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ sqlState: "57P01", retryable: true });
+
+    const late = killable();
+    const lateError = await late.runtime.transaction(async (transaction) => {
+      late.poolClient.emit("error", idleKill(null));
+      late.poolClient.emit("error", idleKill("25P03"));
+      await transaction.query({ text: "SELECT 1" }, { domain: "transaction", operation: "afterKill" });
+    }, options).catch((caught: unknown) => caught);
+    expect(lateError).toMatchObject({ sqlState: "25P03", retryable: true });
+  });
+
+  it.each([
+    ["25P03", false],
+    ["57P01", true],
+    ["08006", true],
+    ["42501", false],
+  ])("classifies a COMMIT that fails after a captured %s async error", async (code, ambiguous) => {
+    const f = killable();
+    const error = await f.runtime.transaction(async () => {
+      f.poolClient.emit("error", idleKill(code));
+      return "callback finished without another query";
+    }, options).catch((caught: unknown) => caught);
+
+    expect(f.query).toHaveBeenCalledWith("COMMIT");
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(1);
+    if (ambiguous) {
+      expect(error).toBeInstanceOf(PostgreSqlCommitOutcomeUnknownError);
+      expect(error).toMatchObject({ retryable: false });
+    } else {
+      expect(error).not.toBeInstanceOf(PostgreSqlCommitOutcomeUnknownError);
+      expect(error).toMatchObject(code === "25P03"
+        ? { sqlState: "25P03", retryable: true }
+        : { sqlState: null, retryable: false });
+    }
+  });
+
+  it("destroys without rollback when the callback fails with its own error after an async error", async () => {
+    const f = killable();
+    const error = await f.runtime.transaction(async () => {
+      f.poolClient.emit("error", idleKill());
+      throw new Error("callback failure");
+    }, options).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ operation: "idleKill", sqlState: null, retryable: false });
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(1);
+  });
+
+  it("destroys when the async error fires during a ROLLBACK that then fails", async () => {
+    const f = fixtures((input) => {
+      if (input === "ROLLBACK") {
+        f.poolClient.emit("error", idleKill());
+        throw new Error(NOT_QUERYABLE);
+      }
+      return undefined;
+    });
+    await expect(f.runtime.transaction(async () => {
+      throw new Error("callback failure");
+    }, options)).rejects.toMatchObject({ sqlState: null });
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("detaches and destroys when BEGIN fails after an async error", async () => {
+    const f = fixtures((input) => {
+      if (input === "BEGIN") {
+        f.poolClient.emit("error", idleKill());
+        throw new Error(NOT_QUERYABLE);
+      }
+      return undefined;
+    });
+    const callback = vi.fn(async () => undefined);
+    await expect(f.runtime.transaction(callback, options)).rejects.toMatchObject({ sqlState: null });
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("destroys a client whose async error arrives after a successful COMMIT", async () => {
+    const f = fixtures((input) => {
+      if (input === "COMMIT") f.poolClient.emit("error", idleKill());
+      return undefined;
+    });
+    await expect(f.runtime.transaction(async () => "committed", options)).resolves.toBe("committed");
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("restores listeners and keeps a healthy client after a successful transaction", async () => {
+    const f = fixtures();
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+    await f.runtime.transaction(async (transaction) => {
+      expect(f.poolClient.listenerCount("error")).toBe(1);
+      await transaction.query({ text: "SELECT 1" }, { domain: "transaction", operation: "healthy" });
+    }, options);
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+    expect(f.release).toHaveBeenCalledWith(false);
+  });
+
+  it("starts every checkout of a reused client without captured state", async () => {
+    let dead = false;
+    const f = fixtures((input) => {
+      if (dead && typeof input === "object") throw new Error("ordinary rejection");
+      return undefined;
+    });
+    await f.runtime.transaction(async () => {
+      f.poolClient.emit("error", idleKill());
+    }, options).catch(() => undefined);
+    dead = true;
+    const second = await f.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "SELECT 1" }, { domain: "transaction", operation: "second" });
+    }, options).catch((caught: unknown) => caught);
+    expect(second).toMatchObject({ operation: "second", sqlState: null, retryable: false });
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("fails a savepoint after an async error with the inner query error and no savepoint rollback", async () => {
+    const f = killable();
+    const error = await f.runtime.transaction(async (transaction) => {
+      await transaction.savepoint(async (inner) => {
+        f.poolClient.emit("error", idleKill());
+        await inner.query({ text: "SELECT 1" }, { domain: "transaction", operation: "innerKill" });
+      }, { domain: "transaction", operation: "savepointKill" });
+    }, options).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ operation: "innerKill", sqlState: "25P03", retryable: true });
+    expect(f.query).not.toHaveBeenCalledWith(expect.stringContaining("ROLLBACK"));
+    expect(f.query).not.toHaveBeenCalledWith(expect.stringContaining("RELEASE SAVEPOINT"));
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(1);
+  });
+
+  it("never attaches a listener when the signal aborts during acquisition", async () => {
+    const controller = new AbortController();
+    const f = fixtures();
+    f.connect.mockImplementationOnce(async () => {
+      controller.abort();
+      return f.poolClient;
+    });
+    await expect(f.runtime.transaction(async () => undefined, {
+      ...options, signal: controller.signal,
+    })).rejects.toMatchObject({ operation: "idleKill" });
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("detaches a listener attached just before an abort is observed after acquisition", async () => {
+    let abortChecks = 0;
+    const signal = {
+      get aborted() {
+        abortChecks += 1;
+        return abortChecks >= 4;
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const f = fixtures();
+    await expect(f.runtime.transaction(async () => undefined, { ...options, signal }))
+      .rejects.toMatchObject({ operation: "idleKill", retryable: false });
+    expect(f.query).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("detaches after an abort observed once the listener is attached", async () => {
+    const controller = new AbortController();
+    const f = fixtures();
+    await expect(f.runtime.transaction(async () => {
+      controller.abort();
+    }, { ...options, signal: controller.signal })).rejects.toMatchObject({ operation: "idleKill" });
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("leaves no listener when a direct query aborts around acquisition", async () => {
+    const controller = new AbortController();
+    const aborting = fixtures();
+    aborting.connect.mockImplementationOnce(async () => {
+      controller.abort();
+      return aborting.poolClient;
+    });
+    await expect(aborting.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "directAbortAcquire", signal: controller.signal,
+    })).rejects.toMatchObject({ operation: "directAbortAcquire" });
+    expect(aborting.query).not.toHaveBeenCalled();
+    expect(aborting.release).toHaveBeenCalledWith(true);
+    expect(aborting.poolClient.listenerCount("error")).toBe(0);
+
+    let abortChecks = 0;
+    const lateAbort = {
+      get aborted() {
+        abortChecks += 1;
+        return abortChecks >= 4;
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const attached = fixtures();
+    await expect(attached.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "directAbortAttached", signal: lateAbort,
+    })).rejects.toMatchObject({ operation: "directAbortAttached" });
+    expect(attached.query).not.toHaveBeenCalled();
+    expect(attached.release).toHaveBeenCalledWith(true);
+    expect(attached.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("handles an async error on a direct query client", async () => {
+    const f = fixtures(() => {
+      f.poolClient.emit("error", idleKill());
+      throw new Error(NOT_QUERYABLE);
+    });
+    await expect(f.runtime.query({ text: "SELECT 1" }, { domain: "factory", operation: "directKill" }))
+      .rejects.toMatchObject({ operation: "directKill", sqlState: "25P03", retryable: true });
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("destroys a direct query client whose async error did not reject the query", async () => {
+    const f = fixtures(() => {
+      f.poolClient.emit("error", idleKill());
+      return result([{ value: 1 }]);
+    });
+    await expect(f.runtime.query({ text: "SELECT 1" }, { domain: "factory", operation: "directOk" }))
+      .resolves.toMatchObject({ rows: [{ value: 1 }] });
+    expect(f.release).toHaveBeenCalledWith(true);
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("leaves a healthy direct query client attached to no listener", async () => {
+    const f = fixtures();
+    await f.runtime.query({ text: "SELECT 1" }, { domain: "factory", operation: "directHealthy" });
+    expect(f.release).toHaveBeenCalledWith(false);
+    expect(f.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("surfaces an ordinary non-storage rejection from a direct query unchanged", async () => {
+    const f = fixtures(() => { throw Object.assign(new Error("constraint secret"), { code: "23505" }); });
+    await expect(f.runtime.query({ text: "SELECT 1" }, { domain: "factory", operation: "directSql" }))
+      .rejects.toMatchObject({ sqlState: "23505" });
+    expect(f.release).toHaveBeenCalledWith(false);
   });
 });
