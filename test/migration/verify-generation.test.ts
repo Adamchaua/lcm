@@ -1967,6 +1967,58 @@ describe("verifyMigrationGeneration", () => {
     expect(resumeManifestStore.current.pendingEffect).toBe(null);
   }, 15000);
 
+  it("kBcQG: refuses to resume when the pending effect does not name the persisted report, leaving the manifest untouched", async () => {
+    const homeDir = "/tmp/lcm-verify-resume-effect-mismatch";
+    rmSync(homeDir, { recursive: true, force: true });
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const firstResult = await verifyMigrationGeneration(
+      baseInput({ homeDir }), dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime()),
+    );
+    expect(firstResult.report.activationEligible).toBe(true);
+    const resumeManifestStore = fakeManifestStore();
+    resumeManifestStore.current = beginMigrationEffect(resumeManifestStore.current, {
+      kind: "verify-generation", effectId: "verify-generation-" + fakeHash("some-other-report"),
+      inputSha256: firstResult.inputSha256, startedAt: MANIFEST_FIXTURE_AT,
+    });
+    const beforeManifest = resumeManifestStore.current;
+    const error = await verifyMigrationGeneration(baseInput({ homeDir }), dependenciesFor(fakeCopySource(), fakeRuntime()))
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(MigrationVerificationDriverError);
+    expect((error as MigrationVerificationDriverError).reason).toBe("report-identity-conflict");
+    expect(resumeManifestStore.current).toBe(beforeManifest);
+    expect(resumeManifestStore.current.phase).toBe("copied");
+  }, 15000);
+
+  it("kBcQG: refuses to resume a pending effect whose persisted report is not activation-eligible, leaving the manifest untouched", async () => {
+    const homeDir = "/tmp/lcm-verify-resume-ineligible-report";
+    rmSync(homeDir, { recursive: true, force: true });
+    stubDestinationPrimitives({
+      domainCensus: (domain) => ({ domain, recordCount: 99, prefixSha256: fakeHash(`wrong-${domain}`), terminalIdentitySha256: HASH_A }),
+    });
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => [domain, 1])) as Partial<Record<PortableDomain, number>>;
+    const runtime = fakeRuntime({ session: fakeSession({ ledgerIdentityTotal: 99 * PORTABLE_RECORD_DOMAIN_ORDER.length }) });
+    const firstResult = await verifyMigrationGeneration(
+      baseInput({ homeDir }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+    );
+    expect(firstResult.report.activationEligible).toBe(false);
+    // An ineligible report is persisted as evidence but never begun. A
+    // pending effect that nonetheless names it must not be completed as
+    // eligible, even though its effect id is exactly the report's own.
+    const resumeManifestStore = fakeManifestStore();
+    resumeManifestStore.current = beginMigrationEffect(resumeManifestStore.current, {
+      kind: "verify-generation", effectId: firstResult.effectId, inputSha256: firstResult.inputSha256,
+      startedAt: MANIFEST_FIXTURE_AT,
+    });
+    const beforeManifest = resumeManifestStore.current;
+    const error = await verifyMigrationGeneration(baseInput({ homeDir }), dependenciesFor(fakeCopySource(), fakeRuntime()))
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(MigrationVerificationDriverError);
+    expect((error as MigrationVerificationDriverError).reason).toBe("report-identity-conflict");
+    expect(resumeManifestStore.current).toBe(beforeManifest);
+    expect(resumeManifestStore.current.reports.every((report) => report.kind !== "verification")).toBe(true);
+  }, 15000);
+
   it("refuses when a different effect is already pending for the generation, rather than silently adopting it", async () => {
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
     const manifest = stubDestinationPrimitives();

@@ -1979,6 +1979,16 @@ export async function verifyMigrationGeneration(
   if (resumeManifest.pendingEffect !== null && resumeManifest.pendingEffect.kind === "verify-generation") {
     const pending = resumeManifest.pendingEffect;
     const persistedReport = reportStore.read(input.generationId, pending.inputSha256);
+    // The resume path completes with activationEligible: true, so it must
+    // not trust the pending effect alone. The effect has to name exactly
+    // this report, and the report has to be one that was eligible when it
+    // was built; either failure refuses before the manifest is touched.
+    if (pending.effectId !== migrationVerificationEffectId(persistedReport.reportSha256)) {
+      driverError("report-identity-conflict", "the pending verification effect does not name the persisted report");
+    }
+    if (!persistedReport.activationEligible) {
+      driverError("report-identity-conflict", "the pending verification effect names a report that is not activation-eligible");
+    }
     const completedAt = new Date().toISOString();
     manifestStore.update(input.generationId, resumeManifest.checksumSha256, (current) => completeMigrationEffect(current, {
       effectId: pending.effectId, completedAt, activationEligible: true,
