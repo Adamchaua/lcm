@@ -626,6 +626,8 @@ Verification refuses outright, before any report is written, when:
   from inside the window to catch a value that changes mid-pass;
 - the verification lease is already held by another worker
   (`lease-unavailable`).
+- a lease check finds that the verification lease was lost, which is either
+  expired or taken over (`lease-lost`); see "Lease checks" below.
 
 A refusal writes nothing. It is not the same outcome as a persisted report
 with mismatches: a refusal means verification could not even take a coherent
@@ -798,6 +800,23 @@ journal's refuse-and-restart pattern rather than a retry loop. An operator
 sizing `leaseTtlMs` for a large project should measure the in-window read
 against a realistic copy of that project's own row counts before a
 cutover, not discover the lease was too short during one.
+
+#### Lease checks
+
+Verification checks that it still holds its lease twice: once right after
+the read-only census window closes, and once right before it writes the
+report (the preview, `inspectMigrationVerification`, makes only the first
+check, because it writes nothing). When either check finds the lease lost,
+verification refuses with `lease-lost` and writes no report. It releases
+the lease and closes its connections either way, and a failure while doing
+so never replaces the `lease-lost` refusal.
+
+These checks refuse a report that is known to be stale; they do not extend
+the lease and they do not guarantee it stays held. Verification never renews
+the lease, so the lease can still expire after the second check, during the
+local report write or while the manifest effect is begun and completed. Those
+steps run without a new lease guarantee. Size `leaseTtlMs` as described
+below so the window finishes well inside the term.
 
 #### Measuring the in-window cost
 

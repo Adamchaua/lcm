@@ -498,6 +498,7 @@ function stubDestinationPrimitives(options: {
   manifestCheckpoints?: readonly ReturnType<typeof defaultLedgerCheckpoint>[];
 } = {}) {
   vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+    assertLeaseFence: vi.fn(async () => ({})),
     acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
     releaseLease: vi.fn(async () => null),
   } as never); });
@@ -590,6 +591,7 @@ describe("readFencedDestinationCensus", () => {
   it("pages through readDomainPage until complete, rather than stopping after the first page", async () => {
     let conversationsCalls = 0;
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
@@ -1318,6 +1320,7 @@ describe("verifyMigrationGeneration", () => {
 
   it("refuses when the verification lease is already held", async () => {
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => null),
       releaseLease: vi.fn(async () => null),
     } as never); });
@@ -1337,6 +1340,7 @@ describe("verifyMigrationGeneration", () => {
 
   it("refuses when the destination search configuration is absent", async () => {
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
@@ -1361,6 +1365,7 @@ describe("verifyMigrationGeneration", () => {
     // compiled-in POSTGRESQL_SEARCH_CONFIGURATION_SHA256 rather than
     // only against a second read of itself.
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
@@ -1383,6 +1388,7 @@ describe("verifyMigrationGeneration", () => {
     // v3.4's unattributable-NULL shape: a NULL actualSha256 alone does
     // not say which of the two happened.
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
@@ -1400,6 +1406,7 @@ describe("verifyMigrationGeneration", () => {
 
   it("refuses when the destination system identifier is malformed", async () => {
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
@@ -1450,6 +1457,7 @@ describe("verifyMigrationGeneration", () => {
     const runtime = fakeRuntime({ session });
     let released = false;
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
       releaseLease: vi.fn(async () => { released = true; return null; }),
     } as never); });
@@ -1475,6 +1483,7 @@ describe("verifyMigrationGeneration", () => {
     session.query = vi.fn(async () => { throw new Error("window-failure-canary"); }) as never;
     const runtime = fakeRuntime({ session });
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
       releaseLease: vi.fn(async () => { throw new Error("release-failure-canary"); }),
     } as never); });
@@ -1516,6 +1525,7 @@ describe("verifyMigrationGeneration", () => {
     stubDestinationPrimitives();
     const order: string[] = [];
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
       releaseLease: vi.fn(async () => { order.push("release"); return null; }),
     } as never); });
@@ -1548,6 +1558,7 @@ describe("verifyMigrationGeneration", () => {
     // merely asserting the promise rejects.
     stubDestinationPrimitives();
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
       releaseLease: vi.fn(async () => { throw new Error("release-failure-canary"); }),
     } as never); });
@@ -1588,6 +1599,7 @@ describe("verifyMigrationGeneration", () => {
     stubDestinationPrimitives();
     let releaseLeaseCalled = false;
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
       releaseLease: vi.fn(async () => { releaseLeaseCalled = true; throw new Error("release-failure-canary"); }),
     } as never); });
@@ -1638,6 +1650,7 @@ describe("verifyMigrationGeneration", () => {
       close: vi.fn(async () => { closed = true; order.push("close"); await baseRuntime.close(); }),
     };
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
       releaseLease: vi.fn(async () => {
         order.push("release-start");
@@ -1679,7 +1692,7 @@ describe("verifyMigrationGeneration", () => {
     });
     const releaseLease = vi.fn(async () => { held = false; return null; });
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
-      acquireLease, releaseLease,
+      assertLeaseFence: vi.fn(async () => ({})), acquireLease, releaseLease,
     } as never); });
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
     const input = baseInput({ homeDir: "/tmp/lcm-verify-second-acquire" });
@@ -1918,6 +1931,159 @@ describe("inspectMigrationVerification", () => {
     const store = new MigrationVerificationReportStore({ homeDir });
     expect(store.has("generation-1", inspected.reportSha256)).toBe(false);
   }, 15000);
+});
+
++describe("verification lease fence (#1428)", () => {
+  const FENCE_TOKEN = 7n;
+  const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+  const leaseLost = () => new coordination.PostgreSqlLeaseFenceError(projectId, machineId, FENCE_TOKEN, "assertLeaseFence");
+
+  /** Records one ordered event log across the snapshot close, each fence
+   * check, persist and release, so a test can assert where the fences sit. */
+  function arrange(options: {
+    failFence?: { call: number; error: () => Error };
+    releaseFails?: boolean;
+  } = {}) {
+    stubDestinationPrimitives();
+    const order: string[] = [];
+    const session = fakeSession();
+    session.close = vi.fn(async () => { order.push("snapshot-close"); });
+    const runtime = fakeRuntime({ session });
+    const assertLeaseFence = vi.fn(async () => {
+      order.push("fence");
+      const failure = options.failFence;
+      if (failure !== undefined && assertLeaseFence.mock.calls.length === failure.call) throw failure.error();
+      return {};
+    });
+    const releaseLease = vi.fn(async () => {
+      order.push("release");
+      if (options.releaseFails === true) throw new Error("release-failure-canary");
+      return null;
+    });
+    vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      assertLeaseFence, releaseLease,
+      acquireLease: vi.fn(async () => ({ fencingToken: FENCE_TOKEN } as never)),
+    } as never); });
+    const originalPersist = MigrationVerificationReportStore.prototype.persist;
+    const persist = vi.spyOn(MigrationVerificationReportStore.prototype, "persist").mockImplementation(function (this: MigrationVerificationReportStore, ...args) {
+      order.push("persist");
+      return originalPersist.apply(this, args);
+    });
+    return { order, runtime, assertLeaseFence, releaseLease, persist };
+  }
+
+  function homeDirFor(label: string): string {
+    const homeDir = "/tmp/lcm-verify-fence-" + label;
+    rmSync(homeDir, { recursive: true, force: true });
+    return homeDir;
+  }
+
+  it("fences the lease on a fresh read-committed transaction after the census snapshot closes and again right before persist", async () => {
+    const { order, runtime, assertLeaseFence, releaseLease } = arrange();
+    const result = await verifyMigrationGeneration(
+      baseInput({ homeDir: homeDirFor("ok") }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+    );
+    expect(result.outcome).toBe("clean");
+    expect(order).toEqual(["snapshot-close", "fence", "fence", "persist", "release"]);
+    expect(assertLeaseFence).toHaveBeenCalledTimes(2);
+    for (const call of assertLeaseFence.mock.calls as unknown as Array<[Record<string, unknown>]>) {
+      expect(call[0]).toMatchObject({
+        resourceType: "migration-verification", resourceKey: "generation-1", processId: "worker-1",
+        operation: "verify-generation", fencingToken: FENCE_TOKEN,
+      });
+    }
+    expect(runtime.transaction).toHaveBeenCalledWith(expect.any(Function), expect.objectContaining({
+      operation: "verifyGenerationLeaseFence", projectId, machineId, transactionMode: "read-committed-read-write",
+    }));
+    expect(releaseLease).toHaveBeenCalledTimes(1);
+  }, 15000);
+
+  it("inspect fences once after the window, then releases, and never persists", async () => {
+    const { order, runtime, assertLeaseFence, persist } = arrange();
+    await inspectMigrationVerification(
+      baseInput({ homeDir: homeDirFor("inspect-ok") }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+    );
+    expect(order).toEqual(["snapshot-close", "fence", "release"]);
+    expect(assertLeaseFence).toHaveBeenCalledTimes(1);
+    expect(persist).not.toHaveBeenCalled();
+  }, 15000);
+
+  const sites = [
+    { site: "after the census window", call: 1, events: ["snapshot-close", "fence", "release"] },
+    { site: "immediately before persist", call: 2, events: ["snapshot-close", "fence", "fence", "release"] },
+  ];
+  describe.each(sites)("fence $site", ({ site, call, events }) => {
+    const label = site.replaceAll(" ", "-");
+
+    it("maps a lost lease to lease-lost, publishes nothing, and still releases and closes", async () => {
+      const { order, runtime, assertLeaseFence, releaseLease, persist } = arrange({ failFence: { call, error: leaseLost } });
+      const error = await verifyMigrationGeneration(
+        baseInput({ homeDir: homeDirFor("lost-" + label) }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+      ).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(MigrationVerificationDriverError);
+      expect((error as MigrationVerificationDriverError).reason).toBe("lease-lost");
+      expect((error as MigrationVerificationDriverError).cause).toBeInstanceOf(coordination.PostgreSqlLeaseFenceError);
+      expect(persist).not.toHaveBeenCalled();
+      expect(order).toEqual(events);
+      expect(assertLeaseFence).toHaveBeenCalledTimes(call);
+      expect(releaseLease).toHaveBeenCalledTimes(1);
+      expect(runtime.close).toHaveBeenCalledTimes(1);
+    }, 15000);
+
+    it("lets a non-fence error propagate unchanged and still releases and closes", async () => {
+      const failure = new Error("fence-transport-canary");
+      const { order, runtime, releaseLease, persist } = arrange({ failFence: { call, error: () => failure } });
+      const error = await verifyMigrationGeneration(
+        baseInput({ homeDir: homeDirFor("other-" + label) }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+      ).catch((caught: unknown) => caught);
+      expect(error).toBe(failure);
+      expect(persist).not.toHaveBeenCalled();
+      expect(order).toEqual(events);
+      expect(releaseLease).toHaveBeenCalledTimes(1);
+      expect(runtime.close).toHaveBeenCalledTimes(1);
+    }, 15000);
+
+    it("reports the lost lease, not a release failure that follows it", async () => {
+      const { runtime, releaseLease, persist } = arrange({ failFence: { call, error: leaseLost }, releaseFails: true });
+      const error = await verifyMigrationGeneration(
+        baseInput({ homeDir: homeDirFor("release-fails-" + label) }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+      ).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(MigrationVerificationDriverError);
+      expect((error as MigrationVerificationDriverError).reason).toBe("lease-lost");
+      expect(persist).not.toHaveBeenCalled();
+      expect(releaseLease).toHaveBeenCalledTimes(1);
+      expect(runtime.close).toHaveBeenCalledTimes(1);
+    }, 15000);
+  });
+
+  describe("inspect, after-window fence", () => {
+    it("maps a lost lease to lease-lost and still releases and closes", async () => {
+      const { order, runtime, releaseLease } = arrange({ failFence: { call: 1, error: leaseLost } });
+      const error = await inspectMigrationVerification(
+        baseInput({ homeDir: homeDirFor("inspect-lost") }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+      ).catch((caught: unknown) => caught);
+      expect((error as MigrationVerificationDriverError).reason).toBe("lease-lost");
+      expect(order).toEqual(["snapshot-close", "fence", "release"]);
+      expect(releaseLease).toHaveBeenCalledTimes(1);
+      expect(runtime.close).toHaveBeenCalledTimes(1);
+    }, 15000);
+
+    it("lets a non-fence error propagate unchanged", async () => {
+      const failure = new Error("fence-transport-canary");
+      const { runtime } = arrange({ failFence: { call: 1, error: () => failure } });
+      await expect(inspectMigrationVerification(
+        baseInput({ homeDir: homeDirFor("inspect-other") }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+      )).rejects.toBe(failure);
+    }, 15000);
+
+    it("reports the lost lease, not a release failure that follows it", async () => {
+      const { runtime } = arrange({ failFence: { call: 1, error: leaseLost }, releaseFails: true });
+      const error = await inspectMigrationVerification(
+        baseInput({ homeDir: homeDirFor("inspect-release-fails") }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+      ).catch((caught: unknown) => caught);
+      expect((error as MigrationVerificationDriverError).reason).toBe("lease-lost");
+    }, 15000);
+  });
 });
 
 describe("readSequenceSelfConsistencyMismatches", () => {

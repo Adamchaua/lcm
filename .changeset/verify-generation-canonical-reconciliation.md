@@ -63,6 +63,13 @@ persisted, not released beforehand, so a second worker cannot acquire it
 and start a concurrent recomputation while this attempt's own persist is
 still in flight.
 
+Verification checks that it still holds that lease right after the census
+window closes and again right before the report is written, and refuses
+with a `lease-lost` error, writing nothing, when a check finds the lease
+lost. It does not renew the lease, and the lease can still expire during the
+local report write or while the manifest effect is begun and completed,
+which get no new guarantee.
+
 The sequence self-consistency bound is table-wide, not scoped to the
 project being verified: identity sequences are shared per table across
 every project, so a colliding row in a different project would otherwise

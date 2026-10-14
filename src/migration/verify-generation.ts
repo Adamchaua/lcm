@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
-import { PostgreSqlWorkCoordinator } from "../storage/postgresql/coordination.js";
+import { PostgreSqlLeaseFenceError, PostgreSqlWorkCoordinator } from "../storage/postgresql/coordination.js";
 import { verifyPostgreSqlTransferSchema } from "../storage/postgresql/runtime-readiness.js";
 import {
   inspectPostgreSqlSearchConfiguration,
@@ -111,6 +111,7 @@ export type MigrationVerificationDriverReason =
   | "invalid-input"
   | "destination-drift"
   | "lease-unavailable"
+  | "lease-lost"
   | "report-identity-conflict";
 
 export class MigrationVerificationDriverError extends Error {
@@ -1635,7 +1636,11 @@ export function migrationVerificationEffectId(reportSha256: string): string {
 async function computeVerificationReport(
   input: VerifyMigrationGenerationInput,
   dependencies: VerifyMigrationGenerationDependencies,
-): Promise<{ report: MigrationVerificationReport; releaseLease: () => Promise<void> }> {
+): Promise<{
+  report: MigrationVerificationReport;
+  releaseLease: () => Promise<void>;
+  assertLeaseHeld: () => Promise<void>;
+}> {
   const copySource = await dependencies.openSource({
     generationId: input.generationId, homeDir: input.homeDir, expectedIdentity: input.expectedIdentity,
     scratchParent: input.scratchParent, signal: input.signal,
@@ -1709,6 +1714,31 @@ async function computeVerificationReport(
     // the catch immediately below invokes it on failure. The outer
     // finally must not close runtime a second time in either case.
     releaseLeaseHandedOff = true;
+    // A fence check on a fresh read-committed transaction. The census
+    // snapshot cannot host it: assertLeaseFence requires a live
+    // READ COMMITTED transaction, and the snapshot is REPEATABLE READ.
+    // Verification never renews, so this only reports a lease that a
+    // check has already seen lost. It gives no guarantee about the time
+    // after the check, such as the local report write or begin/complete.
+    const fencedRuntime = runtime;
+    const assertLeaseHeld = async (): Promise<void> => {
+      try {
+        await fencedRuntime.transaction(async (executor) => {
+          await new PostgreSqlWorkCoordinator(
+            executor, input.expectedIdentity.id, input.expectedIdentity.machineId!,
+          ).assertLeaseFence({ ...resource, fencingToken: lease.fencingToken, signal: input.signal });
+        }, {
+          domain: "factory", operation: "verifyGenerationLeaseFence",
+          projectId: input.expectedIdentity.id, machineId: input.expectedIdentity.machineId,
+          transactionMode: "read-committed-read-write", signal: input.signal,
+        });
+      } catch (error) {
+        if (error instanceof PostgreSqlLeaseFenceError) {
+          driverError("lease-lost", "migration verification lease was lost before the report could be published", { cause: error });
+        }
+        throw error;
+      }
+    };
     try {
       const { mismatch: publicListingMismatch, publicListingSha256 } = await runOrderedListingProbe(
         runtime, input.expectedIdentity.id, conversationsPublicOrder, input.signal,
@@ -1740,6 +1770,7 @@ async function computeVerificationReport(
       } finally {
         await session.close();
       }
+      await assertLeaseHeld();
 
       const destinationCensus = destinationRead.census;
       const censusVector = buildCensusVector(destinationCensus);
@@ -1794,7 +1825,7 @@ async function computeVerificationReport(
         sampleParameters: input.sampleParameters,
         mismatches, mismatchTotals,
       };
-      return { report: createMigrationVerificationReport(reportInput), releaseLease };
+      return { report: createMigrationVerificationReport(reportInput), releaseLease, assertLeaseHeld };
     } catch (error) {
       // A secondary failure releasing/closing here must never mask the
       // primary error that got us into this catch: that primary error
@@ -1898,7 +1929,7 @@ export async function verifyMigrationGeneration(
       effectId: pending.effectId, inputSha256: pending.inputSha256,
     };
   }
-  const { report, releaseLease } = await computeVerificationReport(input, dependencies);
+  const { report, releaseLease, assertLeaseHeld } = await computeVerificationReport(input, dependencies);
   // Round-2 P3: the lease stays held across persist and is released
   // only once persist itself has settled (success or failure), so a
   // second worker cannot acquire it and start a concurrent
@@ -1906,6 +1937,7 @@ export async function verifyMigrationGeneration(
   // exactly the window releasing before persist left open.
   let persisted: MigrationVerificationPersistOutcome;
   try {
+    await assertLeaseHeld();
     persisted = reportStore.persist(input.generationId, report);
   } catch (persistError) {
     // Round-4 P3: a plain try/finally here would let releaseLease's own
