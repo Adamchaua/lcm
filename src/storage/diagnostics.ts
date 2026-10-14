@@ -257,7 +257,7 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
         ? normalizeUuidV7(selectedProjectId) === selectedProjectId : /^[a-f0-9]{64}$/u.test(selectedProjectId))) throw new Error("Project diagnostic identity is unavailable.");
       if (backend === "postgresql") {
         const config = before.config.storage.postgresql;
-        runtime = await dependencies.createRuntime({url:config.url,caFile:config.caFile,poolMax:config.poolMax,connectionTimeoutMs:Math.min(config.connectionTimeoutMs,duration),idleTimeoutMs:config.idleTimeoutMs,statementTimeoutMs:Math.min(config.statementTimeoutMs,duration)});
+        runtime = await dependencies.createRuntime({url:config.url,caFile:config.caFile,poolMax:config.poolMax,connectionTimeoutMs:Math.min(config.connectionTimeoutMs,duration),idleTimeoutMs:config.idleTimeoutMs,statementTimeoutMs:Math.min(config.statementTimeoutMs,duration),snapshotIdleTimeoutMs:config.snapshotIdleTimeoutMs});
         if (controller.signal.aborted) { close(); return timeoutSnapshot(); }
         const health = await runtime.health(controller.signal);
         if (controller.signal.aborted) return timeoutSnapshot();

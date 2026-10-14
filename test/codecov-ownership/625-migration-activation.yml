@@ -1,0 +1,16 @@
+references: ["#625", "PR #1443"]
+rationale: >-
+  Adds the eight migration activation modules (absence attribution, restart
+  admission, quiescence, coverage, artifact store, PostgreSQL activation
+  lease, publication step and generation-binding writer) under src/migration/,
+  so they stay in the directory-level migration cutover owner; no topology
+  change.
+pins:
+  - ["src/migration/activation-absence.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-artifact-store.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-coverage.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-lease.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-publication.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-quiescence.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-restart-check.ts", "unit-migration-cutover"]
+  - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]

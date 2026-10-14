@@ -91,8 +91,10 @@ producer's responsibility to keep the source quiescent and its captures coherent
 The PostgreSQL source first admits verified TLS, PostgreSQL 18, schema,
 privileges and the existing machine/project/path binding. It then holds a
 dedicated read-only repeatable-read session. All source reads are serialized on
-that session, and closing the source rolls it back and releases it. Ordinary
-runtime transactions retain their existing mode.
+that session, and closing the source rolls it back and releases it. Catalog
+readiness is re-checked inside the read-only snapshot established when the
+session opens, so readiness evidence and exported reads share that snapshot.
+Ordinary runtime transactions retain their existing mode.
 
 A SQLite destination must be a new exclusively created file in an owner-only
 directory, or the exact generation recorded by an earlier transfer ledger.
@@ -256,6 +258,26 @@ manifest or establish crash-resumable snapshot identity. Capture a persistent
 generation through the snapshot owner when restart-resumable source evidence
 is required.
 
+### PostgreSQL completion recheck
+
+Completing a PostgreSQL run is the last step of a transfer, and it re-reads
+every record the run wrote inside the completing transaction. If any record
+changed or disappeared since verification, completion refuses with
+`verification-failed` and the run stays active. While it does this, the
+transaction holds the project's publication fence, so other writes to that
+project wait until the completion commits or rolls back. The cost grows with
+the size of the run; records are read in bounded batches, so a large run is
+slower to complete but does not load itself into memory.
+
+A run started before the upgrade that adds this check (schema migration 0008)
+carries no per-record content fingerprints and cannot complete. Copy it again
+into a fresh isolated destination.
+
+The recheck belongs to the transition into the completed state. After a run
+has completed, later legitimate edits to the project do not make its completed
+status readback fail, and completing an already completed run again does
+nothing.
+
 ## SQLite recovery archive
 
 Canonical imports write ordinary runtime data to real SQLite tables. Facts
@@ -295,6 +317,7 @@ filesystem path or record payload.
 | `destination-conflict` | Correct target ownership, identity or existing-state conflict; never clear unrelated data automatically. |
 | `destination-uncertain` | Retain evidence and reconcile the exact run receipt before resuming. |
 | `checkpoint-mismatch`, `verification-failed` | Stop; investigate the manifest, progress or actual destination data. |
+| `destination-unexpected-rows` | Stop; the destination holds canonical rows the run did not write. Another writer committed between verification and completion; investigate the extra rows before retrying. |
 | `zero-progress` | Correct the adapter or batch request; no checkpoint was accepted. |
 | `aborted` | Retain the target; retry only with the same valid source generation and target authority. |
 | `close-failed` | Cleanup failed after the operation; do not report overall success. |
