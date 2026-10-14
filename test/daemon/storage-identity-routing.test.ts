@@ -167,6 +167,7 @@ describe("daemon storage identity routing", () => {
     expect(openProject).not.toHaveBeenCalled();
     expect(response.end).toHaveBeenCalledWith(JSON.stringify({
       code: "STORAGE_IDENTITY_REQUIRED",
+      reason: "unbound-postgresql-project",
       error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
       storageBackend: "postgresql",
     }));
@@ -195,6 +196,7 @@ describe("daemon storage identity routing", () => {
 
     expect(response.end).toHaveBeenCalledWith(JSON.stringify({
       code: "STORAGE_IDENTITY_REQUIRED",
+      reason: "unbound-postgresql-project",
       error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
       storageBackend: "postgresql",
     }));
@@ -229,6 +231,7 @@ describe("daemon storage identity routing", () => {
     );
     expect(response.end).toHaveBeenLastCalledWith(JSON.stringify({
       code: "STORAGE_IDENTITY_REQUIRED",
+      reason: "unbound-postgresql-project",
       error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
       storageBackend: "postgresql",
     }));
