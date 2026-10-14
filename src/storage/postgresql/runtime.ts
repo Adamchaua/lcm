@@ -732,7 +732,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
                       savepointFailed = true;
                       savepointFailure ??= normalized;
                       savepointFailureRecoverable =
-                        !queryAborted && !connectionFailure;
+                        !queryAborted && !connectionFailure && !watch!.failed();
                       if (!savepointFailureRecoverable) {
                         recordFatalFailure(
                           normalized,

@@ -289,6 +289,7 @@ describe("PostgreSQL 18 runtime", () => {
       const admin = new PostgreSqlRuntime(settings(database.adminUrl));
       const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }));
       const context = { domain: "transaction", operation: "idleKill" } as const;
+      const idleTimeoutMs = 200;
       try {
         // The relaxed bound is set inside the transaction itself so the test
         // does not depend on the harness role's configured idle timeout.
@@ -297,7 +298,9 @@ describe("PostgreSQL 18 runtime", () => {
         // Client's 'error' event; without the checkout listener that is an
         // unhandled process-level error, which vitest reports as a failure.
         const outcome = await runtime.transaction(async (transaction) => {
-          await transaction.query({ text: "SET LOCAL idle_in_transaction_session_timeout = 200" }, context);
+          await transaction.query({
+            text: `SET LOCAL idle_in_transaction_session_timeout = ${idleTimeoutMs}`,
+          }, context);
           const pid = (await transaction.query<{ pid: number }>({
             text: "SELECT pg_catalog.pg_backend_pid() AS pid",
           }, context)).rows[0].pid;
@@ -305,7 +308,7 @@ describe("PostgreSQL 18 runtime", () => {
             text: "SELECT pid FROM pg_catalog.pg_stat_activity WHERE pid = $1",
             values: [pid],
           }, { domain: "factory", operation: "idleKillObserve" })).rows.length, {
-            timeout: 2_000,
+            timeout: 2 * idleTimeoutMs,
             interval: 25,
           }).toBe(0);
           return transaction.query({ text: "SELECT 1" }, context);

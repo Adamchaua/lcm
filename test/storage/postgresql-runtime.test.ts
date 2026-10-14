@@ -2908,7 +2908,7 @@ describe("PostgreSQL runtime asynchronous failure on a checked-out client", () =
     expect(f.poolClient.listenerCount("error")).toBe(0);
   });
 
-  it("attributes a savepoint query rejection to the captured async error", async () => {
+  it("fails a savepoint after an async error with the inner query error and no savepoint rollback", async () => {
     const f = killable();
     const error = await f.runtime.transaction(async (transaction) => {
       await transaction.savepoint(async (inner) => {
@@ -2916,7 +2916,9 @@ describe("PostgreSQL runtime asynchronous failure on a checked-out client", () =
         await inner.query({ text: "SELECT 1" }, { domain: "transaction", operation: "innerKill" });
       }, { domain: "transaction", operation: "savepointKill" });
     }, options).catch((caught: unknown) => caught);
-    expect(error).toMatchObject({ operation: "savepointKill", sqlState: "25P03", retryable: true });
+    expect(error).toMatchObject({ operation: "innerKill", sqlState: "25P03", retryable: true });
+    expect(f.query).not.toHaveBeenCalledWith(expect.stringContaining("ROLLBACK"));
+    expect(f.query).not.toHaveBeenCalledWith(expect.stringContaining("RELEASE SAVEPOINT"));
     expect(f.release).toHaveBeenCalledWith(true);
     expect(f.poolClient.listenerCount("error")).toBe(1);
   });
@@ -2961,6 +2963,38 @@ describe("PostgreSQL runtime asynchronous failure on a checked-out client", () =
     }, { ...options, signal: controller.signal })).rejects.toMatchObject({ operation: "idleKill" });
     expect(f.release).toHaveBeenCalledWith(true);
     expect(f.poolClient.listenerCount("error")).toBe(0);
+  });
+
+  it("leaves no listener when a direct query aborts around acquisition", async () => {
+    const controller = new AbortController();
+    const aborting = fixtures();
+    aborting.connect.mockImplementationOnce(async () => {
+      controller.abort();
+      return aborting.poolClient;
+    });
+    await expect(aborting.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "directAbortAcquire", signal: controller.signal,
+    })).rejects.toMatchObject({ operation: "directAbortAcquire" });
+    expect(aborting.query).not.toHaveBeenCalled();
+    expect(aborting.release).toHaveBeenCalledWith(true);
+    expect(aborting.poolClient.listenerCount("error")).toBe(0);
+
+    let abortChecks = 0;
+    const lateAbort = {
+      get aborted() {
+        abortChecks += 1;
+        return abortChecks >= 4;
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const attached = fixtures();
+    await expect(attached.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "directAbortAttached", signal: lateAbort,
+    })).rejects.toMatchObject({ operation: "directAbortAttached" });
+    expect(attached.query).not.toHaveBeenCalled();
+    expect(attached.release).toHaveBeenCalledWith(true);
+    expect(attached.poolClient.listenerCount("error")).toBe(0);
   });
 
   it("handles an async error on a direct query client", async () => {
