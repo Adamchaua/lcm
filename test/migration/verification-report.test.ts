@@ -333,6 +333,19 @@ describe("createMigrationVerificationReport / parseMigrationVerificationReport",
     expect(report.reportId).toBe(`verify-generation-${report.reportSha256}`);
     expect(parseMigrationVerificationReport(report)).toEqual(report);
   });
+  it("deep-freezes the report and every nested evidence container on create and parse", () => {
+    const input = baseInput({
+      mismatches: [{ domain: "messages", class: "count", identitySha256: HASH_A }],
+      mismatchTotals: [{ domain: "messages", class: "count", count: 1 }],
+    });
+    for (const report of [createMigrationVerificationReport(input), parseMigrationVerificationReport(createMigrationVerificationReport(input))]) {
+      expect(Object.isFrozen(report.body.censusVector.domains)).toBe(true);
+      expect(Object.isFrozen(report.body.censusVector.domains[0])).toBe(true);
+      expect(Object.isFrozen(report.body.classCoverage[0])).toBe(true);
+      expect(Object.isFrozen(report.mismatches[0])).toBe(true);
+      expect(Object.isFrozen(report.mismatchTotals[0])).toBe(true);
+    }
+  });
   it("creates a dirty report and round-trips it", () => {
     const report = createMigrationVerificationReport(baseInput({
       mismatches: [{ domain: "messages", class: "count", identitySha256: HASH_A }],

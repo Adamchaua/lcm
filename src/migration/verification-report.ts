@@ -78,14 +78,16 @@ function isSafePositiveInteger(value: unknown): value is number {
   return isSafeNonNegativeInteger(value) && value > 0;
 }
 
-function deepFreeze<T>(value: T): T {
-  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
-    Object.freeze(value);
-    if (Array.isArray(value)) {
-      for (const item of value) deepFreeze(item);
-    } else {
-      for (const item of Object.values(value)) deepFreeze(item);
-    }
+function deepFreeze<T>(value: T, visited: WeakSet<object> = new WeakSet()): T {
+  if (value === null || typeof value !== "object") return value;
+  // Freeze unconditionally and always recurse: an already-frozen container
+  // can still hold a mutable child, so Object.isFrozen on the parent proves
+  // nothing about its descendants. The visited set makes shared references
+  // and cycles safe.
+  visited.add(value);
+  Object.freeze(value);
+  for (const child of Object.values(value).filter((item) => !visited.has(item as object))) {
+    deepFreeze(child, visited);
   }
   return value;
 }

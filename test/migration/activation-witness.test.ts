@@ -574,6 +574,41 @@ describe("classifyMigrationRollbackMode", () => {
   });
 });
 
+describe("deep freezing of retained caller input", () => {
+  it("freezes the mutable children of an already-frozen opaque evidence payload on create and parse", () => {
+    const shared = { leaf: 1 };
+    const payload = Object.freeze({ list: [{ leaf: 2 }], first: shared, second: shared });
+    expect(Object.isFrozen(payload.list)).toBe(false);
+
+    const created = createMigrationOpaqueEvidence({ kind: "test-fence", payload });
+    const createdPayload = created.payload as typeof payload;
+    expect(Object.isFrozen(createdPayload.list)).toBe(true);
+    expect(Object.isFrozen(createdPayload.list[0])).toBe(true);
+    expect(Object.isFrozen(createdPayload.first)).toBe(true);
+
+    const parsedPayload = Object.freeze({ list: [{ leaf: 2 }] });
+    const parsed = parseMigrationOpaqueEvidence({
+      version: 1, kind: "test-fence", payload: parsedPayload,
+      evidenceSha256: migrationWitnessSha256({ version: 1, kind: "test-fence", payload: parsedPayload }),
+    });
+    expect(Object.isFrozen((parsed.payload as typeof parsedPayload).list[0])).toBe(true);
+  });
+  it("freezes the mutable children of an already-frozen post-epoch delta retained by a rollback witness", () => {
+    const e = epoch(0);
+    const a = attempt({ epochId: e.epochId, deltaSeed: 0, censusSeed: 0 });
+    const delta = canonicalDelta(1);
+    const frozenOuter = Object.freeze({ version: 1 as const, domains: delta.domains.map((entry) => ({ ...entry })) });
+    expect(Object.isFrozen(frozenOuter.domains)).toBe(false);
+
+    const witness = createMigrationActivationWitness({
+      kind: "rollback", epoch: e, attempt: a,
+      postEpochDelta: frozenOuter, postEpochCensus: null, rollbackMode: "post-write",
+    });
+    expect(Object.isFrozen(witness.postEpochDelta!.domains)).toBe(true);
+    expect(Object.isFrozen(witness.postEpochDelta!.domains[0])).toBe(true);
+  });
+});
+
 describe("MigrationActivationWitness", () => {
   it("creates and round-trips an activation witness", () => {
     const e = epoch(0);
