@@ -496,7 +496,8 @@ component_management:
         - "^src/storage/postgresql/factory\\.ts$"
         - "^src/storage/postgresql/index\\.ts$"
         # #1410 attaches the snapshot checkout's async-failure listener and
-        # resolves the snapshot idle bound here.
+        # resolves the snapshot idle bound here. #1424 gives query and
+        # transaction checkouts the same observer.
         - "^src/storage/postgresql/runtime\\.ts$"
         # #1410 separates the snapshot's idle-in-transaction bound from
         # statementTimeoutMs and captures its async FATAL diagnostic here.
