@@ -288,12 +288,17 @@ component_management:
         # selection in this storage-abstractions owner.
         # #1307 adds explicit-only retained append admission for non-append
         # mutation participants in this same storage-abstractions owner.
+        # #1402 keeps the publication-lock wrapper that classifies
+        # unresolved publication state in this existing owner.
         - "^src/storage/backend\\.ts$"
         # #1347 lets held publication admission skip the append tail wait
         # while still taking the append file lock and phase check here, and
         # chains an admitted frame behind its unresolved admitted predecessor
         # so a timed-out intermediate frame cannot release later same-token
         # frames early.
+        # #1411 keeps lock-token origin tracking and the refusal of
+        # synchronous-origin tokens at asynchronous coordinator seams in this
+        # existing owner; #1407 is its test and documentation debt.
         - "^src/storage/backend-publication\\.ts$"
         # #910 keeps shared publication retry deadlines monotonic in this owner.
         - "^src/storage/publication-convergence\\.ts$"
@@ -478,6 +483,8 @@ component_management:
         - "^src/storage/postgresql/client-config\\.ts$"
         - "^src/storage/postgresql/contracts\\.ts$"
         - "^src/storage/postgresql/errors\\.ts$"
+        # #1402 keeps the publication witness classification in this
+        # existing PostgreSQL-runtime owner.
         - "^src/storage/postgresql/factory\\.ts$"
         - "^src/storage/postgresql/index\\.ts$"
         - "^src/storage/postgresql/runtime\\.ts$"
@@ -514,6 +521,8 @@ component_management:
       name: "Integration - PostgreSQL Coordination"
       paths:
         - "^src/storage/postgresql/coordination\\.ts$"
+        # #1419 keeps the fence-mismatch versus invalid-row distinction in
+        # this existing PostgreSQL-coordination owner.
         - "^src/storage/postgresql/publication-guard\\.ts$"
     - component_id: "integration-postgresql-identity"
       name: "Integration - PostgreSQL Identity"
