@@ -52,6 +52,14 @@ function borrowedSessionHarness(overrides: { backendPid?: number; projectId?: st
     return values.slice(start, start + limit).map((row) => ({ locator: locator(domain, row), byteLength: '1000' }));
   });
   vi.spyOn(mapping, 'readCanonicalRow').mockImplementation(async (_db, _project, domain, key) => byLocator.get(domain)!.get(key) ?? null);
+  vi.spyOn(mapping, 'readCanonicalContentRows').mockImplementation(async (_db, _project, domain, locators) => {
+    const found = new Map<string, Record<string, unknown>>();
+    for (const key of locators) {
+      const row = byLocator.get(domain)!.get(key);
+      if (row !== undefined) found.set(key, row);
+    }
+    return found;
+  });
   vi.spyOn(mapping, 'listConversationMessageHeaders').mockImplementation(async () => []);
   return { session, runtime, dependencies };
 }

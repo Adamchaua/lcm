@@ -2596,6 +2596,17 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     expect(existsSync(fixture.pidPath)).toBe(false);
   });
 
+  it("migrates a published legacy daemon whose health omits the storage backend", async () => {
+    const fieldless = { storageBackend: undefined, version: "1.4.1" };
+    const fixture = await runLegacyFixture({
+      publicHealth: health(4242, { ownerId: "legacy-owner", ...fieldless }),
+      authenticatedHealth: health(4242, { ownerId: "legacy-owner", ...fieldless }),
+    });
+    expect(fixture.result).toMatchObject({ connected: true, restarted: true, stoppedPid: 4242 });
+    expect(fixture.supervisor.stopLegacySystemdUnit).toHaveBeenCalledOnce();
+    expect(fixture.supervisor.start).toHaveBeenCalledOnce();
+  });
+
   it("refuses a remaining legacy PID path without a scoped test-state seam", async () => {
     const dir = root("issue-600-legacy-unscoped-cleanup-");
     const procRoot = join(dir, "proc");

@@ -25,7 +25,7 @@ import { PortableTransferError } from "../portable-transfer.js";
 import { createPortableIndex, type PortableIndex } from "../portable-index.js";
 import {
   decodeCanonicalRow, listCanonicalHeaders, listConversationMessageHeaders,
-  readCanonicalRow,
+  readCanonicalContentRows, readCanonicalRow,
 } from "./portable-mapping.js";
 
 type Snapshot = PostgreSqlQueryExecutor & {
@@ -183,6 +183,29 @@ function assertHeaderLength(length: string): void {
   if (BigInt(length) > BigInt(PORTABLE_LIMITS.maxBatchBytes)) throw new PortableStreamError("record-unrepresentable");
 }
 
+/**
+ * Splits locator picks into consecutive chunks whose aggregate SQL-measured
+ * byteLength stays within PORTABLE_LIMITS.maxBatchBytes, so one batched read
+ * never fetches more than one batch of payload. A single item at the limit
+ * still forms its own chunk (assertHeaderLength already refused anything
+ * larger). An item without a byteLength fails closed. Callers must pass a
+ * non-empty list, so the final chunk is flushed unconditionally.
+ */
+function splitByBytes<T extends {readonly byteLength?: string}>(items: readonly T[]): T[][] {
+  const budget=BigInt(PORTABLE_LIMITS.maxBatchBytes);
+  const chunks:T[][]=[];
+  let current:T[]=[];
+  let currentBytes=0n;
+  for (const item of items) {
+    if (item.byteLength === undefined) invalid();
+    const size=BigInt(item.byteLength);
+    if (current.length > 0 && currentBytes+size > budget) { chunks.push(current); current=[]; currentBytes=0n; }
+    current.push(item); currentBytes+=size;
+  }
+  chunks.push(current);
+  return chunks;
+}
+
 /** Opens one owned read-only snapshot; its identity cannot survive session replacement. */
 export async function createPostgreSqlPortableSource(options: PostgreSqlPortableSourceOptions,
   injected: PostgreSqlPortableSourceDependencies = dependencies): Promise<PortableRecordSource> {
@@ -295,21 +318,31 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     }
     yield `],"sessionId":${canonicalJson(value.sessionId)},"title":${canonicalJson(value.title)},"updatedAt":${canonicalJson(value.updatedAt)}}]`;
   };
-  const eachHeader=async (domain: PortableDomain, visit:(locator:string)=>Promise<void>) => {
+  const eachHeaderPage=async (domain: PortableDomain,
+    visitPage:(headers:readonly {readonly locator:string;readonly byteLength:string}[])=>Promise<void>) => {
     let after: string | null=null;
     while (true) {
       abort(options.signal);
-      const headers=await listCanonicalHeaders(session,expectedIdentity.id,domain,after,1,options.signal);
+      // A page may hold fewer headers than the record bound while rows remain:
+      // listCanonicalHeaders also cuts a page by aggregate locator bytes (#1388).
+      // Resuming after the last returned locator therefore skips nothing.
+      const headers=await listCanonicalHeaders(session,expectedIdentity.id,domain,after,PORTABLE_LIMITS.maxBatchRecords,options.signal);
       if (headers.length === 0) break;
-      if (headers.length > 1) invalid();
+      if (headers.length > PORTABLE_LIMITS.maxBatchRecords) invalid();
+      let previous: string | null=after;
       for (const header of headers) {
         assertHeaderLength(header.byteLength);
-        if (header.locator === after) invalid();
-        await visit(header.locator);
-        after=header.locator;
+        if (header.locator === previous) invalid();
+        previous=header.locator;
       }
+      await visitPage(headers);
+      after=previous;
     }
   };
+  const eachHeader=(domain: PortableDomain, visit:(locator:string,byteLength:string)=>Promise<void>) =>
+    eachHeaderPage(domain,async(headers) => {
+      for (const header of headers) await visit(header.locator,header.byteLength);
+    });
   await eachHeader("conversations",async (locator) => {
     const row=await queryRow("conversations",locator,options.signal);
     const record=draftConversation(row,"0");
@@ -327,8 +360,7 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       }
     } finally { await l.return(undefined); await r.return(undefined); }
   });
-  const recordAt=async(domain:PortableDomain,locator:string,ordinal:number,signal?:AbortSignal):Promise<PortableRecord> => {
-    const row=await queryRow(domain,locator,signal);
+  const recordFromRow=(domain:PortableDomain,row:Record<string,unknown>,locator:string,ordinal:number):PortableRecord => {
     const parent=(parentDomain:"conversations"|"messages",column:string) => {
       if (row[column] === undefined || row[column] === null || domain === parentDomain) return undefined;
       const located=index.lookup(parentDomain,JSON.stringify([String(row[column])]));
@@ -356,12 +388,25 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       conversation:conversation as {identitySha256:string;order:PortableRawConversationOrder}|undefined,
       message:message as {identitySha256:string;order:PortableRawMessageOrder}|undefined,occurrenceOrdinal}),ordinal});
   };
+  const recordAt=async(domain:PortableDomain,locator:string,ordinal:number,signal?:AbortSignal):Promise<PortableRecord> => {
+    const row=await queryRow(domain,locator,signal);
+    return recordFromRow(domain,row,locator,ordinal);
+  };
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
     let count=0;
-    await eachHeader(domain,async(locator) => {
-      const draft=await recordAt(domain,locator,0,options.signal);
-      index.add(locator,draft);
-      count++;
+    // One batched read per byte-bounded chunk of each header page (#1388).
+    // Chunks are finished in order, and rows are consumed in header order, so
+    // occurrence allocation and index ordinals match the per-record walk.
+    await eachHeaderPage(domain,async(headers) => {
+      for (const chunk of splitByBytes(headers)) {
+        abort(options.signal);
+        const rows=await readCanonicalContentRows(session,expectedIdentity.id,domain,chunk.map(header=>header.locator),options.signal);
+        for (const header of chunk) {
+          const draft=recordFromRow(domain,rows.get(header.locator) ?? invalid(),header.locator,0);
+          index.add(header.locator,draft,header.byteLength);
+          count++;
+        }
+      }
     });
     index.finalizeDomain(domain); counts.set(domain,count);
   }
@@ -376,12 +421,15 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     if (encoded === null) invalid();
     return JSON.parse(encoded) as BoundaryEvidence;
   };
-  const checkedRecordAt=async(domain:PortableDomain,locator:string,ordinal:number,signal?:AbortSignal) => {
-    const record=await recordAt(domain,locator,ordinal,signal);
+  const assertBoundaryMatches=(domain:PortableDomain,ordinal:number,record:PortableRecord) => {
     const expected=cachedBoundary(domain,ordinal+1).last;
     if (expected?.recordSha256 !== record.recordSha256 || expected.identitySha256 !== record.identitySha256) {
       throw new PortableStreamError("source-changed");
     }
+  };
+  const checkedRecordAt=async(domain:PortableDomain,locator:string,ordinal:number,signal?:AbortSignal) => {
+    const record=await recordAt(domain,locator,ordinal,signal);
+    assertBoundaryMatches(domain,ordinal,record);
     return record;
   };
   const readOrdinal=async(domain:PortableDomain,ordinal:number,signal?:AbortSignal) => {
@@ -394,14 +442,34 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     let last:BoundaryEvidence["last"]=null;
     let ordinal=0;
     while (ordinal < nextOrdinal) {
-      const entries=index.entries(domain,{afterOrdinal:ordinal-1,limit:Math.min(500,nextOrdinal-ordinal),
+      const entries=index.entries(domain,{afterOrdinal:ordinal-1,limit:Math.min(PORTABLE_LIMITS.maxBatchRecords,nextOrdinal-ordinal),
         maxBytes:PORTABLE_LIMITS.maxBatchBytes,signal});
       if (entries.length === 0) invalid();
-      for (const entry of entries) {
-        const record=await (capture ? recordAt : checkedRecordAt)(domain,entry.locator,entry.ordinal,signal);
-        prefix=appendDigest(prefix,serializePortableRecord(record));
-        last={recordSha256:record.recordSha256,identitySha256:record.identitySha256};ordinal++;
-        if (capture) index.bindScope(prefixScope(domain),String(ordinal),JSON.stringify({prefix,last}));
+      // Batched: one round trip per aggregate-byte-bounded chunk answers the
+      // locators in this ordinal window (bounded by PORTABLE_LIMITS.maxBatchRecords
+      // above) instead of one round trip per record. See #1388; the
+      // incremental digest chain below still processes rows strictly in
+      // entries' order, so boundary/ordering semantics do not change.
+      // Chunking (splitByBytes) additionally bounds each round trip's
+      // aggregate SQL payload bytes to PORTABLE_LIMITS.maxBatchBytes: index.entries' own
+      // maxBytes bound only limits JSON-stringified index metadata, not the
+      // record payload readCanonicalContentRows fetches. The digest loop
+      // runs immediately after each chunk's read, inside this loop, instead
+      // of after accumulating every chunk's rows into one map first: the
+      // Node process's peak resident payload is therefore one chunk (at
+      // most PORTABLE_LIMITS.maxBatchBytes), not the whole entries page.
+      for (const chunk of splitByBytes(entries)) {
+        abort(signal); abort(options.signal);
+        const chunkRows=await readCanonicalContentRows(session,expectedIdentity.id,domain,chunk.map(item=>item.locator),signal);
+        for (const item of chunk) {
+          const row=chunkRows.get(item.locator);
+          if (row === undefined) invalid();
+          const record=recordFromRow(domain,row,item.locator,item.ordinal);
+          if (!capture) assertBoundaryMatches(domain,item.ordinal,record);
+          prefix=appendDigest(prefix,serializePortableRecord(record));
+          last={recordSha256:record.recordSha256,identitySha256:record.identitySha256};ordinal++;
+          if (capture) index.bindScope(prefixScope(domain),String(ordinal),JSON.stringify({prefix,last}));
+        }
       }
     }
     return {prefix,last};
