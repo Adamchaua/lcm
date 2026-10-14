@@ -43,51 +43,12 @@ import {
   migrationMismatchClassOrdinal,
   type MigrationClassCoverageVector,
   type MigrationPublicProbeCoverageVector,
+  type MigrationPublicProbeName,
   type CreateMigrationVerificationReportInput, type MigrationMismatchClass, type MigrationQueueClassificationWitness,
   type MigrationReconciliationDomain, type MigrationSourceWitnessDigests, type MigrationVerificationMismatch,
   type MigrationVerificationMismatchTotal, type MigrationVerificationReport, type MigrationVerificationSampleParameters,
 } from "./verification-report.js";
 import { MigrationVerificationReportStore, type MigrationVerificationPersistOutcome } from "./verification-store.js";
-
-/**
- * V2's replacement for census-alone gating: classes this driver actually
- * checks this pass (either as a recordable mismatch, or as a hard refuse
- * that must have already passed by the time a report is built at all --
- * destination-identity's sealed-witness check, and schema's migrations-
- * chain plus its round-1 search-configuration/collation live-to-live
- * checks, are all the latter shape) are marked ran. Every class this
- * driver defines has an implementation as of round 1 (relation and
- * ledger, plus schema's search-configuration/collation comparisons,
- * were the last additions); a class only ever moves back to not-run if
- * a future change removes its comparator, in which case this set --
- * not the report body, not a comment -- is what stops
- * `activationEligible` from being true while that gap exists.
- */
-export const DRIVER_IMPLEMENTED_MISMATCH_CLASSES: ReadonlySet<MigrationMismatchClass> = new Set([
-  "count", "digest", "identity", "sequence", "schema", "sample", "relation", "ledger",
-]);
-
-function buildClassCoverageVector(): MigrationClassCoverageVector {
-  return MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({
-    class: mismatchClass, ran: DRIVER_IMPLEMENTED_MISMATCH_CLASSES.has(mismatchClass),
-  }));
-}
-
-/**
- * Round-2 follow-up to X2: the search probe's liveness has its own
- * vector, separate from classCoverage's "sample" bit, so a genuine
- * listing mismatch and a not-run search probe in the same pass have an
- * honest joint representation instead of a forced choice between
- * suppressing real evidence and crashing report construction. The
- * listing probe always runs unconditionally; the search probe's ran bit
- * is this pass's actual outcome. See
- * MIGRATION_PUBLIC_PROBE_ORDER's own comment for the reasoning.
- */
-function buildPublicProbeCoverageVector(searchProbeRan: boolean): MigrationPublicProbeCoverageVector {
-  return MIGRATION_PUBLIC_PROBE_ORDER.map((probe) => ({
-    probe, ran: probe === "public-listing" ? true : searchProbeRan,
-  }));
-}
 
 /**
  * The #624 verification driver: plan-v4.md section 2's frozen ordering.
@@ -164,6 +125,25 @@ export async function captureDestinationIdentity(
     driverError("invalid-input", "destination system identifier is invalid");
   }
   return parseMigrationDestinationIdentity({ version: 1, sealedWitnessSha256, systemIdentifier });
+}
+
+/**
+ * The pre-window identity comparisons, kept as one named comparator so the
+ * identity receipt is recorded exactly when both have returned. Unlike the
+ * schema witness (migrations-only per #623), the identity witness is
+ * compared in full: a same-data wrong-database destination must refuse, not
+ * publish a clean report bound to the wrong target.
+ */
+export function assertDestinationIdentityMatches(
+  destinationIdentity: MigrationDestinationIdentity,
+  expected: Readonly<{ expectedDestinationIdentitySha256: string; expectedSystemIdentifier: string }>,
+): void {
+  if (destinationIdentity.sealedWitnessSha256 !== expected.expectedDestinationIdentitySha256) {
+    driverError("destination-drift", "destination identity does not match the expected witness");
+  }
+  if (destinationIdentity.systemIdentifier !== expected.expectedSystemIdentifier) {
+    driverError("destination-drift", "destination system identifier does not match the expected value");
+  }
 }
 
 async function captureCollationSha256(executor: PostgreSqlQueryExecutor, signal?: AbortSignal): Promise<string> {
@@ -298,7 +278,7 @@ export async function captureDestinationSchemaWitness(
  * Both are now rechecked live-to-live here too, closing the interval
  * this function's own name already promised to cover but did not.
  */
-async function assertSchemaWitnessLiveToLive(
+export async function assertSchemaWitnessLiveToLive(
   session: PostgreSqlSnapshotSession, expected: MigrationSchemaWitness, expectedSystemIdentifier: string, signal?: AbortSignal,
 ): Promise<void> {
   const [searchStatus, collationSha256, migrationsSha256, systemIdentifierResult] = await Promise.all([
@@ -440,7 +420,7 @@ function compareTieOrderTitle(left: string | null, right: string | null): number
   return left < right ? -1 : 1;
 }
 
-async function runOrderedListingProbe(
+export async function runOrderedListingProbe(
   executor: PostgreSqlRuntime, projectId: string,
   expectedOrder: readonly MigrationPublicListingSourceEntry[], signal?: AbortSignal,
 ): Promise<{ mismatch: MigrationVerificationMismatch | null; publicListingSha256: string }> {
@@ -1586,6 +1566,79 @@ export function truncateMismatchesPerClass(
   });
 }
 
+// --- Coverage receipts --------------------------------------------------------
+
+/**
+ * One id per group of comparators that together certify a part of the
+ * report. A report's coverage vectors are derived from the receipts a pass
+ * collected: an id is recorded only after every comparator in its group
+ * has returned, so a class or probe is never marked as run by declaration.
+ * Receipts are plain ids with no time, duration or order, because both
+ * coverage vectors are part of the hashed report body.
+ */
+export type MigrationVerificationReceiptId =
+  | "count-digest" | "identity" | "schema" | "sequence" | "relation" | "ledger"
+  | "public-listing" | "public-search";
+
+/**
+ * Which classes and probes each receipt certifies, and the exported
+ * comparators whose completion earns it. The witness audit refers to
+ * receipts by id (a type-only import, so the audit does not load this
+ * driver); test/migration/witness-audit.test.ts resolves each id here and
+ * checks that every listed comparator is the function this module exports.
+ * A hard refusal (identity, schema) aborts the pass before any report
+ * exists, so those receipts can only be absent from a report whose
+ * comparison was not invoked.
+ */
+export const MIGRATION_VERIFICATION_COMPARATORS: Readonly<Record<MigrationVerificationReceiptId, Readonly<{
+  classes: readonly MigrationMismatchClass[];
+  probes: readonly MigrationPublicProbeName[];
+  comparators: readonly ((...args: never[]) => unknown)[];
+}>>> = Object.freeze({
+  "count-digest": { classes: ["count", "digest"], probes: [], comparators: [reconcileCounts] },
+  identity: { classes: ["identity"], probes: [], comparators: [assertDestinationIdentityMatches] },
+  schema: {
+    classes: ["schema"], probes: [], comparators: [captureDestinationSchemaWitness, assertSchemaWitnessLiveToLive],
+  },
+  sequence: { classes: ["sequence"], probes: [], comparators: [readSequenceSelfConsistencyMismatches] },
+  relation: {
+    classes: ["relation"], probes: [],
+    comparators: [reconcileDependencyEdges, readRelationDanglingReferenceMismatches],
+  },
+  ledger: { classes: ["ledger"], probes: [], comparators: [readLedgerMismatches] },
+  "public-listing": { classes: ["sample"], probes: ["public-listing"], comparators: [runOrderedListingProbe] },
+  "public-search": { classes: [], probes: ["public-search"], comparators: [runSearchSelfMatchProbe] },
+});
+
+function buildClassCoverageVector(receipts: ReadonlySet<MigrationVerificationReceiptId>): MigrationClassCoverageVector {
+  const ran = new Set([...receipts].flatMap((id) => MIGRATION_VERIFICATION_COMPARATORS[id].classes));
+  return MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: ran.has(mismatchClass) }));
+}
+
+/**
+ * The search probe's liveness has its own vector, separate from
+ * classCoverage's "sample" bit, so a genuine listing mismatch and a
+ * not-run search probe in the same pass have an honest joint
+ * representation. Each probe's bit is the receipt of its own run: the
+ * listing probe's is that runOrderedListingProbe completed, the search
+ * probe's is that a correlated self-match was confirmed.
+ */
+function buildPublicProbeCoverageVector(
+  receipts: ReadonlySet<MigrationVerificationReceiptId>,
+): MigrationPublicProbeCoverageVector {
+  const ran = new Set([...receipts].flatMap((id) => MIGRATION_VERIFICATION_COMPARATORS[id].probes));
+  return MIGRATION_PUBLIC_PROBE_ORDER.map((probe) => ({ probe, ran: ran.has(probe) }));
+}
+
+/** What the report records for a probe that the testing seam skipped. */
+const SKIPPED_PUBLIC_LISTING = {
+  mismatch: null,
+  publicListingSha256: migrationWitnessSha256(["lcm-migration-verification-public-listing-skipped-v1"]),
+} as const;
+const SKIPPED_SEARCH_PROBE_OUTCOME: MigrationSearchProbeOutcome = {
+  ran: false, chosenOrdinal: null, notRunReason: "the search probe was not invoked",
+};
+
 export interface VerifyMigrationGenerationInput {
   readonly generationId: string;
   readonly targetGenerationId: string;
@@ -1634,6 +1687,13 @@ export interface VerifyMigrationGenerationDependencies {
    * silently absorbed. Production callers must never set this.
    */
   _afterSourceCheckpointsForTesting?: () => Promise<void>;
+  /**
+   * @internal Deterministic seam for proving that a comparator that was
+   * never invoked leaves its classes and probes marked as not run, without
+   * making the pass throw. The named comparators are skipped and earn no
+   * receipt. Production callers must never set this.
+   */
+  _skipComparatorsForTesting?: ReadonlySet<MigrationVerificationReceiptId>;
 }
 
 const defaultDependencies: VerifyMigrationGenerationDependencies = {
@@ -1733,6 +1793,16 @@ async function computeVerificationReport(
   });
   let runtime: PostgreSqlRuntime | undefined;
   let releaseLeaseHandedOff = false;
+  // Completion receipts: the only source of the report's coverage vectors.
+  const receipts = new Set<MigrationVerificationReceiptId>();
+  const isSkipped = (id: MigrationVerificationReceiptId): boolean =>
+    dependencies._skipComparatorsForTesting?.has(id) === true;
+  const receipted = async <T>(id: MigrationVerificationReceiptId, skippedResult: T, run: () => T | Promise<T>): Promise<T> => {
+    if (isSkipped(id)) return skippedResult;
+    const result = await run();
+    receipts.add(id);
+    return result;
+  };
   try {
     await copySource.reauthenticate();
     const {
@@ -1749,15 +1819,7 @@ async function computeVerificationReport(
     if (destinationSchemaWitness.migrationsSha256 !== input.destinationMigrationsSha256) {
       driverError("destination-drift", "destination migrations chain does not match the expected witness");
     }
-    // Unlike the schema witness (migrations-only per #623), the identity
-    // witness is compared in full: a same-data wrong-database destination
-    // must refuse, not publish a clean report bound to the wrong target.
-    if (destinationIdentity.sealedWitnessSha256 !== input.expectedDestinationIdentitySha256) {
-      driverError("destination-drift", "destination identity does not match the expected witness");
-    }
-    if (destinationIdentity.systemIdentifier !== input.expectedSystemIdentifier) {
-      driverError("destination-drift", "destination system identifier does not match the expected value");
-    }
+    await receipted("identity", undefined, () => assertDestinationIdentityMatches(destinationIdentity, input));
 
     // Ledger operand, obtained rather than reimplemented: the same
     // canonicalisation identityFingerprintSha256 was written from by
@@ -1826,13 +1888,17 @@ async function computeVerificationReport(
       }
     };
     try {
-      const { mismatch: publicListingMismatch, publicListingSha256 } = await runOrderedListingProbe(
-        runtime, input.expectedIdentity.id, conversationsPublicOrder, input.signal,
+      const { mismatch: publicListingMismatch, publicListingSha256 } = await receipted(
+        "public-listing", SKIPPED_PUBLIC_LISTING,
+        () => runOrderedListingProbe(fencedRuntime, input.expectedIdentity.id, conversationsPublicOrder, input.signal),
       );
-      const searchProbeOutcome = await runSearchSelfMatchProbe(
+      const searchProbeOutcome = isSkipped("public-search") ? SKIPPED_SEARCH_PROBE_OUTCOME : await runSearchSelfMatchProbe(
         runtime, input.expectedIdentity.id, input.targetGenerationId,
         searchProbeCandidates, input.sampleParameters.seedBasisSha256, input.signal,
       );
+      // A search probe that ran but found no correlated self-match is a
+      // returned outcome, not a completed probe: only a confirmed one earns the receipt.
+      if (searchProbeOutcome.ran) receipts.add("public-search");
 
       const session = await runtime.openReadOnlySnapshot({ projectId: input.expectedIdentity.id, signal: input.signal });
       let destinationRead: MigrationFencedDestinationRead;
@@ -1840,20 +1906,24 @@ async function computeVerificationReport(
       let ledgerMismatches: MigrationVerificationMismatch[];
       try {
         await assertPermanentReadOnlyGuard(session, input.signal);
-        await assertSchemaWitnessLiveToLive(session, destinationSchemaWitness, input.expectedSystemIdentifier, input.signal);
+        await receipted("schema", undefined, () => assertSchemaWitnessLiveToLive(
+          session, destinationSchemaWitness, input.expectedSystemIdentifier, input.signal,
+        ));
         destinationRead = await readFencedDestinationCensus(session, {
           settings: input.destinationSettings, expectedOwner: input.expectedOwner,
           expectedIdentity: input.expectedIdentity, scratchParent: input.scratchParent, signal: input.signal,
         });
-        sequenceMismatches = await readSequenceSelfConsistencyMismatches(session, input.expectedIdentity.id, input.signal);
-        ledgerMismatches = await readLedgerMismatches(session, {
+        sequenceMismatches = await receipted<MigrationVerificationMismatch[]>("sequence", [], () => (
+          readSequenceSelfConsistencyMismatches(session, input.expectedIdentity.id, input.signal)
+        ));
+        ledgerMismatches = await receipted<MigrationVerificationMismatch[]>("ledger", [], () => readLedgerMismatches(session, {
           projectId: input.expectedIdentity.id, targetGenerationId: input.targetGenerationId,
           manifestSha256: copySource.stream.describe().manifestSha256,
           identityFingerprintSha256: destinationProbe.identityFingerprintSha256,
           manifestCheckpoints: manifest.checkpoints, census: destinationRead.census,
           recordIdentities: destinationRead.recordIdentities, recordSha256s: destinationRead.recordSha256s,
           signal: input.signal,
-        });
+        }));
       } finally {
         await session.close();
       }
@@ -1862,14 +1932,16 @@ async function computeVerificationReport(
       const destinationCensus = destinationRead.census;
       const censusVector = buildCensusVector(destinationCensus);
       const canonicalDelta = buildCanonicalDelta(destinationCensus);
-      const countMismatches = reconcileCounts(sourceCheckpoints, destinationCensus);
-      const relationEdgeMismatches = reconcileDependencyEdges(sourceDependencyEdges, destinationRead.dependencyEdges);
-      const relationDanglingMismatches = readRelationDanglingReferenceMismatches(
-        destinationRead.dependencyEdges, destinationRead.recordIdentities,
+      const countMismatches = await receipted<MigrationVerificationMismatch[]>(
+        "count-digest", [], () => reconcileCounts(sourceCheckpoints, destinationCensus),
       );
+      const relationMismatches = await receipted<MigrationVerificationMismatch[]>("relation", [], () => [
+        ...reconcileDependencyEdges(sourceDependencyEdges, destinationRead.dependencyEdges),
+        ...readRelationDanglingReferenceMismatches(destinationRead.dependencyEdges, destinationRead.recordIdentities),
+      ]);
       const domainOrder = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing"] as const;
       const allMismatches = [
-        ...countMismatches, ...sequenceMismatches, ...relationEdgeMismatches, ...relationDanglingMismatches,
+        ...countMismatches, ...sequenceMismatches, ...relationMismatches,
         ...ledgerMismatches, ...(publicListingMismatch ? [publicListingMismatch] : []),
       ];
       const fullMismatches = sortMismatches(allMismatches, domainOrder);
@@ -1907,8 +1979,8 @@ async function computeVerificationReport(
         manifestRevision: input.manifestRevision, manifestChecksumSha256: input.manifestChecksumSha256,
         sourceWitness, destinationIdentity, destinationSchemaWitness,
         projectMapWitnessSha256: input.projectMapWitnessSha256, queueClassificationWitness: input.queueClassificationWitness,
-        censusVector, canonicalDelta, classCoverage: buildClassCoverageVector(),
-        publicProbeSha256, publicProbeCoverage: buildPublicProbeCoverageVector(searchProbeOutcome.ran),
+        censusVector, canonicalDelta, classCoverage: buildClassCoverageVector(receipts),
+        publicProbeSha256, publicProbeCoverage: buildPublicProbeCoverageVector(receipts),
         sampleParameters: input.sampleParameters,
         mismatches, mismatchTotals,
       };

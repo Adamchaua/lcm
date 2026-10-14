@@ -1,4 +1,5 @@
 import type { MigrationMismatchClass, MigrationPublicProbeName, MigrationVerificationReportBody } from "./verification-report.js";
+import type { MigrationVerificationReceiptId } from "./verify-generation.js";
 
 /**
  * The synthesis-round rule (V5/V6): a witness recorded without a
@@ -92,12 +93,19 @@ export type MigrationWitnessAuditEntry =
       /**
        * The closed mismatch classes this witness's live comparison can
        * produce. Ties this inventory to the driver's classCoverage
-       * vector (verify-generation.ts's DRIVER_IMPLEMENTED_MISMATCH_CLASSES)
-       * so the two frozen mechanisms cannot silently drift apart: every
-       * class the driver claims ran must be traceable to a real,
-       * live-compared witness here, and vice versa.
+       * vector so the two frozen mechanisms cannot silently drift apart:
+       * every class a completion receipt can mark as run must be
+       * traceable to a real, live-compared witness here, and vice versa.
        */
       mismatchClasses: readonly MigrationMismatchClass[];
+      /**
+       * The completion receipts whose comparators perform this live
+       * comparison, by id in verify-generation.ts's
+       * MIGRATION_VERIFICATION_COMPARATORS registry. A row cannot claim a
+       * comparison unless the registry names exported comparator functions
+       * for it; the audit test resolves every id and checks that.
+       */
+      receipts: readonly MigrationVerificationReceiptId[];
     }>)
   | (MigrationWitnessAuditEntryCommon & Readonly<{
       comparison: "compared-live-probe-coverage";
@@ -116,6 +124,8 @@ export type MigrationWitnessAuditEntry =
        * applies to classCoverage.
        */
       probes: readonly MigrationPublicProbeName[];
+      /** The completion receipts that mark these probes as run; see compared-live's receipts. */
+      receipts: readonly MigrationVerificationReceiptId[];
     }>)
   | (MigrationWitnessAuditEntryCommon & Readonly<{
       comparison: "structurally-protected";
@@ -156,6 +166,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "refuses destination-drift when it disagrees with expectedDestinationIdentitySha256",
     mismatchClasses: ["identity"],
+    receipts: ["identity"],
   },
   {
     id: "destination-system-identifier", bodyField: "destinationIdentity",
@@ -163,6 +174,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "refuses destination-drift when it disagrees with expectedSystemIdentifier (compared pre-window); round-4 also rechecks it live-to-live from inside the fenced window, on the same borrowed read-only session as the census, refusing destination-drift on a failover between the pre-lease read and the window that the pre-window comparison alone cannot see",
     mismatchClasses: ["identity"],
+    receipts: ["identity", "schema"],
   },
   {
     id: "destination-schema-migrations", bodyField: "destinationSchemaWitness",
@@ -170,6 +182,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "refuses destination-drift when it disagrees with destinationMigrationsSha256 (compared pre-window); round-4 also rechecks it live-to-live from inside the fenced window, on the same borrowed read-only session as the census, refusing destination-drift on a migration committing between the pre-lease read and the window that the pre-window comparison alone cannot see",
     mismatchClasses: ["schema"],
+    receipts: ["schema"],
   },
   {
     id: "destination-schema-search-configuration", bodyField: "destinationSchemaWitness",
@@ -177,6 +190,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "two independent live comparisons, not one: (1) round-3 P2's pinned check -- the pre-window read itself is compared against the compiled-in POSTGRESQL_SEARCH_CONFIGURATION_SHA256 constant the schema installer enforces, refusing invalid-input on a stable-but-wrong configuration that a live-to-live check alone cannot see, since a value that never changes agrees with itself; (2) round-1 W4's fix -- that same pre-window read is compared against a second live read from inside the fenced window, on the same borrowed read-only session as the census, refusing destination-drift on a change between the two reads. Neither subsumes the other: (1) catches a wrong value that is stable across the whole pass, (2) catches a right value that becomes wrong mid-pass. witness-schema-FROZEN-v3.2.md's audit row names the second comparison live-to-live, since a manifest-sealed per-generation baseline from copy time does not exist for this value the way it does for migrations; the pinned constant is a build-level baseline, not a per-generation one, so it does not fill that gap on its own",
     mismatchClasses: ["schema"],
+    receipts: ["schema"],
   },
   {
     id: "destination-schema-collation", bodyField: "destinationSchemaWitness",
@@ -184,6 +198,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "refuses destination-drift (round-1 W4 fix), same live-to-live mechanism as search configuration",
     mismatchClasses: ["schema"],
+    receipts: ["schema"],
   },
   {
     id: "destination-schema-sequence-state-digest", bodyField: "destinationSchemaWitness",
@@ -198,6 +213,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "records a count-class or digest-class mismatch per domain against the source checkpoint",
     mismatchClasses: ["count", "digest"],
+    receipts: ["count-digest"],
   },
   {
     id: "canonical-delta", bodyField: "canonicalDelta",
@@ -212,6 +228,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "records a sequence-class mismatch per domain",
     mismatchClasses: ["sequence"],
+    receipts: ["sequence"],
   },
   {
     id: "relation-edge-set", bodyField: "classCoverage",
@@ -219,6 +236,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "records a relation-class mismatch per domain naming the child's identity digest, never the parent's",
     mismatchClasses: ["relation"],
+    receipts: ["relation"],
   },
   {
     id: "relation-dangling-reference", bodyField: "classCoverage",
@@ -226,6 +244,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "records a relation-class mismatch per domain naming the child's identity digest",
     mismatchClasses: ["relation"],
+    receipts: ["relation"],
   },
   {
     id: "ledger-transfer-run", bodyField: "classCoverage",
@@ -233,6 +252,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "records a ledger-class mismatch on the ledger pseudo-domain when the run is missing, not completed, or any bound value disagrees",
     mismatchClasses: ["ledger"],
+    receipts: ["ledger"],
   },
   {
     id: "ledger-transfer-batches", bodyField: "classCoverage",
@@ -240,6 +260,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "records a ledger-class mismatch naming the domain whose terminal batch is missing or disagrees with the manifest",
     mismatchClasses: ["ledger"],
+    receipts: ["ledger"],
   },
   {
     id: "ledger-transfer-identities", bodyField: "classCoverage",
@@ -247,6 +268,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "records a ledger-class mismatch (cardinality on the ledger pseudo-domain, or per domain for a non-injective mapping)",
     mismatchClasses: ["ledger"],
+    receipts: ["ledger"],
   },
   {
     id: "public-listing-probe", bodyField: "publicProbeSha256",
@@ -254,13 +276,15 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     comparison: "compared-live",
     consequence: "records a sample-class mismatch on the public-listing pseudo-domain",
     mismatchClasses: ["sample"],
+    receipts: ["public-listing"],
   },
   {
     id: "public-probe-coverage", bodyField: "publicProbeCoverage",
-    description: "publicProbeCoverage's two entries: public-listing is unconditionally true (runOrderedListingProbe always executes before this vector is built, so it has no reachable not-run outcome); public-search is the plan-v4 step 5 lcm.search_v1 search probe -- PostgreSqlLexicalSearchRepository.searchMessages, run before the window through the real repository, walking a bounded pool of source message candidates starting at an index derived from sampleParameters.seedBasisSha256 until one candidate's own content produces a *confirmed* destination search result (a self-match, never a cross-engine comparison against SQLite's own search behaviour). Round-4 P1: confirmation means the candidate's source-space identitySha256 is correlated to the destination's native message_id through lcm.transfer_identities and that native key is checked against the actual search results -- a bare non-empty result is no longer sufficient, since a search path that ignores its query or returns a fixed unrelated result would otherwise pass every attempt. This borrows trust from one ledger row per candidate tried: a false pass now requires both a broken search and a transfer_identities row that happens to name exactly the message the broken search returned.",
+    description: "publicProbeCoverage's two entries: public-listing is true only when its completion receipt was recorded, that is when runOrderedListingProbe returned this pass; public-search is the plan-v4 step 5 lcm.search_v1 search probe -- PostgreSqlLexicalSearchRepository.searchMessages, run before the window through the real repository, walking a bounded pool of source message candidates starting at an index derived from sampleParameters.seedBasisSha256 until one candidate's own content produces a *confirmed* destination search result (a self-match, never a cross-engine comparison against SQLite's own search behaviour). Round-4 P1: confirmation means the candidate's source-space identitySha256 is correlated to the destination's native message_id through lcm.transfer_identities and that native key is checked against the actual search results -- a bare non-empty result is no longer sufficient, since a search path that ignores its query or returns a fixed unrelated result would otherwise pass every attempt. This borrows trust from one ledger row per candidate tried: a false pass now requires both a broken search and a transfer_identities row that happens to name exactly the message the broken search returned.",
     comparison: "compared-live-probe-coverage",
-    consequence: "public-listing's entry is always true. For public-search: when a correlated self-match is confirmed, folds ran plus the candidate pool size and the chosen candidate's canonical ordinal into publicProbeSha256, and its entry is true; when every candidate in the pool is exhausted without a confirmed self-match -- whether because a candidate's identity had no correlating transfer_identities row (unattributable) or because a search ran but did not return that candidate's own native key (unconfirmed) -- folds the not-run reason into publicProbeSha256 instead, its entry is false, and activationEligible cannot be true this pass regardless of what the listing probe or any mismatch class found -- an attributed absence per the frozen absence rule, not a mismatch and not a silent pass",
+    consequence: "public-listing's entry is true only when runOrderedListingProbe returned; a pass that did not invoke it records false and cannot be activation-eligible. For public-search: when a correlated self-match is confirmed, folds ran plus the candidate pool size and the chosen candidate's canonical ordinal into publicProbeSha256, and its entry is true; when every candidate in the pool is exhausted without a confirmed self-match -- whether because a candidate's identity had no correlating transfer_identities row (unattributable) or because a search ran but did not return that candidate's own native key (unconfirmed) -- folds the not-run reason into publicProbeSha256 instead, its entry is false, and activationEligible cannot be true this pass regardless of what the listing probe or any mismatch class found -- an attributed absence per the frozen absence rule, not a mismatch and not a silent pass",
     probes: ["public-listing", "public-search"],
+    receipts: ["public-listing", "public-search"],
   },
   {
     id: "project-map-witness", bodyField: "projectMapWitnessSha256",

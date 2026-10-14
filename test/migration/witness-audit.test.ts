@@ -9,7 +9,8 @@ import {
   type CreateMigrationVerificationReportBodyInput,
   type MigrationVerificationReportBody,
 } from "../../src/migration/verification-report.js";
-import { DRIVER_IMPLEMENTED_MISMATCH_CLASSES } from "../../src/migration/verify-generation.js";
+import * as driver from "../../src/migration/verify-generation.js";
+import { MIGRATION_VERIFICATION_COMPARATORS } from "../../src/migration/verify-generation.js";
 import {
   MIGRATION_WITNESS_AUDIT,
   MIGRATION_WITNESS_AUDIT_EXCLUDED_BODY_FIELDS,
@@ -209,30 +210,77 @@ describe("machine-checked witness audit", () => {
 });
 
 describe("reconciliation-class coverage, tied to the same audit inventory", () => {
-  it("has an audit entry mapped to every mismatch class the driver claims as ran, and no other", () => {
-    // Ties the witness audit to verify-generation.ts's own classification
+  const liveEntries = (entries: readonly MigrationWitnessAuditEntry[]) => entries.filter(
+    (entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "compared-live" }> => entry.comparison === "compared-live",
+  );
+  const classesReceiptsCanMarkRan = new Set(
+    Object.values(MIGRATION_VERIFICATION_COMPARATORS).flatMap((entry) => entry.classes),
+  );
+  it("has an audit entry mapped to every mismatch class a completion receipt can mark as ran, and no other", () => {
+    // Ties the witness audit to verify-generation.ts's receipt registry
     // so the two frozen mechanisms cannot silently drift apart: every
-    // class the driver marks ran:true must be traceable to a real,
+    // class a receipt can mark ran:true must be traceable to a real,
     // live-compared witness here, and this inventory must claim no more
-    // than the driver actually implements.
-    const classesNamedByLiveEntries = new Set(
-      MIGRATION_WITNESS_AUDIT
-        .filter((entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "compared-live" }> => entry.comparison === "compared-live")
-        .flatMap((entry) => entry.mismatchClasses),
-    );
-    expect(classesNamedByLiveEntries).toEqual(new Set(DRIVER_IMPLEMENTED_MISMATCH_CLASSES));
+    // than the registry's receipts can certify.
+    const classesNamedByLiveEntries = new Set(liveEntries(MIGRATION_WITNESS_AUDIT).flatMap((entry) => entry.mismatchClasses));
+    expect(classesNamedByLiveEntries).toEqual(classesReceiptsCanMarkRan);
+    expect(classesReceiptsCanMarkRan).toEqual(new Set(MIGRATION_MISMATCH_CLASSES));
   });
   it("fails that cross-check when a live-compared witness's mismatchClasses is dropped (red-first demonstration)", () => {
     const withoutSequenceMapping: readonly MigrationWitnessAuditEntry[] = MIGRATION_WITNESS_AUDIT.map((entry) => (
       entry.id === "sequence-self-consistency" && entry.comparison === "compared-live" ? { ...entry, mismatchClasses: [] } : entry
     ));
-    const classesNamedByLiveEntries = new Set(
-      withoutSequenceMapping
-        .filter((entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "compared-live" }> => entry.comparison === "compared-live")
-        .flatMap((entry) => entry.mismatchClasses),
-    );
-    expect(classesNamedByLiveEntries).not.toEqual(new Set(DRIVER_IMPLEMENTED_MISMATCH_CLASSES));
+    const classesNamedByLiveEntries = new Set(liveEntries(withoutSequenceMapping).flatMap((entry) => entry.mismatchClasses));
+    expect(classesNamedByLiveEntries).not.toEqual(classesReceiptsCanMarkRan);
     expect(classesNamedByLiveEntries.has("sequence")).toBe(false);
+  });
+  it("binds every compared-live and probe-coverage row to receipts that certify exactly what the row claims", () => {
+    const claimingEntries = MIGRATION_WITNESS_AUDIT.filter(
+      (entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "compared-live" | "compared-live-probe-coverage" }> => (
+        entry.comparison === "compared-live" || entry.comparison === "compared-live-probe-coverage"
+      ),
+    );
+    expect(claimingEntries.length).toBeGreaterThan(0);
+    for (const entry of claimingEntries) {
+      expect(entry.receipts.length).toBeGreaterThan(0);
+      for (const receipt of entry.receipts) expect(MIGRATION_VERIFICATION_COMPARATORS).toHaveProperty(receipt);
+      const certifiedClasses = new Set(entry.receipts.flatMap((receipt) => MIGRATION_VERIFICATION_COMPARATORS[receipt].classes));
+      const certifiedProbes = new Set(entry.receipts.flatMap((receipt) => MIGRATION_VERIFICATION_COMPARATORS[receipt].probes));
+      if (entry.comparison === "compared-live") {
+        for (const mismatchClass of entry.mismatchClasses) expect(certifiedClasses.has(mismatchClass)).toBe(true);
+      } else {
+        for (const probe of entry.probes) expect(certifiedProbes.has(probe)).toBe(true);
+      }
+    }
+  });
+  it("leaves no receipt in the registry without an audit row that claims it", () => {
+    const claimed = new Set(MIGRATION_WITNESS_AUDIT.flatMap((entry) => (
+      entry.comparison === "compared-live" || entry.comparison === "compared-live-probe-coverage" ? entry.receipts : []
+    )));
+    expect(claimed).toEqual(new Set(Object.keys(MIGRATION_VERIFICATION_COMPARATORS)));
+  });
+  it("names, for every receipt, the very functions the driver exports as its comparators", () => {
+    // Function objects, compared by identity: a row cannot claim a live
+    // comparison that is not an exported, receipt-producing comparator.
+    const expected = {
+      "count-digest": [driver.reconcileCounts],
+      identity: [driver.assertDestinationIdentityMatches],
+      schema: [driver.captureDestinationSchemaWitness, driver.assertSchemaWitnessLiveToLive],
+      sequence: [driver.readSequenceSelfConsistencyMismatches],
+      relation: [driver.reconcileDependencyEdges, driver.readRelationDanglingReferenceMismatches],
+      ledger: [driver.readLedgerMismatches],
+      "public-listing": [driver.runOrderedListingProbe],
+      "public-search": [driver.runSearchSelfMatchProbe],
+    } as const;
+    expect(Object.keys(MIGRATION_VERIFICATION_COMPARATORS).sort()).toEqual(Object.keys(expected).sort());
+    for (const [receipt, comparators] of Object.entries(expected)) {
+      const registered = MIGRATION_VERIFICATION_COMPARATORS[receipt as keyof typeof expected].comparators;
+      expect(registered).toHaveLength(comparators.length);
+      comparators.forEach((comparator, index) => {
+        expect(typeof comparator).toBe("function");
+        expect(registered[index]).toBe(comparator);
+      });
+    }
   });
   it("rejects a report body whose classCoverage vector omits a reconciliation class entirely", () => {
     // The direct analogue of the witness-completeness check above, for

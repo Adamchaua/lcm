@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrationWitnessSha256 } from "../../src/migration/activation-witness.js";
@@ -36,6 +38,7 @@ import {
   totalsFor,
   truncateMismatchesPerClass,
   verifyMigrationGeneration,
+  type MigrationVerificationReceiptId,
   type VerifyMigrationGenerationDependencies,
   type VerifyMigrationGenerationInput,
 } from "../../src/migration/verify-generation.js";
@@ -2941,5 +2944,77 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: true });
     expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
     expect(result.report.activationEligible).toBe(false);
+  }, 15000);
+});
+
+describe("verifyMigrationGeneration: completion receipts (#1396)", () => {
+  const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+  // Each case names the one comparator group that is never invoked and the
+  // coverage bits that may therefore no longer claim to have run.
+  const skipCases: ReadonlyArray<readonly [MigrationVerificationReceiptId, readonly string[], readonly string[]]> = [
+    ["count-digest", ["count", "digest"], []],
+    ["identity", ["identity"], []],
+    ["schema", ["schema"], []],
+    ["sequence", ["sequence"], []],
+    ["relation", ["relation"], []],
+    ["ledger", ["ledger"], []],
+    ["public-listing", ["sample"], ["public-listing"]],
+    ["public-search", [], ["public-search"]],
+  ];
+
+  it.each(skipCases)(
+    "a skipped %s comparator leaves exactly its bits not run, refuses eligibility and still persists the report",
+    async (receipt, notRunClasses, notRunProbes) => {
+      const manifest = stubDestinationPrimitives();
+      const homeDir = mkdtempSync(join(tmpdir(), "lcm-verify-receipt-"));
+      try {
+        const result = await verifyMigrationGeneration(
+          baseInput({ homeDir }),
+          dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime(), { _skipComparatorsForTesting: new Set([receipt]) }),
+        );
+        expect(result.report.body.classCoverage).toEqual(MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({
+          class: mismatchClass, ran: !notRunClasses.includes(mismatchClass),
+        })));
+        expect(result.report.body.publicProbeCoverage).toEqual(MIGRATION_PUBLIC_PROBE_ORDER.map((probe) => ({
+          probe, ran: !notRunProbes.includes(probe),
+        })));
+        // A skip is not a mismatch and not a failure: the report is clean
+        // evidence of what ran, and is durably persisted as such.
+        expect(result.outcome).toBe("clean");
+        expect(result.report.mismatches).toEqual([]);
+        expect(result.report.activationEligible).toBe(false);
+        expect(new MigrationVerificationReportStore({ homeDir }).has("generation-1", result.report.reportSha256)).toBe(true);
+        // Ineligible, so no manifest effect was begun or completed.
+        expect(manifest.current.phase).toBe("copied");
+      } finally {
+        rmSync(homeDir, { recursive: true });
+      }
+    },
+    15000,
+  );
+
+  it("a skip changes the report identity, so a partially run pass can never share a report with a complete one", async () => {
+    stubDestinationPrimitives();
+    const full = await inspectMigrationVerification(
+      baseInput({ homeDir: "/tmp/lcm-verify-receipt-inspect" }), dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime()),
+    );
+    const partial = await inspectMigrationVerification(
+      baseInput({ homeDir: "/tmp/lcm-verify-receipt-inspect" }),
+      dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime(), { _skipComparatorsForTesting: new Set(["ledger"]) }),
+    );
+    expect(full.activationEligible).toBe(true);
+    expect(partial.activationEligible).toBe(false);
+    expect(partial.reportSha256).not.toBe(full.reportSha256);
+  }, 15000);
+
+  it("a search probe that ran but found no correlated self-match earns no receipt, while the listing probe keeps its own", async () => {
+    stubDestinationPrimitives();
+    const result = await inspectMigrationVerification(
+      baseInput({ homeDir: "/tmp/lcm-verify-receipt-search-miss" }),
+      dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime({ searchRows: [] })),
+    );
+    expect(result.body.publicProbeCoverage).toEqual([
+      { probe: "public-listing", ran: true }, { probe: "public-search", ran: false },
+    ]);
   }, 15000);
 });
