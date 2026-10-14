@@ -364,13 +364,17 @@ config-publishing -> config-published` publishes the project map before the
 completed` releases every project fence with authoritative readback, then
   writes the terminal journal. The completed material is retained
   indefinitely by design; nothing prunes it, and operators must not delete it
-  (see the recovery-evidence warning below). Resume refuses a project journal
-  past acquisition that records no fence, and release refuses to proceed
+  (see the recovery-evidence warning below). Resume refuses, with
+  `unexpected-state` and without changing the phase, a journal with projects
+  at `guarded`, `map-publishing`, `map-published`, `config-publishing`,
+  `config-published`, `releasing`, or `released` that records no fence for a
+  project. Recovery for that refusal is abort. Release refuses to proceed
   while a persisted fence exists without the release and read hooks, leaving
-  the journal at `releasing` (or `abort-releasing` for an abort). To recover,
-  reconstruct the coordinator with a complete provider and retry resume or
-  abort. Only a publication with no projects checkpoints directly to
-  `released`. Journals that are already terminal are not migrated.
+  the journal at `releasing` (or `abort-releasing` for an abort). To recover
+  from the missing release or read hook refusal, or from the admission
+  refusal above, reconstruct the coordinator with a complete provider and
+  retry resume or abort. Only a publication with no projects checkpoints
+  directly to `released`. Journals that are already terminal are not migrated.
 
 The abort sequence is a separate forward-only state machine, never a rewind.
 When abort starts from the initial material-backed journal, its complete

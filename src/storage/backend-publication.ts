@@ -3601,6 +3601,7 @@ const GUARD_RECORDED_FORWARD_PHASES: readonly BackendPublicationPhase[] = [
   "config-publishing",
   "config-published",
   "releasing",
+  "released",
 ];
 
 function sameFenceIdentity(left: BackendPublicationFenceRecord, right: BackendPublicationFenceRecord): boolean {

@@ -2197,8 +2197,11 @@ describe("BackendPublicationCoordinator", () => {
   });
 
   it("finalizes a journal already at the released checkpoint", async () => {
-    const { home, fake } = await preparedFixture();
-    rewriteJournal(home, (journal) => ({ ...journal, phase: "released" }));
+    const { home, fake } = await coordinatorDriftFixture("released-replay");
+    const parked = readBackendPublicationJournal(home);
+    expect(parked?.projects).toHaveLength(1);
+    expect(parked?.projects[0]?.fence?.releasedAt).not.toBeNull();
+    expect(parked?.projects[0]?.fence).not.toBeNull();
     expect((await coordinator(home, fake.driver).resume()).phase).toBe("completed");
   });
 
@@ -2519,7 +2522,7 @@ describe("BackendPublicationCoordinator", () => {
     expect(fence?.releasedAt).not.toBeNull();
   });
 
-  it("handles optional remote admission seams and already-active fences", async () => {
+  it("refuses incomplete remote admission seams and handles already-active fences", async () => {
     const absentReadHome = makeHome();
     const absentRead = makeDriver(material());
     absentRead.driver.acquireRemoteGuard = vi.fn(async () => fenceRecord());
@@ -2545,7 +2548,7 @@ describe("BackendPublicationCoordinator", () => {
     expect(active.driver.releaseRemoteGuard).toHaveBeenCalledOnce();
   });
 
-+  describe("complete remote guard provider requirement", () => {
+  describe("complete remote guard provider requirement", () => {
     type GuardHook = "acquireRemoteGuard" | "readRemoteGuard" | "releaseRemoteGuard";
 
     function withoutHook(driver: BackendPublicationDriver, hook: GuardHook): BackendPublicationDriver {
@@ -2609,6 +2612,20 @@ describe("BackendPublicationCoordinator", () => {
       await expect(coordinator(home, guardless).resume()).resolves.toMatchObject({ phase: "completed", projects: [] });
     });
 
+    it("finalizes a released journal without projects when no guard hooks exist", async () => {
+      const home = makeHome();
+      const input = material();
+      const guardless = withoutGuard(makeDriver(input).driver);
+      const retained = vi.fn(async () => undefined);
+      guardless.retainCompletedMaterial = retained;
+
+      await coordinator(home, guardless).prepare({ ...inputFor(input), projects: [] });
+      rewriteJournal(home, (journal) => ({ ...journal, phase: "released" }));
+
+      await expect(coordinator(home, guardless).resume()).resolves.toMatchObject({ phase: "completed", projects: [] });
+      expect(retained).toHaveBeenCalledOnce();
+    });
+
     it.each(["acquireRemoteGuard", "readRemoteGuard"] as const)(
       "refuses to record guarded when %s is missing and leaves abort available",
       async (hook) => {
@@ -2657,10 +2674,12 @@ describe("BackendPublicationCoordinator", () => {
       expect(cleanup).toHaveBeenCalledTimes(mode === "resume" ? 0 : 1);
     });
 
-    it.each(["guarded", "map-publishing", "map-published", "config-publishing", "config-published", "releasing"] as const)(
+    it.each(["guarded", "map-publishing", "map-published", "config-publishing", "config-published", "releasing", "released"] as const)(
       "refuses to resume a %s journal that has no recorded fence",
       async (phase) => {
         const { home, fake } = await preparedFixture();
+        const retained = vi.fn(async () => undefined);
+        fake.driver.retainCompletedMaterial = retained;
         rewriteJournal(home, (journal) => ({ ...journal, phase }));
 
         await expect(coordinator(home, fake.driver).resume()).rejects.toMatchObject({ reason: "unexpected-state" });
@@ -2668,11 +2687,11 @@ describe("BackendPublicationCoordinator", () => {
         expect(readBackendPublicationJournal(home)?.phase).toBe(phase);
         expect(fake.calls).toEqual([]);
         expect(fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+        expect(retained).not.toHaveBeenCalled();
         await expect(coordinator(home, fake.driver).abort()).resolves.toMatchObject({ phase: "aborted" });
       },
     );
   });
-
 
   it("acquires and releases projects in canonical order", async () => {
     const home = makeHome();
