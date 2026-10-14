@@ -20,7 +20,7 @@ import { createPortableIndex, type PortableIndex } from '../portable-index.js';
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlQueryOptions } from './contracts.js';
 import { buildPostgreSqlClientConfig } from './client-config.js';
 import { verifyPostgreSqlTransferSchema } from './runtime-readiness.js';
-import { assertPostgreSqlRecordCapability, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, readCanonicalContentRows, readCanonicalContentSizes, canonicalRowContentSha256, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
+import { assertPostgreSqlRecordCapability, countCanonicalRows, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, readCanonicalContentRows, readCanonicalContentSizes, canonicalRowContentSha256, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
 import { createPostgreSqlPortableSource, readPostgreSqlPortableWitness } from './portable-source.js';
 import { acquirePostgreSqlProjectPublicationLock } from './publication-guard.js';
 
@@ -448,6 +448,39 @@ async function canonicalVerification(state:DestinationState,manifest:PortableMan
   finally{try{if(stream)await stream.close();else await source.close();}catch{if(primary===undefined)fail('close-failed');}}
 }
 
+/**
+ * Set-membership half of the completion proof for #1426. The checkpoint recheck
+ * only covers this run's own batch bookkeeping, so a canonical row that another
+ * writer committed after verification streamed the destination is invisible to
+ * it: the row has no entry in this run's identity ledger. Admission proved every
+ * non-identity domain empty and the apply path records exactly one
+ * lcm.transfer_identities row per applied record, so under the project
+ * publication fence held by our caller any live surplus over the ledger is a row
+ * this run did not write. Identity domains are excluded on purpose: their ledger
+ * rows are admission-time lookups rather than writes, and machines are
+ * project-linked rather than project-owned, so a ledger tally is meaningless for
+ * them. The live tally issues two database-side counts per tallied domain: the
+ * ledger tally and the live canonical count, the latter over the same scope
+ * predicate as the verification stream (countCanonicalRows). It runs only on the
+ * active-to-completed transition, not on post-commit readback, where a legitimate
+ * writer may already have added rows. A surplus refuses as
+ * destination-unexpected-rows, distinct from verification-failed (content
+ * mismatch); a deficit refuses as verification-failed. Together with the per-row
+ * content recheck in assertRunContentUnchanged it proves the live set is exactly
+ * the run's set.
+ */
+async function assertNoForeignCanonicalRows(executor:PostgreSqlQueryExecutor,state:DestinationState,signal?:AbortSignal):Promise<void>{
+  for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.filter(domain=>!(IDENTITY_DOMAINS as readonly string[]).includes(domain))){
+    const ledger=await executor.query<{count:string}>({text:'SELECT COUNT(*) AS count FROM lcm.transfer_identities WHERE run_id=$1 AND domain=$2',values:[state.input.runId,domain]},options(state,signal));
+    const tally=ledger.rows[0]?.count;
+    const expected=typeof tally==='string'?Number(tally):NaN;
+    if(!Number.isSafeInteger(expected))fail('destination-uncertain');
+    const live=await countCanonicalRows(executor,state.input.expectedIdentity.id,domain,signal);
+    if(live>expected)fail('destination-unexpected-rows');
+    if(live<expected)fail('verification-failed');
+  }
+}
+
 /** Completes only the exact terminal prefix authenticated by canonical verification. */
 async function verifiedCompletionState(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<{state:DestinationState;row:RunRow}>{
   const state=checkedState(authority);
@@ -570,6 +603,7 @@ export async function completePortableDestinationInTransaction(executor:PostgreS
   // The content recheck belongs to the active-to-completed transition (see
   // readPortableCompletedRunInTransaction); repeating completion is a no-op.
   if(row.state==='completed')return;
+  await assertNoForeignCanonicalRows(executor,state,signal);
   await assertRunContentUnchanged(state,executor,signal);
   await executor.query({text:"UPDATE lcm.transfer_runs SET state='completed' WHERE run_id=$1",values:[state.input.runId]},options(state,signal));
 }

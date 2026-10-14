@@ -110,6 +110,35 @@ describe('PostgreSQL canonical destination native persistence',()=>{
       }finally{await destination.close();await source.close();}
     }));
   },120000);
+  it('refuses completion when another writer commits a canonical row after verification, then completes once it is gone',async()=>{
+    await withPostgreSqlTestDatabase('portable-foreign-source',async sourceDb=>withPostgreSqlTestDatabase('portable-foreign-target',async targetDb=>{
+      const {source,input,destination}=await setup(sourceDb,targetDb);
+      try{
+        const manifest=source.describe();
+        await destination.admit(manifest,await destination.preflight(manifest,source));
+        await applyEveryDomain(source,destination);
+        const machine=await targetDb.migrator.query({text:'SELECT machine_id FROM lcm.machines ORDER BY machine_id LIMIT 1'},context);
+        const insertForeign=()=>targetDb.migrator.query({text:"INSERT INTO lcm.session_instructions(project_id,machine_id,scope_hash,client_name,session_id,worktree_path,cwd_path,content,content_hash) VALUES ($1,$2,$3,'codex','foreign-session','/foreign','/foreign','Foreign instruction',$4)",values:[input.expectedIdentity.id,machine.rows[0]!.machine_id,'9'.repeat(64),'a'.repeat(64)]},context);
+        // The completion transaction is the first read-write transaction after the
+        // verification stream; a writer commits just before it begins.
+        const original=Client.prototype.query;
+        let armed=true;
+        const spy=vi.spyOn(Client.prototype,'query').mockImplementation(function(this:Client,...args:unknown[]){
+          if(armed && (args[0] as {text?:string})?.text==='BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE'){
+            armed=false;
+            return insertForeign().then(()=>Reflect.apply(original,this,args)) as never;
+          }
+          return Reflect.apply(original,this,args) as never;
+        });
+        try{await expect(destination.verifyComplete(manifest)).rejects.toMatchObject({code:'destination-unexpected-rows'});}finally{spy.mockRestore();}
+        expect(armed).toBe(false);
+        expect((await targetDb.migrator.query({text:'SELECT state FROM lcm.transfer_runs'},context)).rows).toEqual([{state:'active'}]);
+        await targetDb.migrator.query({text:"DELETE FROM lcm.session_instructions WHERE session_id='foreign-session'"},context);
+        await expect(destination.verifyComplete(manifest)).resolves.toMatchObject({contentSha256:manifest.contentSha256,complete:true});
+        expect((await targetDb.migrator.query({text:'SELECT state FROM lcm.transfer_runs'},context)).rows).toEqual([{state:'completed'}]);
+      }finally{await destination.close();await source.close();}
+    }));
+  },120000);
   it('rolls back native rows if the connection fails immediately before COMMIT, then retries once',async()=>{
     await withPostgreSqlTestDatabase('portable-before-source',async sourceDb=>withPostgreSqlTestDatabase('portable-before-target',async targetDb=>{
       const {source,destination}=await setup(sourceDb,targetDb);

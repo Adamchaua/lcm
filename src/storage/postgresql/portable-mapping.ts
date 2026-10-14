@@ -118,6 +118,15 @@ export async function listCanonicalHeaders(executor:PostgreSqlQueryExecutor,proj
   const result = await executor.query<{locator:string;byteLength:string}>({text:`SELECT page.locator, page."byteLength" FROM (SELECT ${locator} AS locator, sized.byte_length::text AS "byteLength", row_number() OVER page_order AS page_row, sum(octet_length(${locator})) OVER page_order AS page_bytes FROM (SELECT ${mapping.keys.map((key) => `r.${key}::text AS ${key}`).join(", ")}, ${sizeExpression(domain,mapping)} AS byte_length FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ($2::text[] IS NULL OR ${keyExpression(mapping)} > $2::text[] COLLATE "C") ORDER BY ${keyExpression(mapping)} COLLATE "C" LIMIT $3) sized WINDOW page_order AS (ORDER BY ${keyExpression(mapping,"sized")} COLLATE "C" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) page WHERE page.page_row = 1 OR page.page_bytes <= $4::bigint ORDER BY page.page_row`,values:[projectId,keys,limit,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-headers",projectId,signal});
   return result.rows;
 }
+/** Database-side row count over the exact scope that listCanonicalHeaders pages, oversized rows included. */
+export async function countCanonicalRows(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,signal?:AbortSignal):Promise<number> {
+  const mapping = mappingForDomain(domain);
+  const result = await executor.query<{count:string}>({text:`SELECT COUNT(*)::text AS count FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)})`,values:[projectId]},{domain:"transaction",operation:"portable-count",projectId,signal});
+  const count = result.rows[0]?.count;
+  const parsed = typeof count === "string" && /^(0|[1-9][0-9]*)$/.test(count) ? Number(count) : Number.NaN;
+  if (!Number.isSafeInteger(parsed)) fail();
+  return parsed;
+}
 /**
  * Message closure traversal uses numeric seq, independently of opaque locator
  * order. Every caller reads one header per call, so the per-row bound already

@@ -10,6 +10,7 @@ import { PortableTransferError } from '../../src/storage/portable-transfer.js';
 import * as mapping from '../../src/storage/postgresql/portable-mapping.js';
 import { createPortableRecordStream, PORTABLE_RECORD_DOMAIN_ORDER, serializePortableRecord, type PortableDomain } from '../../src/storage/portable-record-stream.js';
 import type { StorageIdentityContext } from '../../src/storage/contracts.js';
+import { isPostgreSqlSnapshotTerminationError, PostgreSqlStorageOperationError } from '../../src/storage/postgresql/errors.js';
 
 const projectId = '01990000-0000-7000-8000-000000000001';
 const machineId = '01990000-0000-7000-8000-000000000002';
@@ -67,6 +68,27 @@ describe('PostgreSQL portable source admission', () => {
     const h=harness(), controller=new AbortController();controller.abort();
     await expect(adapter.createPostgreSqlPortableSource({settings,expectedOwner:'owner',expectedIdentity:identity(),signal:controller.signal},h.dependencies as never)).rejects.toMatchObject({code:'aborted'});
     expect(h.dependencies.createRuntime).not.toHaveBeenCalled();
+  });
+  it('attaches an already-sanitized storage cause but never a raw driver error', async()=>{
+    const h=harness();
+    const sanitizedCause=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'25P03',true,
+    );
+    h.dependencies.verifyRuntimeSchema.mockRejectedValue(sanitizedCause);
+    const error=await adapter.createPostgreSqlPortableSource(
+      {settings,expectedOwner:'owner',expectedIdentity:identity()},h.dependencies as never,
+    ).catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable'});
+    expect((error as {cause?:unknown}).cause).toBe(sanitizedCause);
+
+    const h2=harness();
+    h2.dependencies.verifyRuntimeSchema.mockRejectedValue(new Error('raw driver secret'));
+    const error2=await adapter.createPostgreSqlPortableSource(
+      {settings,expectedOwner:'owner',expectedIdentity:identity()},h2.dependencies as never,
+    ).catch((e:unknown)=>e);
+    expect(error2).toMatchObject({code:'source-unavailable'});
+    expect((error2 as {cause?:unknown}).cause).toBeUndefined();
+    expect(JSON.stringify(error2)).not.toContain('raw driver secret');
   });
 });
 
@@ -316,6 +338,104 @@ describe('PostgreSQL source failure boundaries',()=>{
     h.runtime.close.mockRejectedValue(new Error('runtime-secret'));
     await expect(source.close()).rejects.toMatchObject({code:'source-unavailable'});
     expect(h.session.close).toHaveBeenCalledTimes(1);expect(h.runtime.close).toHaveBeenCalledTimes(1);
+  });
+  it('tolerates a 25P03 (or connection-termination) session close failure, unlike an ordinary one',async()=>{
+    const idleKill=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'25P03',true,
+    );
+    const h=dataHarness(),source=await open(h);
+    h.session.close.mockRejectedValue(idleKill);
+    await expect(source.close()).resolves.toBeUndefined();
+    expect(h.session.close).toHaveBeenCalledTimes(1);expect(h.runtime.close).toHaveBeenCalledTimes(1);
+
+    const h2=dataHarness(),source2=await open(h2);
+    const ordinaryFailure=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'23505',false,
+    );
+    h2.session.close.mockRejectedValue(ordinaryFailure);
+    const error=await source2.close().catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable'});
+    expect((error as {cause?:unknown}).cause).toBe(ordinaryFailure);
+  });
+  it('tolerates a live message-only torn connection but not a live generic not-queryable close failure',async()=>{
+    // What a session.close() ROLLBACK actually rejects with, live, after an
+    // idle-in-transaction FATAL: either a message-only torn connection
+    // that survives normalization as retryable with no sqlState, or, if
+    // undiagnosed, a generic "not queryable" rejection that never carries
+    // a code and is not retryable. Only the first is tolerated.
+    const tornConnection=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},null,true,
+    );
+    const h=dataHarness(),source=await open(h);
+    h.session.close.mockRejectedValue(tornConnection);
+    await expect(source.close()).resolves.toBeUndefined();
+
+    const notQueryable=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},null,false,
+    );
+    const h2=dataHarness(),source2=await open(h2);
+    h2.session.close.mockRejectedValue(notQueryable);
+    const error=await source2.close().catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable'});
+    expect((error as {cause?:unknown}).cause).toBe(notQueryable);
+  });
+  it.each([
+    ['a normalized 25P03 idle-in-transaction kill',()=>new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'25P03',true),true],
+    ['a normalized 57P01 shutdown',()=>new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'57P01',true),true],
+    ['a normalized message-only torn connection',()=>new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},null,true),true],
+    ['a raw 25P03 driver error',()=>Object.assign(new Error('raw secret'),{code:'25P03'}),true],
+    ['a raw torn-connection driver error',()=>new Error('Connection terminated unexpectedly'),true],
+    ['a normalized 42501 permission-denied failure',()=>new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'42501',false),false],
+    ['a normalized generic not-queryable failure',()=>new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},null,false),false],
+    ['a raw unrelated driver error',()=>new Error('raw secret'),false],
+  ])('marks a readDomainPage source-unavailable retryable only for genuine termination: %s',async(_name,makeFailure,retryable)=>{
+    const h=dataHarness(),source=await open(h),failure=makeFailure();
+    h.read.mockRejectedValue(failure);
+    const error=await source.readDomainPage(page('project')).catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable',retryable});
+    expect((error as codec.PortableStreamError).retryable).toBe(isPostgreSqlSnapshotTerminationError(failure));
+    expect(JSON.stringify(error)).not.toContain('raw secret');
+    await source.close();
+  });
+  it('lets the generic stream retry a PostgreSQL termination and fail fast on a non-transient source failure',async()=>{
+    const retry=dataHarness(),retrySource=await open(retry),retryStream=await createPortableRecordStream(retrySource);
+    retry.read.mockRejectedValue(new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'25P03',true));
+    const retryError=await retryStream.readBatch({domain:'project',maxRecords:1,maxBytes:150994944}).catch((e:unknown)=>e);
+    expect(retryError).toMatchObject({code:'source-unavailable',retryable:true});
+
+    const denied=dataHarness(),deniedSource=await open(denied),deniedStream=await createPortableRecordStream(deniedSource);
+    denied.read.mockRejectedValue(new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'42501',false));
+    const deniedError=await deniedStream.readBatch({domain:'project',maxRecords:1,maxBytes:150994944}).catch((e:unknown)=>e);
+    expect(deniedError).toMatchObject({code:'source-invalid',retryable:false});
+  });
+  it('drives the generic stream close-cause-forwarding true arm through the real PostgreSQL source, not a synthetic double',async()=>{
+    // portable-record-stream.ts's own close() forwards error.cause only
+    // when the caught error is instanceof PortableStreamError. The one
+    // production source that ever throws that shape from close() is this
+    // PostgreSQL source (via safeError attaching an already-sanitized
+    // StorageOperationError as cause); every other unit fixture in the
+    // stream's own test file throws a plain Error, which never reaches
+    // that arm. Wrap the real source in the real generic stream and close
+    // the stream (not the source directly) so the true arm executes for a
+    // genuine reason, not a hand-built PortableStreamError.
+    const h=dataHarness(),source=await open(h),stream=await createPortableRecordStream(source);
+    const ordinaryFailure=new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'23505',false,
+    );
+    h.session.close.mockRejectedValue(ordinaryFailure);
+    const error=await stream.close().catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable',retryable:true});
+    expect((error as {cause?:unknown}).cause).toBe(ordinaryFailure);
+  });
+  it('still fails a close when index closure fails, even alongside a tolerated 25P03 session close',async()=>{
+    const h=dataHarness(),source=await open(h),original=PortableIndex.prototype.close;
+    vi.spyOn(PortableIndex.prototype,'close').mockImplementation(function(){original.call(this);throw new Error('index-secret');});
+    h.session.close.mockRejectedValue(new PostgreSqlStorageOperationError(
+      'STORAGE_OPERATION_FAILED',{domain:'transaction',operation:'snapshot',projectId},'25P03',true,
+    ));
+    const error=await source.close().catch((e:unknown)=>e);
+    expect(error).toMatchObject({code:'source-unavailable'});
+    expect(JSON.stringify(error)).not.toContain('index-secret');
   });
 });
 

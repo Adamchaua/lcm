@@ -15,9 +15,11 @@ import { PostgreSqlSnapshotSession, type PostgreSqlSnapshotOptions } from "./sna
 import { buildPostgreSqlClientConfig } from "./client-config.js";
 import {
   isPostgreSqlConnectionError,
+  isPostgreSqlSnapshotTerminationSqlState,
   normalizePostgreSqlError,
   PostgreSqlStorageOperationError,
   PostgreSqlCommitOutcomeUnknownError,
+  sanitizeSqlState,
 } from "./errors.js";
 import {
   areRequiredPostgreSqlExtensionsReady,
@@ -219,6 +221,65 @@ function abortCause(): Error {
   return new Error("postgresql query aborted");
 }
 
+/**
+ * Checkout-scoped observer for a pooled client's asynchronous 'error' event.
+ * idle_in_transaction_session_timeout (and a server shutdown) kills an idle
+ * checked-out backend with a FATAL that node-pg emits on the Client rather
+ * than on any query promise; with no listener that emit is an unhandled
+ * process-level error. The state lives in this closure, never on the
+ * PoolClient, and {@link detach} must run before the client is released so
+ * the listener cannot linger on a client that returns to the pool.
+ */
+interface CheckoutAsyncFailureWatch {
+  /** Whether the checked-out client emitted an asynchronous 'error'. */
+  readonly failed: () => boolean;
+  /** Whether the captured SQLSTATE is a connection termination (08xxx, 57P0x). */
+  readonly terminated: () => boolean;
+  /**
+   * Gives a code-free normalized rejection the captured SQLSTATE, but only
+   * when that code is a genuine connection termination or idle-in-transaction
+   * kill (the same narrow gate as PostgreSqlSnapshotSession): the rejection
+   * of a query on an already-dead client is a generic "not queryable" error
+   * that carries no diagnostic of its own.
+   */
+  readonly reattach: (
+    normalized: StorageOperationError,
+    context: PostgreSqlOperationContext,
+  ) => StorageOperationError;
+  readonly detach: () => void;
+}
+
+function watchCheckoutAsyncFailure(client: PoolClient): CheckoutAsyncFailureWatch {
+  let failed = false;
+  let capturedSqlState: string | null = null;
+  const onAsyncFailure = (error: unknown): void => {
+    failed = true;
+    capturedSqlState ??= sanitizeSqlState(error);
+  };
+  client.on("error", onAsyncFailure);
+  return {
+    failed: () => failed,
+    terminated: () => capturedSqlState !== null && isPostgreSqlConnectionError({ code: capturedSqlState }),
+    reattach: (normalized, context) => {
+      if (
+        capturedSqlState !== null
+        && isPostgreSqlSnapshotTerminationSqlState(capturedSqlState)
+        && normalized instanceof PostgreSqlStorageOperationError
+        && normalized.sqlState === null
+      ) {
+        return new PostgreSqlStorageOperationError(
+          normalized.code as "STORAGE_INITIALIZATION_FAILED" | "STORAGE_OPERATION_FAILED",
+          context,
+          capturedSqlState,
+          true,
+        );
+      }
+      return normalized;
+    },
+    detach: () => { client.removeListener("error", onAsyncFailure); },
+  };
+}
+
 function combineAbortSignals(
   querySignal: AbortSignal | undefined,
   transactionSignal: AbortSignal | undefined,
@@ -297,12 +358,20 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
 
   /** Open after factory/schema/project admission; never changes mutation mode. */
   async openReadOnlySnapshot(
-    input: PostgreSqlSnapshotOptions,
+    input: Omit<PostgreSqlSnapshotOptions, "snapshotIdleTimeoutMs">,
   ): Promise<PostgreSqlSnapshotSession> {
     const context = { ...input, domain: "transaction", operation: "snapshot" } as const;
     const projectIds = normalizedProjectScope(context);
     if (projectIds.length !== 1) throw transactionScopeError(context);
-    const options = { projectId: projectIds[0]!, signal: input.signal };
+    const options = {
+      projectId: projectIds[0]!,
+      signal: input.signal,
+      // Derived once from this runtime's own connection settings, never
+      // from a per-call caller override. This is the single seam that
+      // resolves an omitted snapshotIdleTimeoutMs to the definite fallback
+      // the snapshot actually applies.
+      snapshotIdleTimeoutMs: this.settings.snapshotIdleTimeoutMs,
+    };
     this.assertOpen(context);
     const client = await this.acquire(context).catch((error: unknown): never => {
       throw normalizePostgreSqlError(error, context);
@@ -318,6 +387,27 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         throw error;
       }
     }
+    // idle_in_transaction_session_timeout is checked between statements,
+    // so the FATAL it produces on an idle snapshot ordinarily has no
+    // in-flight query to reject; node-pg instead emits 'error' on the
+    // checked-out Client. Scoped to this snapshot checkout only (see
+    // issue #1424 for the wider gap on other checked-out clients): without
+    // a listener that emit is an unhandled process-level error. Removed on
+    // release so it never lingers on a client returned to the pool.
+    //
+    // forwardAsyncFailure is definitely assigned before any 'error' can be
+    // delivered: PostgreSqlSnapshotSession.open constructs the session
+    // synchronously and its constructor calls onAsyncFailure in the same
+    // tick as the attach below, before open's first await. EventEmitter
+    // delivery is synchronous as well, so no event can reach
+    // onClientAsyncFailure while the variable is unassigned; there is no
+    // pre-registration window and therefore no placeholder to fill it.
+    // Attach and detach are unconditional for the same reason: the
+    // session always registers in this runtime-driven flow, so a guard
+    // around either would have a structurally unreachable arm.
+    let forwardAsyncFailure!: (sqlState: string | null) => void;
+    const onClientAsyncFailure = (error: unknown): void => { forwardAsyncFailure(sanitizeSqlState(error)); };
+    client.on("error", onClientAsyncFailure);
     session = await PostgreSqlSnapshotSession.open({
       query: <R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
         config: QueryConfig<I>, queryOptions: PostgreSqlQueryOptions,
@@ -326,9 +416,11 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       ),
       rollback: async () => { await client.query("ROLLBACK"); },
       release: (destroy) => {
+        client.removeListener("error", onClientAsyncFailure);
         if (session) this.snapshots.delete(session);
         client.release(destroy);
       },
+      onAsyncFailure: (handler) => { forwardAsyncFailure = handler; },
     }, options);
     if (this.closed) {
       await session.close();
@@ -362,17 +454,21 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
   ): Promise<QueryResult<R>> {
     this.assertOpen(options);
     let client: PoolClient | undefined;
+    let watch: CheckoutAsyncFailureWatch | undefined;
     let destroy = false;
     try {
       client = await this.acquire(options);
+      watch = watchCheckoutAsyncFailure(client);
       const result = await this.queryClient<R, I>(client, config, options);
       this.poolFailed = false;
       return result;
     } catch (error) {
       destroy = options.signal?.aborted === true || isPostgreSqlConnectionError(error);
-      throw normalizePostgreSqlError(error, options);
+      const normalized = normalizePostgreSqlError(error, options);
+      throw watch?.reattach(normalized, options) ?? normalized;
     } finally {
-      client?.release(destroy);
+      watch?.detach();
+      client?.release(destroy || watch?.failed() === true);
     }
   }
 
@@ -417,10 +513,12 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     const setupSql = transactionSetupSql(options, requiresAdmission);
     this.assertOpen(options);
     let client: PoolClient | undefined;
+    let watch: CheckoutAsyncFailureWatch | undefined;
     let destroy = false;
     let commitAttempted = false;
     try {
       client = await this.acquire(options);
+      watch = watchCheckoutAsyncFailure(client);
       if (options.signal?.aborted) {
         destroy = true;
         throw aborted(options);
@@ -459,7 +557,10 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         ) {
           destroy = true;
         }
-        const normalized = normalizePostgreSqlError(error, failureOptions);
+        const normalized = watch!.reattach(
+          normalizePostgreSqlError(error, failureOptions),
+          failureOptions,
+        );
         transactionFailed = true;
         transactionFailure ??= normalized;
         return normalized;
@@ -624,14 +725,14 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
                         isPostgreSqlConnectionError(error);
                       const queryAborted =
                         effectiveOptions.signal?.aborted === true;
-                      const normalized = normalizePostgreSqlError(
-                        error,
+                      const normalized = watch!.reattach(
+                        normalizePostgreSqlError(error, effectiveOptions),
                         effectiveOptions,
                       );
                       savepointFailed = true;
                       savepointFailure ??= normalized;
                       savepointFailureRecoverable =
-                        !queryAborted && !connectionFailure;
+                        !queryAborted && !connectionFailure && !watch!.failed();
                       if (!savepointFailureRecoverable) {
                         recordFatalFailure(
                           normalized,
@@ -746,8 +847,13 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       return callbackOutcome.result;
     } catch (error) {
       const connectionFailure = isPostgreSqlConnectionError(error);
-      const commitOutcomeAmbiguous = commitAttempted && connectionFailure;
-      if (options.signal?.aborted === true || connectionFailure) destroy = true;
+      const commitOutcomeAmbiguous = commitAttempted
+        && (connectionFailure || watch?.terminated() === true);
+      if (
+        options.signal?.aborted === true
+        || connectionFailure
+        || watch?.failed() === true
+      ) destroy = true;
       if (client && !destroy && options.signal?.aborted !== true) {
         try {
           await client.query("ROLLBACK");
@@ -758,9 +864,11 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       if (commitOutcomeAmbiguous) {
         throw new PostgreSqlCommitOutcomeUnknownError(options);
       }
-      throw normalizePostgreSqlError(error, options);
+      const normalized = normalizePostgreSqlError(error, options);
+      throw commitAttempted ? watch!.reattach(normalized, options) : normalized;
     } finally {
-      client?.release(destroy);
+      watch?.detach();
+      client?.release(destroy || watch?.failed() === true);
     }
   }
 

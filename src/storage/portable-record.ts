@@ -1043,6 +1043,15 @@ export interface PortableStreamErrorOptions {
   readonly manifestSha256?: string;
   readonly checkpointSha256?: string;
   readonly retryable?: boolean;
+  /**
+   * The underlying already-sanitized storage error, when known. Deliberately
+   * excluded from {@link PortableStreamError.toJSON}: StorageOperationError
+   * is documented deliberately cause-free, and wholesale cause serialization
+   * is a log-hygiene regression. Callers that need the original failure
+   * (for example its PostgreSQL sqlState) read `error.cause` directly; never
+   * log it wholesale.
+   */
+  readonly cause?: unknown;
 }
 
 export type PortableStreamErrorCode =
@@ -1099,7 +1108,11 @@ export class PortableStreamError extends Error {
     const normalizedCode = PORTABLE_STREAM_ERROR_CODES.includes(code)
       ? code
       : "malformed-record";
-    super(`Portable record stream error: ${normalizedCode}`);
+    const cause = readErrorOption(options, "cause");
+    super(
+      `Portable record stream error: ${normalizedCode}`,
+      cause === undefined ? undefined : { cause },
+    );
     this.name = "PortableStreamError";
     this.code = normalizedCode;
     const retryable = readErrorOption(options, "retryable");
