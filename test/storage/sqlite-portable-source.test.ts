@@ -219,6 +219,11 @@ describe("SQLite supplied canonical generation", () => {
   });
 
   it("authenticates many successive checkpoint prefixes without rescanning earlier source records",async()=>{
+    // Authenticate the capture as settled: its read starts well after the
+    // fixture's timestamps, so cached verification does not depend on how
+    // quickly this test runs inside the racy-timestamp window.
+    const realNow=Date.now.bind(Date);
+    vi.spyOn(Date,"now").mockImplementation(()=>realNow()+10_000);
     const source=await open(fixture(db=>conversations(db,60)));
     const stream=await createPortableRecordStream(source);
     const description=source.describeSource();
