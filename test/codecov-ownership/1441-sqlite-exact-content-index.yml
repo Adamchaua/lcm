@@ -1,0 +1,7 @@
+references: ["#1441"]
+rationale: >-
+  #1441 adds a partial (project_id, content, created_at) index so the SQLite
+  exact-content dedup lookup is index-backed; migration.ts keeps its
+  established owner. The dedup.ts edit is comment-only and not material.
+pins:
+  - ["src/db/migration.ts", "unit-local-persistence"]
