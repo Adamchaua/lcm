@@ -44,6 +44,18 @@ export async function withStorageBackendConsumerLockAsync<T>(
   return withBackendPublicationConsumerLockAsync(homeDir, callback);
 }
 
+/**
+ * Run an asynchronous classification read under the publication lock without
+ * rejecting unresolved or non-terminal publication state, so a caller can
+ * report that state instead of failing before it can inspect it.
+ */
+export async function withStorageBackendClassificationLockAsync<T>(
+  homeDir: string | undefined,
+  callback: (lockToken: object) => Promise<T> | T,
+): Promise<T> {
+  return withBackendPublicationConsumerLockAsync(homeDir, callback, { allowUnresolved: true });
+}
+
 /** Authenticate the selected backend against durable publication state. */
 export function assertStorageBackendPublication(
   config: StorageBackendSelection,
