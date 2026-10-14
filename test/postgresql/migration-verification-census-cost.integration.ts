@@ -50,9 +50,12 @@ function formatMs(value: number): string {
  * Not a regression gate: performance numbers are environment-dependent and
  * asserting a fixed threshold here would be exactly the kind of invented
  * cost this item explicitly forbids. This test's job is to produce real,
- * measured numbers from a real PostgreSQL 18 instance and write them to
- * .superpowers/624/impl/census-cost.md verbatim, so the lease TTL proposal
- * in that file is derived from an actual run rather than an assumption.
+ * measured numbers from a real PostgreSQL 18 instance and print them as a
+ * Markdown report (or, when LCM_MIGRATION_CENSUS_COST_EVIDENCE_DIR is set,
+ * write that report to census-cost.md in the named directory), so a lease
+ * TTL can be derived from an actual run rather than an assumption. It is
+ * opt-in: run it with "pnpm run test:postgresql:census-cost"; the default
+ * PostgreSQL run excludes it.
  *
  * Covers the full in-window read as it actually runs today: the census
  * (readFencedDestinationCensus, which now also collects relation-class
@@ -318,19 +321,16 @@ it("measures the full live in-window read against a realistic destination and re
         "proposed leaseTtlMs = ceil(" + formatMs(totalMs) + " * " + String(marginMultiplier) + ") = " + String(proposedLeaseTtlMs) + " ms",
         "",
       ];
-      // The evidence file this measurement regenerates lives at a
-      // gitignored, repository-tree-relative path
-      // (.superpowers/624/impl/census-cost.md) that only ever existed in
-      // the worktrees that produced it. Deriving that path from
+      // The evidence file this measurement regenerates used to live at a
+      // gitignored, repository-tree-relative path that only ever existed
+      // in the worktrees that produced it. Deriving that path from
       // process.cwd() assumed a repository layout no clean checkout
       // guarantees: PR #1420's CI run failed with ENOENT on a fresh
       // checkout where .superpowers/ (and its parent, in that container)
-      // never existed, even though the measurement itself succeeded in
-      // about 68 seconds. The write is now opt-in, gated on an explicit
-      // env var the caller supplies rather than a path this test
-      // invents: set only when a developer is deliberately regenerating
-      // the checked-in evidence file locally. When it is not set (every
-      // CI run, and any environment that has not opted in), the report
+      // never existed, even though the measurement itself succeeded. The
+      // write is opt-in, gated on an explicit env var the caller supplies
+      // rather than a path this test invents: set only when a developer
+      // is deliberately saving the report. When it is not set, the report
       // is still produced and still logged, just not written to disk --
       // the measurement and its assertions below are unaffected either
       // way.

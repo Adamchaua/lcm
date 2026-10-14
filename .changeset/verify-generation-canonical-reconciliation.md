@@ -52,7 +52,8 @@ re-hashes each row individually, so its wall time is roughly linear in row
 count rather than a flat per-domain cost, and the census, sequence check and
 read-only guard all run inside one fenced window bounded by a single
 verification lease that is never renewed mid-window. See
-`docs/migration-cutover.md` for the measured figure and sizing guidance.
+`docs/migration-cutover.md` for how to measure it with
+`pnpm run test:postgresql:census-cost` and for the lease sizing guidance.
 
 The verification lease is held until the report has been durably
 persisted, not released beforehand, so a second worker cannot acquire it

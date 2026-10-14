@@ -761,24 +761,15 @@ canonicalisation path reads and re-hashes each row individually rather
 than in batches, and the `relation` class re-reads every row a second
 time through that same per-record path to collect dependency edges, so
 wall time is roughly linear in the number of rows in scope, not a flat
-per-domain overhead. Measured against a live PostgreSQL 18 instance with
-9,345 rows across the copied domains (dominated by conversations,
-messages and message-parts), the census-plus-relation phase took about
-130.5 seconds and the ledger phase (all four of its checks, including the
-round-4 P2 identity-set digest) took about 97.6 milliseconds -- 0.075% of
-the census-plus-relation figure, comfortably inside the 10% abort
-threshold that addition was measured against before it was kept; together
-with the read-only guard and the sequence check, the whole in-window read
-took about 130.7 seconds, and the two pre-window probes (the
-public-listing repository read and the destination probe) added a further
-272 milliseconds outside the lease window, for a measured total of about
-130.9 seconds. Census-plus-relation alone is 99.7% of that total; the
-ledger, sequence-check and read-only guard phases are each under 100
-milliseconds and do not materially move the figure. This section's name
-is historical -- the number below covers the whole in-window read, not
-the census alone -- because once `relation` and `ledger` existed,
-splitting the figure back apart would have told an operator less, not
-more, about what `leaseTtlMs` actually needs to cover.
+per-domain overhead.
+
+The figure to size for is the whole in-window read (the read-only guard, the
+census with its relation pass, the sequence check and the ledger check), not
+the census alone. The census and relation passes dominate it because they read
+each row; the guard, sequence and ledger checks are server-side
+queries rather than per-row reads. The two probes that run before the
+fenced window opens (the public-listing repository read and the
+destination probe) are measured separately.
 
 The extra `relation`-class read pass is structural, not an oversight left
 for a later item. The only surface this driver is permitted to read
@@ -804,38 +795,43 @@ held by a single verification lease, and the lease has a caller-supplied
 mid-window; if the window does not finish inside the lease term,
 verification fails rather than extending it, exactly like the rest of this
 journal's refuse-and-restart pattern rather than a retry loop. An operator
-sizing `leaseTtlMs` for a large project should measure the whole in-window
-read against a realistic copy of that project's own row counts before a
-cutover, not discover the lease was too short during one. As a starting
-point rather than a promise, this repository's own measured total above
-(about 130.9 seconds) scaled by a stated 3x safety margin -- not a second
-measurement -- yields `leaseTtlMs = 392,787`; the same approach (measure,
-then apply a stated margin, then let the arithmetic be checked) is what an
-operator should repeat against their own data before relying on any
-specific `leaseTtlMs` value. This section has stated 95.9 seconds
-(`leaseTtlMs = 288,787`), 98.7 seconds (`leaseTtlMs = 297,088`) and 100.8
-seconds (`leaseTtlMs = 302,384`) in earlier runs of the same harness
-against the same fixture; the figures above are from a run at this
-candidate's own commit, after round-4 added the ledger class's per-domain
-identity-set digest reconciliation (verify-generation.ts's
-`readLedgerMismatches`) inside the fenced window -- one grouped,
-server-side SQL aggregate, not a per-row read, measured against the 10%
-abort threshold before being kept (see
-`.superpowers/624/impl/census-cost.md`) -- and the round-1 review fixes
-that added one pg_catalog metadata query inside the fenced window (the
-sequence-backed identity-column completeness guard) and one before it
-(reading the destination's own applied-migrations table instead of the
-compiled-in bundle). None of these are per-row reads and none changes
-the census's dominant, round-trip-per-record cost; the increase across
-these four runs is consistent with that added work plus ordinary host
-variance.
+sizing `leaseTtlMs` for a large project should measure the in-window read
+against a realistic copy of that project's own row counts before a
+cutover, not discover the lease was too short during one.
 
-The authoritative source for these numbers is
-`.superpowers/624/impl/census-cost.md` (worktree-local, regenerated
-by re-running
-`test/postgresql/migration-verification-census-cost.integration.ts`,
-not hand-edited); this section is kept in sync with that file rather
-than the reverse. Re-running the same harness against the same fixture
-can itself produce a few seconds of variance on a shared host, as the
-four figures above show, so treat any single run as an estimate to
-re-check periodically, not an exact constant.
+#### Measuring the in-window cost
+
+Run the opt-in measurement from a checkout of this repository:
+
+```bash
+pnpm run test:postgresql:census-cost
+```
+
+The script builds the project and then runs only
+`test/postgresql/migration-verification-census-cost.integration.ts` through
+the PostgreSQL harness, against the harness's isolated PostgreSQL instance.
+The measurement is excluded from `pnpm run test:postgresql` and from CI, so
+it never runs unless you ask for it. It seeds a bulk fixture, runs the same
+in-window reads verification runs, and prints a Markdown report with the row
+count per domain, the wall time of each phase (marked as before or inside the
+lease window), a `window total` row for the in-window read, a `measured total`
+row that adds the two pre-window probes, and a `Proposed lease TTL` line. Set
+`LCM_MIGRATION_CENSUS_COST_EVIDENCE_DIR` to a directory to have the report
+written there as `census-cost.md` instead of printed.
+
+Timings depend on the host and PostgreSQL instance, so measure on hardware
+comparable to the cutover environment and repeat the measurement when that
+environment changes. The cost is round-trip dominated and linear in rows, so
+for a destination larger than the fixture, scale the measured in-window total
+by the ratio of row counts before applying the margin below.
+
+#### Sizing `leaseTtlMs`
+
+Set `leaseTtlMs` to at least the measured in-window total multiplied by 3.
+The 3x factor is a safety margin for a destination about three times larger
+than the one measured, or for equivalent disk and network degradation; it is
+an assumption, not a second measurement. The lease is also held while the two
+pre-window probes run and while the report is persisted, which the margin is
+expected to absorb. The report's `Proposed lease TTL` line applies the same
+3x factor to the measured total including those probes, so it is never smaller
+than this rule.
