@@ -828,13 +828,16 @@ by the ratio of row counts before applying the margin below.
 #### Sizing `leaseTtlMs`
 
 Set `leaseTtlMs` to at least the measured in-window total multiplied by 3.
-The 3x factor is a safety margin for a destination about three times larger
-than the one measured, or for equivalent disk and network degradation; it is
-an assumption, not a second measurement. The lease is also held while the two
-pre-window probes run and while the report is persisted, which the margin is
-expected to absorb. The report's `Proposed lease TTL` line applies the same
-3x factor to the measured total including those probes, so it is never smaller
-than this rule.
+If the destination has more rows than the fixture, first scale that total by
+the ratio of row counts, then multiply by 3. The 3x factor is a safety margin
+for disk and network degradation; it is an assumption, not a second
+measurement. The lease covers the ordered listing probe, the search probe, the
+in-window reads and report persistence, which the margin is expected to
+absorb. The destination probe runs before the lease is acquired. The report's
+`Proposed lease TTL` line applies the same 3x factor to the measured total at
+the fixture's own scale, including both pre-window probes, so it is never
+smaller than this rule at that scale. Scale it by the row-count ratio too for
+a larger destination.
 
 ### Verification memory use scales with the project
 
