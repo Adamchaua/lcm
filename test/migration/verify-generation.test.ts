@@ -905,6 +905,57 @@ describe("readLedgerMismatches", () => {
       identitySha256: migrationWitnessSha256(["ledger-record-set-mismatch-v1", "messages"]),
     }]);
   });
+  describe("a domain outside the portable order (kALxd, kBcQT)", () => {
+    const unexpectedDomain = "unexpected-domain-canary";
+    const unexpectedMismatch = {
+      domain: "ledger", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-unexpected-domain-v1", unexpectedDomain]),
+    };
+    it("records an extra transfer_batches domain instead of dropping it", async () => {
+      const session = fakeSession({
+        ledgerCheckpoints: [
+          ...PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain)),
+          { ...defaultLedgerCheckpoint("messages"), domain: unexpectedDomain as PortableDomain },
+        ],
+      });
+      expect(await readLedgerMismatches(session as never, ledgerInput())).toEqual([unexpectedMismatch]);
+    });
+    it("records an unexpected transfer_identities domain instead of dropping it", async () => {
+      const session = fakeSession({
+        ledgerIdentitySets: [{ domain: unexpectedDomain, identitySha256s: [fakeHash("m-a")] }],
+      });
+      expect(await readLedgerMismatches(session as never, ledgerInput())).toEqual([unexpectedMismatch]);
+    });
+    it("records one mismatch when both queries return the same unexpected domain", async () => {
+      const session = fakeSession({
+        ledgerCheckpoints: [
+          ...PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain)),
+          { ...defaultLedgerCheckpoint("messages"), domain: unexpectedDomain as PortableDomain },
+        ],
+        ledgerIdentitySets: [{ domain: unexpectedDomain, identitySha256s: [fakeHash("m-a")] }],
+      });
+      expect(await readLedgerMismatches(session as never, ledgerInput())).toEqual([unexpectedMismatch]);
+    });
+    it("normalizes a non-injective mapping under an unexpected domain to the ledger pseudo-domain", async () => {
+      const session = fakeSession({ ledgerNonInjective: [{ domain: unexpectedDomain, nativeKey: "native-key-a" }] });
+      expect(await readLedgerMismatches(session as never, ledgerInput())).toEqual([{
+        domain: "ledger", class: "ledger",
+        identitySha256: migrationWitnessSha256(["ledger-non-injective-mapping-v1", unexpectedDomain, "native-key-a"]),
+      }]);
+    });
+    it("builds a report with the mismatch and without the raw value instead of failing construction", async () => {
+      stubDestinationPrimitives();
+      const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+      const session = fakeSession({ ledgerNonInjective: [{ domain: unexpectedDomain, nativeKey: "native-key-a" }] });
+      const result = await inspectMigrationVerification(
+        baseInput({ homeDir: "/tmp/lcm-verify-unexpected-ledger-domain" }),
+        dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime({ session })),
+      );
+      expect(result.activationEligible).toBe(false);
+      expect(result.mismatches.some((mismatch) => mismatch.domain === "ledger" && mismatch.class === "ledger")).toBe(true);
+      expect(JSON.stringify(result)).not.toContain(unexpectedDomain);
+    }, 15000);
+  });
 });
 
 describe("streamSourceCheckpoints: dependency edge capture", () => {

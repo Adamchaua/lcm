@@ -906,6 +906,34 @@ function digestRecordSet(records: ReadonlyMap<string, string>): string | null {
   return sha256Hex([...records.keys()].sort().map((identity) => identity + records.get(identity)!).join(""));
 }
 
+const PORTABLE_DOMAIN_NAMES: ReadonlySet<string> = new Set(PORTABLE_RECORD_DOMAIN_ORDER);
+
+/**
+ * A domain read back from the ledger is untrusted text. One that is not a
+ * portable domain must never be cast to PortableDomain or reach the report
+ * as itself (report construction rejects an unknown domain outright, which
+ * would turn evidence into a construction failure). It is recorded under
+ * the existing ledger pseudo-domain instead.
+ */
+function ledgerReportDomain(rawDomain: string): MigrationReconciliationDomain {
+  return PORTABLE_DOMAIN_NAMES.has(rawDomain) ? rawDomain as PortableDomain : "ledger";
+}
+
+/**
+ * The one surplus-domain check for every ledger query that groups by
+ * domain: a domain the portable order does not contain is a ledger
+ * mismatch whose opaque identity hashes the raw value, so the report
+ * carries the evidence without carrying the value.
+ */
+function readLedgerSurplusDomainMismatches(rawDomains: Iterable<string>): MigrationVerificationMismatch[] {
+  const surplus = new Set<string>();
+  for (const rawDomain of rawDomains) if (!PORTABLE_DOMAIN_NAMES.has(rawDomain)) surplus.add(rawDomain);
+  return [...surplus].sort().map((rawDomain) => ({
+    domain: "ledger" as const, class: "ledger" as const,
+    identitySha256: migrationWitnessSha256(["ledger-unexpected-domain-v1", rawDomain]),
+  }));
+}
+
 /**
  * Ledger class: lcm.transfer_runs / transfer_batches / transfer_identities,
  * all read inside the step 6 snapshot, nothing read after it. The run row
@@ -986,7 +1014,7 @@ export async function readLedgerMismatches(
   }, { ...queryOptions, operation: "verifyGenerationLedgerInjectivity" });
   for (const row of nonInjectiveResult.rows) {
     mismatches.push({
-      domain: row.domain as PortableDomain, class: "ledger",
+      domain: ledgerReportDomain(row.domain), class: "ledger",
       identitySha256: migrationWitnessSha256(["ledger-non-injective-mapping-v1", row.domain, row.native_key]),
     });
   }
@@ -1029,6 +1057,10 @@ export async function readLedgerMismatches(
       });
     }
   }
+
+  mismatches.push(...readLedgerSurplusDomainMismatches(
+    [...batchResult.rows, ...identitySetResult.rows].map((row) => row.domain),
+  ));
 
   return mismatches;
 }
