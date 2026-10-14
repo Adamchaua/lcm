@@ -757,7 +757,8 @@ open destination source), the sequence self-consistency check, and the
 `ledger` class's three-table SQL against `transfer_runs`/`transfer_batches`/
 `transfer_identities` (including, as of round-4 P2, a per-domain identity-
 set digest reconciling exactly which identities the ledger recorded
-against what the destination's own read independently observed) -- does
+against what the destination's own read independently observed, and a
+matching digest over each identity's record digest) -- does
 not have a fixed cost. Its dominant cost is the census: the destination's
 canonicalisation path reads and re-hashes each row individually rather
 than in batches, and the `relation` class re-reads every row a second

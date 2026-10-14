@@ -702,6 +702,9 @@ export interface MigrationFencedDestinationRead {
   readonly census: readonly MigrationVerificationDomainCensus[];
   readonly dependencyEdges: ReadonlyMap<PortableDomain, ReadonlySet<string>>;
   readonly recordIdentities: ReadonlyMap<PortableDomain, ReadonlySet<string>>;
+  /** Per domain, each destination record's identity digest mapped to the
+   * record digest the same page read already produced (no extra read). */
+  readonly recordSha256s: ReadonlyMap<PortableDomain, ReadonlyMap<string, string>>;
 }
 
 /**
@@ -734,8 +737,10 @@ export async function readFencedDestinationCensus(
   });
   try {
     const census = PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => readPostgreSqlPortableSourceDomainCensus(destinationSource, domain));
-    const { dependencyEdges, recordIdentities } = await readDestinationDependencyEdges(destinationSource, input.signal);
-    return { census, dependencyEdges, recordIdentities };
+    const { dependencyEdges, recordIdentities, recordSha256s } = await readDestinationDependencyEdges(
+      destinationSource, input.signal,
+    );
+    return { census, dependencyEdges, recordIdentities, recordSha256s };
   } finally {
     // Borrowed session: this must never close it. Verified by
     // test/storage/postgresql-portable-source-borrowed-session.test.ts and
@@ -746,12 +751,18 @@ export async function readFencedDestinationCensus(
 
 async function readDestinationDependencyEdges(
   destinationSource: PortableRecordSource, signal?: AbortSignal,
-): Promise<{ dependencyEdges: Map<PortableDomain, Set<string>>; recordIdentities: Map<PortableDomain, Set<string>> }> {
+): Promise<{
+  dependencyEdges: Map<PortableDomain, Set<string>>;
+  recordIdentities: Map<PortableDomain, Set<string>>;
+  recordSha256s: Map<PortableDomain, Map<string, string>>;
+}> {
   const dependencyEdges = new Map<PortableDomain, Set<string>>();
   const recordIdentities = new Map<PortableDomain, Set<string>>();
+  const recordSha256s = new Map<PortableDomain, Map<string, string>>();
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
     const edgeSet = new Set<string>(); dependencyEdges.set(domain, edgeSet);
     const identitySet = new Set<string>(); recordIdentities.set(domain, identitySet);
+    const recordSha256ByIdentity = new Map<string, string>(); recordSha256s.set(domain, recordSha256ByIdentity);
     let afterOrdinal = 0;
     for (;;) {
       const page = await destinationSource.readDomainPage({
@@ -760,13 +771,14 @@ async function readDestinationDependencyEdges(
       });
       for (const record of page.records) {
         identitySet.add(record.identitySha256);
+        recordSha256ByIdentity.set(record.identitySha256, record.recordSha256);
         collectDependencyEdges(record, edgeSet);
       }
       afterOrdinal += page.records.length;
       if (page.complete) break;
     }
   }
-  return { dependencyEdges, recordIdentities };
+  return { dependencyEdges, recordIdentities, recordSha256s };
 }
 
 /**
@@ -844,6 +856,7 @@ export interface MigrationLedgerReconciliationInput {
   readonly manifestCheckpoints: readonly MigrationCheckpoint[];
   readonly census: readonly MigrationVerificationDomainCensus[];
   readonly recordIdentities: ReadonlyMap<PortableDomain, ReadonlySet<string>>;
+  readonly recordSha256s: ReadonlyMap<PortableDomain, ReadonlyMap<string, string>>;
   readonly signal?: AbortSignal;
 }
 
@@ -878,6 +891,19 @@ export interface MigrationLedgerReconciliationInput {
 function digestIdentitySet(identities: ReadonlySet<string>): string | null {
   if (identities.size === 0) return null;
   return sha256Hex([...identities].sort().join(""));
+}
+
+/**
+ * The record-digest counterpart of digestIdentitySet: folds each domain's
+ * (identity_sha256, record_sha256) pairs, ordered by identity, into one
+ * digest to compare against a server-side aggregate over the ledger's
+ * identity_sha256 || record_sha256. Identities are fixed-width and unique
+ * per domain, so ordering the pairs by identity is the same byte order the
+ * server's ORDER BY identity_sha256 COLLATE "C" produces.
+ */
+function digestRecordSet(records: ReadonlyMap<string, string>): string | null {
+  if (records.size === 0) return null;
+  return sha256Hex([...records.keys()].sort().map((identity) => identity + records.get(identity)!).join(""));
 }
 
 /**
@@ -970,12 +996,17 @@ export async function readLedgerMismatches(
   // of copied identities per domain, not just its size and uniqueness.
   // One grouped, server-side aggregate query; no per-identity row is
   // ever fetched to the client for this check.
-  const identitySetResult = await session.query<{ domain: string; identity_set_sha256: string | null }>({
-    text: "SELECT domain, encode(public.digest(string_agg(identity_sha256, '' ORDER BY identity_sha256 COLLATE \"C\"), 'sha256'), 'hex') AS identity_set_sha256 "
+  const identitySetResult = await session.query<{
+    domain: string; identity_set_sha256: string | null; record_set_sha256: string | null;
+  }>({
+    text: "SELECT domain, "
+      + "encode(public.digest(string_agg(identity_sha256, '' ORDER BY identity_sha256 COLLATE \"C\"), 'sha256'), 'hex') AS identity_set_sha256, "
+      + "encode(public.digest(string_agg(identity_sha256 || record_sha256, '' ORDER BY identity_sha256 COLLATE \"C\"), 'sha256'), 'hex') AS record_set_sha256 "
       + "FROM lcm.transfer_identities WHERE run_id = $1 GROUP BY domain",
     values: [run.run_id],
   }, { ...queryOptions, operation: "verifyGenerationLedgerIdentitySet" });
   const identitySetByDomain = new Map(identitySetResult.rows.map((row) => [row.domain, row.identity_set_sha256] as const));
+  const recordSetByDomain = new Map(identitySetResult.rows.map((row) => [row.domain, row.record_set_sha256] as const));
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
     const expectedSha256 = digestIdentitySet(input.recordIdentities.get(domain) ?? new Set());
     const actualSha256 = identitySetByDomain.get(domain) ?? null;
@@ -983,6 +1014,18 @@ export async function readLedgerMismatches(
       mismatches.push({
         domain, class: "ledger",
         identitySha256: migrationWitnessSha256(["ledger-identity-set-mismatch-v1", domain]),
+      });
+    }
+    // The identity set alone cannot see a ledger row whose record_sha256
+    // was substituted while its identity stayed. The same grouped query
+    // folds the pairs, and the destination side reuses the record digests
+    // the relation walk already read.
+    const expectedRecordSha256 = digestRecordSet(input.recordSha256s.get(domain) ?? new Map());
+    const actualRecordSha256 = recordSetByDomain.get(domain) ?? null;
+    if (expectedRecordSha256 !== actualRecordSha256) {
+      mismatches.push({
+        domain, class: "ledger",
+        identitySha256: migrationWitnessSha256(["ledger-record-set-mismatch-v1", domain]),
       });
     }
   }
@@ -1765,7 +1808,8 @@ async function computeVerificationReport(
           manifestSha256: copySource.stream.describe().manifestSha256,
           identityFingerprintSha256: destinationProbe.identityFingerprintSha256,
           manifestCheckpoints: manifest.checkpoints, census: destinationRead.census,
-          recordIdentities: destinationRead.recordIdentities, signal: input.signal,
+          recordIdentities: destinationRead.recordIdentities, recordSha256s: destinationRead.recordSha256s,
+          signal: input.signal,
         });
       } finally {
         await session.close();

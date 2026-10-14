@@ -119,15 +119,15 @@ it("measures the full live in-window read against a realistic destination and re
       // rather than a fast-fail empty-run short circuit.
       const warmupSession = await runtime.openReadOnlySnapshot({ projectId: seeded.expectedIdentity.id });
       let totalRecordCount = 0;
-      const identityRows: Array<{ domain: string; identitySha256: string }> = [];
+      const identityRows: Array<{ domain: string; identitySha256: string; recordSha256: string }> = [];
       try {
         const warmupRead = await readFencedDestinationCensus(warmupSession, {
           settings: settings(db.runtimeUrl), expectedOwner: "lcm_test_migrator",
           expectedIdentity: seeded.expectedIdentity, scratchParent,
         });
         totalRecordCount = warmupRead.census.reduce((sum, entry) => sum + entry.recordCount, 0);
-        for (const [domain, identities] of warmupRead.recordIdentities) {
-          for (const identitySha256 of identities) identityRows.push({ domain, identitySha256 });
+        for (const [domain, records] of warmupRead.recordSha256s) {
+          for (const [identitySha256, recordSha256] of records) identityRows.push({ domain, identitySha256, recordSha256 });
         }
       } finally {
         await warmupSession.close();
@@ -160,11 +160,11 @@ it("measures the full live in-window read against a realistic destination and re
       await db.migrator.query({
         text: "INSERT INTO lcm.transfer_identities (run_id, domain, identity_sha256, ordinal, native_key, record_sha256) "
           + "SELECT $1, d.domain, d.identity_sha256, d.ordinal, "
-          + "'census-cost-native-key-' || d.ordinal, encode(digest('census-cost-record-' || d.ordinal, 'sha256'), 'hex') "
-          + "FROM unnest($2::text[], $3::text[], $4::bigint[]) AS d(domain, identity_sha256, ordinal)",
+          + "'census-cost-native-key-' || d.ordinal, d.record_sha256 "
+          + "FROM unnest($2::text[], $3::text[], $4::bigint[], $5::text[]) AS d(domain, identity_sha256, ordinal, record_sha256)",
         values: [
           runId, identityRows.map((row) => row.domain), identityRows.map((row) => row.identitySha256),
-          identityRows.map((_row, index) => index),
+          identityRows.map((_row, index) => index), identityRows.map((row) => row.recordSha256),
         ],
       }, { domain: "factory", operation: "seedCensusCostLedgerIdentities" });
 
@@ -200,7 +200,7 @@ it("measures the full live in-window read against a realistic destination and re
           projectId: seeded.expectedIdentity.id, targetGenerationId,
           manifestSha256, identityFingerprintSha256: destinationProbe.identityFingerprintSha256,
           manifestCheckpoints, census: destinationRead.census,
-          recordIdentities: destinationRead.recordIdentities,
+          recordIdentities: destinationRead.recordIdentities, recordSha256s: destinationRead.recordSha256s,
         });
         ledgerMs = performance.now() - ledgerStart;
 
@@ -211,7 +211,9 @@ it("measures the full live in-window read against a realistic destination and re
         // before/after harness run. Same SQL text production runs.
         const identitySetDigestStart = performance.now();
         await session.query({
-          text: "SELECT domain, encode(digest(string_agg(identity_sha256, '' ORDER BY identity_sha256 COLLATE \"C\"), 'sha256'), 'hex') AS identity_set_sha256 "
+          text: "SELECT domain, "
+            + "encode(digest(string_agg(identity_sha256, '' ORDER BY identity_sha256 COLLATE \"C\"), 'sha256'), 'hex') AS identity_set_sha256, "
+            + "encode(digest(string_agg(identity_sha256 || record_sha256, '' ORDER BY identity_sha256 COLLATE \"C\"), 'sha256'), 'hex') AS record_set_sha256 "
             + "FROM lcm.transfer_identities WHERE run_id = $1 GROUP BY domain",
           values: [runId],
         }, { domain: "factory", operation: "measureLedgerIdentitySetDigestCost" });

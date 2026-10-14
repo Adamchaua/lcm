@@ -262,7 +262,12 @@ function fakeSession(overrides: {
   ledgerRun?: { state?: string; manifestSha256?: string; projectSha256?: string } | null;
   ledgerCheckpoints?: readonly ReturnType<typeof defaultLedgerCheckpoint>[];
   ledgerNonInjective?: ReadonlyArray<{ domain: string; nativeKey: string }>;
-  ledgerIdentitySets?: ReadonlyArray<{ domain: string; identitySha256s: readonly string[] }>;
+  ledgerIdentitySets?: ReadonlyArray<{
+    domain: string; identitySha256s: readonly string[];
+    // The ledger's record_sha256 for each identity, in the same order;
+    // omitted means the fixture's ledger carries no record digests.
+    recordSha256s?: readonly string[];
+  }>;
   identityColumns?: ReadonlyArray<{ tableName: string; columnName: string }>;
   migrationsRows?: ReadonlyArray<{ id: string; checksum_sha256: string }>;
   systemIdentifier?: string;
@@ -316,6 +321,14 @@ function fakeSession(overrides: {
             domain: entry.domain,
             identity_set_sha256: entry.identitySha256s.length === 0
               ? null : createHash("sha256").update([...entry.identitySha256s].sort().join(""), "utf8").digest("hex"),
+            record_set_sha256: entry.recordSha256s === undefined || entry.identitySha256s.length === 0
+              ? null
+              : createHash("sha256").update(
+                entry.identitySha256s.map((identity, index) => [identity, entry.recordSha256s![index]!] as const)
+                  .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+                  .map(([identity, record]) => identity + record).join(""),
+                "utf8",
+              ).digest("hex"),
           })),
         };
       }
@@ -570,6 +583,7 @@ describe("readFencedDestinationCensus", () => {
   it("collects destination record identities and dependency edges from readDomainPage", async () => {
     const destinationRecord = {
       identitySha256: fakeHash("destination-child"),
+      recordSha256: fakeHash("destination-child-record"),
       dependencies: [{ domain: "project", identitySha256: fakeHash("destination-parent") }],
     };
     stubDestinationPrimitives({
@@ -584,6 +598,9 @@ describe("readFencedDestinationCensus", () => {
       settings: baseInput().destinationSettings, expectedOwner: "owner", expectedIdentity: identity(), scratchParent: "/scratch",
     });
     expect(result.recordIdentities.get("conversations")).toEqual(new Set([fakeHash("destination-child")]));
+    expect(result.recordSha256s.get("conversations")).toEqual(
+      new Map([[fakeHash("destination-child"), fakeHash("destination-child-record")]]),
+    );
     expect(result.dependencyEdges.get("conversations")).toEqual(new Set([
       fakeHash("destination-child") + "|project|" + fakeHash("destination-parent"),
     ]));
@@ -736,6 +753,7 @@ describe("readLedgerMismatches", () => {
     manifestCheckpoints?: readonly ReturnType<typeof defaultLedgerCheckpoint>[];
     census?: ReturnType<typeof ledgerCensus>;
     recordIdentities?: ReadonlyMap<PortableDomain, ReadonlySet<string>>;
+    recordSha256s?: ReadonlyMap<PortableDomain, ReadonlyMap<string, string>>;
   } = {}) {
     return {
       projectId, targetGenerationId: "generation-1-postgresql",
@@ -743,6 +761,7 @@ describe("readLedgerMismatches", () => {
       manifestCheckpoints: overrides.manifestCheckpoints ?? PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain)),
       census: overrides.census ?? ledgerCensus(),
       recordIdentities: overrides.recordIdentities ?? new Map(),
+      recordSha256s: overrides.recordSha256s ?? new Map(),
     };
   }
   it("passes when the run, batches and identities all agree with the manifest and census", async () => {
@@ -849,6 +868,41 @@ describe("readLedgerMismatches", () => {
     expect(mismatches).toEqual([{
       domain: "messages", class: "ledger",
       identitySha256: migrationWitnessSha256(["ledger-identity-set-mismatch-v1", "messages"]),
+    }]);
+  });
+  it("passes when a domain's identity and record digests agree between the destination's own read and the ledger", async () => {
+    // Both sides carry real, non-empty (identity, record) pairs in
+    // different orders, so the comparison is a sorted fold on each side
+    // rather than a vacuous null === null.
+    const session = fakeSession({
+      ledgerIdentitySets: [{
+        domain: "messages", identitySha256s: [fakeHash("m-a"), fakeHash("m-b")],
+        recordSha256s: [fakeHash("r-a"), fakeHash("r-b")],
+      }],
+    });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput({
+      recordIdentities: new Map([["messages", new Set([fakeHash("m-b"), fakeHash("m-a")])]]),
+      recordSha256s: new Map([["messages", new Map([[fakeHash("m-b"), fakeHash("r-b")], [fakeHash("m-a"), fakeHash("r-a")]])]]),
+    }));
+    expect(mismatches).toEqual([]);
+  });
+  it("osW red case: flags a ledger record digest that was substituted while every identity, count and key still agree", async () => {
+    // The identity-set check cannot see this: the same two identities are
+    // recorded, one-to-one, and the destination holds the same two. Only
+    // the record digest of one identity differs.
+    const session = fakeSession({
+      ledgerIdentitySets: [{
+        domain: "messages", identitySha256s: [fakeHash("m-a"), fakeHash("m-b")],
+        recordSha256s: [fakeHash("r-a"), fakeHash("r-substituted")],
+      }],
+    });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput({
+      recordIdentities: new Map([["messages", new Set([fakeHash("m-a"), fakeHash("m-b")])]]),
+      recordSha256s: new Map([["messages", new Map([[fakeHash("m-a"), fakeHash("r-a")], [fakeHash("m-b"), fakeHash("r-b")]])]]),
+    }));
+    expect(mismatches).toEqual([{
+      domain: "messages", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-record-set-mismatch-v1", "messages"]),
     }]);
   });
 });
