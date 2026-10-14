@@ -114,6 +114,7 @@ function makeDriver(input: BackendPublicationRecoveryMaterial): {
   let state = sourceState(input);
   const expectedTarget = targetState(input);
   const calls: string[] = [];
+  const fences = new Map<string, BackendPublicationFenceRecord>();
   const driver: BackendPublicationDriver = {
     observeLocalState: vi.fn(async () => state),
     publishProjectMap: vi.fn(async ({ permit }) => {
@@ -139,6 +140,20 @@ function makeDriver(input: BackendPublicationRecoveryMaterial): {
       calls.push("restore-map");
       state = { ...state, projectMap: sourceState(input).projectMap };
       return sourceState(input).projectMap;
+    }),
+    acquireRemoteGuard: vi.fn(async ({ journal, project }) => {
+      const fence = fenceRecord({
+        projectId: project.remoteProjectId,
+        publicationId: journal.publicationId,
+        targetBackend: journal.targetBackend,
+        evidenceSha256: project.evidenceSha256,
+      });
+      fences.set(project.remoteProjectId, fence);
+      return fence;
+    }),
+    readRemoteGuard: vi.fn(async ({ project }) => fences.get(project.remoteProjectId) ?? null),
+    releaseRemoteGuard: vi.fn(async ({ project, fence }) => {
+      fences.set(project.remoteProjectId, { ...fence, releasedAt: "2026-08-06T12:01:00.000Z" });
     }),
   };
   return { driver, getState: () => state, setState: (next) => { state = next; }, calls };
@@ -618,6 +633,9 @@ function countingDriver(input: BackendPublicationRecoveryMaterial): Readonly<{
         calls.push("restore-project-map");
         return base.restoreProjectMap(context);
       },
+      acquireRemoteGuard: base.acquireRemoteGuard,
+      readRemoteGuard: base.readRemoteGuard,
+      releaseRemoteGuard: base.releaseRemoteGuard,
     },
   };
 }
@@ -2193,6 +2211,7 @@ describe("BackendPublicationCoordinator", () => {
     const home = makeHome();
     let state = exactSource;
     const expected = targetState(input);
+    const guard = makeDriver(input).driver;
     const driver: BackendPublicationDriver = {
       observeLocalState: vi.fn(async () => state),
       publishProjectMap: vi.fn(async ({ permit }) => {
@@ -2215,6 +2234,9 @@ describe("BackendPublicationCoordinator", () => {
         state = { ...state, projectMap: exactSource.projectMap };
         return state.projectMap;
       }),
+      acquireRemoteGuard: guard.acquireRemoteGuard,
+      readRemoteGuard: guard.readRemoteGuard,
+      releaseRemoteGuard: guard.releaseRemoteGuard,
     };
     await coordinator(home, driver).prepare(inputFor(input));
     expect((await coordinator(home, driver).resume()).phase).toBe("completed");
@@ -2501,10 +2523,12 @@ describe("BackendPublicationCoordinator", () => {
     const absentReadHome = makeHome();
     const absentRead = makeDriver(material());
     absentRead.driver.acquireRemoteGuard = vi.fn(async () => fenceRecord());
+    delete absentRead.driver.readRemoteGuard;
+    delete absentRead.driver.releaseRemoteGuard;
     await expect(coordinator(absentReadHome, absentRead.driver).prepare(inputFor(material())))
-      .resolves.toMatchObject({ phase: "prepared" });
-    await expect(coordinator(absentReadHome, absentRead.driver).resume()).resolves.toMatchObject({ phase: "completed" });
+      .rejects.toMatchObject({ reason: "invalid-input" });
     expect(absentRead.driver.acquireRemoteGuard).not.toHaveBeenCalled();
+    expect(readBackendPublicationJournal(absentReadHome)).toBeNull();
 
     const activeHome = makeHome();
     const active = makeDriver(material());
@@ -2520,6 +2544,135 @@ describe("BackendPublicationCoordinator", () => {
     expect(active.driver.acquireRemoteGuard).not.toHaveBeenCalled();
     expect(active.driver.releaseRemoteGuard).toHaveBeenCalledOnce();
   });
+
++  describe("complete remote guard provider requirement", () => {
+    type GuardHook = "acquireRemoteGuard" | "readRemoteGuard" | "releaseRemoteGuard";
+
+    function withoutHook(driver: BackendPublicationDriver, hook: GuardHook): BackendPublicationDriver {
+      const copy = { ...driver };
+      delete copy[hook];
+      return copy;
+    }
+
+    function withoutGuard(driver: BackendPublicationDriver): BackendPublicationDriver {
+      return withoutHook(withoutHook(withoutHook(driver, "acquireRemoteGuard"), "readRemoteGuard"), "releaseRemoteGuard");
+    }
+
+    function materialFile(home: string): string {
+      return join(backendPublicationDirectory(home), "publication-1.material");
+    }
+
+    it.each(["acquireRemoteGuard", "readRemoteGuard", "releaseRemoteGuard"] as const)(
+      "refuses prepare with projects when %s is missing",
+      async (hook) => {
+        const home = makeHome();
+        const input = material();
+        const fake = makeDriver(input);
+        const incomplete = withoutHook(fake.driver, hook);
+
+        await expect(coordinator(home, incomplete).prepare(inputFor(input)))
+          .rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("remote guard provider") });
+
+        expect(readBackendPublicationJournal(home)).toBeNull();
+        expect(existsSync(materialFile(home))).toBe(false);
+        expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+      },
+    );
+
+    it("refuses an incomplete provider before archiving an existing terminal journal", async () => {
+      const home = makeHome();
+      const input = material();
+      const fake = makeDriver(input);
+      await coordinator(home, fake.driver).prepare(inputFor(input));
+      await expect(coordinator(home, fake.driver).resume()).resolves.toMatchObject({ phase: "completed" });
+      const journalPath = backendPublicationJournalPath(home);
+      const before = readFileSync(journalPath);
+
+      await expect(coordinator(home, withoutGuard(fake.driver)).prepare({
+        ...inputFor(input),
+        publicationId: "publication-2",
+      })).rejects.toMatchObject({ reason: "invalid-input" });
+
+      expect(readFileSync(journalPath)).toEqual(before);
+      expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+      expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+    });
+
+    it("prepares and resumes a publication without projects when no guard hooks exist", async () => {
+      const home = makeHome();
+      const input = material();
+      const fake = makeDriver(input);
+      const guardless = withoutGuard(fake.driver);
+
+      await expect(coordinator(home, guardless).prepare({ ...inputFor(input), projects: [] }))
+        .resolves.toMatchObject({ phase: "prepared" });
+      await expect(coordinator(home, guardless).resume()).resolves.toMatchObject({ phase: "completed", projects: [] });
+    });
+
+    it.each(["acquireRemoteGuard", "readRemoteGuard"] as const)(
+      "refuses to record guarded when %s is missing and leaves abort available",
+      async (hook) => {
+        const { home, fake } = await preparedFixture();
+        const incomplete = withoutHook(fake.driver, hook);
+
+        await expect(coordinator(home, incomplete).resume()).rejects.toMatchObject({ reason: "unexpected-state" });
+        expect(readBackendPublicationJournal(home)?.phase).toBe("acquiring");
+        await expect(coordinator(home, incomplete).resume()).rejects.toMatchObject({ reason: "unexpected-state" });
+        expect(readBackendPublicationJournal(home)?.phase).toBe("acquiring");
+        expect(fake.calls).toEqual([]);
+
+        await expect(coordinator(home, incomplete).abort()).resolves.toMatchObject({ phase: "aborted" });
+        expect(existsSync(materialFile(home))).toBe(false);
+      },
+    );
+
+    it.each(
+      (["releaseRemoteGuard", "readRemoteGuard"] as const).flatMap((hook) => (
+        [[hook, "resume"], [hook, "abort"]] as const
+      )),
+    )("refuses to release a persisted fence without %s during %s and finishes with a complete provider", async (hook, mode) => {
+      const { home, fake } = await releasingFixture();
+      const cleanup = vi.fn(async ({ homeDir, recoveryReference }: Readonly<{
+        homeDir: string | undefined;
+        recoveryReference: { relativePath: string };
+      }>) => {
+        rmSync(join(backendPublicationDirectory(homeDir), recoveryReference.relativePath));
+      });
+      fake.driver.cleanupAbortedMaterial = cleanup;
+      const incomplete = withoutHook(fake.driver, hook);
+      const run = (active: BackendPublicationDriver) => (
+        mode === "resume" ? coordinator(home, active).resume() : coordinator(home, active).abort()
+      );
+
+      await expect(run(incomplete)).rejects.toMatchObject({ reason: "unexpected-state" });
+      expect(readBackendPublicationJournal(home)?.phase).toBe(mode === "resume" ? "releasing" : "abort-releasing");
+      expect(readBackendPublicationJournal(home)?.projects[0]?.fence).not.toBeNull();
+      expect(existsSync(materialFile(home))).toBe(true);
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+
+      await expect(run(fake.driver)).resolves.toMatchObject({ phase: mode === "resume" ? "completed" : "aborted" });
+      expect(fake.driver.releaseRemoteGuard).toHaveBeenCalledOnce();
+      expect(existsSync(materialFile(home))).toBe(mode === "resume");
+      expect(cleanup).toHaveBeenCalledTimes(mode === "resume" ? 0 : 1);
+    });
+
+    it.each(["guarded", "map-publishing", "map-published", "config-publishing", "config-published", "releasing"] as const)(
+      "refuses to resume a %s journal that has no recorded fence",
+      async (phase) => {
+        const { home, fake } = await preparedFixture();
+        rewriteJournal(home, (journal) => ({ ...journal, phase }));
+
+        await expect(coordinator(home, fake.driver).resume()).rejects.toMatchObject({ reason: "unexpected-state" });
+
+        expect(readBackendPublicationJournal(home)?.phase).toBe(phase);
+        expect(fake.calls).toEqual([]);
+        expect(fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+        await expect(coordinator(home, fake.driver).abort()).resolves.toMatchObject({ phase: "aborted" });
+      },
+    );
+  });
+
 
   it("acquires and releases projects in canonical order", async () => {
     const home = makeHome();
@@ -2711,8 +2864,14 @@ describe("BackendPublicationCoordinator", () => {
         },
       ],
     }));
-    const skippedRecovered = await coordinator(skipped.home, skipped.fake.driver).recoverPending();
-    expect(skippedRecovered?.phase).toBe("completed");
+    await expect(coordinator(skipped.home, skipped.fake.driver).recoverPending())
+      .rejects.toMatchObject({ reason: "unexpected-state" });
+    expect(readBackendPublicationJournal(skipped.home)?.phase).toBe("releasing");
+    expect(skipped.fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+    const skippedRecovered = await coordinator(skipped.home, skipped.fake.driver)
+      .recoverPending({ disposition: "abort" });
+    expect(skippedRecovered?.phase).toBe("aborted");
+    expect(skipped.fake.driver.releaseRemoteGuard).toHaveBeenCalledOnce();
 
     const successor = await releasingFixture();
     rewriteJournal(successor.home, (journal) => ({
