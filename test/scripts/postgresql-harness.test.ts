@@ -1127,6 +1127,43 @@ describe("PostgreSQL harness utilities", () => {
     }
   });
 
+  it("passes the census-cost flag to the Docker runner only when the parent set it", async () => {
+    const runWithFlag = async (flag: string | undefined) => {
+      const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-census-env-"));
+      const setupDocker = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+      const testProcess = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+      vi.stubEnv("LCM_TEST_POSTGRES_CENSUS_COST", flag);
+      try {
+        await runTests({
+          runId: "a".repeat(32),
+          directory,
+          parent: directory,
+          names: { runner: "lcm-pg-runner-test", network: "lcm-pg-network-test" },
+          owner: { pid: 1, birth: "1", scope: "test-scope" },
+          environment: { LCM_TEST_POSTGRES_RUN_ID: "a".repeat(32) },
+        }, true, setupDocker, testProcess);
+        return {
+          runnerLines: readFileSync(join(directory, "runner.env"), "utf8").trim().split("\n"),
+          testProcess,
+        };
+      } finally {
+        vi.unstubAllEnvs();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    };
+
+    const requested = await runWithFlag("true");
+    expect(requested.runnerLines).toContain("LCM_TEST_POSTGRES_CENSUS_COST=true");
+    expect(requested.testProcess).not.toHaveBeenCalled();
+
+    const absent = await runWithFlag(undefined);
+    expect(absent.runnerLines.some((line) => line.startsWith("LCM_TEST_POSTGRES_CENSUS_COST="))).toBe(false);
+    expect(absent.testProcess).toHaveBeenCalledOnce();
+    expect(absent.testProcess.mock.calls[0][1]).toContainEqual(
+      expect.stringMatching(/test[\\/]postgresql[\\/]signal\.integration\.ts$/u),
+    );
+  });
+
   it.each(["host test process", "Docker runner attachment"])(
     "terminates a pending %s before teardown cleanup",
     async (pendingTarget) => {
