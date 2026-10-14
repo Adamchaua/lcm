@@ -835,3 +835,40 @@ pre-window probes run and while the report is persisted, which the margin is
 expected to absorb. The report's `Proposed lease TTL` line applies the same
 3x factor to the measured total including those probes, so it is never smaller
 than this rule.
+
+### Verification memory use scales with the project
+
+Verification holds its working evidence in memory for the whole run. There
+is no streaming fallback: the run needs every set below at once, so memory
+use grows with the size of the project and is not capped by a setting.
+
+- **Destination.** For every domain, the set of record identities and the set
+  of dependency edges read from the destination. Identities are 64-character
+  hex digests; an edge key combines the child identity, the parent domain and
+  the parent identity, so it is a little over twice that length.
+- **Source.** For every domain, the set of dependency edges, plus one entry
+  per conversation (creation time, identity digest and title) used for the
+  public-listing comparison, plus a small fixed pool of message candidates
+  for the search probe.
+- **Public listing.** The complete result of the destination's conversation
+  listing, which the probe reads in one call, and the entries derived from it.
+
+Both sides are held concurrently, so peak memory is roughly proportional to
+the number of records plus dependency edges on the source and on the
+destination together, plus the number of conversations on both sides.
+Conversation titles are held in full.
+
+The source side is read before the verification lease is acquired. The
+public-listing read and the destination sets are built after the lease is
+held, so a project large enough to need a long lease also needs the memory
+for its destination sets during that lease. Size `leaseTtlMs` as described
+above, and treat memory as a separate requirement: a longer lease does not
+reduce it.
+
+For a very large project, make sure the host has free memory for the record,
+edge and conversation counts on both sides, and that the Node.js heap limit
+of the process that runs verification is raised accordingly (for example with
+`NODE_OPTIONS=--max-old-space-size=<megabytes>`). If the process runs out of
+memory, verification stops and no report is written; it never trims its
+evidence to fit. Verification restarts from the beginning, and a lease left
+behind by the stopped process expires after `leaseTtlMs`.
