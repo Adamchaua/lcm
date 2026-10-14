@@ -22,6 +22,10 @@ import { findAllCodexTranscripts } from "./codex-transcript.js";
 import { sanitizeTerminalText } from "./terminal-sanitize.js";
 import { listCliProjects } from "./cli-storage.js";
 import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
+import {
+  TransportedUnboundProjectError,
+  UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+} from "./storage/identity-context.js";
 
 export type ImportProvider = "claude" | "codex" | "all";
 
@@ -186,14 +190,36 @@ interface SessionEntry {
   client: TranscriptClient;
 }
 
+/**
+ * Map an import failure to the static unbound-project remedy.
+ *
+ * A real run fails at /ingest with HTTP 409 when the daemon refuses an
+ * unbound PostgreSQL project; the client surfaces that as a
+ * TransportedUnboundProjectError. Anything else keeps the generic diagnostic.
+ */
+function unboundImportDiagnostic(error: unknown): string | undefined {
+  return error instanceof TransportedUnboundProjectError
+    ? UNBOUND_POSTGRESQL_PROJECT_MESSAGE
+    : undefined;
+}
+
 async function ingestSessionList(
   client: DaemonClient,
   sessions: SessionEntry[],
   options: ImportOptions,
   result: ImportResult,
+  reportedProjectFailures: Set<string>,
 ): Promise<void> {
   const previousSummaries = new Map<string, string>();
   const total = sessions.length;
+
+  // Remedy lines are printed at most once per project per import. The set is
+  // owned by importSessions and shared across every call, keyed by cwd.
+  function reportProjectFailure(cwd: string, remedy: string | undefined): void {
+    if (remedy === undefined || reportedProjectFailures.has(cwd)) return;
+    reportedProjectFailures.add(cwd);
+    console.error(`  ${sanitizeTerminalText(cwd)}: ${remedy}`);
+  }
 
   for (const { path, sessionId, cwd, client: clientName } of sessions) {
     if (options.dryRun) {
@@ -279,11 +305,13 @@ async function ingestSessionList(
         }
       }
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
-    } catch {
+    } catch (error) {
       result.failed++;
       if (options.replay) previousSummaries.delete(replayKey); // chain broken for this project/client
+      const remedy = unboundImportDiagnostic(error);
+      reportProjectFailure(cwd, remedy);
       if (options.verbose) {
-        console.error(`  \u274c ${sanitizeTerminalText(sessionId)}: ingest failed`);
+        console.error(`  \u274c ${sanitizeTerminalText(sessionId)}: ${remedy ?? "ingest failed"}`);
       }
       options.onProgress?.({ completed: result.imported + result.skippedEmpty + result.failed, total, current: { sessionId, messages: 0, tokens: 0, startedAt: Date.now() } });
     }
@@ -303,6 +331,7 @@ export async function importSessions(
   const configFile = configPath();
   selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
   const provider: ImportProvider = options.provider ?? "claude";
+  const reportedProjectFailures = new Set<string>();
   const result: ImportResult = {
     imported: 0,
     skippedEmpty: 0,
@@ -369,6 +398,7 @@ export async function importSessions(
         sessionFiles.map(f => ({ ...f, cwd, client: "claude" as const })),
         options,
         result,
+        reportedProjectFailures,
       );
     }
   }
@@ -440,7 +470,7 @@ export async function importSessions(
       });
     }
 
-    await ingestSessionList(client, codexSessions, options, result);
+    await ingestSessionList(client, codexSessions, options, result, reportedProjectFailures);
   }
 
   return result;

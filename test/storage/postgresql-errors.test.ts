@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { StorageOperationError } from "../../src/storage/errors.js";
 import {
   isPostgreSqlConnectionError,
+  isPostgreSqlSnapshotTerminationError,
   isRetryablePostgreSqlError,
   normalizePostgreSqlError,
   PostgreSqlCommitOutcomeUnknownError,
@@ -121,5 +122,83 @@ describe("PostgreSQL error normalization", () => {
       domain: "transaction",
       operation: "commit",
     }).toJSON()).not.toHaveProperty("machineId");
+  });
+
+  it.each(["25P03", "08000", "08006", "57P01", "57P02", "57P03", "ECONNRESET", "ETIMEDOUT"])(
+    "classifies raw driver failure %s as a snapshot termination, unlike the wider connection-error helper",
+    (code) => {
+      const raw = Object.assign(new Error("driver secret"), { code });
+      expect(isPostgreSqlSnapshotTerminationError(raw)).toBe(true);
+    },
+  );
+
+  it("does not classify 25P03 as a connection error, only as a snapshot termination", () => {
+    const idleKill = Object.assign(new Error("idle-in-transaction session timeout"), { code: "25P03" });
+    expect(isPostgreSqlConnectionError(idleKill)).toBe(false);
+    expect(isPostgreSqlSnapshotTerminationError(idleKill)).toBe(true);
+  });
+
+  it.each(["23505", "40001", "080000"])(
+    "does not classify ordinary or malformed SQLSTATE %s as a snapshot termination",
+    (code) => {
+      expect(isPostgreSqlSnapshotTerminationError(Object.assign(new Error("private"), { code }))).toBe(false);
+    },
+  );
+
+  it("reads sqlState from an already-normalized PostgreSqlStorageOperationError", () => {
+    const idleKill = normalizePostgreSqlError(
+      Object.assign(new Error("idle-in-transaction session timeout"), { code: "25P03" }),
+      { domain: "transaction", operation: "snapshot", projectId: "project" },
+    );
+    expect(isPostgreSqlSnapshotTerminationError(idleKill)).toBe(true);
+    const ordinary = normalizePostgreSqlError(
+      Object.assign(new Error("unique violation"), { code: "23505" }),
+      { domain: "transaction", operation: "snapshot", projectId: "project" },
+    );
+    expect(isPostgreSqlSnapshotTerminationError(ordinary)).toBe(false);
+    const unknownState = normalizePostgreSqlError(
+      new Error("unknown driver failure"),
+      { domain: "transaction", operation: "snapshot", projectId: "project" },
+    );
+    expect(isPostgreSqlSnapshotTerminationError(unknownState)).toBe(false);
+  });
+
+  it.each([undefined, null, {}, { code: 123 }])(
+    "does not classify unsafe value %# as a snapshot termination",
+    (error) => {
+      expect(isPostgreSqlSnapshotTerminationError(error)).toBe(false);
+    },
+  );
+
+  it("tolerates a live message-only torn connection but not a live generic not-queryable rejection", () => {
+    const context = { domain: "transaction", operation: "snapshot", projectId: "project" } as const;
+    // idle_in_transaction_session_timeout fires with no query in flight;
+    // the FATAL never reaches the operation's own rejection. What the
+    // operation actually rejects with, after the socket end follows, is
+    // this message-only shape (RETRYABLE_DRIVER_MESSAGES match, no code).
+    const tornConnection = normalizePostgreSqlError(new Error("Connection terminated unexpectedly"), context);
+    expect(tornConnection).toMatchObject({ sqlState: null, retryable: true });
+    expect(isPostgreSqlSnapshotTerminationError(tornConnection)).toBe(true);
+
+    // A generic "not queryable" local rejection (what pg's Client.query
+    // produces once _queryable is false, with no code and not in
+    // RETRYABLE_DRIVER_MESSAGES) must NOT be tolerated on its own: an
+    // ordinary, undiagnosed dead session looks exactly like this too, and
+    // the whole point of the async-failure listener + reattach is that
+    // this predicate should not have to guess.
+    const notQueryable = normalizePostgreSqlError(
+      new Error("Client has encountered a connection error and is not queryable"), context,
+    );
+    expect(notQueryable).toMatchObject({ sqlState: null, retryable: false });
+    expect(isPostgreSqlSnapshotTerminationError(notQueryable)).toBe(false);
+
+    // retryable alone, without a null sqlState, is never sufficient: 40001
+    // keeps its own sqlState through normalization and is retryable, but
+    // it is a serialization failure, not a connection termination.
+    const serializationFailure = normalizePostgreSqlError(
+      Object.assign(new Error("could not serialize access"), { code: "40001" }), context,
+    );
+    expect(serializationFailure).toMatchObject({ sqlState: "40001", retryable: true });
+    expect(isPostgreSqlSnapshotTerminationError(serializationFailure)).toBe(false);
   });
 });

@@ -1,17 +1,36 @@
-import { describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import type { ResolvedPostgreSqlConfig } from "../../src/daemon/config.js";
+import {
+  BackendPublicationCoordinator,
+  backendPublicationCanonicalSha256,
+  backendPublicationJournalPath,
+  backendPublicationMaterialWitness,
+  captureBackendPublicationState,
+  readBackendPublicationJournal,
+} from "../../src/storage/backend-publication.js";
 import type {
   BackendPublicationJournal,
   BackendPublicationLockToken,
+  BackendPublicationDriver,
+  BackendPublicationRecoveryFile,
+  BackendPublicationRecoveryMaterial,
   BackendPublicationStateWitness,
 } from "../../src/storage/backend-publication.js";
+import {
+  assertStorageBackendPublication,
+  withStorageBackendClassificationLockAsync,
+} from "../../src/storage/backend.js";
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
 import type { ProjectStorage } from "../../src/storage/contracts.js";
 import { StorageOperationError } from "../../src/storage/errors.js";
 import {
   createPostgreSqlStorageBackendFactoryForTesting,
   createPostgreSqlStorageBackendFactoryWithHome,
+  capturePublicationWitnessOutcome,
   FactorySignalExecutor,
   type PostgreSqlFactoryDependencies,
 } from "../../src/storage/postgresql/factory.js";
@@ -37,6 +56,7 @@ const config: ResolvedPostgreSqlConfig = {
     connectionTimeoutMs: 10_000,
     idleTimeoutMs: 30_000,
     statementTimeoutMs: 60_000,
+    snapshotIdleTimeoutMs: 300_000,
     migrationRole: "lcm_migrator",
     url: "postgresql://runtime:canary-password@db.example/lcm",
     caFile: "/private/canary-ca.pem",
@@ -196,6 +216,10 @@ function harness(): {
       events.push("lock");
       return callback({} as BackendPublicationLockToken);
     },
+    withClassificationLock: async (_homeDir, callback) => {
+      events.push("lock");
+      return callback({} as BackendPublicationLockToken);
+    },
     assertPublication: (_selection, _token) => { events.push("assert"); },
     readJournal: () => journal,
     captureState: () => state,
@@ -255,6 +279,7 @@ describe("PostgreSQL storage backend factory", () => {
       connectionTimeoutMs: config.postgresql.connectionTimeoutMs,
       idleTimeoutMs: config.postgresql.idleTimeoutMs,
       statementTimeoutMs: config.postgresql.statementTimeoutMs,
+      snapshotIdleTimeoutMs: config.postgresql.snapshotIdleTimeoutMs,
     });
     expect(captured).not.toBe(config.postgresql);
     expect(events).toEqual(["readiness:lcm_migrator"]);
@@ -914,6 +939,78 @@ describe("PostgreSQL storage backend factory", () => {
     }
   });
 
+  it("distinguishes authoritative absence from a definite witness mismatch", async () => {
+    const { dependencies } = harness();
+    dependencies.readJournal = () => null;
+    await expect(capturePublicationWitnessOutcome(dependencies, "/home/operator"))
+      .resolves.toEqual({ status: "absent" });
+    const mismatched: Array<{
+      publicationJournal: BackendPublicationJournal;
+      phase: string;
+      targetBackend: string;
+    }> = [
+      {
+        publicationJournal: { ...journal, phase: "aborted" },
+        phase: "aborted",
+        targetBackend: "postgresql",
+      },
+      {
+        publicationJournal: { ...journal, targetBackend: "sqlite" },
+        phase: "completed",
+        targetBackend: "sqlite",
+      },
+    ];
+    for (const { publicationJournal, phase, targetBackend } of mismatched) {
+      const { dependencies: mismatchDependencies } = harness();
+      mismatchDependencies.readJournal = () => publicationJournal;
+      await expect(
+        capturePublicationWitnessOutcome(mismatchDependencies, "/home/operator"),
+      ).resolves.toEqual({ status: "mismatch", phase, targetBackend });
+    }
+  });
+
+  it("returns the four-field witness when the journal attests postgresql", async () => {
+    const { dependencies } = harness();
+    const outcome = await capturePublicationWitnessOutcome(dependencies, "/home/operator");
+    expect(outcome).toEqual({
+      status: "present",
+      witness: {
+        journalChecksum: journal.checksumSha256,
+        journalPhase: "completed",
+        targetBackend: "postgresql",
+        stateSha256: expect.any(String),
+      },
+    });
+    expect(Object.isFrozen(outcome)).toBe(true);
+  });
+
+  it("carries a failed witness read as unresolvable instead of discarding it", async () => {
+    const readCanary = new Error("private journal-read canary");
+    const { dependencies: readDependencies } = harness();
+    readDependencies.readJournal = () => { throw readCanary; };
+    await expect(
+      capturePublicationWitnessOutcome(readDependencies, "/home/operator"),
+    ).resolves.toEqual({ status: "unresolvable", cause: readCanary });
+    const stateCanary = new Error("private state-capture canary");
+    const { dependencies: stateDependencies } = harness();
+    stateDependencies.captureState = () => { throw stateCanary; };
+    await expect(
+      capturePublicationWitnessOutcome(stateDependencies, "/home/operator"),
+    ).resolves.toEqual({ status: "unresolvable", cause: stateCanary });
+    const admissionCanary = new Error("private admission canary");
+    const { dependencies: admissionDependencies } = harness();
+    admissionDependencies.assertPublication = () => { throw admissionCanary; };
+    await expect(
+      capturePublicationWitnessOutcome(admissionDependencies, "/home/operator"),
+    ).resolves.toEqual({ status: "unresolvable", cause: admissionCanary });
+    const lockCanary = new Error("private lock canary");
+    const { dependencies: lockDependencies } = harness();
+    lockDependencies.withClassificationLock = async () => { throw lockCanary; };
+    await expect(
+      capturePublicationWitnessOutcome(lockDependencies, "/home/operator"),
+    ).resolves.toEqual({ status: "unresolvable", cause: lockCanary });
+  });
+
   it("reports sanitized runtime health while open", async () => {
     const { runtime, dependencies } = harness();
     const factory = await createPostgreSqlStorageBackendFactoryForTesting(
@@ -1261,3 +1358,212 @@ describe("PostgreSQL storage backend factory", () => {
     expect(serialized).not.toContain("SELECT");
   });
 });
+
+describe("publication witness classification against real publication state", () => {
+  const roots: string[] = [];
+
+  afterEach(() => {
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true });
+  });
+
+  function makeHome(): string {
+    const home = mkdtempSync(join(tmpdir(), "lcm-factory-witness-"));
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    roots.push(home);
+    return home;
+  }
+
+  function recoveryFile(content: string): BackendPublicationRecoveryFile {
+    return {
+      presence: "present",
+      content: Buffer.from(content),
+      mode: 0o600,
+      uid: typeof process.getuid === "function" ? process.getuid() : 0,
+      gid: typeof process.getgid === "function" ? process.getgid() : 0,
+      nlink: "1",
+      dev: "1",
+      ino: "2",
+      parentDev: "3",
+      parentIno: "4",
+    };
+  }
+
+  const recoveryMaterial: BackendPublicationRecoveryMaterial = {
+    source: {
+      config: recoveryFile('{"backend":"sqlite"}'),
+      projectMap: recoveryFile('{"projects":[]}'),
+    },
+    target: {
+      config: recoveryFile('{"backend":"postgresql"}'),
+      projectMap: recoveryFile('{"projects":["remote"]}'),
+    },
+  };
+
+  function fakeDriver(): BackendPublicationDriver {
+    const source = backendPublicationMaterialWitness(recoveryMaterial);
+    const target = backendPublicationMaterialWitness({
+      source: recoveryMaterial.target,
+      target: recoveryMaterial.target,
+    });
+    let state = source;
+    return {
+      observeLocalState: async () => state,
+      publishProjectMap: async () => {
+        state = { ...state, projectMap: target.projectMap };
+        return target.projectMap;
+      },
+      publishConfig: async () => {
+        state = { ...state, config: target.config };
+        return target.config;
+      },
+      restoreConfig: async () => source.config,
+      restoreProjectMap: async () => source.projectMap,
+    };
+  }
+
+  function realDependencies(): PostgreSqlFactoryDependencies {
+    return {
+      ...harness().dependencies,
+      withClassificationLock: withStorageBackendClassificationLockAsync,
+      assertPublication: assertStorageBackendPublication,
+      readJournal: readBackendPublicationJournal,
+      captureState: captureBackendPublicationState,
+    };
+  }
+
+  async function completedJournal(home: string): Promise<void> {
+    const driver = fakeDriver();
+    const active = new BackendPublicationCoordinator({ homeDir: home, driver });
+    await active.prepare({
+      publicationId: "publication-1",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      material: recoveryMaterial,
+      projects: [{
+        localProjectId: "local-project",
+        remoteProjectId: "remote-project",
+        evidenceSha256: "a".repeat(64),
+      }],
+      now: new Date("2026-08-06T12:00:00.000Z"),
+    });
+    await active.resume();
+  }
+
+  function rewriteJournal(
+    home: string,
+    mutate: (record: Record<string, unknown>) => Record<string, unknown>,
+  ): void {
+    const path = backendPublicationJournalPath(home);
+    const next = mutate(JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>);
+    const { checksumSha256: _checksum, ...payload } = next;
+    writeFileSync(path, JSON.stringify({
+      ...payload,
+      checksumSha256: backendPublicationCanonicalSha256(payload),
+    }) + "\n", { mode: 0o600 });
+  }
+
+  async function maintenanceJournal(
+    home: string,
+    phase: "maintenance-held" | "selection-completed",
+  ): Promise<void> {
+    const active = new BackendPublicationCoordinator({ homeDir: home, driver: fakeDriver() });
+    const held = await active.enterMaintenance({
+      publicationId: "maintenance-publication",
+      generationId: "maintenance-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{
+        machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+        queueCutoff: null,
+        evidenceSha256: "a".repeat(64),
+      }],
+    });
+    if (phase === "maintenance-held") return;
+    const prepared = await active.prepareMaintenanceSelection({
+      expectedChecksumSha256: held.checksumSha256,
+      generationId: held.generationId,
+      targetBackend: "postgresql",
+      terminalEvidenceSha256: "c".repeat(64),
+    });
+    await active.completeMaintenanceSelection({
+      expectedChecksumSha256: prepared.checksumSha256,
+      generationId: prepared.generationId,
+      terminalEvidenceSha256: prepared.terminalEvidenceSha256!,
+    });
+  }
+
+  it("reports an empty journal slot as absent through the classification lock", async () => {
+    const home = makeHome();
+    await expect(capturePublicationWitnessOutcome(realDependencies(), home))
+      .resolves.toEqual({ status: "absent" });
+    expect(existsSync(join(home, ".lcm", "backend-publication", "journal.json"))).toBe(false);
+    await expect(withStorageBackendClassificationLockAsync(home, async () => "ran"))
+      .resolves.toBe("ran");
+  });
+
+  it("reports a non-terminal or wrong-target v2 journal as mismatch", async () => {
+    const preparing = makeHome();
+    const active = new BackendPublicationCoordinator({ homeDir: preparing, driver: fakeDriver() });
+    await active.prepare({
+      publicationId: "publication-1",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      material: recoveryMaterial,
+      projects: [],
+      now: new Date("2026-08-06T12:00:00.000Z"),
+    });
+    const phase = readBackendPublicationJournal(preparing)!.phase;
+    expect(phase).not.toBe("completed");
+    await expect(capturePublicationWitnessOutcome(realDependencies(), preparing))
+      .resolves.toEqual({ status: "mismatch", phase, targetBackend: "postgresql" });
+
+    const sqliteTarget = makeHome();
+    await completedJournal(sqliteTarget);
+    rewriteJournal(sqliteTarget, (record) => ({
+      ...record,
+      sourceBackend: "postgresql",
+      targetBackend: "sqlite",
+    }));
+    await expect(capturePublicationWitnessOutcome(realDependencies(), sqliteTarget))
+      .resolves.toEqual({ status: "mismatch", phase: "completed", targetBackend: "sqlite" });
+  });
+
+  it("reports any v3 maintenance journal as unresolvable", async () => {
+    for (const phase of ["maintenance-held", "selection-completed"] as const) {
+      const home = makeHome();
+      await maintenanceJournal(home, phase);
+      await expect(capturePublicationWitnessOutcome(realDependencies(), home))
+        .resolves.toMatchObject({
+          status: "unresolvable",
+          cause: { name: "BackendPublicationJournalError", reason: "unresolved-publication" },
+        });
+    }
+  });
+
+  it("reports a completed postgresql journal as present only after strict admission", async () => {
+    const home = makeHome();
+    await completedJournal(home);
+    const journal = readBackendPublicationJournal(home)!;
+    await expect(capturePublicationWitnessOutcome(realDependencies(), home))
+      .resolves.toEqual({
+        status: "present",
+        witness: {
+          journalChecksum: journal.checksumSha256,
+          journalPhase: "completed",
+          targetBackend: "postgresql",
+          stateSha256: backendPublicationCanonicalSha256(captureBackendPublicationState(home)),
+        },
+      });
+
+    const publicationDirectory = join(home, ".lcm", "backend-publication");
+    const evidence = readdirSync(publicationDirectory).filter((entry) => entry.endsWith(".material"));
+    expect(evidence.length).toBeGreaterThan(0);
+    for (const entry of evidence) rmSync(join(publicationDirectory, entry));
+    await expect(capturePublicationWitnessOutcome(realDependencies(), home))
+      .resolves.toMatchObject({
+        status: "unresolvable",
+        cause: { code: "ENOENT" },
+      });
+  });
+});
+

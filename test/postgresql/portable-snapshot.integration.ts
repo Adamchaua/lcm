@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { beforeAll, describe, expect, it } from "vitest";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS } from "../../src/storage/postgresql/snapshot-session.js";
 import {
   assertHarnessReady,
   settings,
@@ -138,6 +139,98 @@ describe("PostgreSQL 18 portable snapshot session", () => {
       } finally {
         controller.abort();
         await session.close();
+        await administrator.close();
+      }
+    });
+  });
+
+  it("bounds the snapshot's idle-in-transaction timeout independently of the connection-level statement-scale bound", async () => {
+    await withPostgreSqlTestDatabase("snapshot-idle-timeout", async (database) => {
+      const projectId = await createFixture(database);
+      const options = { ...context, projectId };
+      const session = await database.runtime.openReadOnlySnapshot({ projectId });
+      try {
+        // pg_settings.setting is the raw effective value in the GUC's base
+        // unit (ms for this setting), unaffected by current_setting()'s
+        // "nicest unit" pretty-printing (for example "5min"), so comparing
+        // it as a plain integer cannot flake on display formatting.
+        await expect(session.query<{ setting: string }>({
+          text: "SELECT setting FROM pg_catalog.pg_settings WHERE name = 'idle_in_transaction_session_timeout'",
+        }, options)).resolves.toMatchObject({
+          rows: [{ setting: String(DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS) }],
+        });
+      } finally {
+        await session.close();
+      }
+      // A fresh query config object: the driver's Query wrapper mutates a
+      // config object it is given a callback through (attaching its own
+      // callback onto it), so reusing the same object reference across two
+      // separate query() calls corrupts the second call. Never share one.
+      await expect(database.runtime.query<{ setting: string }>({
+        text: "SELECT setting FROM pg_catalog.pg_settings WHERE name = 'idle_in_transaction_session_timeout'",
+      }, context)).resolves.toMatchObject({ rows: [{ setting: "5000" }] });
+    });
+  });
+
+  it("reverts the relaxed idle bound on the same pooled client after the snapshot closes", async () => {
+    await withPostgreSqlTestDatabase("snapshot-idle-revert", async (database) => {
+      const projectId = await createFixture(database);
+      // A single-connection pool guarantees the post-close query below
+      // reuses the exact physical backend the snapshot held, proving
+      // is_local revert semantics rather than merely a fresh connection.
+      const solo = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }));
+      try {
+        const session = await solo.openReadOnlySnapshot({ projectId });
+        const backendPid = session.identity.backendPid;
+        await session.close();
+        // No projectId: this must take the plain queryDirect path on the
+        // runtime's own pool, not the project-scoped mutation-guarded
+        // transaction() path, so it actually reuses the recycled backend
+        // instead of opening an unrelated read-write transaction.
+        await expect(solo.query<{ pid: number; setting: string }>({
+          text: `SELECT pg_catalog.pg_backend_pid() AS pid,
+                   (SELECT setting FROM pg_catalog.pg_settings
+                    WHERE name = 'idle_in_transaction_session_timeout') AS setting`,
+        }, context)).resolves.toMatchObject({ rows: [{ pid: backendPid, setting: "5000" }] });
+      } finally {
+        await solo.close();
+      }
+    });
+  });
+
+  it("enforces a deliberately tiny snapshotIdleTimeoutMs bound per session, server-side, without an unhandled error", async () => {
+    await withPostgreSqlTestDatabase("snapshot-idle-enforced", async (database) => {
+      const projectId = await createFixture(database);
+      const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+      const tiny = new PostgreSqlRuntime(settings(database.runtimeUrl, { snapshotIdleTimeoutMs: 200 }));
+      try {
+        const session = await tiny.openReadOnlySnapshot({ projectId });
+        const backendPid = session.identity.backendPid;
+        try {
+          // idle_in_transaction_session_timeout is checked between
+          // statements and fires with no query in flight, so it can never
+          // be observed as a query rejection shape on a healthy driver;
+          // the server actually terminating the backend is the real proof
+          // of enforcement. Poll pg_stat_activity from an independent
+          // administrator connection until the snapshot's backend is gone.
+          await expect.poll(async () => {
+            const activity = await administrator.query<{ pid: number }>({
+              text: "SELECT pid FROM pg_catalog.pg_stat_activity WHERE pid = $1",
+              values: [backendPid],
+            }, context);
+            return activity.rows.length;
+          }, { timeout: 5_000, interval: 25 }).toBe(0);
+          // The checkout's async-failure listener already observed the
+          // FATAL and marked the session destroyed, so close() skips a
+          // doomed ROLLBACK against the now-dead backend and resolves
+          // cleanly instead of throwing or becoming an unhandled process
+          // error.
+          await expect(session.close()).resolves.toBeUndefined();
+        } finally {
+          await session.close().catch(() => undefined);
+        }
+      } finally {
+        await tiny.close();
         await administrator.close();
       }
     });

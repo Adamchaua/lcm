@@ -14,6 +14,10 @@ import { openSqlitePortableDestination } from "../../src/storage/sqlite/portable
 import { openSqlitePortableSource, sqlitePortableFileSha256, type SqlitePortableIdentityFacts } from "../../src/storage/sqlite/portable-source.js";
 import { createSqliteRepositories, createSqliteRepositoryStores } from "../../src/storage/sqlite/repositories.js";
 import { createPostgreSqlPortableSource } from "../../src/storage/postgresql/portable-source.js";
+import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { verifyPostgreSqlRuntimeSchema, verifyPostgreSqlTransferSchema } from "../../src/storage/postgresql/runtime-readiness.js";
+import { normalizeProjectPath } from "../../src/project-map.js";
+import type { PostgreSqlQueryExecutor } from "../../src/storage/postgresql/contracts.js";
 import { createPostgreSqlPortableDestination } from "../../src/storage/postgresql/portable-destination.js";
 import { PostgreSqlPromotedMemoryRepository } from "../../src/storage/postgresql/memory-repositories.js";
 import type { StorageIdentityContext, PromotedMemoryRepository } from "../../src/storage/contracts.js";
@@ -213,6 +217,34 @@ async function sqliteSource(path: string, expectedIdentity: StorageIdentityConte
 }
 
 describe("PostgreSQL 18 and SQLite complete canonical transfer", { timeout: 120_000 }, () => {
+  it("rechecks transfer readiness inside the read-only snapshot before canonical reads", async () => {
+    await withPostgreSqlTestDatabase("portable-snapshot-readiness", async database => {
+      const fixture = await seedPortablePostgreSql(database.migrator);
+      await transferGrants(database);
+      const calls: { executor: PostgreSqlQueryExecutor; isolation: string; readOnly: string }[] = [];
+      const verifyTransferSchema: typeof verifyPostgreSqlTransferSchema = async (executor, options) => {
+        const state = (await executor.query<{ isolation: string; read_only: string }>({
+          text: "SELECT current_setting('transaction_isolation') AS isolation, current_setting('transaction_read_only') AS read_only",
+        }, context)).rows[0]!;
+        const readiness = await verifyPostgreSqlTransferSchema(executor, options);
+        calls.push({ executor, isolation: state.isolation, readOnly: state.read_only });
+        return readiness;
+      };
+      await withOwnedHandles(async (_root, own) => {
+        const source = own(await createPortableRecordStream(await createPostgreSqlPortableSource({
+          settings: settings(database.runtimeUrl), expectedOwner: "lcm_test_migrator", expectedIdentity: fixture.expectedIdentity, admission: "transfer",
+        }, { createRuntime: runtimeSettings => new PostgreSqlRuntime(runtimeSettings), verifyRuntimeSchema: verifyPostgreSqlRuntimeSchema,
+          verifyTransferSchema, normalizePath: normalizeProjectPath })));
+        expect(calls).toHaveLength(2);
+        expect(calls[1]!.executor).not.toBe(calls[0]!.executor);
+        expect(calls[1]).toMatchObject({ isolation: "repeatable read", readOnly: "on" });
+        // The verifier's transaction-local set_config calls persist in the snapshot; exported reads must still succeed.
+        const corpus = await capture(source);
+        expect(corpus.get("project")).toHaveLength(1);
+      });
+    });
+  });
+
   it("moves independently seeded PostgreSQL through SQLite archive into a fresh PostgreSQL database with all 22 hashes intact", async () => {
     await withPostgreSqlTestDatabase("portable-origin", async origin => {
       const fixture = await seedPortablePostgreSql(origin.migrator);

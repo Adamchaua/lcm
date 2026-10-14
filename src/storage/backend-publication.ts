@@ -385,6 +385,7 @@ export type BackendPublicationLockToken = object;
 
 const activePublicationLockTokens = new WeakMap<BackendPublicationLockToken, {
   readonly rootPath: string;
+  readonly origin: "sync" | "async";
   active: boolean;
 }>();
 /**
@@ -1702,9 +1703,12 @@ function contextualAppendLockToken(
   return inherited.token;
 }
 
-function newLockToken(homeDir: string | undefined): BackendPublicationLockToken {
+function newLockToken(
+  homeDir: string | undefined,
+  origin: "sync" | "async",
+): BackendPublicationLockToken {
   const token = {};
-  activePublicationLockTokens.set(token, { rootPath: rootPath(homeDir), active: true });
+  activePublicationLockTokens.set(token, { rootPath: rootPath(homeDir), origin, active: true });
   return token;
 }
 
@@ -1897,7 +1901,7 @@ function consumerLockCallback<T>(
   };
   const run = (): T => {
     refreshDirectories();
-    const token = newLockToken(homeDir);
+    const token = newLockToken(homeDir, "sync");
     if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
     if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
     try {
@@ -1961,7 +1965,7 @@ export async function withBackendPublicationConsumerLockAsync<T>(
   };
   const run = async (): Promise<T> => {
     refreshDirectories();
-    const token = newLockToken(homeDir);
+    const token = newLockToken(homeDir, "async");
     if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
     if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
     try {
@@ -3702,6 +3706,7 @@ export class BackendPublicationCoordinator {
 
   async prepareMaintenanceSelection(
     input: PrepareBackendMaintenanceSelectionInput,
+    lockToken?: BackendPublicationLockToken,
   ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
@@ -3731,11 +3736,12 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, prepared, journal.checksumSha256);
       return prepared;
-    });
+    }, lockToken);
   }
 
   async completeMaintenanceSelection(
     input: CompleteBackendMaintenanceSelectionInput,
+    lockToken?: BackendPublicationLockToken,
   ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
@@ -3763,10 +3769,13 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, completed, journal.checksumSha256);
       return completed;
-    });
+    }, lockToken);
   }
 
-  async abortMaintenance(input: AbortBackendMaintenanceInput): Promise<BackendMaintenanceJournal> {
+  async abortMaintenance(
+    input: AbortBackendMaintenanceInput,
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
       if (journal === null) return fail("publication-evidence-missing", "backend maintenance journal is missing");
@@ -3792,10 +3801,13 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, aborted, journal.checksumSha256);
       return aborted;
-    });
+    }, lockToken);
   }
 
-  async prepare(input: PrepareBackendPublicationInput): Promise<BackendPublicationJournal> {
+  async prepare(
+    input: PrepareBackendPublicationInput,
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendPublicationJournal> {
     return this.#locked(async (directoryHandle) => {
       const validated = validateInput(input);
       const existing = readParsedJournalFromDirectory(
@@ -3852,24 +3864,27 @@ export class BackendPublicationCoordinator {
       );
       this.#observer("after-prepared", backendPublicationJournalPath(this.#homeDir));
       return prepared;
-    });
+    }, lockToken);
   }
 
-  async resume(): Promise<BackendPublicationJournal> {
-    return this.#locked(async (directoryHandle) => this.#resumeUnlocked(directoryHandle));
+  async resume(lockToken?: BackendPublicationLockToken): Promise<BackendPublicationJournal> {
+    return this.#locked(async (directoryHandle) => this.#resumeUnlocked(directoryHandle), lockToken);
   }
 
-  async abort(): Promise<BackendPublicationJournal> {
-    return this.#locked(async (directoryHandle) => this.#abortUnlocked(directoryHandle));
+  async abort(lockToken?: BackendPublicationLockToken): Promise<BackendPublicationJournal> {
+    return this.#locked(async (directoryHandle) => this.#abortUnlocked(directoryHandle), lockToken);
   }
 
-  async recoverPending(options: RecoverPendingOptions = {}): Promise<BackendPublicationJournal | null> {
+  async recoverPending(
+    options: RecoverPendingOptions = {},
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendPublicationJournal | null> {
     return this.#locked(async (directoryHandle) => {
       const journal = readJournalFromDirectory(this.#homeDir, directoryHandle);
       if (journal === null) return null;
       if (options.disposition === "abort") return this.#abortUnlocked(directoryHandle);
       return this.#resumeUnlocked(directoryHandle);
-    });
+    }, lockToken);
   }
 
   async #locked<T>(
@@ -3894,6 +3909,12 @@ export class BackendPublicationCoordinator {
     };
     if (lockToken !== undefined) {
       assertLockToken(lockToken, this.#homeDir);
+      if (activePublicationLockTokens.get(lockToken)!.origin === "sync") {
+        return fail(
+          "permit-mismatch",
+          "synchronous-origin publication lock token cannot authorize an asynchronous coordinator seam because the synchronous wrapper releases the lock when its callback returns",
+        );
+      }
       return operation();
     }
     return withBackendPublicationLockAsync(this.#homeDir, operation);

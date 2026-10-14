@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import { normalizeUuidV7 } from "../../machine-identity.js";
 import { normalizeProjectPath } from "../../project-map.js";
 import type { StorageIdentityContext } from "../contracts.js";
+import { StorageOperationError } from "../errors.js";
 import {
   PORTABLE_LIMITS, PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_RECORD_SCHEMA_SHA256,
   PortableStreamError, canonicalJson, createPortableRecord, serializePortableRecord, sha256,
@@ -16,6 +17,7 @@ import type {
 import type {
   PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlRuntimeHealth,
 } from "./contracts.js";
+import { isPostgreSqlSnapshotTerminationError } from "./errors.js";
 import type { PostgreSqlSnapshotSession } from "./snapshot-session.js";
 import { PostgreSqlRuntime } from "./runtime.js";
 import { verifyPostgreSqlRuntimeSchema, verifyPostgreSqlTransferSchema } from "./runtime-readiness.js";
@@ -104,7 +106,17 @@ function safeError(error: unknown): PortableStreamError {
     if (error.code === "unsupported-capability") return new PortableStreamError("record-unrepresentable");
     if (error.code === "invalid-input") return new PortableStreamError("source-invalid");
   }
-  return new PortableStreamError("source-unavailable");
+  // Attach the cause only when it already arrived sanitized (a
+  // StorageOperationError never carries connection strings, credentials or
+  // raw driver detail such as internalQuery/host). A raw, unnormalized
+  // error is never attached: that is the leak path.
+  // retryable marks a genuine connection termination or idle-in-transaction
+  // kill so the backend-neutral stream can retry it without knowing
+  // PostgreSQL SQLSTATE semantics.
+  return new PortableStreamError("source-unavailable", {
+    cause: error instanceof StorageOperationError ? error : undefined,
+    retryable: isPostgreSqlSnapshotTerminationError(error),
+  });
 }
 function invalid(): never { throw new PortableStreamError("source-invalid"); }
 function rawOrder(order: readonly PortableOrderScalar[]): unknown[] {
@@ -178,6 +190,7 @@ export async function createPostgreSqlPortableSource(options: PostgreSqlPortable
   let session: Snapshot | undefined;
   let index: PortableIndex | undefined;
   const ownsSession=options.session === undefined;
+  let verify: PostgreSqlPortableSourceDependencies["verifyRuntimeSchema"] | PostgreSqlPortableSourceDependencies["verifyTransferSchema"];
   try {
     abort(options.signal);
     assertIdentity(options.expectedIdentity);
@@ -190,7 +203,7 @@ export async function createPostgreSqlPortableSource(options: PostgreSqlPortable
       if (health.status !== "healthy" || health.tls !== true || health.serverMajorVersion !== 18
         || health.serverEncoding !== "UTF8") invalid();
       abort(options.signal);
-      const verify=options.admission === "transfer" ? injected.verifyTransferSchema : injected.verifyRuntimeSchema;
+      verify=options.admission === "transfer" ? injected.verifyTransferSchema : injected.verifyRuntimeSchema;
       if (!verify) invalid();
       await verify(runtime,{expectedOwner:options.expectedOwner,signal:options.signal});
       await registeredIdentity(runtime,expectedIdentity,normalizedPath,options.signal);
@@ -201,6 +214,13 @@ export async function createPostgreSqlPortableSource(options: PostgreSqlPortable
       session=options.session;
     }
     if (session.identity.projectId !== expectedIdentity.id) invalid();
+    // Snapshot-session opens REPEATABLE READ READ ONLY and pins it with its pid query, so
+    // this recheck joins the snapshot used for every export read; DDL committed before the
+    // pin is caught here. The verifier only SELECTs, except transaction-local set_config
+    // calls that last until the snapshot rollback and do not affect schema-qualified SQL.
+    // Non-MVCC probes (pg_stat_ssl, current_setting) are live state; snapshotState rechecks them.
+    // A borrowed session's admission belongs to the caller that opened it.
+    if (verify !== undefined) await verify(session,{expectedOwner:options.expectedOwner,signal:options.signal});
     await registeredIdentity(session,expectedIdentity,normalizedPath,options.signal);
     const capturedAt=await snapshotState(session,options.signal);
     const sourceWitnessSha256=await readPostgreSqlPortableWitness(session,expectedIdentity.id,options.signal);
@@ -478,12 +498,34 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       closed=true;brands.delete(source);
       closePromise=tail.then(async()=> {
         let failed=false;
-        try { index.close(); } catch { failed=true; }
+        let cause: unknown;
+        try { index.close(); } catch (error) { failed=true; cause=error; }
         // A borrowed session is retained and closed by its owner; closing
         // one here would be a defect surfacing only under crash or reuse.
-        if (ownsSession) { try { await session.close(); } catch { failed=true; } }
-        if (runtime !== undefined) { try { await runtime.close(); } catch { failed=true; } }
-        if (failed) throw new PortableStreamError("source-unavailable");
+        if (ownsSession) {
+          try {
+            await session.close();
+          } catch (error) {
+            // Tolerate a session already dead from a 25P03 idle-kill,
+            // 08xxx/57P0x connection termination, or a message-only torn
+            // connection that survives normalization as retryable with no
+            // sqlState (isPostgreSqlSnapshotTerminationError). It does NOT
+            // tolerate a generic "not queryable" local rejection (no
+            // sqlState, not retryable) unless the snapshot checkout's
+            // async-failure listener already captured a real diagnostic and
+            // reattached it (PostgreSqlSnapshotSession.normalize); an
+            // undiagnosed dead session still fails loudly here. Disk-index
+            // and pool close failures below always propagate; this
+            // tolerance is scoped to the session arm only.
+            if (!isPostgreSqlSnapshotTerminationError(error)) { failed=true; cause??=error; }
+          }
+        }
+        if (runtime !== undefined) { try { await runtime.close(); } catch (error) { failed=true; cause??=error; } }
+        if (failed) {
+          throw new PortableStreamError("source-unavailable", {
+            cause: cause instanceof StorageOperationError ? cause : undefined,
+          });
+        }
       });
       return closePromise;
     },
