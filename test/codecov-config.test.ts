@@ -671,6 +671,15 @@ function validateFragment(name: string, document: unknown, context: FragmentCont
   return errors;
 }
 
+// Parse one fragment so a YAML error names the fragment instead of the loader.
+function parseFragment(name: string, text: string): { document: unknown } | { error: string } {
+  try {
+    return { document: loadYaml(text) };
+  } catch (error) {
+    return { error: `${name}: YAML parse error: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 function readOwnershipFragments(context: FragmentContext): { fragments: OwnershipFragment[]; errors: string[] } {
   const errors: string[] = [];
   const fragments: OwnershipFragment[] = [];
@@ -686,7 +695,12 @@ function readOwnershipFragments(context: FragmentContext): { fragments: Ownershi
       errors.push(`${entry.name}: must be a regular file`);
       continue;
     }
-    const document = loadYaml(readFileSync(join(ownershipFragmentDirectory, entry.name), "utf8"));
+    const parsed = parseFragment(entry.name, readFileSync(join(ownershipFragmentDirectory, entry.name), "utf8"));
+    if ("error" in parsed) {
+      errors.push(parsed.error);
+      continue;
+    }
+    const { document } = parsed;
     const fragmentErrors = validateFragment(entry.name, document, context);
     if (fragmentErrors.length > 0) {
       errors.push(...fragmentErrors);
@@ -812,6 +826,9 @@ describe("Codecov configuration", () => {
     expect(validateFragment("1403-cli-help.yml", valid, context)).toEqual([]);
     expect(validateFragment("1403-cli-help.yml", { ...valid, references: ["PR #1403", "G007", "response-fence"] }, context)).toEqual([]);
     expect(isValidFragmentName(legacyLedgerName)).toBe(true);
+    expect(parseFragment("1403-cli-help.yml", "references: [")).toMatchObject({ error: expect.stringMatching(/^1403-cli-help\.yml: YAML parse error: /) });
+    expect(parseFragment("1403-cli-help.yml", "a: 1\na: 2\n")).toMatchObject({ error: expect.stringContaining("duplicated mapping key") });
+    expect(parseFragment("1403-cli-help.yml", "references: [\"#1403\"]\n")).toEqual({ document: { references: ["#1403"] } });
     for (const name of ["0000-other.yml", "0-x.yml", "1403-Cli.yml", "1403-cli.yaml", "cli-1403.yml", "1403--cli.yml", ".1403-cli.yml", "1403-cli.yml.bak", "1403_cli.yml"]) {
       expect(isValidFragmentName(name), name).toBe(false);
     }
