@@ -1,0 +1,13 @@
+references: ["#1384", "PR #1408"]
+rationale: >-
+  Keeps the frozen startup-backend admission discriminator and the
+  halted-sweep health report daemon-core-owned, the frozen-backend sweep
+  halt, its single report and the shared scheduled-work teardown
+  daemon-events-owned, the optional background passive-event status block
+  route-owned, and the admitted drain lease acquisition in the PostgreSQL
+  passive-events owner. No file changes component.
+pins:
+  - ["src/daemon/server.ts", "unit-daemon-core"]
+  - ["src/daemon/passive-event-processor.ts", "unit-daemon-events"]
+  - ["src/daemon/routes/status.ts", "unit-daemon-routes"]
+  - ["src/daemon/passive-event-replication.ts", "integration-postgresql-passive-events"]

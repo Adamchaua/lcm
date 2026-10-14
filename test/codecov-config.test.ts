@@ -182,7 +182,10 @@ const expectedComponents = [
   {
     component_id: "unit-daemon-events",
     name: "Unit - Daemon Passive Events",
-    paths: ["^src/daemon/passive-event-processor\\.ts$"],
+    paths: [
+      "^src/daemon/passive-event-processor\\.ts$",
+      "^src/daemon/passive-event-replication-pass\\.ts$",
+    ],
   },
   {
     component_id: "unit-mcp",
@@ -780,7 +783,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(244);
+    expect(productionFiles).toHaveLength(245);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -810,7 +813,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(244);
+    expect(ownershipCounts.size).toBe(245);
   });
 
   test("keeps every recorded ownership decision in its intended component", () => {

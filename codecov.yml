@@ -224,6 +224,7 @@ component_management:
         # #969 promote-events notification body-shape validation remains
         # daemon-events-owned.
         - "^src/daemon/passive-event-processor\\.ts$"
+        - "^src/daemon/passive-event-replication-pass\\.ts$"
     - component_id: "unit-mcp"
       name: "Unit - MCP"
       paths:
