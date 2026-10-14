@@ -1660,6 +1660,44 @@ describe("verifyMigrationGeneration", () => {
     expect(runtime.close).toHaveBeenCalledTimes(1);
   }, 15000);
 
+  it("#1415: an immediate second verify of the same generation acquires the lease the first one released", async () => {
+    // The release-on-open-runtime test above proves release runs before the
+    // runtime closes, but it never models lease state, so it cannot show the
+    // consequence that matters to the operator: after a successful verify the
+    // lease row is actually free. This coordinator keeps real acquire/release
+    // state (a second acquireLease returns null until the first is released),
+    // so a release that is skipped or misordered surfaces as
+    // lease-unavailable on the second run. The manifest is rewound between
+    // runs so the second run is a fresh verification rather than a resume.
+    const manifest = stubDestinationPrimitives();
+    const initialManifest = manifest.current;
+    let held = false;
+    const acquireLease = vi.fn(async () => {
+      if (held) return null;
+      held = true;
+      return { fencingToken: 1n } as never;
+    });
+    const releaseLease = vi.fn(async () => { held = false; return null; });
+    vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      acquireLease, releaseLease,
+    } as never); });
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const input = baseInput({ homeDir: "/tmp/lcm-verify-second-acquire" });
+    const first = await verifyMigrationGeneration(
+      input, dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime()),
+    );
+    expect(first.outcome).toBe("clean");
+    expect(held).toBe(false);
+    manifest.current = initialManifest;
+    const second = await verifyMigrationGeneration(
+      input, dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime()),
+    );
+    expect(second.outcome).toBe("clean");
+    expect(acquireLease).toHaveBeenCalledTimes(2);
+    expect(releaseLease).toHaveBeenCalledTimes(2);
+    expect(held).toBe(false);
+  }, 15000);
+
   it("uses the production default dependencies when none are injected", async () => {
     stubDestinationPrimitives();
     const copySource = fakeCopySource();
