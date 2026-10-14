@@ -54,6 +54,7 @@ describe("storage configuration", () => {
           connectionTimeoutMs: 12_000,
           idleTimeoutMs: 0,
           statementTimeoutMs: 90_000,
+          snapshotIdleTimeoutMs: 120_000,
           migrationRole: "stored_migrator",
         },
       },
@@ -66,6 +67,7 @@ describe("storage configuration", () => {
         connectionTimeoutMs: 12_000,
         idleTimeoutMs: 0,
         statementTimeoutMs: 90_000,
+        snapshotIdleTimeoutMs: 120_000,
         migrationRole: "stored_migrator",
       },
     });
@@ -104,6 +106,7 @@ describe("storage configuration", () => {
         connectionTimeoutMs: 10_000,
         idleTimeoutMs: 30_000,
         statementTimeoutMs: 60_000,
+        snapshotIdleTimeoutMs: 300_000,
         migrationRole: "lcm_migrator",
       },
     });
@@ -131,6 +134,7 @@ describe("storage configuration", () => {
           connectionTimeoutMs: 600_000,
           idleTimeoutMs: 3_600_000,
           statementTimeoutMs: 3_600_000,
+          snapshotIdleTimeoutMs: 3_600_000,
         },
       },
     }), {}, postgresEnv());
@@ -140,8 +144,13 @@ describe("storage configuration", () => {
         connectionTimeoutMs: 600_000,
         idleTimeoutMs: 3_600_000,
         statementTimeoutMs: 3_600_000,
+        snapshotIdleTimeoutMs: 3_600_000,
       },
     });
+    const minimum = parseDaemonConfig(JSON.stringify({
+      storage: { backend: "postgresql", postgresql: { snapshotIdleTimeoutMs: 1 } },
+    }), {}, postgresEnv());
+    expect(minimum.storage).toMatchObject({ postgresql: { snapshotIdleTimeoutMs: 1 } });
   });
 
   it("applies runtime overrides above environment secrets and JSON", () => {
@@ -166,6 +175,7 @@ describe("storage configuration", () => {
         connectionTimeoutMs: 10_000,
         idleTimeoutMs: 30_000,
         statementTimeoutMs: 60_000,
+        snapshotIdleTimeoutMs: 300_000,
         migrationRole: "lcm_migrator",
         url: "postgresql://runtime:secret@runtime.example.com/lcm",
         caFile: runtimeCa,
@@ -188,6 +198,7 @@ describe("storage configuration", () => {
         connectionTimeoutMs: 10_000,
         idleTimeoutMs: 30_000,
         statementTimeoutMs: 60_000,
+        snapshotIdleTimeoutMs: 300_000,
         migrationRole: "trim_migrator",
         url: "postgresql://trim-user:trim-secret@db.example.com/lcm",
         caFile: trustedCa,
@@ -250,6 +261,10 @@ describe("storage configuration", () => {
     [{ backend: "sqlite", postgresql: { connectionTimeoutMs: 600_001 } }, "storage.postgresql.connectionTimeoutMs"],
     [{ backend: "sqlite", postgresql: { idleTimeoutMs: -1 } }, "storage.postgresql.idleTimeoutMs"],
     [{ backend: "sqlite", postgresql: { statementTimeoutMs: 0 } }, "storage.postgresql.statementTimeoutMs"],
+    [{ backend: "sqlite", postgresql: { snapshotIdleTimeoutMs: 0 } }, "storage.postgresql.snapshotIdleTimeoutMs"],
+    [{ backend: "sqlite", postgresql: { snapshotIdleTimeoutMs: -1 } }, "storage.postgresql.snapshotIdleTimeoutMs"],
+    [{ backend: "sqlite", postgresql: { snapshotIdleTimeoutMs: 1.5 } }, "storage.postgresql.snapshotIdleTimeoutMs"],
+    [{ backend: "sqlite", postgresql: { snapshotIdleTimeoutMs: 3_600_001 } }, "storage.postgresql.snapshotIdleTimeoutMs"],
     [{ backend: "postgresql", postgresql: { migrationRole: 7 } }, "storage.postgresql.migrationRole"],
     [{ backend: "postgresql", postgresql: { migrationRole: "   " } }, "storage.postgresql.migrationRole"],
     [{ backend: "postgresql", postgresql: { migrationRole: "bad\u0000role" } }, "storage.postgresql.migrationRole"],
@@ -490,6 +505,7 @@ describe("storage configuration", () => {
         connectionTimeoutMs: 10_000,
         idleTimeoutMs: 30_000,
         statementTimeoutMs: 60_000,
+        snapshotIdleTimeoutMs: 300_000,
         migrationRole: "lcm_migrator",
       },
     });
@@ -509,11 +525,25 @@ describe("storage configuration", () => {
       connectionTimeoutMs: 10_000,
       idleTimeoutMs: 30_000,
       statementTimeoutMs: 60_000,
+      snapshotIdleTimeoutMs: 300_000,
       migrationRole: "lcm_migrator",
     });
     expect(reloaded.storage).toMatchObject({ postgresql: { migrationRole: "lcm_migrator" } });
     expect(JSON.stringify(persisted.storage)).not.toContain("postgresql://");
     expect(JSON.stringify(persisted.storage)).not.toContain("caFile");
+  });
+
+  it("round-trips an explicit non-default snapshotIdleTimeoutMs through persistence and reload", () => {
+    const config = parseDaemonConfig(JSON.stringify({
+      storage: { backend: "postgresql", postgresql: { snapshotIdleTimeoutMs: 45_000 } },
+    }), {}, postgresEnv());
+    expect(config.storage).toMatchObject({ postgresql: { snapshotIdleTimeoutMs: 45_000 } });
+    const persisted = daemonConfigForPersistence(config);
+    expect((persisted.storage as Record<string, unknown>).postgresql).toMatchObject({
+      snapshotIdleTimeoutMs: 45_000,
+    });
+    const reloaded = parseDaemonConfig(JSON.stringify(persisted), {}, postgresEnv());
+    expect(reloaded.storage).toMatchObject({ postgresql: { snapshotIdleTimeoutMs: 45_000 } });
   });
 
   it("starts the daemon with explicitly unavailable staged PostgreSQL storage", async () => {
