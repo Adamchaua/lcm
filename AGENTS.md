@@ -29,9 +29,9 @@
 
 ## Codecov Components Maintenance
 
-- Update `codecov.yml` and `test/codecov-config.test.ts` atomically whenever production TypeScript, features, or components are added, removed, moved, materially changed, or otherwise make classification stale.
-- Require complete exclusive ownership and accurate stable IDs/names/paths: every covered production TypeScript file belongs to exactly one component.
-- Do not freeze the taxonomy at its current count; intentional additions/removals must update the literal map and count atomically.
+- `codecov.yml` holds the component map; `test/codecov-config.test.ts` holds the literal copy of that map, the literal component count, and the literal owned-file count. Update them atomically whenever production TypeScript, features, or components are added, removed, moved, or otherwise make classification stale, so that every covered production TypeScript file belongs to exactly one component with accurate stable IDs, names, and paths. Do not freeze the taxonomy at its current count.
+- Record every ownership decision for a materially changed, added, removed, moved, or re-owned production TypeScript file as one new file in `test/codecov-ownership/`, named `<issue-or-PR-number>-<slug>.yml`, with `references`, `rationale`, and `pins` as `[file, component]` pairs; the test rejects any other shape and requires every production file to be pinned by some fragment. Edit an existing fragment only to delete or amend a pin whose file was removed, moved, or re-owned; delete a fragment that would be left without pins and name it in the new fragment's rationale. Never append provenance to the test, its titles, or `codecov.yml`: the comments already there are frozen history.
+- Reviewers confirm that every materially changed production TypeScript file gained a fragment pin; the test enforces only that every production file is pinned somewhere and that every pin agrees with `codecov.yml`.
 - Forbid Codecov flags, statuses, ignore/coverage exclusions, report-only runs, or reporting-topology changes without an explicit design change.
 - Preserve the existing 100% line, branch, function, and statement gate enforced over the complete collected scope by the merged `main` CI report and by a fresh `pnpm run test:ci`.
 

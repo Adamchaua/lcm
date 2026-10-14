@@ -1,0 +1,546 @@
+# Frozen ledger of the Codecov ownership pins and provenance comments that
+# lived in test/codecov-config.test.ts before per-decision fragments existed.
+# Moved verbatim (comments, tuple order and duplicates preserved) by the
+# fragment layout change. Do not add provenance here: record a new decision
+# as a new file in this directory. Edit a pin below only when its file is
+# removed, moved, or re-owned.
+references:
+  - response-fence
+  - "#681"
+  - "#700"
+  - "#701"
+  - "#703"
+  - "#705"
+  - "#709"
+  - "#710"
+  - "#713"
+  - "#756"
+  - "#726"
+  - "#734"
+  - "#737"
+  - "#742"
+  - "#760"
+  - "#763"
+  - "#804"
+  - "#805"
+  - "#824"
+  - "#825"
+  - "#833"
+  - "#888"
+  - "#864"
+  - "#866"
+  - "#722"
+  - "#786"
+  - "#952"
+  - "#814"
+  - "#882"
+  - "#930"
+  - "#969"
+  - "#989"
+  - "#1003"
+  - "#1049"
+  - "#964"
+  - "#1106"
+  - "#1191"
+  - "#1196"
+  - "#1229"
+  - "#1321"
+  - "#1338"
+  - "#1347"
+  - "#1353"
+  - "#1354"
+  - "#1356"
+  - "#1357"
+  - "#1358"
+  - "#1403"
+  - "#1450"
+  - "#1390"
+  - "#1371"
+  - "#1402"
+  - "#1407"
+  - "#1411"
+  - "#1419"
+  - "#1393"
+  - "#1413"
+  - "#1430"
+  - "#1466"
+rationale: >-
+  Pins and provenance recorded before the per-decision fragment layout;
+  every comment below names the issue or decision that pinned the files
+  that follow it. The baseline classification appendix pins every other
+  production file to the unique owner codecov.yml gave it at migration
+  base 8b8b85e571269879886f8d7886610211ef1b36fd; those are not issue decisions.
+# #792 keeps grep session filtering and #794 grep-since validation in the
+# existing route component. #862 keeps recent limit validation, #863
+# keeps expand depth validation in the same daemon-routes component.
+# #930 keeps expand body-shape validation in that component as well.
+# #969 keeps the route-family and passive notification body-shape
+# validation in their existing route and daemon-events components.
+# #1217 keeps native snapshot retries, preparation/admission and attempt lifetime route-owned.
+# #888 keeps private final ingest and compact metadata writes route-owned.
+# #890 keeps bounded best-effort status metadata reads route-owned.
+# #1003 keeps preliminary metadata admission daemon-core-owned.
+# #1050 keeps bounded preliminary metadata serialization there too.
+# #1032 keeps the shared private-file writer's retained-parent checks and
+# publication outcomes configuration-security-owned.
+# #947 keeps promote metadata-parent resource handling and fail-closed
+# topology behavior in the existing daemon-routes component.
+# #948 keeps promote metadata parent-first admission, sampled read binding,
+# and retained identity revalidation in the daemon-routes component.
+# #964 keeps the path-bound root/projects/leaf metadata lifetime there too.
+# #1062 keeps retained-parent create-if-absent filesystem semantics in
+# configuration-security and promote collision handling in daemon-routes.
+# #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
+# #814 fresh-root descriptor and pre-handoff content checks remain
+# configuration-security-owned.
+pins:
+  # #866 export admission failures and sensitive result emission stay CLI-owned.
+  # #1081 keeps unsupported export-format admission CLI-owned.
+  # #1088 keeps unsupported connector-list-format admission CLI-owned.
+  # #978 keeps compact replacement runtime-digest admission CLI-owned.
+  # #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
+  # #1201 keeps diagnostic identity admission CLI-owned.
+  # #1413 keeps the unbound-project remedy for promote and import, and
+  # #1466 keeps per-project export failure attribution and the failed
+  # project count, in this existing CLI owner. Both are confined to
+  # existing files and add no component, so this pin records that
+  # decision for a materially changed file.
+  - ["bin/lcm.ts", "unit-cli"]
+  - ["src/config-manager.ts", "unit-configuration-security"]
+  - ["src/private-mutation-lock.ts", "unit-configuration-security"]
+  - ["src/home-parent-auth.ts", "unit-configuration-security"]
+  # #1041 preserves bootstrap directory authentication errors when
+  # descriptor cleanup also fails in this existing owner.
+  # #1144 preserves admission callback failures while retaining ordered
+  # bootstrap-lock, home, and parent descriptor cleanup evidence here.
+  - ["src/runtime-paths.ts", "unit-configuration-security"]
+  # #1195 strict module-relative asset resolution retains this owner.
+  - ["src/runtime-root.ts", "unit-configuration-security"]
+  - ["src/security-files.ts", "unit-configuration-security"]
+  - ["src/sensitive.ts", "unit-configuration-security"]
+  # #1358 collapses redundant nested lazy prefixes in five generated
+  # Gitleaks rules and adds a structurally verified, fail-closed keyword
+  # prefilter to the scrub engine. Both files stay configuration-security
+  # owned and the component topology is unchanged; these pins name the
+  # mappings that decision covers.
+  - ["src/scrub.ts", "unit-configuration-security"]
+  - ["src/generated-patterns.ts", "unit-configuration-security"]
+  # #1335 supplementary-plane CJK column widths are a material change to
+  # terminal bounding that retains this owner, as in #1195 and #1203.
+  - ["src/terminal-sanitize.ts", "unit-configuration-security"]
+  # #1049 keeps project metadata owner and single-link admission here.
+  # #1430 keeps the bound project identity type in this existing owner.
+  - ["src/project-map.ts", "unit-project-worktrees"]
+  # #1356/#1357 authenticate the project-map key before it becomes a
+  # storage identity, suppress alias-time metadata backfill until that
+  # authentication, and stop enumeration and preview presenting an
+  # identity storage refuses. The change is confined to existing files and
+  # adds no component, so every touched file keeps its established owner;
+  # these pins record that decision for materially changed files.
+  # #1403 keeps guarded per-project identity resolution during
+  # PostgreSQL project enumeration in this existing owner. The change
+  # is confined to existing files and adds no component, so every
+  # touched file keeps its established owner; this pin records that
+  # decision for a materially changed file.
+  # #1430 keeps the bound-identity split for project enumeration in this
+  # existing owner. The change is confined to existing files and adds no
+  # component, so this pin records that decision for a materially
+  # changed file.
+  - ["src/cli-storage.ts", "unit-cli"]
+  # #1393 keeps the project subcommand synopsis listing
+  # renew-retired-identity in this existing CLI owner; the change adds
+  # no component, so this pin records the decision for a materially
+  # changed file.
+  - ["src/cli-help.ts", "unit-cli"]
+  - ["src/db/events-path.ts", "unit-local-persistence"]
+  - ["src/identity-service.ts", "integration-postgresql-identity"]
+  # #889 keeps private import metadata publication in this owner.
+  # #1308 keeps import metadata convergence in this existing owner;
+  # canonical and collapsed metadata are now read live after the write
+  # that changes each row, not from a scan-time snapshot.
+  - ["src/portable-knowledge.ts", "unit-project-worktrees"]
+  # #866 stats config retries and journal failures, plus #973 project
+  # database admission, retain this owner.
+  - ["src/stats.ts", "unit-memory-retrieval"]
+  - ["src/connectors/codex-hooks.ts", "unit-connectors"]
+  - ["src/connectors/installer.ts", "unit-connectors"]
+  # #881 absent-config journal admission and #882 post-health identity
+  # fencing remain installer-owned.
+  - ["installer/install.ts", "unit-installation"]
+  # #1201 observation parser/client, allowlist and server retain daemon-core ownership.
+  # Prompt-search publication dispatch remains daemon-core-owned.
+  - ["src/daemon/client.ts", "unit-daemon-core"]
+  # #1413 keeps the typed unbound-project 409 reason discriminator in
+  # this existing daemon-core owner.
+  - ["src/daemon/http-url.ts", "unit-daemon-core"]
+  - ["src/daemon/config.ts", "unit-daemon-core"]
+  # #1430 keeps the bound-identity split for hook identity resolution in
+  # this existing daemon-core owner.
+  - ["src/daemon/project.ts", "unit-daemon-core"]
+  # Compact forwards current operation tokens; SQLite validates handle admission.
+  - ["src/daemon/routes/compact.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/describe.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/expand.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/ingest.ts", "unit-daemon-routes"]
+  # #1371 routes the manual store through the shared deduplication
+  # decision instead of a direct insert. The route owns its input; the
+  # decision helper stays in unit-promotion.
+  - ["src/daemon/routes/store.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/status.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"]
+  # #1148 keeps promoted created_at UTC parsing in the existing daemon
+  # routes owner; prompt-search publication errors and restore retain their
+  # route ownership.
+  - ["src/daemon/routes/prompt-search.ts", "unit-daemon-routes"]
+  # #1203 adds native recall evidence without changing component topology.
+  - ["src/db/promoted-recall-evidence.ts", "unit-local-persistence"]
+  - ["src/storage/postgresql/tsquery-evidence.ts", "integration-postgresql-search"]
+  - ["src/storage/contracts.ts", "unit-storage-abstractions"]
+  # #1413 keeps the typed unbound-project transport error and 409 reason
+  # constants, and #1430 the bound-identity overloads, in this existing
+  # storage-abstractions owner. The change adds no component, so this pin
+  # records that decision for a materially changed file.
+  - ["src/storage/identity-context.ts", "unit-storage-abstractions"]
+  - ["src/storage/sqlite/repositories.ts", "unit-local-persistence"]
+  - ["src/storage/postgresql/lexical-search-repository.ts", "integration-postgresql-search"]
+  - ["src/daemon/routes/restore.ts", "unit-daemon-routes"]
+  # #1413 keeps the storage-identity-required reason discriminator on the
+  # unbound-project and machine-identity 409 responses route-owned.
+  - ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"]
+  # #833 passive-event identity admission remains route-owned.
+  # #1158 keeps passive PostgreSQL promotion route behavior here; its
+  # deduplication helper remains owned by unit-promotion.
+  - ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"]
+  # #793 search-limit validation, #863 expand depth validation, and #864
+  # search candidate recall remain owned by daemon routes.
+  - ["src/daemon/routes/search.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/grep.ts", "unit-daemon-routes"]
+  # #1390 threads owner scope and the live backend into the promote
+  # route's deduplication call so the exact-content lookup runs; the
+  # input is route-owned and the decision helper stays in unit-promotion.
+  - ["src/daemon/routes/promote.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/recent.ts", "unit-daemon-routes"]
+  - ["src/daemon/passive-event-processor.ts", "unit-daemon-events"]
+  # #1153 exact identity and #1158 backend-guarded owner scope remain
+  # within the existing promotion component.
+  # #1354 serializes promoted-memory deduplication decisions with a
+  # project-scoped transaction advisory lock. The change is confined to
+  # existing files and adds no production file, so every touched file
+  # keeps its established owner and the component topology is unchanged;
+  # these pins record that decision.
+  - ["src/promotion/dedup.ts", "unit-promotion"]
+  # #1106/#618 keep discovery-related files in their established owners.
+  - ["src/daemon/server.ts", "unit-daemon-core"]
+  # #1343 and #1348 widen nested-public handoff ownership in the error
+  # sanitizer. This is a material change that retains its existing owner,
+  # as in #1195 and #1203.
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]
+  # #1413 keeps the unbound-project remedy for import in this existing
+  # import owner.
+  - ["src/import.ts", "unit-transcripts-import"]
+  # #1358 also drops the redundant residual scrub pass for strings the
+  # first pass left unchanged, which retains this existing owner.
+  - ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"]
+  # #1338 replaces compact discovery's per-conversation native-transcript
+  # query with a batched project-level lookup and adds the contract member
+  # both backends implement. The change is confined to existing files, so
+  # every touched file keeps its established owner and the component
+  # topology is unchanged; these pins record that decision.
+  # #1403 keeps the per-project unbound-binding discovery diagnostic in
+  # this existing compaction owner. The change is confined to existing
+  # files and adds no component, so every touched file keeps its
+  # established owner; this pin records that decision for a
+  # materially changed file.
+  # #1413 keeps the compact --all message separating enumeration failure
+  # from per-project open failures in this existing compaction owner.
+  - ["src/batch-compact.ts", "unit-compaction-summarization"]
+  # #1353 qualifies every equality comparison in the PostgreSQL memory
+  # repositories against pg_catalog so a hostile search_path cannot
+  # resolve a different operator. The change is confined to that existing
+  # file and adds no component, so it keeps its established owner; this
+  # pin records that decision for a materially changed file.
+  - ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"]
+  - ["src/storage/sqlite/native-transcript-repository.ts", "unit-local-persistence"]
+  - ["src/storage/postgresql/native-transcript-repository.ts", "integration-postgresql-transcripts"]
+  - ["src/daemon/version.ts", "unit-daemon-core"]
+  # #885 keeps the shared missing-Codex diagnostic and its resolver
+  # identity handling within the existing LLM component. #934 keeps
+  # caller-cancellation handling during resolver teardown in this owner.
+  # #1154/#1157 retain Spark protocol normalization, bounded upstream
+  # classification, and terminal sentinel handling in this owner.
+  # #1168 retains accepted HTTP body and SSE failure classification in
+  # this LLM-owned component.
+  - ["src/llm/codex-process.ts", "unit-llm-prompts"]
+  - ["src/llm/codex-config.ts", "unit-llm-prompts"]
+  - ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"]
+  - ["src/llm/process-utils.ts", "unit-llm-prompts"]
+  # #997 keeps doctor publication retry deadlines monotonic in this owner.
+  # #619 keeps observational doctor refusal guidance in this owner.
+  # #1201 identity observation and unverified queue readiness retain this owner.
+  - ["src/doctor/doctor.ts", "unit-diagnostics"]
+  # #944/#950/#966 keep typed daemon-tmp diagnostics, authenticated restart
+  # convergence, and bounded birth samples in the service-manager component.
+  - ["src/daemon/lifecycle-scope.ts", "integration-service-managers"]
+  - ["src/daemon/lifecycle.ts", "integration-service-managers"]
+  # #1450 keeps canonical stable managed PATH construction and direct
+  # executable admission in the existing service-manager owner.
+  - ["src/daemon/managed-path.ts", "integration-service-managers"]
+  - ["src/daemon/supervisor.ts", "integration-service-managers"]
+  # #837 consumer-admission descriptor cleanup remains storage-owned.
+  # #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
+  # #1307 explicit-only retained append admission for non-append mutation
+  # participants stays storage-abstractions-owned.
+  # #1402 keeps the publication-lock wrapper that classifies unresolved
+  # publication state in this existing owner. The change is confined to
+  # this existing file and adds no component, so it keeps its established
+  # owner; this pin records that decision for a materially changed file.
+  - ["src/storage/backend.ts", "unit-storage-abstractions"]
+  # #1347 lets a caller that already holds publication admission skip the
+  # in-process append tail wait while still taking the append file lock
+  # and the maintenance-phase check, and chains an admitted frame behind
+  # its unresolved admitted predecessor so a timed-out intermediate
+  # frame cannot release later same-token frames early. The change is
+  # confined to this existing file, so it keeps its established owner
+  # and the component topology is unchanged; this pin records that
+  # decision.
+  # #1411 keeps lock-token origin tracking and the refusal of
+  # synchronous-origin tokens at asynchronous coordinator seams in this
+  # existing owner; #1407 is its test and documentation debt. The change
+  # adds no component, so the file keeps its established owner and this
+  # pin records that decision for a materially changed file.
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
+  # #1229 local outbox diagnostic admission stays local-event-storage-owned.
+  - ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"]
+  - ["src/storage/local-hook-outbox-schema.ts", "unit-local-event-storage"]
+  - ["src/migration/manifest-store.ts", "unit-migration-cutover"]
+  - ["src/migration/maintenance.ts", "unit-migration-cutover"]
+  # #1321 drops the Node 22 transaction-probe fallback from the receipts
+  # module; its cutover receipt logic keeps this owner.
+  - ["src/migration/receipts.ts", "unit-migration-cutover"]
+  - ["src/migration/queue-evidence.ts", "unit-migration-cutover"]
+  - ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"]
+  # #1380 clears the settlement primary error once a mutate is
+  # acknowledged, so retry diagnostics report the current readback
+  # failure instead of a stale one from an earlier attempt. The change
+  # is confined to this existing file, so it keeps its established
+  # owner; this pin records that decision.
+  - ["src/migration/copy-destination.ts", "unit-migration-cutover"]
+  - ["src/storage/contracts.ts", "unit-storage-abstractions"]
+  - ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"]
+  # #1354 supplies the promoted-memory decision serializer only from the
+  # PostgreSQL transaction scope. A component path regex already matched
+  # this file, but the owner list had never named it.
+  - ["src/storage/postgresql/project-storage.ts", "unit-storage-abstractions"]
+  # #1402 keeps the publication witness classification in this existing
+  # PostgreSQL-runtime owner. The change adds no component, so the file
+  # keeps its established owner; this pin records that decision for a
+  # materially changed file.
+  - ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"]
+  # #1419 keeps the fence-mismatch versus invalid-row distinction in this
+  # existing PostgreSQL-coordination owner. The change adds no component,
+  # so the file keeps its established owner; this pin records that
+  # decision for a materially changed file.
+  - ["src/storage/postgresql/publication-guard.ts", "integration-postgresql-coordination"]
+  # #1195 checksummed packaged migration loading remains schema-owned.
+  # #1306 adds the 0007 promoted-content digest migration and its
+  # schema snapshot, keeping the packaged migration manifest here.
+  # #1378 adds the 0008 transfer-identity content-digest migration
+  # and its regenerated schema snapshot; ownership is unchanged.
+  - ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"]
+  # #1378 reads back each written record inside the same fenced
+  # transaction and stores its content fingerprint; both files keep
+  # their established owner.
+  - ["src/storage/postgresql/portable-destination.ts", "integration-postgresql-portable"]
+  - ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"]
+  # #1306 indexes owner exact-content lookup by a generated SHA-256
+  # digest, retaining the raw-equality residual it always used.
+  # #1354 adds the promoted-memory decision serializer beside the
+  # repositories it serializes.
+  - ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"]
+  - ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"]
+  # #989 event-sidecar parent authentication stays local-persistence-owned.
+  # #1101 numeric skipped-sidecar counts stay local-persistence-owned.
+  # #1191 mutating sidecar scan lifetime stays local-persistence-owned.
+  # #1307 queue-before-consumer ordering for mutating sidecar scans stays
+  # local-persistence-owned.
+  - ["src/db/event-sidecars.ts", "unit-local-persistence"]
+  - ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"]
+  - ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"]
+  # #619 retained daemon pool observations stay diagnostics-owned.
+  - ["src/storage/diagnostics.ts", "unit-diagnostics"]
+  - ["src/storage/diagnostic-renderer.ts", "unit-diagnostics"]
+  - ["src/storage/diagnostic-project.ts", "unit-diagnostics"]
+  - ["src/storage/postgresql/diagnostics.ts", "unit-diagnostics"]
+  # #992 keeps pre-initialization SQLite leaf admission and final
+  # opened-identity fencing local-persistence-owned.
+  - ["src/db/connection.ts", "unit-local-persistence"]
+  - ["src/db/database-parent.ts", "unit-local-persistence"]
+  # Retained-handle token scopes and fresh factory health remain local persistence.
+  - ["src/storage/sqlite/factory.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/project-storage.ts", "unit-local-persistence"]
+  # #1020 keeps message timestamp mapping in the existing local-persistence
+  # component; conversation timestamps remain on their existing mapper.
+  # G007 keeps SQLite regex snippet redaction and Unicode bounding in this
+  # existing owner without changing the component taxonomy.
+  - ["src/store/conversation-store.ts", "unit-local-persistence"]
+  - ["src/store/summary-store.ts", "unit-local-persistence"]
+  - ["src/store/regex-snippet.ts", "unit-local-persistence"]
+  - ["src/db/stored-timestamp.ts", "unit-local-persistence"]
+  - ["src/hooks/event-scrubbing.ts", "unit-hooks"]
+  # #1229 local-enqueue health-token forwarding stays hook-owned.
+  - ["src/hooks/local-enqueue.ts", "unit-hooks"]
+  - ["src/hooks/post-tool.ts", "unit-hooks"]
+  - ["src/hooks/publication-fence.ts", "unit-hooks"]
+  # #1155 retains SessionStart outbox pruning admission in the hook owner.
+  - ["src/hooks/restore.ts", "unit-hooks"]
+  # Bounded Claude completion delivery remains within the hook component.
+  - ["src/hooks/session-end.ts", "unit-hooks"]
+  # #793 search-limit schema remains owned by MCP tools.
+  - ["src/mcp/tools/lcm-search.ts", "unit-mcp"]
+  - ["src/mcp/tools/lcm-grep.ts", "unit-mcp"]
+  # #863 expand-depth schema remains owned by MCP tools.
+  - ["src/mcp/tools/lcm-expand.ts", "unit-mcp"]
+  # #1371 store merge-behavior help and tool description keep their
+  # CLI and MCP owners.
+  - ["src/cli-help.ts", "unit-cli"]
+  - ["src/mcp/tools/lcm-store.ts", "unit-mcp"]
+  # #972 search cwd client typing remains memory/retrieval-owned.
+  - ["src/memory/index.ts", "unit-memory-retrieval"]
+  # #793 shared search-limit contract remains retrieval-owned.
+  - ["src/retrieval.ts", "unit-memory-retrieval"]
+  # ---- Baseline classification appendix ----
+  # Every production file not pinned above, with the unique owner codecov.yml
+  # assigned it at migration base 8b8b85e571269879886f8d7886610211ef1b36fd. Owner copied, not decided.
+  - ["installer/dry-run-deps.ts", "unit-installation"]
+  - ["installer/uninstall.ts", "unit-installation"]
+  - ["src/bootstrap.ts", "unit-installation"]
+  - ["src/cli/pipeline-runner.ts", "unit-cli"]
+  - ["src/cli/pipeline-step.ts", "unit-cli"]
+  - ["src/cli/progress-state.ts", "unit-cli"]
+  - ["src/cli/render-frame.ts", "unit-cli"]
+  - ["src/cli/render-summary.ts", "unit-cli"]
+  - ["src/codex-project-resolution.ts", "unit-project-worktrees"]
+  - ["src/codex-transcript.ts", "unit-transcripts-import"]
+  - ["src/compaction.ts", "unit-compaction-summarization"]
+  - ["src/config-projection.ts", "unit-configuration-security"]
+  - ["src/connectors/constants.ts", "unit-connectors"]
+  - ["src/connectors/registry.ts", "unit-connectors"]
+  - ["src/connectors/template-service.ts", "unit-connectors"]
+  - ["src/connectors/types.ts", "unit-connectors"]
+  - ["src/daemon/auth.ts", "unit-daemon-core"]
+  - ["src/daemon/cancellation.ts", "unit-daemon-core"]
+  - ["src/daemon/content-fence.ts", "unit-daemon-core"]
+  - ["src/daemon/health-observation.ts", "integration-service-managers"]
+  - ["src/daemon/invocation-coordinator.ts", "unit-daemon-core"]
+  - ["src/daemon/managed-credentials.ts", "integration-service-managers"]
+  - ["src/daemon/orientation.ts", "unit-daemon-core"]
+  - ["src/daemon/passive-event-replication.ts", "integration-postgresql-passive-events"]
+  - ["src/daemon/project-queue.ts", "unit-daemon-core"]
+  - ["src/daemon/proxy-manager.ts", "unit-daemon-core"]
+  - ["src/daemon/publication-queue.ts", "unit-daemon-core"]
+  - ["src/daemon/remediation.ts", "unit-daemon-core"]
+  - ["src/daemon/routes/invocation-control.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/pool-stats.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/stats.ts", "unit-daemon-routes"]
+  - ["src/daemon/staged-postgresql.ts", "integration-postgresql-runtime"]
+  - ["src/daemon/summarizer.ts", "unit-daemon-core"]
+  - ["src/daemon/validate-cwd.ts", "unit-daemon-core"]
+  - ["src/db/config.ts", "unit-local-persistence"]
+  - ["src/db/events-stats.ts", "unit-local-persistence"]
+  - ["src/db/features.ts", "unit-local-persistence"]
+  - ["src/db/migration.ts", "unit-local-persistence"]
+  - ["src/db/promoted.ts", "unit-local-persistence"]
+  - ["src/db/recall.ts", "unit-local-persistence"]
+  - ["src/db/redaction-stats.ts", "unit-local-persistence"]
+  - ["src/diagnose.ts", "unit-diagnostics"]
+  - ["src/doctor/types.ts", "unit-diagnostics"]
+  - ["src/expansion.ts", "unit-memory-retrieval"]
+  - ["src/git-project.ts", "unit-project-worktrees"]
+  - ["src/hooks/auto-heal.ts", "unit-hooks"]
+  - ["src/hooks/compact.ts", "unit-hooks"]
+  - ["src/hooks/config.ts", "unit-hooks"]
+  - ["src/hooks/daemon-notice.ts", "unit-hooks"]
+  - ["src/hooks/dispatch.ts", "unit-hooks"]
+  - ["src/hooks/events-db.ts", "unit-hooks"]
+  - ["src/hooks/extractors.ts", "unit-hooks"]
+  - ["src/hooks/hook-error-diagnostic.ts", "unit-hooks"]
+  - ["src/hooks/hook-errors.ts", "unit-hooks"]
+  - ["src/hooks/memory-context.ts", "unit-hooks"]
+  - ["src/hooks/post-tool-normalization.ts", "unit-hooks"]
+  - ["src/hooks/probe-precompact.ts", "unit-hooks"]
+  - ["src/hooks/probe-sessionstart.ts", "unit-hooks"]
+  - ["src/hooks/session-snapshot.ts", "unit-hooks"]
+  - ["src/hooks/user-prompt.ts", "unit-hooks"]
+  - ["src/import-summary.ts", "unit-transcripts-import"]
+  - ["src/installer/settings.ts", "unit-installation"]
+  - ["src/large-files.ts", "unit-compaction-summarization"]
+  - ["src/legacy-names.ts", "unit-configuration-security"]
+  - ["src/llm/anthropic.ts", "unit-llm-prompts"]
+  - ["src/llm/claude-process.ts", "unit-llm-prompts"]
+  - ["src/llm/mock-summarizer.ts", "unit-llm-prompts"]
+  - ["src/llm/openai.ts", "unit-llm-prompts"]
+  - ["src/llm/types.ts", "unit-llm-prompts"]
+  - ["src/machine-identity.ts", "unit-project-worktrees"]
+  - ["src/mcp/server.ts", "unit-mcp"]
+  - ["src/mcp/tools/lcm-describe.ts", "unit-mcp"]
+  - ["src/mcp/tools/lcm-doctor.ts", "unit-mcp"]
+  - ["src/mcp/tools/lcm-stats.ts", "unit-mcp"]
+  - ["src/migration/batch-copy.ts", "unit-migration-cutover"]
+  - ["src/migration/copy-source.ts", "unit-migration-cutover"]
+  - ["src/migration/index.ts", "unit-migration-cutover"]
+  - ["src/migration/protocol.ts", "unit-migration-cutover"]
+  - ["src/promotion/detector.ts", "unit-promotion"]
+  - ["src/prompts/loader.ts", "unit-llm-prompts"]
+  - ["src/secret-key.ts", "unit-configuration-security"]
+  - ["src/shell-quote.ts", "unit-configuration-security"]
+  - ["src/storage/capabilities.ts", "unit-storage-abstractions"]
+  - ["src/storage/errors.ts", "unit-storage-abstractions"]
+  - ["src/storage/factory.ts", "unit-storage-abstractions"]
+  - ["src/storage/home-lock-topology.ts", "unit-storage-abstractions"]
+  - ["src/storage/index.ts", "unit-storage-abstractions"]
+  - ["src/storage/local-hook-event-sequence.ts", "unit-local-event-storage"]
+  - ["src/storage/local-transcript-quarantine.ts", "unit-transcripts-import"]
+  - ["src/storage/native-transcripts.ts", "unit-transcripts-import"]
+  - ["src/storage/portable-index.ts", "unit-storage-abstractions"]
+  - ["src/storage/portable-record.ts", "unit-storage-abstractions"]
+  - ["src/storage/portable-transfer.ts", "unit-storage-abstractions"]
+  - ["src/storage/portable.ts", "unit-storage-abstractions"]
+  - ["src/storage/postgresql.ts", "integration-postgresql-runtime"]
+  - ["src/storage/postgresql/client-config.ts", "integration-postgresql-runtime"]
+  - ["src/storage/postgresql/contracts.ts", "integration-postgresql-runtime"]
+  - ["src/storage/postgresql/conversation-repository.ts", "integration-postgresql-conversations"]
+  - ["src/storage/postgresql/coordination.ts", "integration-postgresql-coordination"]
+  - ["src/storage/postgresql/errors.ts", "integration-postgresql-runtime"]
+  - ["src/storage/postgresql/extensions.ts", "integration-postgresql-schema"]
+  - ["src/storage/postgresql/identity-repository.ts", "integration-postgresql-identity"]
+  - ["src/storage/postgresql/index.ts", "integration-postgresql-runtime"]
+  - ["src/storage/postgresql/passive-event-repository.ts", "integration-postgresql-passive-events"]
+  - ["src/storage/postgresql/portable-source.ts", "integration-postgresql-portable"]
+  - ["src/storage/postgresql/provisioning.ts", "integration-postgresql-schema"]
+  - ["src/storage/postgresql/runtime-readiness.ts", "integration-postgresql-schema"]
+  - ["src/storage/postgresql/runtime.ts", "integration-postgresql-runtime"]
+  - ["src/storage/postgresql/search-configuration.ts", "integration-postgresql-search"]
+  - ["src/storage/postgresql/snapshot-session.ts", "integration-postgresql-runtime"]
+  - ["src/storage/publication-convergence.ts", "unit-storage-abstractions"]
+  - ["src/storage/session-instructions.ts", "unit-local-event-storage"]
+  - ["src/storage/sqlite/executor.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/health.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/portable-archive.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/portable-capture.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/portable-destination.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/portable-runtime-mapping.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/portable-sidecars.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/portable-source.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/portable-utf8.ts", "unit-local-persistence"]
+  - ["src/store/fts5-sanitize.ts", "unit-local-persistence"]
+  - ["src/store/full-text-fallback.ts", "unit-local-persistence"]
+  - ["src/store/index.ts", "unit-local-persistence"]
+  - ["src/store/regex-safety.ts", "unit-local-persistence"]
+  - ["src/summarize.ts", "unit-compaction-summarization"]
+  - ["src/transcript-provider.ts", "unit-transcripts-import"]
+  - ["src/transcript.ts", "unit-transcripts-import"]
+  - ["src/types.ts", "unit-configuration-security"]
+  - ["src/url-display.ts", "unit-configuration-security"]
+  - ["src/worktree-reconciliation-fence.ts", "unit-project-worktrees"]
+  - ["src/worktree-reconciliation.ts", "unit-project-worktrees"]
