@@ -179,6 +179,11 @@ prefix and source boundaries, and applies batches in dependency order. Empty
 domains also receive durable terminal checkpoints. Progress is emitted only
 for an exact acknowledged checkpoint. The final result requires all domain
 counts and hashes to agree with SQL readback and the source to remain stable.
+A captured SQLite source rejects a same-size write that lands inside one
+filesystem timestamp tick: a captured file is re-hashed on every check until
+its modification and change times are more than two seconds older than the read
+that last authenticated it. This holds on filesystems with timestamp
+granularity of one second or finer.
 
 The package subpath exports both backend adapters, the record/manifest/checkpoint
 codecs, stream construction, transfer execution, constants, and their TypeScript
