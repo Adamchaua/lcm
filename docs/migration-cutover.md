@@ -629,7 +629,9 @@ Verification refuses outright, before any report is written, when:
   database, such as a misconfigured connection string or a restored clone.
   The caller's expected identity must agree with the manifest as well. The
   PostgreSQL system identifier is not recorded by the copy, so it is compared
-  only against the value the caller supplies;
+  only against the value the caller supplies. Resuming an interrupted
+  verification also refuses a persisted report whose destination identity
+  differs from the manifest's;
 - the destination's search configuration is absent, malformed, or present
   but does not match the digest this build's schema installer expects
   (a stable configuration installed from a different revision, for

@@ -2049,6 +2049,36 @@ describe("verifyMigrationGeneration", () => {
     expect(resumeManifestStore.current.reports.every((report) => report.kind !== "verification")).toBe(true);
   }, 15000);
 
+  it("refuses to resume a pending effect whose persisted report destination differs from the sealed manifest, leaving the manifest pending", async () => {
+    const homeDir = "/tmp/lcm-verify-resume-destination-drift";
+    rmSync(homeDir, { recursive: true, force: true });
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const firstResult = await verifyMigrationGeneration(
+      baseInput({ homeDir }), dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime()),
+    );
+    expect(firstResult.report.activationEligible).toBe(true);
+    // The persisted eligible report froze HASH_A as its sealed witness. The
+    // pending effect names it correctly, but the sealed manifest now carries
+    // a different destination identity, so completion must refuse.
+    const resumeManifestStore = fakeManifestStore();
+    const begun = beginMigrationEffect(resumeManifestStore.current, {
+      kind: "verify-generation", effectId: firstResult.effectId, inputSha256: firstResult.inputSha256,
+      startedAt: MANIFEST_FIXTURE_AT,
+    });
+    resumeManifestStore.current = {
+      ...begun, destination: { ...begun.destination, identitySha256: fakeHash("drifted-destination") },
+    };
+    const beforeManifest = resumeManifestStore.current;
+    const error = await verifyMigrationGeneration(baseInput({ homeDir }), dependenciesFor(fakeCopySource(), fakeRuntime()))
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(MigrationVerificationDriverError);
+    expect((error as MigrationVerificationDriverError).reason).toBe("destination-drift");
+    expect(resumeManifestStore.current).toBe(beforeManifest);
+    expect(resumeManifestStore.current.phase).toBe("copied");
+    expect(resumeManifestStore.current.pendingEffect).not.toBe(null);
+  }, 15000);
+
   it("refuses when a different effect is already pending for the generation, rather than silently adopting it", async () => {
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
     const manifest = stubDestinationPrimitives();

@@ -2112,7 +2112,10 @@ export async function inspectMigrationVerification(
  * because an earlier attempt already persisted and began it -- the report
  * is already frozen, content-addressed evidence -- so this attempt reads
  * that report back and completes with it directly, without repeating any
- * of the expensive destination work below. This is what makes a crash
+ * of the expensive destination work below. Resume binds the frozen report
+ * to the sealed manifest: it refuses unless the report's own recorded
+ * destination identity equals manifest.destination.identitySha256, by
+ * comparing persisted values only. This is what makes a crash
  * between begin and complete resumable without recomputation, and what
  * makes destination drift after begin harmless: this path never reopens
  * the destination at all.
@@ -2129,13 +2132,19 @@ export async function verifyMigrationGeneration(
     const persistedReport = reportStore.read(input.generationId, pending.inputSha256);
     // The resume path completes with activationEligible: true, so it must
     // not trust the pending effect alone. The effect has to name exactly
-    // this report, and the report has to be one that was eligible when it
-    // was built; either failure refuses before the manifest is touched.
+    // this report, the report has to be one that was eligible when it was
+    // built, and the destination identity it froze has to be the manifest's
+    // sealed one (an eligible report from before the manifest binding was
+    // enforced must not complete); any failure refuses before the manifest
+    // is touched. Persisted values only: the destination is never reopened.
     if (pending.effectId !== migrationVerificationEffectId(persistedReport.reportSha256)) {
       driverError("report-identity-conflict", "the pending verification effect does not name the persisted report");
     }
     if (!persistedReport.activationEligible) {
       driverError("report-identity-conflict", "the pending verification effect names a report that is not activation-eligible");
+    }
+    if (persistedReport.body.destinationIdentity.sealedWitnessSha256 !== resumeManifest.destination.identitySha256) {
+      driverError("destination-drift", "the persisted verification report destination identity does not match the sealed manifest");
     }
     const completedAt = new Date().toISOString();
     manifestStore.update(input.generationId, resumeManifest.checksumSha256, (current) => completeMigrationEffect(current, {

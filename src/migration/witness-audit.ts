@@ -164,7 +164,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     id: "destination-identity-sealed-witness", bodyField: "destinationIdentity",
     description: "The destination's re-derived sealed five-field identity witness.",
     comparison: "compared-live",
-    consequence: "refuses destination-drift when it disagrees with the sealed manifest's destination.identitySha256 or with expectedDestinationIdentitySha256 (the address/port/oid five-field witness is what binds the physical target)",
+    consequence: "refuses destination-drift when it disagrees with the sealed manifest's destination.identitySha256 or with expectedDestinationIdentitySha256 (the five-field witness -- database name, database OID, server address, server port and project id -- is what binds the physical target); resuming a pending verification effect applies the same manifest comparison to the persisted report's sealed witness, without reopening the destination",
     mismatchClasses: ["identity"],
     receipts: ["identity"],
   },
