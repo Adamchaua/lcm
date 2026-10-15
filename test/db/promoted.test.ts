@@ -1,11 +1,11 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { getLcmConnection, closeLcmConnection } from "../../src/db/connection.js";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import { parsePromotedTags, PromotedStore } from "../../src/db/promoted.js";
-import type { DatabaseSync } from "node:sqlite";
 
 const tempDirs: string[] = [];
 
@@ -322,6 +322,73 @@ describe("PromotedStore", () => {
     expect(store.findExactContent("same punctuation!", "p2")?.id).toBe(otherProject);
     expect(store.findExactContent("same punctuation?", "p1")).toBeNull();
     expect(store.findExactContent("same punctuation!", "missing")).toBeNull();
+  });
+
+  describe("exact-content index", () => {
+    const indexName = "promoted_active_content_idx";
+    const indexColumns = (db: DatabaseSync): string[] =>
+      (db.prepare(`PRAGMA index_info(${indexName})`).all() as Array<{ name: string }>).map((c) => c.name);
+    const indexDefinition = (db: DatabaseSync): string | undefined =>
+      (db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?").get(indexName) as
+        | { sql: string }
+        | undefined)?.sql;
+
+    it("is created on a fresh database as a partial (project_id, content, created_at) index", () => {
+      const db = makeDb();
+      expect(indexColumns(db)).toEqual(["project_id", "content", "created_at"]);
+      expect(indexDefinition(db)).toMatch(/WHERE archived_at IS NULL/);
+    });
+
+    it("is added to a pre-change database and re-running migrations is idempotent", () => {
+      const db = new DatabaseSync(":memory:");
+      db.exec(`
+        CREATE TABLE promoted (
+          id TEXT PRIMARY KEY,
+          content TEXT NOT NULL,
+          tags TEXT NOT NULL DEFAULT '[]',
+          source_summary_id TEXT,
+          project_id TEXT NOT NULL,
+          session_id TEXT,
+          depth INTEGER NOT NULL DEFAULT 0,
+          confidence REAL NOT NULL DEFAULT 1.0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX promoted_project_idx ON promoted (project_id, created_at);
+      `);
+      db.prepare("INSERT INTO promoted (id, content, project_id) VALUES ('old', 'kept', 'p1')").run();
+      expect(indexDefinition(db)).toBeUndefined();
+
+      runLcmMigrations(db);
+      const definition = indexDefinition(db);
+      expect(indexColumns(db)).toEqual(["project_id", "content", "created_at"]);
+      expect(definition).toMatch(/WHERE archived_at IS NULL/);
+
+      runLcmMigrations(db);
+      expect(indexDefinition(db)).toBe(definition);
+      expect(new PromotedStore(db).findExactContent("kept", "p1")?.id).toBe("old");
+      db.close();
+    });
+
+    it("serves the findExactContent statement from the index", () => {
+      const db = makeDb();
+      const store = new PromotedStore(db);
+      for (let i = 0; i < 200; i += 1) {
+        store.insert({ content: `filler memory ${i}`, projectId: "p1" });
+      }
+      const statements: string[] = [];
+      const prepare = db.prepare.bind(db);
+      db.prepare = ((sql: string) => {
+        statements.push(sql);
+        return prepare(sql);
+      }) as typeof db.prepare;
+      store.findExactContent("filler memory 7", "p1");
+      db.prepare = prepare;
+
+      const sql = statements.find((candidate) => candidate.includes("content = ?"));
+      expect(sql).toBeDefined();
+      const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all("filler memory 7", "p1") as Array<{ detail: string }>;
+      expect(plan.map((row) => row.detail).join("\n")).toContain(indexName);
+    });
   });
 
   it("archive() soft-deletes entry and removes from FTS5", () => {
