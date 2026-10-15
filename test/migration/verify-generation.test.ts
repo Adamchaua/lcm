@@ -2120,7 +2120,7 @@ describe("inspectMigrationVerification", () => {
   }, 15000);
 });
 
-+describe("verification lease fence (#1428)", () => {
+describe("verification lease fence (#1428)", () => {
   const FENCE_TOKEN = 7n;
   const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
   const leaseLost = () => new coordination.PostgreSqlLeaseFenceError(projectId, machineId, FENCE_TOKEN, "assertLeaseFence");
