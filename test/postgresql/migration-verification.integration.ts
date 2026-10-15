@@ -319,9 +319,10 @@ it("the search probe's ledger correlation and real search both run as live SQL a
       // -- exactly the defect both reviewers found in the production
       // code, just reproduced in the fixture instead.
       await db.migrator.query({
-        text: "INSERT INTO lcm.transfer_identities (run_id, domain, identity_sha256, ordinal, native_key, record_sha256) "
-          + "VALUES ($1, 'messages', $2, 0, $3, $4)",
-        values: [runId, candidateIdentitySha256, JSON.stringify([seeded.messageId]), "e".repeat(64)],
+        text: "INSERT INTO lcm.transfer_identities "
+          + "(run_id, domain, identity_sha256, ordinal, native_key, record_sha256, content_sha256) "
+          + "VALUES ($1, 'messages', $2, 0, $3, $4, $5)",
+        values: [runId, candidateIdentitySha256, JSON.stringify([seeded.messageId]), "e".repeat(64), "c".repeat(64)],
       }, { domain: "factory", operation: "seedLiveSearchProbeIdentity" });
 
       const outcome = await runSearchSelfMatchProbe(
@@ -712,9 +713,10 @@ it("relation and ledger read real SQL against a sound fixture and produce no mis
         ],
       }, { domain: "factory", operation: "seedLiveLedgerBatches" });
       await db.migrator.query({
-        text: "INSERT INTO lcm.transfer_identities (run_id, domain, identity_sha256, ordinal, native_key, record_sha256) "
+        text: "INSERT INTO lcm.transfer_identities "
+          + "(run_id, domain, identity_sha256, ordinal, native_key, record_sha256, content_sha256) "
           + "SELECT $1, d.domain, d.identity_sha256, d.ordinal, "
-          + "'live-native-key-' || d.ordinal, d.record_sha256 "
+          + "'live-native-key-' || d.ordinal, d.record_sha256, repeat('c', 64) "
           + "FROM unnest($2::text[], $3::text[], $4::bigint[], $5::text[]) AS d(domain, identity_sha256, ordinal, record_sha256)",
         values: [
           runId, identityRows.map((row) => row.domain), identityRows.map((row) => row.identitySha256),

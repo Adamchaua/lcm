@@ -158,9 +158,10 @@ it("measures the full live in-window read against a realistic destination and re
         ],
       }, { domain: "factory", operation: "seedCensusCostLedgerBatches" });
       await db.migrator.query({
-        text: "INSERT INTO lcm.transfer_identities (run_id, domain, identity_sha256, ordinal, native_key, record_sha256) "
+        text: "INSERT INTO lcm.transfer_identities "
+          + "(run_id, domain, identity_sha256, ordinal, native_key, record_sha256, content_sha256) "
           + "SELECT $1, d.domain, d.identity_sha256, d.ordinal, "
-          + "'census-cost-native-key-' || d.ordinal, d.record_sha256 "
+          + "'census-cost-native-key-' || d.ordinal, d.record_sha256, repeat('c', 64) "
           + "FROM unnest($2::text[], $3::text[], $4::bigint[], $5::text[]) AS d(domain, identity_sha256, ordinal, record_sha256)",
         values: [
           runId, identityRows.map((row) => row.domain), identityRows.map((row) => row.identitySha256),
