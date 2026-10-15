@@ -186,7 +186,8 @@ For a claimed event, `completeApplied`:
 
 1. validates the exact lease fence in a short `READ COMMITTED` transaction;
 2. locks and revalidates the exact claimed inbox row;
-3. calls the supplied effect callback with that same transaction executor; and
+3. calls the supplied effect callback, which may be a no-op, with that same
+   transaction executor; and
 4. records `applied` and its timestamp before the transaction commits.
 
 An effect cannot commit separately from the applied transition. Application

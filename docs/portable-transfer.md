@@ -187,6 +187,21 @@ counts and hashes to agree with SQL readback and the source to remain stable.
 A captured SQLite source applies the capture-cache rule described under
 "Source and destination ownership". It holds on filesystems with timestamp
 granularity of one second or finer.
+Completion compares two derivations of the data: the destination's
+`verifyComplete` reopens what it wrote and recomputes counts and digests
+from durable storage, and the runner requires the result to equal the
+manifest it negotiated from the source. The built-in adapters also persist the
+admitted manifest (SQLite `manifest_json`, PostgreSQL `manifest_bytes`). SQLite
+readback re-derives counts and digests and compares them with that persisted
+manifest; PostgreSQL binds the run to its persisted bytes and compares a fresh
+canonical scan with the negotiated manifest. This does not attest the
+manifest against an independently sourced record, because the expectation is
+derived in the same process as the transfer. A caller that needs that
+independence must save the manifest before the transfer and afterwards compare
+its `contentSha256` and each domain's `recordCount` and `prefixSha256` with a
+fresh destination readback. The source description and coverage evidence and
+`manifestSha256` are snapshot-specific and are not compared.
+`runPortableTransfer` does not produce such an artifact.
 
 The package subpath exports both backend adapters, the record/manifest/checkpoint
 codecs, stream construction, transfer execution, constants, and their TypeScript
