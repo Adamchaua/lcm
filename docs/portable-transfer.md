@@ -197,9 +197,11 @@ manifest; PostgreSQL binds the run to its persisted bytes and compares a fresh
 canonical scan with the negotiated manifest. This does not attest the
 manifest against an independently sourced record, because the expectation is
 derived in the same process as the transfer. A caller that needs that
-independence must serialize the manifest before the transfer and compare a
-fresh readback with that durable copy afterwards; `runPortableTransfer` does
-not produce such an artifact.
+independence must save the manifest before the transfer and afterwards compare
+its `contentSha256` and each domain's `recordCount` and `prefixSha256` with a
+fresh destination readback. The source description and coverage evidence and
+`manifestSha256` are snapshot-specific and are not compared.
+`runPortableTransfer` does not produce such an artifact.
 
 The package subpath exports both backend adapters, the record/manifest/checkpoint
 codecs, stream construction, transfer execution, constants, and their TypeScript
