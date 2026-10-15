@@ -880,9 +880,10 @@ is no streaming fallback: the run needs every set below at once, so memory
 use grows with the size of the project and is not capped by a setting.
 
 - **Destination.** For every domain, the set of record identities and the set
-  of dependency edges read from the destination. Identities are 64-character
-  hex digests; an edge key combines the child identity, the parent domain and
-  the parent identity, so it is a little over twice that length.
+  of dependency edges read from the destination, plus one record digest per
+  record. Identities and record digests are 64-character hex digests; an edge
+  key combines the child identity, the parent domain and the parent identity,
+  so it is a little over twice that length.
 - **Source.** For every domain, the set of dependency edges, plus one entry
   per conversation (creation time, identity digest and title) used for the
   public-listing comparison, plus a small fixed pool of message candidates

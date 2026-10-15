@@ -60,8 +60,8 @@ verification lease that is never renewed mid-window. See
 `docs/migration-cutover.md` for how to measure it with
 `pnpm run test:postgresql:census-cost` and for the lease sizing guidance.
 Verification also keeps the identity and dependency-edge sets of both sides,
-and the full conversation listing, in memory at once; the same guide
-documents that memory bound.
+one record digest per destination record, and the full conversation listing,
+in memory at once; the same guide documents that memory bound.
 
 The verification lease is held until the report has been durably
 persisted, not released beforehand, so a second worker cannot acquire it
