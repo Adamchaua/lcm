@@ -448,7 +448,7 @@ export class PromotedStore {
       sql += " AND julianday(created_at) >= julianday(?)";
       params.push(opts.since);
     }
-    sql += " ORDER BY created_at ASC";
+    sql += " ORDER BY created_at ASC, rowid ASC";
 
     let rows = this.db.prepare(sql).all(...params) as Array<PromotedRow & PromotedContentRow>;
 
@@ -466,7 +466,7 @@ export class PromotedStore {
     const rows = this.db.prepare(
       `SELECT content, typeof(content) AS content_type,
               instr(content, char(0)) AS content_nul_marker
-       FROM promoted WHERE archived_at IS NULL LIMIT ?`
+       FROM promoted WHERE archived_at IS NULL ORDER BY rowid ASC LIMIT ?`
     ).all(limit) as Array<PromotedContentRow>;
     return rows.map(readPromotedContent);
   }
@@ -594,7 +594,7 @@ export class PromotedStore {
       sql += " AND project_id = ?";
       params.push(opts.projectId);
     }
-    sql += " ORDER BY created_at ASC";
+    sql += " ORDER BY created_at ASC, rowid ASC";
 
     const rows = this.db.prepare(sql).all(...params) as Array<PromotedRow & PromotedContentRow>;
     if (rows.length === 0) return [];
@@ -716,7 +716,7 @@ export class PromotedStore {
       sql += ` AND project_id = ?${params.length + 1}`;
       params.push(projectId);
     }
-    sql += " ORDER BY matched_terms DESC, confidence DESC, created_at ASC";
+    sql += " ORDER BY matched_terms DESC, confidence DESC, created_at ASC, rowid ASC";
 
     const rows = this.db.prepare(sql).all(...params) as Array<PromotedRow & PromotedContentRow & { matched_terms: number }>;
     let candidates = rows.map((row) => ({
