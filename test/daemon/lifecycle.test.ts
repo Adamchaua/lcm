@@ -110,7 +110,12 @@ function withHermeticLifecycleSeams(
   ]) {
     mkdirSync(directory, { recursive: true });
   }
-  return { ...options, _hermeticTestSeams: seams, _assertBackendPublication: () => undefined };
+  return {
+    ...options,
+    _hermeticTestSeams: seams,
+    // PostgreSQL selection needs completed publication evidence that these fixtures do not create.
+    ...(options.expectedStorageBackend === "postgresql" ? { _assertBackendPublication: () => undefined } : {}),
+  };
 }
 
 function ensureDaemon(
@@ -177,7 +182,6 @@ describe("ensureDaemon", () => {
       _platform: "freebsd",
       _skipSpawn: true,
       _fetchOverride: fetchMock as FetchOverride,
-      _assertBackendPublication: () => undefined,
     })).resolves.toMatchObject({ connected: false, spawned: false });
     expect(fetchMock).not.toHaveBeenCalled();
   });
