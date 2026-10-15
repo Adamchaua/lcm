@@ -98,13 +98,21 @@ import {
  *    the coordinator is not called. A non-terminal version-2 journal of a
  *    different publicationId is publication-collision, returned with that
  *    journal; recoverPending is not called and the other generation is
- *    never driven forward.
+ *    never driven forward. A version-2 journal of this publicationId whose
+ *    sourceBackend, targetBackend or covered projects (localProjectId,
+ *    remoteProjectId, evidenceSha256) differ from the input is also
+ *    publication-collision, returned with that journal, whatever its
+ *    phase: a publicationId alone does not make a journal this
+ *    publication's, and a reused id is another generation's journal that
+ *    is neither resumed nor reported as this call's result.
  * 4. Lease fences are asserted for every project, except when the journal
  *    is of this publicationId and already terminal (its fences are already
  *    released).
- * 5. A version-2 journal of this publicationId is driven with
- *    recoverPending({ disposition: "resume" }, lockToken) and its result is
- *    reported.
+ * 5. A version-2 journal of this publicationId that passes the identity
+ *    check is driven with recoverPending({ disposition: "resume" },
+ *    lockToken) and its result is reported. The journal recoverPending
+ *    returns is held to the same identity check: a same-id journal that
+ *    no longer matches is publication-collision, not this call's result.
  * 6. Every other case (no journal, a terminal version-3 maintenance
  *    journal, or a terminal journal of another publicationId) is a fresh
  *    prepare then resume under the same lockToken. recoverPending is not
@@ -233,8 +241,10 @@ export type ActivationPublicationStatus =
 
 /** Attributed dispatch result. journal is set when the coordinator returned
  * one (completed or aborted) and for a publication-collision, where it is
- * the colliding generation's journal for the caller's diagnosis. It is null
- * for duplicate-publication-input, publication-unresolvable,
+ * the colliding journal for the caller's diagnosis: either another
+ * generation's in-flight journal, or a journal that reuses this
+ * publicationId with a different sourceBackend, targetBackend or project
+ * coverage. It is null for duplicate-publication-input, publication-unresolvable,
  * maintenance-in-flight and the fence and artifact refusals. fenceChecks
  * lists one lease assertion per project only when the lease loop ran. It is
  * empty for the refusals that precede it (duplicate-publication-input,
@@ -285,6 +295,38 @@ function sameProjectCoverage(
   const artifactKeys = new Set(artifactProjects.map(projectCoverageKey));
   return inputProjects.every((project) => artifactKeys.has(projectCoverageKey(project)));
 }
+
+/**
+ * Why a journal carrying this call's publicationId is nevertheless not this
+ * publication's journal, or null when it is. A publicationId is only a
+ * caller-chosen string; the journal is this publication's only when its
+ * sourceBackend, targetBackend and covered projects also agree with the
+ * input. A journal that reuses the id for a different migration must not
+ * be resumed (recoverPending would drive that other journal forward) and
+ * its terminal phase must not be reported as this call's outcome.
+ */
+function journalIdentityMismatch(
+  journal: BackendPublicationJournal,
+  input: ActivationPublicationInput,
+): string | null {
+  if (journal.sourceBackend !== input.sourceBackend) {
+    return "sourceBackend " + journal.sourceBackend + " rather than " + input.sourceBackend;
+  }
+  if (journal.targetBackend !== input.targetBackend) {
+    return "targetBackend " + journal.targetBackend + " rather than " + input.targetBackend;
+  }
+  if (!sameProjectCoverage(journal.projects, input.projects)) {
+    return "a different set of covered projects than this call's fenced leases";
+  }
+  return null;
+}
+
+function reusedIdCollisionDetail(origin: string, journal: BackendPublicationJournal, mismatch: string): string {
+  return origin + " reuses publicationId " + journal.publicationId + " at phase " + journal.phase +
+    " but names " + mismatch + "; it is another generation's journal, and this function refuses to resume it " +
+    "or to report it as this publication's result";
+}
+
 /**
  * Drive a version-2 backend publication for migration activation to
  * completion (or a confirmed abort), under a single retained lock token.
@@ -352,11 +394,22 @@ export async function driveActivationPublication(
       fenceChecks,
     );
   }
-  const sameIdJournal = existing !== null && existing.publicationId === input.publicationId;
+  const sameIdJournal = existing !== null && existing.publicationId === input.publicationId ? existing : null;
+  if (sameIdJournal !== null) {
+    const mismatch = journalIdentityMismatch(sameIdJournal, input);
+    if (mismatch !== null) {
+      return buildResult(
+        "publication-collision",
+        reusedIdCollisionDetail("the live backend publication journal", sameIdJournal, mismatch),
+        sameIdJournal,
+        fenceChecks,
+      );
+    }
+  }
 
   // A terminal journal of this publication has already released its fences,
   // so its result is reported without requiring active leases.
-  if (!(sameIdJournal && existingTerminal)) {
+  if (!(sameIdJournal !== null && existingTerminal)) {
     for (const project of input.projects) {
       const assertion = await assertActivationLeaseFence(guard, {
         projectId: project.remoteProjectId,
@@ -399,9 +452,18 @@ export async function driveActivationPublication(
   // lifetime analysis: that confirmation does not survive the awaits
   // below, and the coordinator's own acquireAll step independently
   // re-checks the same fences at the moment it actually consumes them.
-  if (sameIdJournal) {
+  if (sameIdJournal !== null) {
     const recovered = await coordinator.recoverPending({ disposition: "resume" }, input.lockToken);
     if (recovered !== null && recovered.publicationId === input.publicationId) {
+      const mismatch = journalIdentityMismatch(recovered, input);
+      if (mismatch !== null) {
+        return buildResult(
+          "publication-collision",
+          reusedIdCollisionDetail("the backend publication journal recoverPending returned", recovered, mismatch),
+          recovered,
+          fenceChecks,
+        );
+      }
       return buildResult(
         recovered.phase === "aborted" ? "aborted" : "completed",
         "the existing backend publication journal for " + recovered.publicationId + " was driven to phase " +

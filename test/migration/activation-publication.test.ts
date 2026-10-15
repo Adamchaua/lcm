@@ -103,7 +103,9 @@ function baseJournal(overrides: Partial<BackendPublicationJournal> = {}): Backen
     recoveryReference: null,
     sourceState: { config: absentWitness(), projectMap: absentWitness() },
     targetState: { config: absentWitness(), projectMap: absentWitness() },
-    projects: [],
+    projects: [
+      { localProjectId: "local-a", remoteProjectId: "remote-a", evidenceSha256: EVIDENCE_A, fence: null },
+    ],
     checksumSha256: "e".repeat(64),
     ...overrides,
   };
@@ -207,7 +209,7 @@ describe("driveActivationPublication", () => {
 
   it("handles zero covered projects without asserting any fence", async () => {
     const guard = fakeGuard({});
-    const journal = baseJournal({ phase: "completed" });
+    const journal = baseJournal({ phase: "completed", projects: [] });
     const coordinator = fakeCoordinator({ recoverPending: vi.fn(async () => journal) });
     const result = await driveActivationPublication(guard, coordinator, baseInput({ projects: [] }), {
       readPublicationJournal: () => journal,
@@ -789,5 +791,118 @@ describe("driveActivationPublication: journal gate (#1443)", () => {
     expect(result.detail).toContain("digest does not match");
     expect(coordinator.prepare).not.toHaveBeenCalled();
   });
+});
+
+describe("driveActivationPublication: reused publicationId with a different identity (#1443)", () => {
+  const PROJECT_B = { localProjectId: "local-b", remoteProjectId: "remote-b", evidenceSha256: EVIDENCE_B };
+
+  const mismatches: ReadonlyArray<[string, Partial<BackendPublicationJournal>, string]> = [
+    ["sourceBackend", { sourceBackend: "postgresql" }, "sourceBackend postgresql rather than sqlite"],
+    ["targetBackend", { targetBackend: "sqlite" }, "targetBackend sqlite rather than postgresql"],
+    [
+      "project evidence",
+      { projects: [{ localProjectId: "local-a", remoteProjectId: "remote-a", evidenceSha256: EVIDENCE_B, fence: null }] },
+      "a different set of covered projects",
+    ],
+    [
+      "project remoteProjectId",
+      { projects: [{ localProjectId: "local-a", remoteProjectId: "remote-b", evidenceSha256: EVIDENCE_A, fence: null }] },
+      "a different set of covered projects",
+    ],
+    [
+      "project count",
+      {
+        projects: [
+          { localProjectId: "local-a", remoteProjectId: "remote-a", evidenceSha256: EVIDENCE_A, fence: null },
+          { ...PROJECT_B, fence: null },
+        ],
+      },
+      "a different set of covered projects",
+    ],
+  ];
+
+  describe.each(["completed", "aborted", "guarded"] as const)("for a peeked same-id journal at phase %s", (phase) => {
+    it.each(mismatches)(
+      "refuses a differing %s as publication-collision without asserting leases or calling the coordinator",
+      async (_label, overrides, expectedDetail) => {
+        const guard = fakeGuard({ "remote-a": "satisfied" });
+        const coordinator = fakeCoordinator();
+        const reused = baseJournal({ phase, ...overrides });
+        const readArtifact = vi.fn(() => artifactMaterial());
+        const result = await driveActivationPublication(guard, coordinator, baseInput(), {
+          readPublicationJournal: () => reused,
+          readArtifact,
+        });
+        expect(result).toMatchObject({ status: "publication-collision", journal: reused, fenceChecks: [] });
+        expect(result.detail).toContain("reuses publicationId " + PUBLICATION_ID + " at phase " + phase);
+        expect(result.detail).toContain(expectedDetail);
+        expect(guard.read).not.toHaveBeenCalled();
+        expect(readArtifact).not.toHaveBeenCalled();
+        expect(coordinator.recoverPending).not.toHaveBeenCalled();
+        expect(coordinator.prepare).not.toHaveBeenCalled();
+        expect(coordinator.resume).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  it("refuses a same-id journal recoverPending returns with a different identity instead of reporting it", async () => {
+    const guard = fakeGuard({ "remote-a": "satisfied" });
+    const raced = baseJournal({ phase: "completed", targetBackend: "sqlite" });
+    const coordinator = fakeCoordinator({ recoverPending: vi.fn(async () => raced) });
+    const input = baseInput();
+    const result = await driveActivationPublication(guard, coordinator, input, {
+      readPublicationJournal: () => baseJournal({ phase: "guarded" }),
+      readArtifact: () => artifactMaterial(),
+    });
+    expect(result).toMatchObject({ status: "publication-collision", journal: raced });
+    expect(result.detail).toContain("recoverPending returned reuses publicationId " + PUBLICATION_ID);
+    expect(result.detail).toContain("targetBackend sqlite rather than postgresql");
+    expect(result.fenceChecks).toHaveLength(1);
+    expect(coordinator.recoverPending).toHaveBeenCalledWith({ disposition: "resume" }, input.lockToken);
+    expect(coordinator.prepare).not.toHaveBeenCalled();
+    expect(coordinator.resume).not.toHaveBeenCalled();
+  });
+
+  it.each(["completed", "guarded"] as const)(
+    "still accepts a same-id journal at phase %s whose identity matches regardless of project order or fence state",
+    async (phase) => {
+      const guard = fakeGuard({ "remote-a": "satisfied", "remote-b": "satisfied" });
+      const fence: BackendPublicationFenceRecord = {
+        projectId: "remote-a",
+        machineId: "machine-a",
+        publicationId: PUBLICATION_ID,
+        targetBackend: TARGET,
+        evidenceSha256: EVIDENCE_A,
+        fencingToken: "1",
+        acquiredAt: "2026-01-01T00:00:00.000Z",
+        renewedAt: "2026-01-01T00:00:00.000Z",
+        expiresAt: "2999-01-01T00:00:00.000Z",
+        releasedAt: null,
+        databaseExpired: false,
+      };
+      const matching = baseJournal({
+        phase,
+        projects: [
+          { ...PROJECT_B, fence: null },
+          { localProjectId: "local-a", remoteProjectId: "remote-a", evidenceSha256: EVIDENCE_A, fence },
+        ],
+      });
+      const driven = { ...matching, phase: "completed" as const };
+      const coordinator = fakeCoordinator({ recoverPending: vi.fn(async () => driven) });
+      const input = baseInput({
+        projects: [
+          { localProjectId: "local-a", remoteProjectId: "remote-a", evidenceSha256: EVIDENCE_A },
+          PROJECT_B,
+        ],
+      });
+      const result = await driveActivationPublication(guard, coordinator, input, {
+        readPublicationJournal: () => matching,
+      });
+      expect(result).toMatchObject({ status: "completed", journal: driven });
+      expect(result.fenceChecks).toHaveLength(phase === "completed" ? 0 : 2);
+      expect(coordinator.recoverPending).toHaveBeenCalledWith({ disposition: "resume" }, input.lockToken);
+      expect(coordinator.prepare).not.toHaveBeenCalled();
+    },
+  );
 });
 

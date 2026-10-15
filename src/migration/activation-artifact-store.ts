@@ -897,11 +897,16 @@ export type ActivationArtifactReadDependencies = Readonly<{
  * repaired: reads never mutate, so converging that state is the writer
  * retry's job, not this reader's.
  *
- * The artifact directory is opened and authenticated first (no-follow, so
- * a symlinked directory is refused) and re-asserted after the read, so a
- * swapped directory cannot redirect it. The parsed record must also hash
- * to the requested identity digest; a record stored under another name is
- * an ActivationArtifactIdentityMismatchError, never returned.
+ * The private LCM root and then the artifact directory beneath it are
+ * each opened and authenticated first (no-follow at each component, so a
+ * symlinked ~/.lcm is refused just as a symlinked artifact directory is --
+ * the same two-level authentication the writer performs) and both are
+ * re-asserted after the read, so a swapped root or directory cannot
+ * redirect it. Only a root or directory that is genuinely absent (ENOENT)
+ * is an absent artifact; a root that exists but cannot be authenticated
+ * is unresolvable. The parsed record must also hash to the requested
+ * identity digest; a record stored under another name is an
+ * ActivationArtifactIdentityMismatchError, never returned.
  */
 export function readActivationArtifact(
   input: Readonly<{ homeDir?: string; identityDigest: string }>,
@@ -910,64 +915,81 @@ export function readActivationArtifact(
   if (!IDENTITY_DIGEST_PATTERN.test(input.identityDigest)) {
     throw new ActivationArtifactValidationError("activation artifact identity digest is invalid");
   }
+  const root = rootPath(input.homeDir);
   const directory = activationArtifactDirectory(input.homeDir);
   const path = activationArtifactPath(input.homeDir, input.identityDigest);
   const expectedUid = dependencies.expectedUid ?? currentUid();
   const readWithStat = dependencies.readWithStat ?? readBoundedRegularFileWithStat;
 
-  let handle: PrivateDirectoryHandle | undefined;
+  let rootHandle: PrivateDirectoryHandle | undefined;
   try {
-    handle = openPrivateDirectoryIfExists(directory, { expectedUid });
+    rootHandle = openPrivateDirectoryIfExists(root, { expectedUid });
   } catch (error) {
     throw new ActivationArtifactPresenceUnresolvableError(
-      "cannot authenticate the activation artifact directory " + directory + ": " + (error as Error).message,
+      "cannot authenticate the private LCM root " + root + ": " + (error as Error).message,
       { cause: error },
     );
   }
-  if (handle === undefined) return null;
+  if (rootHandle === undefined) return null;
   try {
-    let outcome;
+    let handle: PrivateDirectoryHandle | undefined;
     try {
-      outcome = attributeNullableRead<BoundedFileResult>(
-        () => readWithStat(path, {
-          allowedRoot: directory,
-          maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
-          expectedUid,
-          allowedModes: [PRIVATE_FILE_MODE],
-          requireSingleLink: true,
-        }),
-      );
-    } catch (error) {
-      if (isMultipleHardLinksError(error)) {
-        throw new ActivationArtifactPresenceUnresolvableError(
-          "activation artifact at " + path +
-            " has multiple hard links and cannot be authenticated by a read; retry publication to converge the interrupted durable write",
-        );
-      }
-      throw error;
-    }
-    if (outcome.kind === "unresolvable") {
-      throw new ActivationArtifactPresenceUnresolvableError(
-        "cannot determine whether an activation artifact exists at " + path + ": " + outcome.detail,
-      );
-    }
-    const material = outcome.kind === "absent" ? null : parseActivationArtifactMaterial(outcome.value.content, path);
-    try {
-      assertPrivateDirectory(handle, directory, handle.witness, expectedUid);
+      handle = openPrivateDirectoryIfExists(directory, { expectedUid });
     } catch (error) {
       throw new ActivationArtifactPresenceUnresolvableError(
-        "the activation artifact directory " + directory + " changed during the read: " + (error as Error).message,
+        "cannot authenticate the activation artifact directory " + directory + ": " + (error as Error).message,
         { cause: error },
       );
     }
-    if (material !== null && computeActivationArtifactIdentityDigest(material) !== input.identityDigest) {
-      throw new ActivationArtifactIdentityMismatchError(
-        "the activation artifact stored at " + path + " does not hash to identity digest " + input.identityDigest,
-      );
+    if (handle === undefined) return null;
+    try {
+      let outcome;
+      try {
+        outcome = attributeNullableRead<BoundedFileResult>(
+          () => readWithStat(path, {
+            allowedRoot: directory,
+            maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
+            expectedUid,
+            allowedModes: [PRIVATE_FILE_MODE],
+            requireSingleLink: true,
+          }),
+        );
+      } catch (error) {
+        if (isMultipleHardLinksError(error)) {
+          throw new ActivationArtifactPresenceUnresolvableError(
+            "activation artifact at " + path +
+              " has multiple hard links and cannot be authenticated by a read; retry publication to converge the interrupted durable write",
+          );
+        }
+        throw error;
+      }
+      if (outcome.kind === "unresolvable") {
+        throw new ActivationArtifactPresenceUnresolvableError(
+          "cannot determine whether an activation artifact exists at " + path + ": " + outcome.detail,
+        );
+      }
+      const material = outcome.kind === "absent" ? null : parseActivationArtifactMaterial(outcome.value.content, path);
+      try {
+        assertPrivateDirectory(handle, directory, handle.witness, expectedUid);
+        assertPrivateDirectory(rootHandle, root, rootHandle.witness, expectedUid);
+      } catch (error) {
+        throw new ActivationArtifactPresenceUnresolvableError(
+          "the activation artifact directory " + directory + " or its private LCM root changed during the read: " +
+            (error as Error).message,
+          { cause: error },
+        );
+      }
+      if (material !== null && computeActivationArtifactIdentityDigest(material) !== input.identityDigest) {
+        throw new ActivationArtifactIdentityMismatchError(
+          "the activation artifact stored at " + path + " does not hash to identity digest " + input.identityDigest,
+        );
+      }
+      return material;
+    } finally {
+      handle.close();
     }
-    return material;
   } finally {
-    handle.close();
+    rootHandle.close();
   }
 }
 

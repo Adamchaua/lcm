@@ -11,6 +11,11 @@ rationale: >-
   check. The activation lease reader also maps the guard's read-time
   fence-mismatch (a decodable row naming a different targetBackend or
   evidence digest, split from invalid-row by #1419) to identity-mismatch.
+  The publication step further refuses a journal that reuses this
+  publicationId with a different sourceBackend, targetBackend or project
+  coverage (publication-collision, before any coordinator call), and the
+  artifact reader authenticates the private LCM root before the artifact
+  directory, as the writer already did (#1443 follow-up threads).
 pins:
   - ["src/migration/activation-absence.ts", "unit-migration-cutover"]
   - ["src/migration/activation-artifact-store.ts", "unit-migration-cutover"]

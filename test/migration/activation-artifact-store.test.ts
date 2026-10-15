@@ -1570,6 +1570,28 @@ describe("readActivationArtifact: authenticated directory and identity digest (#
     );
   });
 
+  it("refuses a symlinked private LCM root that redirects the read to another home's artifacts", () => {
+    const realHome = home();
+    const { published } = storedFixture(realHome);
+    const attackerHome = homeWithoutLcmRoot();
+    symlinkSync(join(realHome, ".lcm"), join(attackerHome, ".lcm"));
+    expect(() => readActivationArtifact({ homeDir: attackerHome, identityDigest: published.identityDigest })).toThrow(
+      expect.objectContaining({
+        name: "ActivationArtifactPresenceUnresolvableError",
+        message: expect.stringContaining("cannot authenticate the private LCM root " + join(attackerHome, ".lcm")),
+      }),
+    );
+  });
+
+  it("refuses a private LCM root with an untrusted mode", () => {
+    const homeDir = home();
+    const { published } = storedFixture(homeDir);
+    chmodSync(join(homeDir, ".lcm"), 0o755);
+    expect(() => readActivationArtifact({ homeDir, identityDigest: published.identityDigest })).toThrow(
+      ActivationArtifactPresenceUnresolvableError,
+    );
+  });
+
   it("reports an absent artifact file inside an existing artifact directory as null", () => {
     const homeDir = home();
     const { published } = storedFixture(homeDir);
@@ -1601,6 +1623,28 @@ describe("readActivationArtifact: authenticated directory and identity digest (#
     ).toThrow(ActivationArtifactPresenceUnresolvableError);
   });
 
+  it("refuses when the private LCM root changes while the file is being read", () => {
+    const homeDir = home();
+    const { published } = storedFixture(homeDir);
+    expect(() =>
+      readActivationArtifact(
+        { homeDir, identityDigest: published.identityDigest },
+        {
+          readWithStat: (path: string, options: BoundedFileOptions) => {
+            const result = readBoundedRegularFileWithStat(path, options);
+            chmodSync(join(homeDir, ".lcm"), 0o755);
+            return result;
+          },
+        },
+      ),
+    ).toThrow(
+      expect.objectContaining({
+        name: "ActivationArtifactPresenceUnresolvableError",
+        message: expect.stringContaining("changed during the read"),
+      }),
+    );
+  });
+
   it("refuses a valid record stored under a file name that is not its identity digest", () => {
     const homeDir = home();
     const { published } = storedFixture(homeDir);
@@ -1612,26 +1656,32 @@ describe("readActivationArtifact: authenticated directory and identity digest (#
     );
   });
 
-  it("closes the directory descriptor after a successful read and after a refused read", () => {
+  it("closes the root and directory descriptors after a successful read and after a refused read", () => {
     const homeDir = home();
     const { published } = storedFixture(homeDir);
     const wrongDigest = published.identityDigest === HASH_A ? HASH_B : HASH_A;
     copyFileSync(published.path, activationArtifactPath(homeDir, wrongDigest));
     chmodSync(activationArtifactPath(homeDir, wrongDigest), 0o600);
     const store = activationArtifactDirectory(homeDir);
+    const lcmRoot = join(homeDir, ".lcm");
     const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
     const originalOpenSync = nodeFs.openSync as (path: string, flags: unknown, mode?: unknown) => number;
     const originalCloseSync = nodeFs.closeSync as (fd: number) => void;
     const open = new Set<number>();
+    const seen = new Set<string>();
     withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
       const fd = mode === undefined ? originalOpenSync(path, flags) : originalOpenSync(path, flags, mode);
-      if (path === store) open.add(fd);
+      if (path === store || path === lcmRoot) {
+        open.add(fd);
+        seen.add(path);
+      }
       return fd;
     }) as never, () => withPatchedFs("closeSync", ((fd: number) => {
       open.delete(fd);
       originalCloseSync(fd);
     }) as never, () => {
       expect(readActivationArtifact({ homeDir, identityDigest: published.identityDigest })).not.toBeNull();
+      expect([...seen].sort()).toEqual([store, lcmRoot].sort());
       expect(open.size).toBe(0);
       expect(() => readActivationArtifact({ homeDir, identityDigest: wrongDigest })).toThrow(
         ActivationArtifactIdentityMismatchError,
