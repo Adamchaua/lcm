@@ -25,6 +25,7 @@ import {
   withBackendPublicationConsumerLockAsync,
   type BackendMaintenanceJournal,
   type BackendPublicationDriver,
+  type BackendPublicationFenceRecord,
   type BackendPublicationJournal,
   type BackendPublicationLockToken,
   type BackendPublicationRecoveryFile,
@@ -470,6 +471,7 @@ describe("driveActivationPublication: journal gate (#1443)", () => {
     const state = backendPublicationMaterialWitness({ source: material.source, target: material.target });
     const targetState = backendPublicationMaterialWitness({ source: material.target, target: material.target });
     let observed = state;
+    const fences = new Map<string, BackendPublicationFenceRecord>();
     const driver: BackendPublicationDriver = {
       observeLocalState: async () => observed,
       publishProjectMap: async ({ permit }) => {
@@ -484,6 +486,27 @@ describe("driveActivationPublication: journal gate (#1443)", () => {
       },
       restoreConfig: async () => state.config,
       restoreProjectMap: async () => state.projectMap,
+      acquireRemoteGuard: async ({ journal, project }) => {
+        const fence: BackendPublicationFenceRecord = {
+          projectId: project.remoteProjectId,
+          machineId: MACHINE,
+          publicationId: journal.publicationId,
+          targetBackend: journal.targetBackend,
+          evidenceSha256: project.evidenceSha256,
+          fencingToken: "1",
+          acquiredAt: "2026-09-19T00:00:00.000Z",
+          renewedAt: "2026-09-19T00:00:00.000Z",
+          expiresAt: "2999-09-19T00:00:00.000Z",
+          releasedAt: null,
+          databaseExpired: false,
+        };
+        fences.set(project.remoteProjectId, fence);
+        return fence;
+      },
+      readRemoteGuard: async ({ project }) => fences.get(project.remoteProjectId) ?? null,
+      releaseRemoteGuard: async ({ project, fence }) => {
+        fences.set(project.remoteProjectId, { ...fence, releasedAt: "2026-09-19T00:01:00.000Z" });
+      },
     };
     return new BackendPublicationCoordinator({ homeDir, driver });
   }
