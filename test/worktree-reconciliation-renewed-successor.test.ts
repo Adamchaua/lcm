@@ -307,7 +307,6 @@ describe("Renewed project successor authentication through a local alias", () =>
       openSession: () => Promise.reject(
         new Error("local alias linking must not open a remote identity session"),
       ),
-      _assertBackendPublication: () => undefined,
     };
   }
 

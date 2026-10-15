@@ -1,0 +1,7 @@
+references: ["#1459"]
+rationale: >-
+  #1459 makes the captured SQLite authority re-hash a version whose timestamps
+  are within the racy window of its authenticating read; portable-capture.ts
+  keeps its established owner.
+pins:
+  - ["src/storage/sqlite/portable-capture.ts", "unit-local-persistence"]

@@ -16,6 +16,7 @@ import type {
   BackendPublicationJournal,
   BackendPublicationLockToken,
   BackendPublicationDriver,
+  BackendPublicationFenceRecord,
   BackendPublicationRecoveryFile,
   BackendPublicationRecoveryMaterial,
   BackendPublicationStateWitness,
@@ -1406,6 +1407,7 @@ describe("publication witness classification against real publication state", ()
       target: recoveryMaterial.target,
     });
     let state = source;
+    const fences = new Map<string, BackendPublicationFenceRecord>();
     return {
       observeLocalState: async () => state,
       publishProjectMap: async () => {
@@ -1418,6 +1420,27 @@ describe("publication witness classification against real publication state", ()
       },
       restoreConfig: async () => source.config,
       restoreProjectMap: async () => source.projectMap,
+      acquireRemoteGuard: async ({ journal, project }) => {
+        const fence: BackendPublicationFenceRecord = {
+          projectId: project.remoteProjectId,
+          machineId: "machine",
+          publicationId: journal.publicationId,
+          targetBackend: journal.targetBackend,
+          evidenceSha256: project.evidenceSha256,
+          fencingToken: "1",
+          acquiredAt: "2026-08-06T12:00:00.000Z",
+          renewedAt: "2026-08-06T12:00:00.000Z",
+          expiresAt: "2999-08-06T12:00:00.000Z",
+          releasedAt: null,
+          databaseExpired: false,
+        };
+        fences.set(project.remoteProjectId, fence);
+        return fence;
+      },
+      readRemoteGuard: async ({ project }) => fences.get(project.remoteProjectId) ?? null,
+      releaseRemoteGuard: async ({ project, fence }) => {
+        fences.set(project.remoteProjectId, { ...fence, releasedAt: "2026-08-06T12:01:00.000Z" });
+      },
     };
   }
 

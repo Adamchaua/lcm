@@ -18,6 +18,13 @@ function fixture(data: Uint8Array = Buffer.alloc(128 * 1024, 42)) {
   const expected = createHash("sha256").update(data).digest("hex");
   return { dir, path, expected, authority: () => createCapturedSqliteAuthority(path, expected) };
 }
+/** Offsets the wall clock the authority samples; positive settles a fresh fixture, negative keeps it racy. */
+function clock() {
+  const real = Date.now.bind(Date);
+  const state = { offsetMs: 0 };
+  vi.spyOn(Date, "now").mockImplementation(() => real() + state.offsetMs);
+  return state;
+}
 afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe("immutable SQLite captures", () => {
@@ -61,6 +68,7 @@ describe("immutable SQLite captures", () => {
 describe("cached capture authentication", () => {
   it("hashes in bounded chunks only on first or forced checks across many batches", async () => {
     const f = fixture();
+    clock().offsetMs = 10_000;
     const authority = f.authority();
     const read = vi.spyOn(fs, "readSync");
     authority.checkSync();
@@ -89,7 +97,7 @@ describe("cached capture authentication", () => {
   });
 
   it("reauthenticates unchanged bytes after metadata drift", () => {
-    const f = fixture(); const authority = f.authority(); authority.checkSync();
+    const f = fixture(); clock().offsetMs = 10_000; const authority = f.authority(); authority.checkSync();
     const read = vi.spyOn(fs, "readSync");
     fs.utimesSync(f.path, 10, 20);
     authority.checkSync();
@@ -150,11 +158,76 @@ describe("cached capture authentication", () => {
   });
 
   it("preserves cancellation without losing a valid cached authority", async () => {
-    const f = fixture(); const authority = f.authority();
+    const f = fixture(); clock().offsetMs = 10_000; const authority = f.authority();
     await expect(authority.check(AbortSignal.abort())).rejects.toMatchObject({ code: "aborted" });
     await authority.check();
+    const read = vi.spyOn(fs, "readSync");
     await expect(authority.check(AbortSignal.abort())).rejects.toMatchObject({ code: "aborted" });
     authority.checkSync();
+    expect(read).not.toHaveBeenCalled();
+  });
+});
+
+describe("racy capture timestamps", () => {
+  function heldAtSnapshot(path: string) {
+    const snapshot = fs.lstatSync(path, { bigint: true });
+    const mask = <T extends fs.BigIntStats>(stat: T): T => Object.assign(stat, { mtimeNs: snapshot.mtimeNs, ctimeNs: snapshot.ctimeNs });
+    const lstat = fs.lstatSync; const fstat = fs.fstatSync; const open = promises.open;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((target: fs.PathLike, options?: unknown) => {
+      const stat = lstat(target, options as never);
+      return String(target) === path && (options as { bigint?: boolean } | undefined)?.bigint ? mask(stat as fs.BigIntStats) : stat;
+    }) as typeof fs.lstatSync);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, options?: unknown) => {
+      const stat = fstat(fd, options as never);
+      return (options as { bigint?: boolean } | undefined)?.bigint ? mask(stat as fs.BigIntStats) : stat;
+    }) as typeof fs.fstatSync);
+    vi.spyOn(promises, "open").mockImplementation((async (...args: Parameters<typeof promises.open>) => {
+      const handle = await open(...args);
+      const stat = handle.stat.bind(handle);
+      handle.stat = (async (...statArgs: Parameters<typeof handle.stat>) => mask(await stat(...statArgs) as fs.BigIntStats)) as typeof handle.stat;
+      return handle;
+    }) as typeof promises.open);
+  }
+
+  it.each(["sync", "async"])("rejects a same-size write that leaves every observed version field unchanged through the %s seam", async mode => {
+    const f = fixture(); clock().offsetMs = -60_000; const authority = f.authority();
+    if (mode === "sync") authority.checkSync(); else await authority.check();
+    const bytes = fs.readFileSync(f.path); bytes[60] ^= 1;
+    heldAtSnapshot(f.path);
+    fs.writeFileSync(f.path, bytes);
+    if (mode === "sync") expect(() => authority.checkSync()).toThrow(expect.objectContaining({ code: "source-changed" }));
+    else await expect(authority.check()).rejects.toMatchObject({ code: "source-changed" });
+  });
+
+  it.each(["sync", "async"])("rehashes every check until a rehash starts after the window, then trusts the version through the %s seam", async mode => {
+    const f = fixture(); const state = clock(); state.offsetMs = -60_000; const authority = f.authority();
+    const read = vi.spyOn(fs, "readSync"); const open = vi.spyOn(promises, "open");
+    const check = async () => { if (mode === "sync") authority.checkSync(); else await authority.check(); };
+    const reads = () => mode === "sync" ? read.mock.calls.length : open.mock.calls.length;
+    await check();
+    expect(reads()).toBe(mode === "sync" ? 3 : 1);
+    state.offsetMs = -30_000;
+    await check();
+    expect(reads()).toBe(mode === "sync" ? 6 : 2);
+    state.offsetMs = 10_000;
+    await check();
+    expect(reads()).toBe(mode === "sync" ? 9 : 3);
+    await check();
+    expect(reads()).toBe(mode === "sync" ? 9 : 3);
+  });
+
+  it("treats a version with an old mtime but a recent ctime as racy", () => {
+    const f = fixture(); const state = clock(); state.offsetMs = -10_000;
+    fs.utimesSync(f.path, 10, 20);
+    const authority = f.authority();
+    const read = vi.spyOn(fs, "readSync");
+    authority.checkSync(); authority.checkSync();
+    expect(read).toHaveBeenCalledTimes(6);
+    state.offsetMs = 10_000;
+    authority.checkSync();
+    expect(read).toHaveBeenCalledTimes(9);
+    authority.checkSync();
+    expect(read).toHaveBeenCalledTimes(9);
   });
 });
 
