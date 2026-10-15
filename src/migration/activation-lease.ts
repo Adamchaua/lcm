@@ -724,8 +724,9 @@ export type ActivationLeaseAssertResult = Readonly<{
   detail: string;
   /** The fence observed at read time, or null when none could be
    * attributed (absent, unresolvable, or a targetBackend/evidenceSha256
-   * identity mismatch that PostgreSqlBackendPublicationGuard#read itself
-   * refused to return -- see resolveActivationLeaseFence). Populated for
+   * identity mismatch, or a corrupt or ambiguous stored row (invalid-row),
+   * that PostgreSqlBackendPublicationGuard#read itself refused to return --
+   * see resolveActivationLeaseFence). Populated for
    * a publicationId mismatch or an inactive (released/expired) fence, since
    * those are only ever detected once a fence is already in hand. */
   fence: ActivationLeaseFence | null;
@@ -767,10 +768,12 @@ export async function assertActivationLeaseFence(
     return buildAssertResult("unsatisfied", "fence-absent", resolution.detail, null);
   }
   if (resolution.kind === "identity-mismatch") {
-    // resolveActivationLeaseFence already established that targetBackend
-    // and/or evidenceSha256 (and/or, defensively, projectId) do not match
-    // -- no fence object is obtainable in this branch at all (see its own
-    // doc comment for why), so this result carries fence: null.
+    // resolveActivationLeaseFence reached this branch in one of two ways:
+    // a decodable row naming a different targetBackend and/or evidenceSha256
+    // (and/or, defensively, projectId) (fence-mismatch), or a corrupt or
+    // ambiguous row that cannot be trusted (invalid-row), where no mismatch
+    // was established. No fence object is obtainable in either case (see its
+    // own doc comment for why), so this result carries fence: null.
     return buildAssertResult("unsatisfied", "fence-identity-mismatch", resolution.detail, null);
   }
   const fence = resolution.fence;

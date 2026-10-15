@@ -184,7 +184,7 @@ describe("resolveActivationLeaseFence", () => {
     expect(result).toMatchObject({ detail: expect.stringContaining("corrupt or ambiguous") });
   });
 
-  it("propagates a guard error reason other than invalid-row unchanged", async () => {
+  it("propagates a guard error reason other than fence-mismatch/invalid-row unchanged", async () => {
     const boom = guardError("readback-mismatch");
     const guard = fakeGuard({ read: vi.fn(async () => { throw boom; }) });
     await expect(resolveActivationLeaseFence(guard, mutationInput)).rejects.toThrow(boom);
