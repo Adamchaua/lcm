@@ -226,11 +226,12 @@ concurrently. Retry delay uses bounded exponential backoff with deterministic
 jitter, stale claims are recoverable, and poison events remain inspectable
 until exact replay.
 
-Applying a claimed event performs no additional remote work. The inbox row is
-itself the delivery artifact and memory promotion happens locally through the
-selected project storage, so an event is fully delivered once its inbox row is
-durably `applied`. Whether a real remote-side effect was originally intended
-here is tracked in issue #1398.
+Applying a claimed event intentionally performs no remote-side effect. The
+inbox row is itself the delivery artifact and memory promotion happens locally
+through the selected project storage, so the durable `applied` inbox row is
+the terminal delivery outcome. The `applyEvent` hook exists so that any future
+effect would share the `applied` transaction; adding one would be a new
+feature, not a missing piece of this worker.
 
 #### When the daemon runs it
 

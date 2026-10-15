@@ -22,11 +22,11 @@ import type { PostgreSqlPassiveEventRepository } from "../storage/postgresql/pas
  * PostgreSQL project storage, and `docs/passive-learning.md` describes this
  * worker as distinct from that route consumer, so an event is fully delivered
  * once its inbox row is durably `applied`. The `applied` transition is
- * therefore the terminal outcome and this hook exists only so the transition
- * and any future effect share one short transaction.
+ * therefore the terminal outcome, and no remote-side effect is intended. This
+ * hook exists so that any future effect would share the `applied`
+ * transaction; adding one would be a new feature, not a missing piece.
  *
- * This is a deliberate decision rather than an unfinished one. Whether #91
- * intended a real remote-side effect here is tracked in issue #1398.
+ * This is a deliberate decision rather than an unfinished one.
  */
 export async function applyReplicatedPassiveEvent(): Promise<void> {
   return undefined;
