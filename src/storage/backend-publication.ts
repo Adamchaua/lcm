@@ -3588,6 +3588,22 @@ function activeFence(fence: BackendPublicationFenceRecord | null): boolean {
   return fence !== null && fence.releasedAt === null && !fence.databaseExpired;
 }
 
+function hasCompleteGuardProvider(driver: BackendPublicationDriver): boolean {
+  return driver.acquireRemoteGuard !== undefined
+    && driver.readRemoteGuard !== undefined
+    && driver.releaseRemoteGuard !== undefined;
+}
+
+const GUARD_RECORDED_FORWARD_PHASES: readonly BackendPublicationPhase[] = [
+  "guarded",
+  "map-publishing",
+  "map-published",
+  "config-publishing",
+  "config-published",
+  "releasing",
+  "released",
+];
+
 function sameFenceIdentity(left: BackendPublicationFenceRecord, right: BackendPublicationFenceRecord): boolean {
   return left.projectId === right.projectId
     && left.machineId === right.machineId
@@ -3810,6 +3826,12 @@ export class BackendPublicationCoordinator {
   ): Promise<BackendPublicationJournal> {
     return this.#locked(async (directoryHandle) => {
       const validated = validateInput(input);
+      if (validated.projects.length > 0 && !hasCompleteGuardProvider(this.#driver)) {
+        return fail(
+          "invalid-input",
+          "backend publication with projects requires a complete remote guard provider",
+        );
+      }
       const existing = readParsedJournalFromDirectory(
         this.#homeDir,
         directoryHandle,
@@ -3982,6 +4004,9 @@ export class BackendPublicationCoordinator {
       this.#driver.acquireRemoteGuard === undefined
       || this.#driver.readRemoteGuard === undefined
     ) {
+      if (journal.projects.length > 0) {
+        return fail("unexpected-state", "remote guard acquisition requires a complete remote guard provider");
+      }
       return transition(journal, "guarded", directoryHandle, this.#homeDir, this.#observer);
     }
     let current = journal;
@@ -4006,6 +4031,11 @@ export class BackendPublicationCoordinator {
     directoryHandle: BackendPublicationDirectoryHandle,
   ): Promise<BackendPublicationJournal> {
     const phase = aborting ? "abort-releasing" : "releasing" as const;
+    const releaseUnavailable = this.#driver.releaseRemoteGuard === undefined
+      || this.#driver.readRemoteGuard === undefined;
+    if (releaseUnavailable && journal.projects.some((project) => project.fence !== null)) {
+      return fail("unexpected-state", "remote guard release requires a complete remote guard provider");
+    }
     let current = aborting
       ? transition(journal, phase, directoryHandle, this.#homeDir, this.#observer)
       : journal;
@@ -4265,6 +4295,12 @@ export class BackendPublicationCoordinator {
       journal = transition(journal, "acquiring", directoryHandle, this.#homeDir, this.#observer);
     }
     if (journal.phase === "acquiring") journal = await this.#acquireAll(journal, directoryHandle);
+    if (
+      GUARD_RECORDED_FORWARD_PHASES.includes(journal.phase)
+      && journal.projects.some((project) => project.fence === null)
+    ) {
+      return fail("unexpected-state", "backend publication journal lacks a recorded remote guard fence");
+    }
     if (journal.phase === "guarded" || journal.phase === "map-publishing") journal = await this.#publishMap(journal, directoryHandle);
     if (journal.phase === "map-published" || journal.phase === "config-publishing") journal = await this.#publishConfig(journal, directoryHandle);
     if (journal.phase === "config-published") {

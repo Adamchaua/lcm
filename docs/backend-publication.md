@@ -150,6 +150,15 @@ root:
   history/
 ```
 
+A completed publication's `<publication-id>.material` is retained
+indefinitely by design. Nothing prunes it: each file is at most 8,388,608
+bytes, there is one file per completed publication, and there is no aggregate
+cap, so unbounded growth is accepted. Terminal admission authenticates the
+file today, and the planned rollback (#626 / #1433) will read it instead of
+re-deriving it. A future prune must keep what rollback reads or be designed
+with that path. Do not delete these files (see the warning below about
+recovery evidence).
+
 Migration snapshot maintenance uses a separate exact version-3 journal branch
 in this same coordinator and directory. It does not create a sibling lock or
 coordinator. Version-2 publication journals retain their existing parser,
@@ -324,13 +333,13 @@ The normal forward sequence is:
 ```text
 preparing
   -> prepared
-  -> acquiring       (one persisted checkpoint per project, when remote fences are enabled)
+  -> acquiring       (one persisted checkpoint per project, when the publication has projects)
   -> guarded
   -> map-publishing
   -> map-published
   -> config-publishing
   -> config-published
-  -> releasing       (one persisted checkpoint per project, when remote fences are enabled)
+  -> releasing       (one persisted checkpoint per project, when the publication has projects)
   -> released
   -> completed
 ```
@@ -340,17 +349,32 @@ The phase groups have distinct recovery meanings:
 - **Preparation:** `preparing -> prepared` writes the deterministic journal,
   seals the material, authenticates it, and records the material reference.
 - **Admission:** `prepared -> acquiring -> guarded` acquires each project
-  fence in sorted project order. With no remote-guard driver, the coordinator
-  checkpoints directly to `guarded`; otherwise `acquiring` is rewritten for
-  each project as its authoritative fence is persisted.
+  fence in sorted project order, rewriting `acquiring` for each project as its
+  authoritative fence is persisted. A publication with projects requires a
+  complete remote guard provider (acquire, read, and release hooks):
+  `prepare` refuses with `invalid-input` otherwise, and `resume` refuses to
+  record `guarded` without the acquire and read hooks, leaving the journal at
+  `acquiring`. Only a publication with no projects checkpoints directly to
+  `guarded`.
 - **Publication:** `guarded -> map-publishing -> map-published ->
 config-publishing -> config-published` publishes the project map before the
   configuration. A recovered `*-publishing` phase rechecks witnesses and
   completes the mutation only when the expected state is not already present.
 - **Release/finalization:** `config-published -> releasing -> released ->
 completed` releases every project fence with authoritative readback, then
-  retains the completed material and writes the terminal journal. With no
-  remote-guard driver, `config-published` checkpoints directly to `released`.
+  writes the terminal journal. The completed material is retained
+  indefinitely by design; nothing prunes it, and operators must not delete it
+  (see the recovery-evidence warning below). Resume refuses, with
+  `unexpected-state` and without changing the phase, a journal with projects
+  at `guarded`, `map-publishing`, `map-published`, `config-publishing`,
+  `config-published`, `releasing`, or `released` that records no fence for a
+  project. Recovery for that refusal is abort. Release refuses to proceed
+  while a persisted fence exists without the release and read hooks, leaving
+  the journal at `releasing` (or `abort-releasing` for an abort). To recover
+  from the missing release or read hook refusal, or from the admission
+  refusal above, reconstruct the coordinator with a complete provider and
+  retry resume or abort. Only a publication with no projects checkpoints
+  directly to `released`. Journals that are already terminal are not migrated.
 
 The abort sequence is a separate forward-only state machine, never a rewind.
 When abort starts from the initial material-backed journal, its complete

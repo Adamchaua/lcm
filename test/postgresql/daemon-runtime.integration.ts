@@ -34,6 +34,7 @@ import {
   type BackendPublicationRecoveryFile,
 } from "../../src/storage/backend-publication.js";
 import { applyBackendPublicationProjectMapFile } from "../../src/project-map.js";
+import { inMemoryPublicationGuard } from "./operational-fixture.js";
 import {
   PostgreSqlIdentityRepository,
   type RegisteredMachine,
@@ -124,6 +125,7 @@ function recoveryFile(content: string): BackendPublicationRecoveryFile {
 
 function publicationDriver(homeDir: string): BackendPublicationDriver {
   return {
+    ...inMemoryPublicationGuard(),
     observeLocalState: async () => captureBackendPublicationState(homeDir),
     publishProjectMap: (input: BackendPublicationFileMutationContext) =>
       applyBackendPublicationProjectMapFile(input),
