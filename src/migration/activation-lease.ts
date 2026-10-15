@@ -168,9 +168,10 @@ export interface ActivationLeasePublicationGuard {
  *
  * Anything else -- including an error that is not a
  * PostgreSqlStorageOperationError at all, such as
- * PostgreSqlBackendPublicationGuardError's own "invalid-row" or
- * "invalid-input" reasons (which signal corrupt stored data or a caller
- * bug, never an inability to read) -- is left unrecognized here and
+ * PostgreSqlBackendPublicationGuardError's own "fence-mismatch",
+ * "invalid-row" or "invalid-input" reasons (which signal a different
+ * generation's row, corrupt stored data or a caller bug, never an
+ * inability to read) -- is left unrecognized here and
  * propagates unchanged, per attributeNullableReadAsync's contract.
  */
 export function classifyPostgreSqlFenceReadFailure(error: unknown): NullableReadClassification | undefined {
@@ -224,18 +225,19 @@ export type ActivationLeaseReadInput = Readonly<{
  * place in this module that calls guard.read().
  *
  * One sharp edge, verified at source rather than assumed: guard.read()
- * itself validates the returned row's targetBackend and evidenceSha256
- * against exactly the values passed in input (see exactFence in
- * publication-guard.ts), and THROWS PostgreSqlBackendPublicationGuardError
- * ("invalid-row") instead of returning a non-matching row -- it never
- * returns a "present" fence whose targetBackend or evidenceSha256 differs
- * from what this call asked for. A caller that already knows those two
+ * itself compares the decoded row's targetBackend and evidenceSha256
+ * against exactly the values passed in input, and THROWS
+ * PostgreSqlBackendPublicationGuardError ("fence-mismatch") instead of
+ * returning a non-matching row -- it never returns a "present" fence whose
+ * targetBackend or evidenceSha256 differs from what this call asked for.
+ * A row that cannot be decoded at all (corrupt stored data, or more than
+ * one row) throws "invalid-row" instead. A caller that already knows those two
  * fields are correct for the row it expects (the common case) is
  * unaffected. A caller that needs to tolerate a stored row belonging to a
  * genuinely different generation -- including one that differs
  * specifically in targetBackend or evidenceSha256, not just machineId or
  * publicationId -- must use resolveActivationLeaseFence below instead,
- * which catches exactly that throw.
+ * which catches exactly those throws.
  */
 export async function readActivationLeaseFence(
   guard: ActivationLeasePublicationGuard,
@@ -261,37 +263,37 @@ export type ActivationLeaseFenceResolution =
 
 /**
  * Resolve the fenced-lease row for one project, tolerating a stored row
- * that belongs to a different generation instead of letting
- * PostgreSqlBackendPublicationGuard#read's own internal validation throw
+ * that belongs to a different generation (or cannot be decoded) instead of
+ * letting PostgreSqlBackendPublicationGuard#read's own validation throw
  * uncaught.
  *
  * Verified at source: PostgreSqlBackendPublicationGuard#read's SQL only
  * filters by project_id/resource_type/resource_key -- it does not filter
  * by targetBackend or evidenceSha256 at the database level, since those
  * two fields are encoded inside the row's own `operation` text column,
- * not separate columns. The row it fetches is then passed through
- * exactFence, which throws PostgreSqlBackendPublicationGuardError
- * ("invalid-row") when the row's decoded targetBackend or evidenceSha256
- * does not match the caller's input, rather than returning that differing
- * row for inspection. A different-generation conflict that happens to
+ * not separate columns. The row it fetches is first decoded (a row that
+ * cannot be decoded throws PostgreSqlBackendPublicationGuardError
+ * "invalid-row", as does a result with more than one row) and then
+ * compared with the caller's input: a decodable row whose targetBackend or
+ * evidenceSha256 differs throws "fence-mismatch" rather than being
+ * returned for inspection. A different-generation conflict that happens to
  * differ in targetBackend or evidenceSha256 (as opposed to machineId or
  * publicationId, neither of which read() validates at all) therefore
  * surfaces as a thrown exception from read() itself, not as an
  * attributable "present" outcome a caller could compare against its own
  * expected identity. This function is what makes that survivable for
  * renewActivationLease, releaseActivationLease and
- * assertActivationLeaseFence: it catches exactly that "invalid-row" throw
- * and reports it as "identity-mismatch".
+ * assertActivationLeaseFence: it catches those throws and reports both as
+ * "identity-mismatch".
  *
- * This is deliberately imprecise in one way that is disclosed rather than
- * hidden: exactFence's "invalid-row" reason is also used for genuinely
- * corrupt stored row data (an unparseable owner_machine_id, a malformed
- * operation identity string, and so on -- see storedFenceFromRow in
- * publication-guard.ts), and nothing in the thrown error distinguishes
- * "this row belongs to a different generation" from "this row's data is
- * corrupt". Both are reported here as "identity-mismatch", because both
- * mean the same thing to this function's callers: the stored row cannot
- * be trusted as the caller's own generation's fence.
+ * The two reasons are distinguishable at the guard (fence-mismatch is a
+ * routine different-generation conflict; invalid-row is data damage, an
+ * unparseable owner_machine_id, a malformed operation identity string, and
+ * so on -- see storedFenceFromRow in publication-guard.ts), and the detail
+ * text here says which one applied. Both are reported with the same
+ * "identity-mismatch" kind, fail-closed, because both mean the same thing
+ * to this function's callers: the stored row cannot be trusted as the
+ * caller's own generation's fence.
  */
 export async function resolveActivationLeaseFence(
   guard: ActivationLeasePublicationGuard,
@@ -303,13 +305,19 @@ export async function resolveActivationLeaseFence(
     if (outcome.kind === "absent") return { kind: "absent", detail: outcome.detail };
     return { kind: "unresolvable", detail: outcome.detail };
   } catch (error) {
-    if (error instanceof PostgreSqlBackendPublicationGuardError && error.reason === "invalid-row") {
+    if (error instanceof PostgreSqlBackendPublicationGuardError && error.reason === "fence-mismatch") {
       return {
         kind: "identity-mismatch",
         detail: `a fenced-lease row exists for project ${input.projectId} but does not match the expected `
           + `target backend (${input.targetBackend}) and/or evidence digest; PostgreSqlBackendPublicationGuard`
-          + "#read refuses to return a non-matching row for inspection, so this cannot be distinguished from "
-          + "corrupt stored row data",
+          + "#read refuses to return a non-matching row for inspection",
+      };
+    }
+    if (error instanceof PostgreSqlBackendPublicationGuardError && error.reason === "invalid-row") {
+      return {
+        kind: "identity-mismatch",
+        detail: `the fenced-lease row for project ${input.projectId} is corrupt or ambiguous and cannot be `
+          + "trusted as the expected generation's fence",
       };
     }
     throw error;
@@ -384,22 +392,19 @@ export type ActivationLeaseIdentity = Readonly<{
  * sites below call resolveActivationLeaseFence first and return early on
  * every other outcome). resolveActivationLeaseFence's fence comes from
  * guard.read(), and the real PostgreSqlBackendPublicationGuard#read
- * (publication-guard.ts) validates its row through
- * exactFence(row, { projectId, targetBackend, evidenceSha256 }, operation)
- * -- deliberately omitting exactFence's optional expected.machineId and
- * expected.publicationId parameters. exactFence's own check fails the row
- * when fence.targetBackend does not match, when fence.evidenceSha256 does
- * not match, or (only when that expected field is passed) when machineId
- * or publicationId do not match; with the latter two never passed by
- * read(), it can throw "invalid-row" (surfaced by
- * resolveActivationLeaseFence as "identity-mismatch", and handled by both
- * of this function's callers *before* sameGeneration ever runs) only for a
- * targetBackend or evidenceSha256 mismatch. It can never return a
+ * (publication-guard.ts) decodes its row with storedFenceFromRow and then
+ * compares only the decoded targetBackend and evidenceSha256 with the
+ * caller's input -- it never compares machineId or publicationId. A
+ * decodable row whose targetBackend or evidenceSha256 differs makes read()
+ * throw "fence-mismatch" (a row that cannot be decoded throws
+ * "invalid-row"); resolveActivationLeaseFence surfaces both as
+ * "identity-mismatch", and both of this function's callers handle that
+ * *before* sameGeneration ever runs. read() can therefore never return a
  * "present" fence whose targetBackend or evidenceSha256 differ from the
  * caller's own input -- by the time this function runs, those two fields
  * are already guaranteed to match. machineId and publicationId are the
- * only fields read()'s exactFence call never validates, so they are the
- * only two fields left for this function to check.
+ * only fields read() never validates, so they are the only two fields left
+ * for this function to check.
  *
  * This was previously a four-field comparison. The targetBackend and
  * evidenceSha256 clauses were reachable in this module's unit tests only
@@ -415,16 +420,16 @@ export type ActivationLeaseIdentity = Readonly<{
  * This is unrelated to PostgreSqlBackendPublicationGuard#acquire's own,
  * separate internal sameGeneration check (see acquire's local variable of
  * the same name in publication-guard.ts): that check reads the competing
- * row through the more permissive storedFenceFromRow, not exactFence, and
- * so genuinely can observe a targetBackend/evidenceSha256 mismatch there.
- * That is a different call path with a different validator and is
- * unaffected by this change.
+ * row through the more permissive storedFenceFromRow, not read()'s
+ * identity comparison, and so genuinely can observe a
+ * targetBackend/evidenceSha256 mismatch there. That is a different call
+ * path with a different validator and is unaffected by this change.
  *
- * Issue #1419 tracks the real guard folding an identity mismatch and a
- * corrupted stored row into one indistinguishable thrown "invalid-row"
- * error. If that is ever narrowed so read() can return a non-matching row
- * instead of throwing, this function's reachability analysis -- and its
- * test coverage -- will need to be revisited.
+ * Issue #1419 split the guard's read() failure: a decodable non-matching
+ * row throws "fence-mismatch" and a corrupt row keeps "invalid-row". If
+ * read() is ever changed to return a non-matching row instead of throwing,
+ * this function's reachability analysis -- and its test coverage -- will
+ * need to be revisited.
  */
 function sameGeneration(fence: ActivationLeaseFence, identity: ActivationLeaseIdentity): boolean {
   return fence.publicationId === identity.publicationId

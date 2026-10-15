@@ -167,14 +167,22 @@ describe("resolveActivationLeaseFence", () => {
   });
 
   it(
-    "reports identity-mismatch when guard.read() itself refuses a targetBackend/evidenceSha256 mismatch "
-      + "(invalid-row), rather than letting the exception propagate",
+    "reports identity-mismatch when guard.read() itself refuses a decodable targetBackend/evidenceSha256 "
+      + "mismatch (fence-mismatch), rather than letting the exception propagate",
     async () => {
-      const guard = fakeGuard({ read: vi.fn(async () => { throw guardError("invalid-row"); }) });
+      const guard = fakeGuard({ read: vi.fn(async () => { throw guardError("fence-mismatch"); }) });
       const result = await resolveActivationLeaseFence(guard, mutationInput);
       expect(result.kind).toBe("identity-mismatch");
+      expect(result).toMatchObject({ detail: expect.stringContaining("does not match the expected") });
     },
   );
+
+  it("reports identity-mismatch, fail-closed, for a corrupt or ambiguous row (invalid-row)", async () => {
+    const guard = fakeGuard({ read: vi.fn(async () => { throw guardError("invalid-row"); }) });
+    const result = await resolveActivationLeaseFence(guard, mutationInput);
+    expect(result.kind).toBe("identity-mismatch");
+    expect(result).toMatchObject({ detail: expect.stringContaining("corrupt or ambiguous") });
+  });
 
   it("propagates a guard error reason other than invalid-row unchanged", async () => {
     const boom = guardError("readback-mismatch");
@@ -263,13 +271,13 @@ describe("renewActivationLease", () => {
     expect(result.status).toBe("conflict");
   });
 
-  it(
+  it.each(["fence-mismatch", "invalid-row"] as const)(
     "reports conflict when the diagnostic read finds a targetBackend/evidenceSha256 identity mismatch "
-      + "(guard.read() itself refuses that row; see resolveActivationLeaseFence)",
-    async () => {
+      + "or a corrupt row (guard.read() throws %s; see resolveActivationLeaseFence)",
+    async (reason) => {
       const guard = fakeGuard({
         renew: vi.fn(async () => { throw guardError("fence-mismatch"); }),
-        read: vi.fn(async () => { throw guardError("invalid-row"); }),
+        read: vi.fn(async () => { throw guardError(reason); }),
       });
       const result = await renewActivationLease(guard, renewInput);
       expect(result.status).toBe("conflict");
@@ -402,13 +410,13 @@ describe("releaseActivationLease", () => {
     expect(result.status).toBe("conflict");
   });
 
-  it(
+  it.each(["fence-mismatch", "invalid-row"] as const)(
     "reports conflict when the diagnostic read finds a targetBackend/evidenceSha256 identity mismatch "
-      + "(guard.read() itself refuses that row; see resolveActivationLeaseFence)",
-    async () => {
+      + "or a corrupt row (guard.read() throws %s; see resolveActivationLeaseFence)",
+    async (reason) => {
       const guard = fakeGuard({
         release: vi.fn(async () => { throw guardError("fence-mismatch"); }),
-        read: vi.fn(async () => { throw guardError("invalid-row"); }),
+        read: vi.fn(async () => { throw guardError(reason); }),
       });
       const result = await releaseActivationLease(guard, mutationInput);
       expect(result.status).toBe("conflict");
@@ -507,21 +515,21 @@ describe("assertActivationLeaseFence", () => {
     expect(result).toMatchObject({ status: "unsatisfied", reason: "fence-identity-mismatch", fence });
   });
 
-  it(
+  it.each(["fence-mismatch", "invalid-row"] as const)(
     "reports unsatisfied/fence-identity-mismatch with fence: null on a targetBackend/evidenceSha256 "
-      + "mismatch (guard.read() itself refuses to return the differing row; see resolveActivationLeaseFence)",
-    async () => {
-      const guard = fakeGuard({ read: vi.fn(async () => { throw guardError("invalid-row"); }) });
+      + "mismatch or corrupt row (guard.read() throws %s; see resolveActivationLeaseFence)",
+    async (reason) => {
+      const guard = fakeGuard({ read: vi.fn(async () => { throw guardError(reason); }) });
       const result = await assertActivationLeaseFence(guard, assertInput);
       expect(result).toMatchObject({ status: "unsatisfied", reason: "fence-identity-mismatch", fence: null });
     },
   );
 
-  it("propagates a guard error reason other than invalid-row unchanged, never guessing at attribution", async () => {
+  it("propagates a guard error reason other than fence-mismatch/invalid-row unchanged, never guessing at attribution", async () => {
     const boom = guardError("readback-mismatch");
     // readActivationLeaseFence's own classifier does not recognize this
     // reason, so it is not "unresolvable" either; resolveActivationLeaseFence
-    // only converts "invalid-row" -- anything else propagates.
+    // only converts "fence-mismatch" and "invalid-row" -- anything else propagates.
     const guard = fakeGuard({ read: vi.fn(async () => { throw boom; }) });
     await expect(assertActivationLeaseFence(guard, assertInput)).rejects.toThrow(boom);
   });

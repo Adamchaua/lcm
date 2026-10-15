@@ -8,7 +8,9 @@ rationale: >-
   threads, #1452 thread): publication journal gate, artifact directory and
   digest authentication, scratch-twin directory durability, restart pid
   attribution, events-database coverage and the maintenance-held quiescence
-  check.
+  check. The activation lease reader also maps the guard's read-time
+  fence-mismatch (a decodable row naming a different targetBackend or
+  evidence digest, split from invalid-row by #1419) to identity-mismatch.
 pins:
   - ["src/migration/activation-absence.ts", "unit-migration-cutover"]
   - ["src/migration/activation-artifact-store.ts", "unit-migration-cutover"]
