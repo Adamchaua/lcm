@@ -9,6 +9,7 @@ import * as coordination from "../../src/storage/postgresql/coordination.js";
 import * as searchConfiguration from "../../src/storage/postgresql/search-configuration.js";
 import * as portableSource from "../../src/storage/postgresql/portable-source.js";
 import * as portableDestination from "../../src/storage/postgresql/portable-destination.js";
+import { PORTABLE_INITIAL_CHECKPOINT_SHA256 } from "../../src/storage/postgresql/portable-destination.js";
 import * as manifestStoreModule from "../../src/migration/manifest-store.js";
 import * as copySourceModule from "../../src/migration/copy-source.js";
 import * as runtimeReadiness from "../../src/storage/postgresql/runtime-readiness.js";
@@ -267,6 +268,11 @@ const SEQUENCE_BACKED_TABLES: Record<string, string> = {
   "passive-events": "lcm.passive_event_inbox",
 };
 
+interface LedgerBatchRowFixture {
+  domain: string; prior_checkpoint_sha256: string; checkpoint_sha256: string;
+  first_ordinal: string; next_ordinal: string;
+}
+
 function fakeSession(overrides: {
   xid?: string | null;
   sequenceState?: Partial<Record<string, {
@@ -276,6 +282,8 @@ function fakeSession(overrides: {
   ledgerIdentityTotal?: number | null;
   ledgerRun?: { state?: string; manifestSha256?: string; projectSha256?: string } | null;
   ledgerCheckpoints?: readonly ReturnType<typeof defaultLedgerCheckpoint>[];
+  /** Raw transfer_batches rows; replaces the single-row chain derived from ledgerCheckpoints. */
+  ledgerBatchRows?: readonly LedgerBatchRowFixture[];
   ledgerNonInjective?: ReadonlyArray<{ domain: string; nativeKey: string }>;
   ledgerIdentitySets?: ReadonlyArray<{
     domain: string; identitySha256s: readonly string[];
@@ -316,7 +324,12 @@ function fakeSession(overrides: {
         return { rows: [{ run_id: "fake-run-id", state: ledgerRun.state, manifest_sha256: ledgerRun.manifestSha256, project_sha256: ledgerRun.projectSha256 }] };
       }
       if (config.text.includes("lcm.transfer_batches")) {
-        return { rows: ledgerCheckpoints.map((entry) => ({ domain: entry.domain, checkpoint_sha256: entry.sourceCheckpointSha256, next_ordinal: String(entry.ordinal) })) };
+        return {
+          rows: overrides.ledgerBatchRows ?? ledgerCheckpoints.map((entry) => ({
+            domain: entry.domain, prior_checkpoint_sha256: PORTABLE_INITIAL_CHECKPOINT_SHA256,
+            checkpoint_sha256: entry.sourceCheckpointSha256, first_ordinal: "0", next_ordinal: String(entry.ordinal),
+          })),
+        };
       }
       if (config.text.includes("GROUP BY domain, native_key")) {
         return { rows: ledgerNonInjective.map((entry) => ({ domain: entry.domain, native_key: entry.nativeKey })) };
@@ -844,6 +857,93 @@ describe("readLedgerMismatches", () => {
       domain: "summaries", class: "ledger",
       identitySha256: migrationWitnessSha256(["ledger-batch-mismatch-v1", "summaries"]),
     }]);
+  });
+  describe("transfer-batch chain (B5-2)", () => {
+    const target = "messages" as const;
+    const terminal = defaultLedgerCheckpoint(target);
+    const terminalOrdinal = terminal.ordinal;
+    const batchRow = (prior: string, checkpoint: string, first: number, next: number): LedgerBatchRowFixture => ({
+      domain: target, prior_checkpoint_sha256: prior, checkpoint_sha256: checkpoint,
+      first_ordinal: String(first), next_ordinal: String(next),
+    });
+    const otherDomainRows = (): LedgerBatchRowFixture[] => PORTABLE_RECORD_DOMAIN_ORDER
+      .filter((domain) => domain !== target)
+      .map((domain) => {
+        const entry = defaultLedgerCheckpoint(domain);
+        return {
+          domain, prior_checkpoint_sha256: PORTABLE_INITIAL_CHECKPOINT_SHA256,
+          checkpoint_sha256: entry.sourceCheckpointSha256, first_ordinal: "0", next_ordinal: String(entry.ordinal),
+        };
+      });
+    const middle = fakeHash("chain-middle");
+    const batchMismatch = {
+      domain: target, class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-batch-mismatch-v1", target]),
+    };
+    async function read(targetRows: readonly LedgerBatchRowFixture[]) {
+      const session = fakeSession({ ledgerBatchRows: [...otherDomainRows(), ...targetRows] });
+      return readLedgerMismatches(session as never, ledgerInput());
+    }
+    it("passes a multi-batch chain from the initial prior, in any row order", async () => {
+      const rows = [
+        batchRow(PORTABLE_INITIAL_CHECKPOINT_SHA256, middle, 0, 1),
+        batchRow(middle, terminal.sourceCheckpointSha256, 1, terminalOrdinal),
+      ];
+      expect(await read(rows)).toEqual([]);
+      expect(await read([...rows].reverse())).toEqual([]);
+    });
+    it("reads every batch row of the run in a deterministic order", async () => {
+      const session = fakeSession();
+      await readLedgerMismatches(session as never, ledgerInput());
+      const batchCall = session.query.mock.calls.find(([config]) => (
+        (config as { text: string }).text.includes("FROM lcm.transfer_batches")
+      ))![0] as { text: string };
+      expect(batchCall.text).not.toContain("DISTINCT ON");
+      expect(batchCall.text).toContain("ORDER BY domain, first_ordinal, next_ordinal, checkpoint_sha256");
+    });
+    it("flags a chain whose intermediate link is missing", async () => {
+      expect(await read([
+        batchRow(PORTABLE_INITIAL_CHECKPOINT_SHA256, middle, 0, 1),
+        batchRow(fakeHash("absent-link"), terminal.sourceCheckpointSha256, 1, terminalOrdinal),
+      ])).toEqual([batchMismatch]);
+    });
+    it("flags an orphan surplus row beside a valid chain", async () => {
+      expect(await read([
+        batchRow(fakeHash("orphan-prior"), fakeHash("orphan-checkpoint"), 0, 1),
+        batchRow(PORTABLE_INITIAL_CHECKPOINT_SHA256, terminal.sourceCheckpointSha256, 0, terminalOrdinal),
+      ])).toEqual([batchMismatch]);
+    });
+    it("flags a second chain reaching the same terminal ordinal", async () => {
+      const otherMiddle = fakeHash("second-chain-middle");
+      expect(await read([
+        batchRow(fakeHash("second-prior"), otherMiddle, 0, 1),
+        batchRow(otherMiddle, fakeHash("second-terminal"), 1, terminalOrdinal),
+        batchRow(PORTABLE_INITIAL_CHECKPOINT_SHA256, terminal.sourceCheckpointSha256, 0, terminalOrdinal),
+      ])).toEqual([batchMismatch]);
+    });
+    it("flags a chain that does not start at the initial prior", async () => {
+      expect(await read([
+        batchRow(fakeHash("not-initial"), terminal.sourceCheckpointSha256, 0, terminalOrdinal),
+      ])).toEqual([batchMismatch]);
+    });
+    it("flags a chain whose first row does not start at ordinal 0", async () => {
+      expect(await read([
+        batchRow(PORTABLE_INITIAL_CHECKPOINT_SHA256, terminal.sourceCheckpointSha256, 1, terminalOrdinal),
+      ])).toEqual([batchMismatch]);
+    });
+    it("flags a link whose first_ordinal is not the previous next_ordinal", async () => {
+      expect(await read([
+        batchRow(PORTABLE_INITIAL_CHECKPOINT_SHA256, middle, 0, 1),
+        batchRow(middle, terminal.sourceCheckpointSha256, 2, terminalOrdinal),
+      ])).toEqual([batchMismatch]);
+    });
+    it("flags a row set that loops back to an already walked prior", async () => {
+      expect(await read([
+        batchRow(PORTABLE_INITIAL_CHECKPOINT_SHA256, middle, 0, 1),
+        batchRow(terminal.sourceCheckpointSha256, middle, terminalOrdinal, terminalOrdinal),
+        batchRow(middle, terminal.sourceCheckpointSha256, 1, terminalOrdinal),
+      ])).toEqual([batchMismatch]);
+    });
   });
   it("flags an identity cardinality mismatch against the census total", async () => {
     const session = fakeSession({ ledgerIdentityTotal: LEDGER_TOTAL_RECORD_COUNT_DEFAULT + 1 });
@@ -1646,6 +1746,59 @@ describe("verifyMigrationGeneration", () => {
     expect(result.outcome).toBe("mismatches");
     expect(result.report.mismatches.some((mismatch) => mismatch.domain === "machines" && mismatch.class === "count")).toBe(true);
   }, 15000);
+
+  describe("in-snapshot transfer-schema admission (B5-1)", () => {
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    it("re-runs the transfer-schema admission on the pinned snapshot session as well as the runtime", async () => {
+      stubDestinationPrimitives();
+      const session = fakeSession();
+      const runtime = fakeRuntime({ session });
+      const dependencies = dependenciesFor(fakeCopySource({ recordCounts }), runtime);
+      const input = baseInput({ homeDir: "/tmp/lcm-verify-snapshot-admission" });
+      const result = await verifyMigrationGeneration(input, dependencies);
+      expect(result.outcome).toBe("clean");
+      const calls = vi.mocked(dependencies.verifyTransferSchema).mock.calls;
+      expect(calls).toHaveLength(2);
+      expect(calls[0]![0]).toBe(runtime);
+      expect(calls[1]![0]).toBe(session);
+      expect(calls[1]![1]).toEqual({
+        expectedOwner: input.expectedOwner, signal: input.signal,
+      });
+    }, 15000);
+    it("refuses before any report is persisted when only the in-snapshot admission fails", async () => {
+      stubDestinationPrimitives();
+      const session = fakeSession();
+      const runtime = fakeRuntime({ session });
+      const failure = new Error("snapshot-schema-drift-canary");
+      const dependencies = dependenciesFor(fakeCopySource({ recordCounts }), runtime, {
+        verifyTransferSchema: vi.fn(async (executor: unknown) => {
+          if (executor === session) throw failure;
+          return {} as never;
+        }) as never,
+      });
+      const persistSpy = vi.spyOn(MigrationVerificationReportStore.prototype, "persist");
+      await expect(verifyMigrationGeneration(
+        baseInput({ homeDir: "/tmp/lcm-verify-snapshot-admission-fails" }), dependencies,
+      )).rejects.toBe(failure);
+      expect(persistSpy).not.toHaveBeenCalled();
+      expect(runtime.close).toHaveBeenCalledTimes(1);
+    }, 15000);
+    it("applies the same in-snapshot admission to the read-only inspection", async () => {
+      stubDestinationPrimitives();
+      const session = fakeSession();
+      const runtime = fakeRuntime({ session });
+      const failure = new Error("inspect-snapshot-schema-drift-canary");
+      const dependencies = dependenciesFor(fakeCopySource({ recordCounts }), runtime, {
+        verifyTransferSchema: vi.fn(async (executor: unknown) => {
+          if (executor === session) throw failure;
+          return {} as never;
+        }) as never,
+      });
+      await expect(inspectMigrationVerification(
+        baseInput({ homeDir: "/tmp/lcm-verify-snapshot-admission-inspect" }), dependencies,
+      )).rejects.toBe(failure);
+    }, 15000);
+  });
 
   it("round-2 P3: releases the lease only after persist has settled, not before it", async () => {
     // Before this fix, the lease was released inside

@@ -242,7 +242,8 @@ export async function createPostgreSqlPortableSource(options: PostgreSqlPortable
     // pin is caught here. The verifier only SELECTs, except transaction-local set_config
     // calls that last until the snapshot rollback and do not affect schema-qualified SQL.
     // Non-MVCC probes (pg_stat_ssl, current_setting) are live state; snapshotState rechecks them.
-    // A borrowed session's admission belongs to the caller that opened it.
+    // A borrowed session's admission belongs to the caller that opened it; the
+    // borrowing caller re-runs it inside the snapshot (verify-generation.ts).
     if (verify !== undefined) await verify(session,{expectedOwner:options.expectedOwner,signal:options.signal});
     await registeredIdentity(session,expectedIdentity,normalizedPath,options.signal);
     const capturedAt=await snapshotState(session,options.signal);

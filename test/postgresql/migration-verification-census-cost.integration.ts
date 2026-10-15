@@ -8,7 +8,7 @@ import { assertHarnessReady, settings, withPostgreSqlTestDatabase } from "./harn
 import { grantPortablePostgreSql, seedPortablePostgreSql } from "./portable-fixture.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import { PostgreSqlConversationRepository } from "../../src/storage/postgresql/conversation-repository.js";
-import { probePostgreSqlPortableDestination } from "../../src/storage/postgresql/portable-destination.js";
+import { PORTABLE_INITIAL_CHECKPOINT_SHA256, probePostgreSqlPortableDestination } from "../../src/storage/postgresql/portable-destination.js";
 import { PORTABLE_RECORD_DOMAIN_ORDER } from "../../src/storage/portable-record.js";
 import {
   assertPermanentReadOnlyGuard,
@@ -152,7 +152,7 @@ it("measures the full live in-window read against a realistic destination and re
           + "SELECT $1, d.domain, $2, $2, '{}'::bytea, d.checkpoint_sha256, 0, 0 "
           + "FROM unnest($3::text[], $4::text[]) AS d(domain, checkpoint_sha256)",
         values: [
-          runId, "0".repeat(64),
+          runId, PORTABLE_INITIAL_CHECKPOINT_SHA256,
           manifestCheckpoints.map((entry) => entry.domain),
           manifestCheckpoints.map((entry) => entry.sourceCheckpointSha256),
         ],

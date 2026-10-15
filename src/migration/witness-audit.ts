@@ -256,9 +256,9 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
   },
   {
     id: "ledger-transfer-batches", bodyField: "classCoverage",
-    description: "lcm.transfer_batches, read fresh inside the window: each of the 22 domains' terminal (highest next_ordinal) batch must carry a checkpoint_sha256 and next_ordinal matching the caller-supplied manifest's own checkpoints array, consumed directly rather than restated.",
+    description: "lcm.transfer_batches, read fresh inside the window: every batch row of the run is read, and each of the 22 domains must hold exactly one contiguous chain (first prior is the copy's initial prior at ordinal 0, each later prior and first_ordinal continue the previous checkpoint and next_ordinal, no orphan, surplus or forked row) whose terminal checkpoint_sha256 and next_ordinal match the caller-supplied manifest's own checkpoints array, consumed directly rather than restated.",
     comparison: "compared-live",
-    consequence: "records a ledger-class mismatch naming the domain whose terminal batch is missing or disagrees with the manifest",
+    consequence: "records a ledger-class mismatch naming the domain whose batch chain is missing, broken, carries surplus rows, or whose terminal batch disagrees with the manifest",
     mismatchClasses: ["ledger"],
     receipts: ["ledger"],
   },

@@ -13,7 +13,7 @@ import {
 import { PostgreSqlConversationRepository } from "../storage/postgresql/conversation-repository.js";
 import { PostgreSqlLexicalSearchRepository } from "../storage/postgresql/lexical-search-repository.js";
 import { mappingForDomain } from "../storage/postgresql/portable-mapping.js";
-import { probePostgreSqlPortableDestination } from "../storage/postgresql/portable-destination.js";
+import { PORTABLE_INITIAL_CHECKPOINT_SHA256, probePostgreSqlPortableDestination } from "../storage/postgresql/portable-destination.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
 import {
@@ -984,6 +984,38 @@ function readLedgerSurplusDomainMismatches(rawDomains: Iterable<string>): Migrat
   }));
 }
 
+interface LedgerBatchRow {
+  domain: string; prior_checkpoint_sha256: string; checkpoint_sha256: string;
+  first_ordinal: string; next_ordinal: string;
+}
+
+/**
+ * The terminal row of one domain's transfer_batches chain, or undefined
+ * when the rows are not exactly one contiguous chain. The copy writes the
+ * first batch with PORTABLE_INITIAL_CHECKPOINT_SHA256 as its prior and
+ * first_ordinal 0, and each later batch with the previous checkpoint as its
+ * prior and the previous next_ordinal as its first_ordinal. A missing
+ * link, a non-zero start, an orphan or surplus row (including a second
+ * chain that reaches the same terminal ordinal) leaves a row unwalked, and
+ * a row set that loops back on itself never ends; all of them yield
+ * undefined. Walking by prior (unique per domain in the schema) keeps the
+ * result independent of row order.
+ */
+function readLedgerChainTerminal(rows: readonly LedgerBatchRow[]): LedgerBatchRow | undefined {
+  const byPrior = new Map(rows.map((row) => [row.prior_checkpoint_sha256, row] as const));
+  const walked = new Set<LedgerBatchRow>();
+  let nextOrdinal = 0;
+  let terminal: LedgerBatchRow | undefined;
+  let row = byPrior.get(PORTABLE_INITIAL_CHECKPOINT_SHA256);
+  while (row !== undefined && !walked.has(row) && Number(row.first_ordinal) === nextOrdinal) {
+    walked.add(row);
+    terminal = row;
+    nextOrdinal = Number(row.next_ordinal);
+    row = byPrior.get(row.checkpoint_sha256);
+  }
+  return row === undefined && walked.size === rows.length ? terminal : undefined;
+}
+
 /**
  * Ledger class: lcm.transfer_runs / transfer_batches / transfer_identities,
  * all read inside the step 6 snapshot, nothing read after it. The run row
@@ -995,7 +1027,12 @@ function readLedgerSurplusDomainMismatches(rawDomains: Iterable<string>): Migrat
  * canonicalisation the ledger row's own project_sha256 was written from.
  * The manifest's checkpoints are consumed directly, never restated: the
  * caller-supplied array from protocol.ts's own MigrationManifest, not a
- * second description of the same structure.
+ * second description of the same structure. Every transfer_batches row of
+ * the run is read: each portable domain must hold exactly one contiguous
+ * chain from the copy's initial prior and ordinal 0 whose terminal row
+ * carries the manifest checkpoint and ordinal, otherwise the domain is a
+ * ledger-batch-mismatch-v1. A domain outside the portable order is the
+ * existing ledger-unexpected-domain-v1 mismatch.
  */
 export async function readLedgerMismatches(
   session: PostgreSqlSnapshotSession, input: MigrationLedgerReconciliationInput,
@@ -1021,15 +1058,20 @@ export async function readLedgerMismatches(
     return mismatches;
   }
 
-  const batchResult = await session.query<{ domain: string; checkpoint_sha256: string; next_ordinal: string }>({
-    text: "SELECT DISTINCT ON (domain) domain, checkpoint_sha256, next_ordinal FROM lcm.transfer_batches "
-      + "WHERE run_id = $1 ORDER BY domain, next_ordinal DESC",
+  const batchResult = await session.query<LedgerBatchRow>({
+    text: "SELECT domain, prior_checkpoint_sha256, checkpoint_sha256, first_ordinal, next_ordinal "
+      + "FROM lcm.transfer_batches WHERE run_id = $1 "
+      + "ORDER BY domain, first_ordinal, next_ordinal, checkpoint_sha256",
     values: [run.run_id],
   }, { ...queryOptions, operation: "verifyGenerationLedgerBatches" });
-  const terminalBatchByDomain = new Map(batchResult.rows.map((row) => [row.domain, row] as const));
+  const batchesByDomain = new Map<string, LedgerBatchRow[]>();
+  for (const row of batchResult.rows) {
+    const rows = batchesByDomain.get(row.domain);
+    if (rows === undefined) batchesByDomain.set(row.domain, [row]); else rows.push(row);
+  }
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
     const expected = input.manifestCheckpoints.find((checkpoint) => checkpoint.domain === domain);
-    const actual = terminalBatchByDomain.get(domain);
+    const actual = readLedgerChainTerminal(batchesByDomain.get(domain) ?? []);
     if (expected === undefined || actual === undefined
       || actual.checkpoint_sha256 !== expected.sourceCheckpointSha256
       || Number(actual.next_ordinal) !== expected.ordinal) {
@@ -1971,6 +2013,10 @@ async function computeVerificationReport(
       let ledgerMismatches: MigrationVerificationMismatch[];
       try {
         await assertPermanentReadOnlyGuard(session, input.signal);
+        // The pre-window check ran on the runtime before this snapshot pinned,
+        // so DDL committed in between would escape it; the pinned session
+        // re-runs the same admission.
+        await dependencies.verifyTransferSchema(session, { expectedOwner: input.expectedOwner, signal: input.signal });
         await receipted("schema", undefined, () => assertSchemaWitnessLiveToLive(
           session, destinationSchemaWitness, input.expectedSystemIdentifier, input.signal,
         ));

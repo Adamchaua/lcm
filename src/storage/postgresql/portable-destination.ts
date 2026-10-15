@@ -63,7 +63,11 @@ interface DestinationState {
 const authorities = new WeakMap<PortableRecordWriter, DestinationState>();
 const preflights = new WeakMap<PortablePreflight, {state:DestinationState; index:PortableIndex;manifestBytes:string}>();
 const completions = new WeakMap<PortableDestinationVerification,{state:DestinationState;manifest:PortableManifest;checkpoints:readonly string[]}>();
-const INITIAL = sha256('lcm-portable-initial-v1');
+/**
+ * prior_checkpoint_sha256 recorded on the first transfer_batches row of every
+ * domain. Exported so a verifier walks the same chain the copy wrote.
+ */
+export const PORTABLE_INITIAL_CHECKPOINT_SHA256 = sha256('lcm-portable-initial-v1');
 export const IDENTITY_DOMAINS = ['machines','project','project-aliases'] as const;
 /**
  * Digest recorded by migration 0008 for transfer_identities rows written
@@ -221,7 +225,7 @@ function enqueue<T>(state:DestinationState,fn:()=>Promise<T>):Promise<T>{
   return pending;
 }
 async function receipt(state:DestinationState,executor:PostgreSqlQueryExecutor,batch:PortableBatch,signal?:AbortSignal):Promise<PortableCheckpoint|undefined>{
-  const result=await executor.query<ReceiptRow>({text:'SELECT batch_sha256,CASE WHEN octet_length(checkpoint_bytes)<=1048576 THEN checkpoint_bytes END AS checkpoint_bytes,checkpoint_sha256 FROM lcm.transfer_batches WHERE run_id=$1 AND domain=$2 AND prior_checkpoint_sha256=$3',values:[state.input.runId,batch.domain,batch.priorCheckpointSha256??INITIAL]},options(state,signal));
+  const result=await executor.query<ReceiptRow>({text:'SELECT batch_sha256,CASE WHEN octet_length(checkpoint_bytes)<=1048576 THEN checkpoint_bytes END AS checkpoint_bytes,checkpoint_sha256 FROM lcm.transfer_batches WHERE run_id=$1 AND domain=$2 AND prior_checkpoint_sha256=$3',values:[state.input.runId,batch.domain,batch.priorCheckpointSha256??PORTABLE_INITIAL_CHECKPOINT_SHA256]},options(state,signal));
   const row=result.rows[0];if(!row)return undefined;
   if(row.batch_sha256!==batchDigest(batch)||row.checkpoint_sha256!==batch.checkpoint.checkpointSha256||!bytesEqual(row.checkpoint_bytes,serializePortableCheckpoint(batch.checkpoint))) fail('checkpoint-mismatch');
   return parsePortableCheckpoint(row.checkpoint_bytes);
@@ -400,7 +404,7 @@ export async function applyPortableBatchInTransaction(executor:PostgreSqlQueryEx
     await executor.query({text:'INSERT INTO lcm.transfer_identities (run_id,domain,identity_sha256,ordinal,native_key,record_sha256,content_sha256) VALUES ($1,$2,$3,$4,$5,$6,$7)',values:[state.input.runId,record.domain,record.identitySha256,String(record.ordinal),key,record.recordSha256,contentSha256]},options(state,signal));
   }
   const checkpointBytes=Buffer.from(serializePortableCheckpoint(batch.checkpoint));
-  await executor.query({text:'INSERT INTO lcm.transfer_batches (run_id,domain,prior_checkpoint_sha256,batch_sha256,checkpoint_bytes,checkpoint_sha256,first_ordinal,next_ordinal) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',values:[state.input.runId,batch.domain,batch.priorCheckpointSha256??INITIAL,batchDigest(batch),checkpointBytes,batch.checkpoint.checkpointSha256,String(prior?.nextOrdinal??0),String(batch.checkpoint.nextOrdinal)]},options(state,signal));
+  await executor.query({text:'INSERT INTO lcm.transfer_batches (run_id,domain,prior_checkpoint_sha256,batch_sha256,checkpoint_bytes,checkpoint_sha256,first_ordinal,next_ordinal) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',values:[state.input.runId,batch.domain,batch.priorCheckpointSha256??PORTABLE_INITIAL_CHECKPOINT_SHA256,batchDigest(batch),checkpointBytes,batch.checkpoint.checkpointSha256,String(prior?.nextOrdinal??0),String(batch.checkpoint.nextOrdinal)]},options(state,signal));
   const updated=await executor.query({text:'UPDATE lcm.transfer_runs SET current_domain=$2,checkpoint_bytes=$3,checkpoint_sha256=$4 WHERE run_id=$1 AND checkpoint_sha256 IS NOT DISTINCT FROM $5',values:[state.input.runId,batch.domain,checkpointBytes,batch.checkpoint.checkpointSha256,current?.checkpointSha256??null]},options(state,signal));
   if(updated.rowCount!==1)fail('checkpoint-mismatch');
   return batch.checkpoint;
