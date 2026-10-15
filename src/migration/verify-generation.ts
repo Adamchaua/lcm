@@ -998,8 +998,11 @@ interface LedgerBatchRow {
  * link, a non-zero start, an orphan or surplus row (including a second
  * chain that reaches the same terminal ordinal) leaves a row unwalked, and
  * a row set that loops back on itself never ends; all of them yield
- * undefined. Walking by prior (unique per domain in the schema) keeps the
- * result independent of row order.
+ * undefined. A zero-width row (next_ordinal equal to first_ordinal) is
+ * legal only as the terminal row of its domain, which the copy can write
+ * for an empty domain or to complete a nonempty one; a zero-width row with
+ * a successor yields undefined. Walking by prior (unique per domain in the
+ * schema) keeps the result independent of row order.
  */
 function readLedgerChainTerminal(rows: readonly LedgerBatchRow[]): LedgerBatchRow | undefined {
   const byPrior = new Map(rows.map((row) => [row.prior_checkpoint_sha256, row] as const));
@@ -1011,7 +1014,9 @@ function readLedgerChainTerminal(rows: readonly LedgerBatchRow[]): LedgerBatchRo
     walked.add(row);
     terminal = row;
     nextOrdinal = Number(row.next_ordinal);
-    row = byPrior.get(row.checkpoint_sha256);
+    const successor = byPrior.get(row.checkpoint_sha256);
+    if (successor !== undefined && nextOrdinal === Number(row.first_ordinal)) return undefined;
+    row = successor;
   }
   return row === undefined && walked.size === rows.length ? terminal : undefined;
 }

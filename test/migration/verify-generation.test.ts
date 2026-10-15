@@ -944,6 +944,45 @@ describe("readLedgerMismatches", () => {
         batchRow(middle, terminal.sourceCheckpointSha256, 1, terminalOrdinal),
       ])).toEqual([batchMismatch]);
     });
+    it("flags an initial zero-width batch that has a successor", async () => {
+      const zeroWidth = fakeHash("initial-zero-width");
+      expect(await read([
+        batchRow(PORTABLE_INITIAL_CHECKPOINT_SHA256, zeroWidth, 0, 0),
+        batchRow(zeroWidth, terminal.sourceCheckpointSha256, 0, terminalOrdinal),
+      ])).toEqual([batchMismatch]);
+    });
+    it("flags an intermediate zero-width batch that has a successor", async () => {
+      const zeroWidth = fakeHash("intermediate-zero-width");
+      expect(await read([
+        batchRow(PORTABLE_INITIAL_CHECKPOINT_SHA256, middle, 0, 1),
+        batchRow(middle, zeroWidth, 1, 1),
+        batchRow(zeroWidth, terminal.sourceCheckpointSha256, 1, terminalOrdinal),
+      ])).toEqual([batchMismatch]);
+    });
+    it("passes a terminal zero-width batch that completes a nonempty prefix", async () => {
+      expect(await read([
+        batchRow(PORTABLE_INITIAL_CHECKPOINT_SHA256, middle, 0, terminalOrdinal),
+        batchRow(middle, terminal.sourceCheckpointSha256, terminalOrdinal, terminalOrdinal),
+      ])).toEqual([]);
+    });
+    it("passes a single zero-width batch for an empty domain", async () => {
+      const [emptyDomain] = PORTABLE_RECORD_DOMAIN_ORDER;
+      const emptyTerminal = defaultLedgerCheckpoint(emptyDomain!);
+      expect(emptyTerminal.ordinal).toBe(0);
+      const rows = [
+        ...otherDomainRows().filter((row) => row.domain !== emptyDomain),
+        ...(emptyDomain === target ? [] : [{
+          domain: target, prior_checkpoint_sha256: PORTABLE_INITIAL_CHECKPOINT_SHA256,
+          checkpoint_sha256: terminal.sourceCheckpointSha256, first_ordinal: "0", next_ordinal: String(terminalOrdinal),
+        }]),
+        {
+          domain: emptyDomain!, prior_checkpoint_sha256: PORTABLE_INITIAL_CHECKPOINT_SHA256,
+          checkpoint_sha256: emptyTerminal.sourceCheckpointSha256, first_ordinal: "0", next_ordinal: "0",
+        },
+      ];
+      const session = fakeSession({ ledgerBatchRows: rows });
+      expect(await readLedgerMismatches(session as never, ledgerInput())).toEqual([]);
+    });
   });
   it("flags an identity cardinality mismatch against the census total", async () => {
     const session = fakeSession({ ledgerIdentityTotal: LEDGER_TOTAL_RECORD_COUNT_DEFAULT + 1 });

@@ -4,8 +4,10 @@ rationale: >-
   verification snapshot and validates each domain's complete transfer-batch
   chain instead of only its terminal row; the chain walk exports the copy's
   initial checkpoint constant from portable-destination.ts, and the
-  witness-audit ledger row text follows. All four files keep their owners;
-  portable-source.ts changes only a comment.
+  witness-audit ledger row text follows. The walk accepts a zero-width batch
+  only as the terminal row of its domain, the one place the copy can write
+  it. All four files keep their owners; portable-source.ts changes only a
+  comment.
 pins:
   - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
   - ["src/migration/witness-audit.ts", "unit-migration-cutover"]

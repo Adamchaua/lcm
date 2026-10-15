@@ -637,6 +637,10 @@ Verification refuses outright, before any report is written, when:
   (a stable configuration installed from a different revision, for
   example) -- checked once before the fenced window opens, and again
   from inside the window to catch a value that changes mid-pass;
+- the destination's transfer schema (ownership, grants and columns) no
+  longer matches what this build expects when verification re-checks it
+  inside the pinned read-only snapshot, for example because the schema
+  changed after the check made before the window opened;
 - the verification lease is already held by another worker
   (`lease-unavailable`).
 - a lease check finds that the verification lease was lost, which is either
@@ -652,7 +656,7 @@ and the reading disagreed with the source.
 Every mismatch names a domain, a closed class (`count`, `digest`, `identity`,
 `relation`, `sequence`, `schema`, `ledger`, `sample`) and an opaque identity
 digest -- never the differing values themselves, a diff, or a query string.
-Two classes are worth calling out because they exist specifically to catch
+Three classes are worth calling out because they exist specifically to catch
 failures that byte-for-byte content equality cannot see:
 
 - **`sequence`**: every PostgreSQL identity column backing a copied domain
@@ -663,6 +667,12 @@ failures that byte-for-byte content equality cannot see:
   activation, even though every canonical digest for that domain is
   identical to a correctly migrated destination -- this is why the check
   exists as its own class rather than folding into the census.
+- **`ledger`**: for each domain, the transfer batches recorded for the run
+  must form one contiguous chain that starts at the copy's initial
+  checkpoint and ordinal 0 and ends at the manifest's checkpoint and
+  ordinal. A missing link, a leftover or duplicate batch, or a second
+  chain is a ledger mismatch. An empty batch is accepted only as the last
+  batch of its domain.
 - **`sample`**: the step-5 public reads run two probes through the real
   production read paths, never a hand-written re-implementation of either.
   The ordered-listing probe runs `PostgreSqlConversationRepository`'s
