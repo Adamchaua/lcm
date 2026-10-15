@@ -569,3 +569,360 @@ held publication token, authority bytes, maintenance journal bytes and phase,
 and snapshot bytes all provably unchanged -- is an open question tracked in
 [issue #1369](https://github.com/donadiosolutions/lcm/issues/1369). It is not
 part of this API's current contract.
+
+## Migration verification and canonical reconciliation evidence
+
+A copied generation is not activation-eligible on its own. Verification reads
+the immutable source snapshot and the live PostgreSQL destination once more,
+independently of the copy worker's own evidence, and produces a durable,
+content-addressed report before any activation step may consider the
+generation. The report is bound to the exact source, destination, manifest,
+schema and project-map witnesses in play, plus the sealed queue-classification
+witness; changing any of those mints a different report identity rather than
+silently reusing an unrelated one.
+
+Publication requires two things together, not a clean report alone: every
+reconciliation class must have actually run, and no class may have produced a
+mismatch. The persisted report carries both facts directly, so this is
+provable from the artifact itself rather than assumed by a reader. Its
+`classCoverage` field records, for every defined reconciliation class,
+whether that class ran this pass; its `activationEligible` field is
+`true` only when every class ran, both public probes ran **and** the report
+is clean.
+
+"Ran" is earned, not declared. Each class and probe is marked as run only
+when the comparisons behind it returned during this pass (a completion
+receipt per comparison group), so a comparison that was never invoked leaves
+its class marked not run, the report is still written, and it is not
+activation-eligible. The receipts are plain identifiers and carry no time,
+duration or ordering, so the report stays deterministic. A report can
+therefore be clean -- zero recorded mismatches -- and still not be
+activation-eligible, because a class that never ran produces no mismatches
+for the same reason an unplugged smoke detector never sounds. Every reconciliation class this driver defines is now implemented
+(`relation` and `ledger` were the last two), so a genuinely clean report
+against a sound destination is activation-eligible. A refusal or a
+mismatch in any class -- including a `relation` edge-set disagreement or
+a `ledger` inconsistency -- still keeps `activationEligible` false, and
+that fact is recorded in the report rather than left to be assumed. Any mismatch in any class,
+including a `sample`-class mismatch from the public-listing probe, refuses
+eligibility outright -- a sample mismatch that were merely recorded without
+refusing would be exactly as decorative as a witness nobody compares.
+
+A report **with** mismatches is still persisted in full as operator
+evidence, but no effect is begun for it. Recovering from a report with
+mismatches means explicit `abort` followed by a new generation, the same
+pattern used throughout this journal for a phase that cannot be resumed in
+place: verification does not retry itself, patch the destination, or narrow
+the report to a smaller domain and try again. The mismatch evidence exists so
+an operator can diagnose what diverged before starting over, not so the same
+generation can be coerced into passing.
+
+### What a refusal means
+
+Verification refuses outright, before any report is written, when:
+
+- the destination's live migrations chain does not match the manifest's
+  sealed schema witness (`destination-drift`, migrations);
+- the destination's live five-field identity witness does not match the
+  manifest's recorded destination identity (`destination-drift`, identity) --
+  this is what catches a same-data verification run pointed at the wrong
+  database, such as a misconfigured connection string or a restored clone.
+  The caller's expected identity must agree with the manifest as well. The
+  PostgreSQL system identifier is not recorded by the copy, so it is compared
+  only against the value the caller supplies. Resuming an interrupted
+  verification also refuses a persisted report whose destination identity
+  differs from the manifest's;
+- the destination's search configuration is absent, malformed, or present
+  but does not match the digest this build's schema installer expects
+  (a stable configuration installed from a different revision, for
+  example) -- checked once before the fenced window opens, and again
+  from inside the window to catch a value that changes mid-pass;
+- the destination's transfer schema (ownership, grants and columns) no
+  longer matches what this build expects when verification re-checks it
+  inside the pinned read-only snapshot, for example because the schema
+  changed after the check made before the window opened;
+- the verification lease is already held by another worker
+  (`lease-unavailable`).
+- a lease check finds that the verification lease was lost, which is either
+  expired or taken over (`lease-lost`); see "Lease checks" below.
+
+A refusal writes nothing. It is not the same outcome as a persisted report
+with mismatches: a refusal means verification could not even take a coherent
+reading of the destination, while a report with mismatches means it could,
+and the reading disagreed with the source.
+
+### Reconciliation classes recorded in a mismatch
+
+Every mismatch names a domain, a closed class (`count`, `digest`, `identity`,
+`relation`, `sequence`, `schema`, `ledger`, `sample`) and an opaque identity
+digest -- never the differing values themselves, a diff, or a query string.
+Three classes are worth calling out because they exist specifically to catch
+failures that byte-for-byte content equality cannot see:
+
+- **`sequence`**: every PostgreSQL identity column backing a copied domain
+  (conversations, messages, recall surfacings, session instructions, passive
+  events) must have its sequence's `last_value` at or above the maximum
+  identity value actually present in that domain's copied rows. A sequence
+  that was reset or never advanced collides with the very next insert after
+  activation, even though every canonical digest for that domain is
+  identical to a correctly migrated destination -- this is why the check
+  exists as its own class rather than folding into the census.
+- **`ledger`**: for each domain, the transfer batches recorded for the run
+  must form one contiguous chain that starts at the copy's initial
+  checkpoint and ordinal 0 and ends at the manifest's checkpoint and
+  ordinal. A missing link, a leftover or duplicate batch, or a second
+  chain is a ledger mismatch. An empty batch is accepted only as the last
+  batch of its domain.
+- **`sample`**: the step-5 public reads run two probes through the real
+  production read paths, never a hand-written re-implementation of either.
+  The ordered-listing probe runs `PostgreSqlConversationRepository`'s
+  production read and compares the result against the source's own
+  canonical `(createdAt, identitySha256, title)` entries captured while
+  streaming the source. Entries are grouped by `createdAt` truncated to the
+  millisecond, and each group's `[identity, title]` pairs are compared as a
+  sorted multiset rather than positionally: the destination lists
+  same-millisecond ties by its own native row id, an independent key from
+  the source's tie-break, so a positional comparison would flag a correctly
+  copied project whenever those two tie-breaks happened to disagree. Each
+  destination row's identity is the conversation's portable identity,
+  derived by the same function the portable record uses from the
+  conversation's own columns, read with the same microsecond text
+  projection the portable export uses (a JavaScript date would drop the
+  sub-millisecond digits the identity is computed from). Identical
+  conversation headers are numbered `0` to `n-1`, which matches the source's
+  occurrence ordinals as a set. No transfer-ledger table is read. A
+  repository bug in filtering, ordering, row count or titles, a
+  substituted record, or two conversations that traded titles inside one
+  millisecond all change a group's pairs and show up here. The search self-match
+  probe runs `PostgreSqlLexicalSearchRepository.searchMessages` against
+  `lcm.search_v1`, walking a small, seeded pool of source message
+  candidates until one candidate's own content produces a non-empty
+  destination search result -- a message finding itself, never a
+  cross-engine comparison against the source's own search behaviour,
+  since SQLite and PostgreSQL tokenize differently and reproducing
+  PostgreSQL's tokenization in this driver would be exactly the kind of
+  second implementation this item has rejected elsewhere. If every
+  candidate in the pool exhausts without a match, the probe cannot tell
+  "search is broken" apart from "the sampled candidates happen not to
+  index to anything" and does not guess: it marks itself not-run with its
+  reason, and `activationEligible` cannot be true for that pass even
+  though nothing is recorded as a mismatch. On a real project with real
+  message content this does not trigger; it exists to catch a
+  `search_v1` configuration that is wrong in a way no digest comparison
+  can see.
+
+  The search self-match candidate pool draws from a fixed-size, early
+  slice of the source's canonical message order (the first
+  `MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE` messages), not the whole
+  domain: reading an arbitrary position deep in the domain would require
+  either a second full domain read or buffering the domain in memory,
+  both of which this item has avoided elsewhere for the same cost
+  reason. The seed drawn from `sampleParameters.seedBasisSha256`
+  chooses the starting index and wrap order within that fixed pool, so
+  the walk is still deterministic and reproducible from the recorded
+  candidate ordinal, but the probe only ever samples an early canonical
+  region of the domain rather than the whole domain. This is a real
+  limitation of what the probe's pass proves -- content anomalies
+  confined to messages outside the pool are not covered by this
+  particular probe -- even though it is the right trade for a liveness
+  check whose job is to catch `search_v1` configuration drift rather
+  than to sample the domain exhaustively.
+
+  The ordered-listing probe's own `ran` state (it completed) and the search
+  probe's own `ran` state (a correlated self-match was confirmed) are tracked
+  independently (`publicProbeCoverage`, one
+  entry per probe), never folded into a single `sample`-class coverage
+  bit: a genuine listing-ordering mismatch stays recorded as evidence
+  exactly when the listing probe ran, regardless of whether the search
+  probe could evaluate that pass, and a not-run search probe refuses
+  `activationEligible` on its own regardless of what the listing probe
+  found. Collapsing both probes' liveness into one bit meant a listing
+  mismatch found in the same pass as a not-run search probe had no
+  honest way to be recorded -- the report would either have to discard
+  real evidence of a listing-ordering bug, or claim `sample` fully ran
+  when only half of it did.
+
+### The public-probe sampling skew
+
+The ordered-listing probe always runs before the fenced census window opens,
+never inside it or after it: PostgreSQL's read surface has no read-only
+transaction mode, so a repository read (which is read-write by construction)
+cannot run inside the window at all. This means the probe describes an
+instant **at or before** the census, never after it. A write committed
+between the probe and the census can only make the probe look stale in the
+conservative direction -- optimistic, not pessimistic -- because the census
+itself is the authoritative, final read and is what publication actually
+gates on. The report binds a versioned ordering marker together with the
+probe's own digest specifically so this ordering fact travels with the
+report rather than depending on prose alone.
+
+### Mismatch evidence is truncated per (domain, class) pair, never the exact count
+
+A single mismatch class is capped at 100 retained entries in the persisted
+report, allocated fairly across every domain that class spans rather than
+consumed entirely by whichever domain sorts first: every domain with at
+least one mismatch in a class keeps at least one retained entry, and the
+remaining budget is distributed round-robin across those domains in frozen
+order. This exists so a badly diverged destination -- the case where
+operator evidence matters most -- still produces a persisted report instead
+of an in-process failure with no evidence at all, even when the failure
+spans more than one domain in the same class. Truncating per class alone,
+ignoring domain, could retain the full 100-entry budget from a single early
+domain and drop every entry from a later domain in the same class, while
+that later domain's **exact** total is still recorded separately -- and the
+report's own consistency check refuses to persist a total with zero
+retained entries, so a multi-domain failure produced neither a refused
+report nor evidence under that scheme. The exact total for each
+(domain, class) pair is always recorded separately from the retained
+entries and is never itself truncated; an operator reading a report with a
+truncated class sees both the retained example entries (at least one per
+affected domain) and the true total for every domain that class spans.
+
+### Verification cost scales with the rows in scope
+
+The in-window read -- the fenced census (which also collects `relation`-
+class dependency edges via a second `readDomainPage` walk over the same
+open destination source), the sequence self-consistency check, and the
+`ledger` class's three-table SQL against `transfer_runs`/`transfer_batches`/
+`transfer_identities` (including, as of round-4 P2, a per-domain identity-
+set digest reconciling exactly which identities the ledger recorded
+against what the destination's own read independently observed, and a
+matching digest over each identity's record digest) -- does
+not have a fixed cost. Its dominant cost is the census: the destination's
+canonicalisation path reads and re-hashes each row individually rather
+than in batches, and the `relation` class re-reads every row a second
+time through that same per-record path to collect dependency edges, so
+wall time is roughly linear in the number of rows in scope, not a flat
+per-domain overhead.
+
+The figure to size for is the whole in-window read (the read-only guard, the
+census with its relation pass, the sequence check and the ledger check), not
+the census alone. The census and relation passes dominate it because they read
+each row; the guard, sequence and ledger checks are server-side
+queries rather than per-row reads. The two probes that run before the
+fenced window opens (the public-listing repository read and the
+destination probe) are measured separately.
+
+The extra `relation`-class read pass is structural, not an oversight left
+for a later item. The only surface this driver is permitted to read
+per-domain dependency data from is `readDomainPage`, an existing read
+already approved for this driver, and that method necessarily re-reads
+each record through the same `checkedRecordAt`/`recordAt`/`readCanonicalRow`
+path the census itself uses during construction. There is no cheaper
+approved surface: the census aggregate accessor exposes only
+`{recordCount, prefixSha256, terminalIdentitySha256}` per domain, never
+per-record dependency data, and widening it would mean touching
+`portable-source.ts` beyond its two approved additive changes, which is
+outside this item's scope. Construction of the destination source already
+performs two full per-record reads before this driver's own code runs at
+all -- once to build the canonical index, once more to compute the
+terminal content digest -- so `relation`'s own contribution is one
+additional pass over data already read twice, not the sole source of read
+cost.
+
+This matters because the census, the sequence check, the `relation` and
+`ledger` reads, and the read-only guard all run inside one fenced window
+held by a single verification lease, and the lease has a caller-supplied
+`leaseTtlMs`. Verification does not renew a lease that is about to expire
+mid-window; if the window does not finish inside the lease term,
+verification fails rather than extending it, exactly like the rest of this
+journal's refuse-and-restart pattern rather than a retry loop. An operator
+sizing `leaseTtlMs` for a large project should measure the in-window read
+against a realistic copy of that project's own row counts before a
+cutover, not discover the lease was too short during one.
+
+#### Lease checks
+
+Verification checks that it still holds its lease twice: once right after
+the read-only census window closes, and once right before it writes the
+report (the preview, `inspectMigrationVerification`, makes only the first
+check, because it writes nothing). When either check finds the lease lost,
+verification refuses with `lease-lost` and writes no report. It releases
+the lease and closes its connections either way, and a failure while doing
+so never replaces the `lease-lost` refusal.
+
+These checks refuse a report that is known to be stale; they do not extend
+the lease and they do not guarantee it stays held. Verification never renews
+the lease, so the lease can still expire after the second check, during the
+local report write or while the manifest effect is begun and completed. Those
+steps run without a new lease guarantee. Size `leaseTtlMs` as described
+below so the window finishes well inside the term.
+
+#### Measuring the in-window cost
+
+Run the opt-in measurement from a checkout of this repository:
+
+```bash
+pnpm run test:postgresql:census-cost
+```
+
+The script builds the project and then runs only
+`test/postgresql/migration-verification-census-cost.integration.ts` through
+the PostgreSQL harness, against the harness's isolated PostgreSQL instance.
+The measurement is excluded from `pnpm run test:postgresql` and from CI, so
+it never runs unless you ask for it. It seeds a bulk fixture, runs the same
+in-window reads verification runs, and prints a Markdown report with the row
+count per domain, the wall time of each phase (marked as before or inside the
+lease window), a `window total` row for the in-window read, a `measured total`
+row that adds the two pre-window probes, and a `Proposed lease TTL` line. Set
+`LCM_MIGRATION_CENSUS_COST_EVIDENCE_DIR` to a directory to have the report
+written there as `census-cost.md` instead of printed.
+
+Timings depend on the host and PostgreSQL instance, so measure on hardware
+comparable to the cutover environment and repeat the measurement when that
+environment changes. The cost is round-trip dominated and linear in rows, so
+for a destination larger than the fixture, scale the measured in-window total
+by the ratio of row counts before applying the margin below.
+
+#### Sizing `leaseTtlMs`
+
+Set `leaseTtlMs` to at least the measured in-window total multiplied by 3.
+If the destination has more rows than the fixture, first scale that total by
+the ratio of row counts, then multiply by 3. The 3x factor is a safety margin
+for disk and network degradation; it is an assumption, not a second
+measurement. The lease covers the ordered listing probe, the search probe, the
+in-window reads and report persistence, which the margin is expected to
+absorb. The destination probe runs before the lease is acquired. The report's
+`Proposed lease TTL` line applies the same 3x factor to the measured total at
+the fixture's own scale, including both pre-window probes, so it is never
+smaller than this rule at that scale. Scale it by the row-count ratio too for
+a larger destination.
+
+### Verification memory use scales with the project
+
+Verification holds its working evidence in memory for the whole run. There
+is no streaming fallback: the run needs every set below at once, so memory
+use grows with the size of the project and is not capped by a setting.
+
+- **Destination.** For every domain, the set of record identities and the set
+  of dependency edges read from the destination, plus one record digest per
+  record. Identities and record digests are 64-character hex digests; an edge
+  key combines the child identity, the parent domain and the parent identity,
+  so it is a little over twice that length.
+- **Source.** For every domain, the set of dependency edges, plus one entry
+  per conversation (creation time, identity digest and title) used for the
+  public-listing comparison, plus a small fixed pool of message candidates
+  for the search probe.
+- **Public listing.** The complete result of the destination's conversation
+  listing, which the probe reads in one call, one header row per destination
+  conversation read to derive its identity, and the entries derived from them.
+
+Both sides are held concurrently, so peak memory is roughly proportional to
+the number of records plus dependency edges on the source and on the
+destination together, plus the number of conversations on both sides.
+Conversation titles are held in full.
+
+The source side is read before the verification lease is acquired. The
+public-listing read and the destination sets are built after the lease is
+held, so a project large enough to need a long lease also needs the memory
+for its destination sets during that lease. Size `leaseTtlMs` as described
+above, and treat memory as a separate requirement: a longer lease does not
+reduce it.
+
+For a very large project, make sure the host has free memory for the record,
+edge and conversation counts on both sides, and that the Node.js heap limit
+of the process that runs verification is raised accordingly (for example with
+`NODE_OPTIONS=--max-old-space-size=<megabytes>`). If the process runs out of
+memory, verification stops and no report is written; it never trims its
+evidence to fit. Verification restarts from the beginning, and a lease left
+behind by the stopped process expires after `leaseTtlMs`.
