@@ -626,7 +626,10 @@ Verification refuses outright, before any report is written, when:
 - the destination's live five-field identity witness does not match the
   manifest's recorded destination identity (`destination-drift`, identity) --
   this is what catches a same-data verification run pointed at the wrong
-  database, such as a misconfigured connection string or a restored clone;
+  database, such as a misconfigured connection string or a restored clone.
+  The caller's expected identity must agree with the manifest as well. The
+  PostgreSQL system identifier is not recorded by the copy, so it is compared
+  only against the value the caller supplies;
 - the destination's search configuration is absent, malformed, or present
   but does not match the digest this build's schema installer expects
   (a stable configuration installed from a different revision, for

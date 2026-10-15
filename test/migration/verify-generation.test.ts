@@ -2470,6 +2470,31 @@ describe("verifyMigrationGeneration: destination identity comparison", () => {
   });
 });
 
+describe("verifyMigrationGeneration: sealed manifest identity binding", () => {
+  it("refuses a destination whose live witness and caller input agree but differ from the manifest's destination identity", async () => {
+    // The live witness and expectedDestinationIdentitySha256 are both HASH_A,
+    // so only the manifest binding can refuse: a caller deriving its
+    // expectation from the connected database must not mint evidence for a
+    // destination other than the one the copy recorded.
+    const manifest = stubDestinationPrimitives();
+    const recordedManifest = manifest.current;
+    manifest.current = {
+      ...recordedManifest, destination: { ...recordedManifest.destination, identitySha256: "b".repeat(64) },
+    };
+    const copySource = fakeCopySource();
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    const persistSpy = vi.spyOn(MigrationVerificationReportStore.prototype, "persist");
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-manifest-identity-drift" }), dependencies,
+    )).rejects.toMatchObject({ reason: "destination-drift", message: expect.stringContaining("sealed manifest") });
+    expect(persistSpy).not.toHaveBeenCalled();
+    expect(runtime.openReadOnlySnapshot).not.toHaveBeenCalled();
+    expect(runtime.close).toHaveBeenCalledTimes(1);
+    expect(manifest.current.phase).toBe("copied");
+  });
+});
+
 describe("verifyMigrationGeneration: system-identifier comparison", () => {
   it("refuses a destination whose live pg_control_system() system identifier does not match the expected value", async () => {
     stubDestinationPrimitives();

@@ -131,15 +131,24 @@ export async function captureDestinationIdentity(
 
 /**
  * The pre-window identity comparisons, kept as one named comparator so the
- * identity receipt is recorded exactly when both have returned. Unlike the
- * schema witness (migrations-only per #623), the identity witness is
- * compared in full: a same-data wrong-database destination must refuse, not
- * publish a clean report bound to the wrong target.
+ * identity receipt is recorded exactly when all of them have returned.
+ * Unlike the schema witness (migrations-only per #623), the identity witness
+ * is compared in full: a same-data wrong-database destination must refuse,
+ * not publish a clean report bound to the wrong target.
+ *
+ * The live witness is bound to the sealed manifest first, so evidence cannot
+ * be minted for a destination other than the one the copy recorded, whatever
+ * the caller supplies; the caller's expected values are then compared as
+ * well. systemIdentifier is caller-bound only: the copy does not record it.
  */
 export function assertDestinationIdentityMatches(
   destinationIdentity: MigrationDestinationIdentity,
   expected: Readonly<{ expectedDestinationIdentitySha256: string; expectedSystemIdentifier: string }>,
+  manifestDestinationIdentitySha256: string,
 ): void {
+  if (destinationIdentity.sealedWitnessSha256 !== manifestDestinationIdentitySha256) {
+    driverError("destination-drift", "destination identity does not match the sealed manifest");
+  }
   if (destinationIdentity.sealedWitnessSha256 !== expected.expectedDestinationIdentitySha256) {
     driverError("destination-drift", "destination identity does not match the expected witness");
   }
@@ -1703,15 +1712,19 @@ export interface VerifyMigrationGenerationInput {
   readonly manifestChecksumSha256: string;
   readonly destinationMigrationsSha256: string;
   /**
-   * manifest.destination.identitySha256: the sealed five-field witness
-   * copy-time recorded for this destination. Compared in full against the
-   * re-derived destinationIdentity.sealedWitnessSha256 -- unlike the
-   * schema witness, which is migrations-only -- so a wrong-database or
-   * failover-since-copy destination refuses instead of publishing a clean
-   * report bound to the wrong destination.
+   * Must equal manifest.destination.identitySha256: the sealed five-field
+   * witness copy-time recorded for this destination. The driver compares the
+   * re-derived destinationIdentity.sealedWitnessSha256 against the manifest
+   * it reads and against this value -- unlike the schema witness, which is
+   * migrations-only -- so a wrong-database or failover-since-copy
+   * destination, or an input that disagrees with the manifest, refuses
+   * instead of publishing a clean report bound to the wrong destination.
    */
   readonly expectedDestinationIdentitySha256: string;
   /**
+   * Caller-bound: the copy does not record system_identifier, so the
+   * manifest cannot verify this value.
+   *
    * pg_control_system()'s system_identifier, recorded as a sibling of the
    * sealed five-field identity witness (per plan-v4 section 4) rather than
    * inside it. Comparing it live-to-live is what catches a destination
@@ -1869,7 +1882,16 @@ async function computeVerificationReport(
     if (destinationSchemaWitness.migrationsSha256 !== input.destinationMigrationsSha256) {
       driverError("destination-drift", "destination migrations chain does not match the expected witness");
     }
-    await receipted("identity", undefined, () => assertDestinationIdentityMatches(destinationIdentity, input));
+    // The manifest's own checkpoints, consumed directly rather than
+    // restated: reading a second, independently derived description of
+    // "what the copy phase finished at" would be exactly the parallel
+    // structure this design avoids elsewhere. A read, never a write: this
+    // function has no manifest-mutation capability at all. Read once, before
+    // the identity comparison, which binds the live destination to it.
+    const manifest = new MigrationManifestStore({ homeDir: input.homeDir }).read(input.generationId);
+    await receipted("identity", undefined, () => (
+      assertDestinationIdentityMatches(destinationIdentity, input, manifest.destination.identitySha256)
+    ));
 
     // Ledger operand, obtained rather than reimplemented: the same
     // canonicalisation identityFingerprintSha256 was written from by
@@ -1881,13 +1903,6 @@ async function computeVerificationReport(
       settings: input.destinationSettings, expectedOwner: input.expectedOwner,
       expectedIdentity: input.expectedIdentity, signal: input.signal,
     });
-    // The manifest's own checkpoints, consumed directly rather than
-    // restated: reading a second, independently derived description of
-    // "what the copy phase finished at" would be exactly the parallel
-    // structure this design avoids elsewhere. A read, never a write: this
-    // function has no manifest-mutation capability at all.
-    const manifest = new MigrationManifestStore({ homeDir: input.homeDir }).read(input.generationId);
-
     const coordinator = new PostgreSqlWorkCoordinator(runtime, input.expectedIdentity.id, input.expectedIdentity.machineId!);
     const resource = {
       resourceType: "migration-verification", resourceKey: input.generationId,

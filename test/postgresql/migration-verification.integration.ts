@@ -240,6 +240,10 @@ it("a real authenticated SQLite copy verifies eligible, with a genuine search se
         ]);
         destinationMigrationsSha256 = schemaWitness.migrationsSha256;
         expectedDestinationIdentitySha256 = identity.sealedWitnessSha256;
+        // The driver binds the live witness to the sealed manifest, so the
+        // value derived from the connected database must be the one the copy
+        // recorded.
+        expect(expectedDestinationIdentitySha256).toBe(manifest.destination.identitySha256);
         expectedSystemIdentifier = identity.systemIdentifier;
       } finally {
         await witnessRuntime.close();

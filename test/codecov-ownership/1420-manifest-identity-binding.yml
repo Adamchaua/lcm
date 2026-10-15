@@ -1,0 +1,9 @@
+references: ["PR #1420"]
+rationale: >-
+  PR #1420 review binds the live destination identity witness to the sealed
+  manifest's destination identity before the identity receipt is recorded,
+  and documents that systemIdentifier stays caller-bound; both files keep
+  their migration owner.
+pins:
+  - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/witness-audit.ts", "unit-migration-cutover"]
