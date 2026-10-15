@@ -406,9 +406,7 @@ describe("mocked server states unavailable from Node HTTP", () => {
         }),
       },
     };
-    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }), {
-      _assertBackendPublication: () => undefined,
-    });
+    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }));
     try {
       let status = 0;
       let body = "";
@@ -437,9 +435,7 @@ describe("mocked server states unavailable from Node HTTP", () => {
 
   it("rejects unhealthy storage admission without inventing an error payload", async () => {
     state.health = { status: "degraded", backend: "sqlite" };
-    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }), {
-      _assertBackendPublication: () => undefined,
-    });
+    const daemon = await createDaemon(loadDaemonConfig("/missing", { daemon: { port: 0, idleTimeoutMs: 0 } }));
     try {
       let status = 0;
       let body = "";
