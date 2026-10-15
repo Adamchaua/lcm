@@ -505,7 +505,6 @@ describe("daemon server", () => {
     }), {
       publicationConfigPath: configPath,
       _scanForTranscripts: scanForTranscripts,
-      _assertBackendPublication: () => undefined,
       _withBackendPublicationConsumerLockAsync: publicationLock as DaemonOptions["_withBackendPublicationConsumerLockAsync"],
     });
 
@@ -671,7 +670,6 @@ describe("daemon server", () => {
       await expect(createDaemon(loadDaemonConfig("/missing", {
         daemon: { port, idleTimeoutMs: 0 },
       }), {
-        _assertBackendPublication: () => undefined,
         _createStorageBackendFactory: async () => factory,
       })).rejects.toThrow();
       expect(close).toHaveBeenCalledOnce();
@@ -1453,7 +1451,6 @@ describe("daemon auth", () => {
       publicationConfigPath: configPath,
       tokenPath,
       _testIdentity: testIdentity,
-      _assertBackendPublication: () => undefined,
     });
 
     try {
@@ -1788,7 +1785,6 @@ describe("daemon auth", () => {
     const daemon = await createDaemon(config, {
       tokenPath,
       _testIdentity: testIdentity,
-      _assertBackendPublication: () => undefined,
     });
     const port = daemon.address().port;
     try {

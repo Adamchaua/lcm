@@ -1,38 +1,12 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { expect, it, vi } from "vitest";
-import {
-  BackendPublicationJournalError,
-  assertBackendPublicationConsumerAccess,
-  withBackendPublicationAppendBarrier,
-  withBackendPublicationAppendBarrierAsync,
-  type BackendPublicationLockToken,
-  type BackendPublicationDriver,
-} from "../../src/storage/backend-publication.js";
-import {
-  assertMigrationReplayAdmission,
-  prepareSqliteMigrationEnrollment,
-  authenticateSqliteMigrationSource,
-  authenticateSqliteMigrationSourceBytes,
-  captureAuthenticatedSqliteMigrationSource,
-  classifyImmutableSqliteSnapshot,
-  inspectImmutableSqliteSnapshot,
-  dryRunAuthenticatedSqliteMigrationSource,
-  type SqliteMigrationEnrollmentInput,
-} from "../../src/migration/maintenance.js";
-import { writeFileSync } from "node:fs";
-import * as identityApi from "../../src/machine-identity.js";
+import { captureAuthenticatedSqliteMigrationSource } from "../../src/migration/maintenance.js";
 import * as publicationApi from "../../src/storage/backend-publication.js";
-import * as identityService from "../../src/identity-service.js";
-import { type IdentityRepository } from "../../src/identity-service.js";
-import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
-import { closeLcmConnection } from "../../src/db/connection.js";
-import * as connectionApi from "../../src/db/connection.js";
-import { appendLocalHookEvents } from "../../src/hooks/local-enqueue.js";
-import { getMigrationReceiptEpoch } from "../../src/migration/receipts.js";
+import { projectMapPath } from "../../src/project-map.js";
 
-import { home, enrollmentFixture, populatedFixture, heldSource, REGISTERED_MACHINE } from "../fixtures/migration-copy.js";
+import { home, populatedFixture, heldSource, REGISTERED_MACHINE } from "../fixtures/migration-copy.js";
 import { openMigrationCopySource } from "../../src/migration/copy-source.js";
 import { PORTABLE_RECORD_DOMAIN_ORDER } from "../../src/storage/portable-record.js";
 import { inspectAuthenticatedSqliteMigrationSnapshot } from "../../src/migration/queue-evidence.js";
@@ -120,7 +94,6 @@ it('refuses arbitrary extra capture facts before source admission', async () => 
 import * as evidenceApi from '../../src/migration/queue-evidence.js';
 import * as sourceApi from '../../src/storage/sqlite/portable-source.js';
 import * as streamApi from '../../src/storage/portable-record-stream.js';
-import { readdirSync, symlinkSync, unlinkSync } from 'node:fs';
 async function captureFixture(){
  const fixture=await populatedFixture();const held=await heldSource(fixture);
  const snapshot=await captureAuthenticatedSqliteMigrationSource(held.authority,held.options);

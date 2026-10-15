@@ -1,0 +1,7 @@
+references: ["#1438"]
+rationale: >-
+  The publication coordinator now refuses to record guarded or released for a
+  publication with projects unless a complete remote guard provider exists, so
+  the file stays in the storage-abstractions owner.
+pins:
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]

@@ -81,12 +81,17 @@ capture across the database and sidecars. The snapshot workflow in #622 adds
 that guarantee; the transfer adapter does not create snapshots itself.
 
 During a SQLite capture's lifetime, ordinary reads recheck file identity and
-metadata and reuse the admitted digest while that metadata is unchanged. A
-same-size byte change with unchanged timestamps can therefore remain unseen by
-an intermediate raw read. Final transfer verification and source close force a
-full-file SHA-256 check: a capture that still differs from the admitted bytes
-cannot pass as a completed transfer. These checks do not replace the snapshot
-producer's responsibility to keep the source quiescent and its captures coherent.
+metadata. They reuse the admitted digest only while that metadata is unchanged
+and the capture's modification and change times are more than two seconds older
+than the read that authenticated it; a capture still inside that window is
+re-hashed on every read. Once a capture has settled, a change that leaves its
+size and both timestamps identical can remain unseen by an intermediate raw
+read. This happens if the timestamps are restored afterwards, the clock steps
+forward, or the file carries future timestamps. Final transfer verification and
+source close force a full-file SHA-256 check: a capture that still differs from
+the admitted bytes cannot pass as a completed transfer. These checks do not
+replace the snapshot producer's responsibility to keep the source quiescent and
+its captures coherent.
 
 The PostgreSQL source first admits verified TLS, PostgreSQL 18, schema,
 privileges and the existing machine/project/path binding. It then holds a
@@ -179,6 +184,9 @@ prefix and source boundaries, and applies batches in dependency order. Empty
 domains also receive durable terminal checkpoints. Progress is emitted only
 for an exact acknowledged checkpoint. The final result requires all domain
 counts and hashes to agree with SQL readback and the source to remain stable.
+A captured SQLite source applies the capture-cache rule described under
+"Source and destination ownership". It holds on filesystems with timestamp
+granularity of one second or finer.
 
 The package subpath exports both backend adapters, the record/manifest/checkpoint
 codecs, stream construction, transfer execution, constants, and their TypeScript

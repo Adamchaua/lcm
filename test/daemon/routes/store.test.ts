@@ -101,8 +101,10 @@ describe("POST /store", () => {
       const db = new DatabaseSync(projectDbPath(tempDir));
       db.exec("PRAGMA busy_timeout = 5000");
       try {
+        // created_at has one-second resolution, so both stores usually tie;
+        // rowid is the insertion order that the assertion below relies on.
         const rows = db.prepare(
-          "SELECT id, tags, confidence FROM promoted WHERE archived_at IS NULL ORDER BY created_at",
+          "SELECT id, tags, confidence FROM promoted WHERE archived_at IS NULL ORDER BY created_at, rowid",
         ).all() as Array<{ id: string; tags: string; confidence: number }>;
         expect(rows.map((row) => row.id)).toEqual([first.id, freshBody.id]);
         expect(JSON.parse(rows[0].tags)).toEqual(["decision", "ledger"]);

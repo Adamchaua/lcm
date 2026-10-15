@@ -12,6 +12,9 @@ export interface CapturedSqliteAuthority {
   check(signal?: AbortSignal, forceHash?: boolean): Promise<void>;
 }
 
+/** Timestamps this close to an authenticating read cannot prove the bytes unchanged. */
+const RACY_WINDOW_NS = 2_000_000_000n;
+
 function abort(signal?: AbortSignal): void {
   if (signal?.aborted) throw new PortableTransferError("aborted", true);
 }
@@ -23,6 +26,13 @@ function identity(stat: BigIntStats): string {
 }
 function version(stat: BigIntStats): string {
   return `${identity(stat)}:${stat.nlink}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+function readStartNs(): bigint {
+  return BigInt(Date.now()) * 1_000_000n;
+}
+function settled(stat: BigIntStats, readStart: bigint): boolean {
+  const limit = readStart - RACY_WINDOW_NS;
+  return stat.mtimeNs < limit && stat.ctimeNs < limit;
 }
 function hasEntry(path: string): boolean {
   try { lstatSync(path); return true; }
@@ -44,30 +54,45 @@ function inspect(path: string): { file: BigIntStats; parent: BigIntStats } {
 /**
  * Capture authentication is source-lifetime scoped. Every operation checks file
  * identity and nanosecond change timestamps; only admission, a metadata change,
- * and explicit final verification read the full file. Reads have bounded memory.
- * The caller revokes the source when any check fails.
+ * an unsettled version, and explicit final verification read the full file.
+ * Reads have bounded memory. The caller revokes the source when any check fails.
+ *
+ * A same-size write inside one filesystem timestamp tick leaves every observed
+ * metadata field unchanged, so an authenticated version is trusted without
+ * rehashing only when its mtime and ctime are both older than the wall-clock
+ * time at which the authenticating read began, minus a two-second window (the
+ * "racily clean" rule of Git's index). A version that is not yet settled is
+ * rehashed on every check; a matching rehash records a fresh read start, so
+ * passage of time alone never settles it. The guarantee holds for filesystems
+ * whose timestamp granularity is at most one second. A forward wall-clock step,
+ * or file timestamps in the future of the authentication clock, can make a
+ * still-racy timestamp look old enough to trust.
  */
 export function createCapturedSqliteAuthority(path: string, expectedSha256: string): CapturedSqliteAuthority {
   try {
     if (resolve(path) !== path || !/^[a-f0-9]{64}$/.test(expectedSha256)) changed();
     const initial = inspect(path);
-    let authenticatedVersion: string | undefined;
+    let authenticated: { version: string; settled: boolean } | undefined;
+    function cached(current: BigIntStats): boolean {
+      return authenticated?.settled === true && authenticated.version === version(current);
+    }
     function inspectCurrent(): BigIntStats {
       const current = inspect(path);
       if (identity(current.file) !== identity(initial.file)
         || identity(current.parent) !== identity(initial.parent)) changed();
       return current.file;
     }
-    function finish(before: BigIntStats, descriptor: BigIntStats, digest: string): void {
+    function finish(before: BigIntStats, descriptor: BigIntStats, digest: string, readStart: bigint): void {
       if (version(before) !== version(descriptor) || version(before) !== version(inspectCurrent())
         || digest !== expectedSha256) changed();
-      authenticatedVersion = version(before);
+      authenticated = { version: version(before), settled: settled(before, readStart) };
     }
     return {
       checkSync(forceHash = false): void {
         try {
           const before = inspectCurrent();
-          if (!forceHash && authenticatedVersion === version(before)) return;
+          if (!forceHash && cached(before)) return;
+          const readStart = readStartNs();
           const fd = openSync(path, "r");
           try {
             if (version(fstatSync(fd, { bigint: true })) !== version(before)) changed();
@@ -75,7 +100,7 @@ export function createCapturedSqliteAuthority(path: string, expectedSha256: stri
             const buffer = Buffer.alloc(64 * 1024);
             let count: number;
             while ((count = readSync(fd, buffer, 0, buffer.length, null)) > 0) hash.update(buffer.subarray(0, count));
-            finish(before, fstatSync(fd, { bigint: true }), hash.digest("hex"));
+            finish(before, fstatSync(fd, { bigint: true }), hash.digest("hex"), readStart);
           } finally { closeSync(fd); }
         } catch (error) { throw normalizePortableTransferError(error, "source-changed"); }
       },
@@ -83,7 +108,8 @@ export function createCapturedSqliteAuthority(path: string, expectedSha256: stri
         try {
           abort(signal);
           const before = inspectCurrent();
-          if (!forceHash && authenticatedVersion === version(before)) return;
+          if (!forceHash && cached(before)) return;
+          const readStart = readStartNs();
           const file = await open(path, "r");
           try {
             abort(signal);
@@ -99,7 +125,7 @@ export function createCapturedSqliteAuthority(path: string, expectedSha256: stri
             }
             const after = await file.stat({ bigint: true });
             abort(signal);
-            finish(before, after, hash.digest("hex"));
+            finish(before, after, hash.digest("hex"), readStart);
           } finally { await file.close(); }
         } catch (error) { throw normalizePortableTransferError(error, "source-changed"); }
       },
