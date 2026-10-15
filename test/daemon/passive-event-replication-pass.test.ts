@@ -128,7 +128,7 @@ const summary = {
 
 describe("passive-event replication pass", () => {
   it("documents the applied transition as the terminal remote outcome", async () => {
-    // #1398 tracks whether a real remote-side effect was ever intended.
+    // No remote-side effect is intended: the applied inbox row is terminal.
     await expect(applyReplicatedPassiveEvent()).resolves.toBeUndefined();
   });
 
