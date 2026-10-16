@@ -25,13 +25,14 @@
  * module doc comment below states that distinction precisely.
  */
 
-import { mkdirSync, mkdtempSync, chmodSync, statSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, chmodSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
 import * as fsModule from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../../src/db/migration.js";
+import { fixtureCanonicalDelta, fixtureCensusVector } from "../fixtures/migration-activation-records.js";
 import {
   openSqlitePortableSource,
   sqlitePortableFileSha256,
@@ -160,6 +161,39 @@ describe("buildRollbackGeneration", () => {
     await expect(buildRollbackGeneration({
       homeDir, generationId: "gen-dup", projectIdentity: identity, source,
     })).rejects.toMatchObject({ name: "RollbackGenerationError", reason: "generation-exists" });
+  });
+
+  it("records the export snapshot's evidence in the witness of both a verified and a quarantined build, and null when none is given", async () => {
+    const exportEvidence = { canonicalDelta: fixtureCanonicalDelta("export"), censusVector: fixtureCensusVector("export") };
+    const witnessOf = (homeDir: string, generationId: string) => JSON.parse(
+      readFileSync(join(rollbackGenerationPath(homeDir, generationId), "witness.json"), "utf8"),
+    ) as { exportEvidence: unknown };
+
+    const homeDir = tempHome();
+    const verified = await buildRollbackGeneration({
+      homeDir, generationId: "gen-evidence-ok", projectIdentity: identity,
+      source: await sqliteSourceStream(sqliteFixture()), exportEvidence,
+    });
+    expect(verified.state).toBe("verified");
+    expect(witnessOf(homeDir, "gen-evidence-ok").exportEvidence).toEqual(exportEvidence);
+
+    const real = await sqliteSourceStream(sqliteFixture());
+    const failing: PortableRecordStream = {
+      describe: () => real.describe(),
+      readBatch: () => { throw new Error("simulated source failure"); },
+      verify: (checkpoint) => real.verify(checkpoint),
+      close: () => real.close(),
+    };
+    const quarantined = await buildRollbackGeneration({
+      homeDir, generationId: "gen-evidence-bad", projectIdentity: identity, source: failing, exportEvidence,
+    });
+    expect(quarantined.state).toBe("quarantined");
+    expect(witnessOf(homeDir, "gen-evidence-bad").exportEvidence).toEqual(exportEvidence);
+
+    await buildRollbackGeneration({
+      homeDir, generationId: "gen-evidence-none", projectIdentity: identity, source: await sqliteSourceStream(sqliteFixture()),
+    });
+    expect(witnessOf(homeDir, "gen-evidence-none").exportEvidence).toBeNull();
   });
 
   it("quarantines rather than deletes when the transfer itself fails, and tightens the partial database file to 0400", async () => {

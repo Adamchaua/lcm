@@ -318,6 +318,13 @@ describe("evaluateRollbackEligibility: authoritative branch", () => {
       .toMatchObject({ eligibility: "refused" });
   });
 
+  it("refuses an authoritative decision whose readback carries no delta", () => {
+    expect(evaluate({ postEpochDelta: null, postEpochCensus: null })).toEqual({
+      eligibility: "refused",
+      reason: "an authoritative rollback needs a canonical delta from its readback",
+    });
+  });
+
   it("refuses on identity mismatch before the classifier is consulted", () => {
     // The census equals the epoch's, so a classifier that ran would grant pre-write.
     const decision = evaluate({

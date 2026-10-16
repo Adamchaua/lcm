@@ -79,7 +79,15 @@ import {
   type MigrationReportReference,
 } from "./protocol.js";
 import { MigrationManifestStore } from "./manifest-store.js";
-import type { MigrationCanonicalDelta, MigrationSelectionAuthority } from "./activation-witness.js";
+import {
+  migrationCanonicalDeltaChanged,
+  migrationCensusVectorsEqual,
+  type MigrationActivationAttempt,
+  type MigrationActivationEpoch,
+  type MigrationCanonicalDelta,
+  type MigrationCensusVector,
+  type MigrationSelectionAuthority,
+} from "./activation-witness.js";
 import {
   readMigrationActivationEvidence,
   resolveRollbackAuthoritativeContext,
@@ -572,9 +580,21 @@ export interface RollbackFencedSession {
   captureReadback(input: Readonly<{
     manifestDestinationWitnessSha256: string;
     canonicalDeltaBaseline: MigrationCanonicalDelta | null;
+    /**
+     * Capture the census even when the delta differs from the baseline.
+     * Step 10 of a post-write rollback sets this: it must reproduce the
+     * export snapshot's census exactly (plan-v3.1 amendment A6), which a
+     * changed delta alone cannot show. Omitted, the census is captured only
+     * when the delta equals the baseline.
+     */
+    requireCensus?: boolean;
   }>): Promise<RollbackEligibilityObservation>;
-  /** Opens the source #626 exports from for post-write generation build. */
-  openPortableSource(): Promise<PortableRecordStream>;
+  /**
+   * Opens the source #626 exports from for post-write generation build,
+   * together with the canonical delta and census vector of the very
+   * snapshot it reads (one derivation, plan-v3.1 amendments A6 and A11).
+   */
+  openPortableSource(): Promise<RollbackExportSource>;
   /**
    * EXTENSION added by this item's continuation (see the standalone doc
    * comment above ComputeRollbackTerminalEvidenceInput for why). Not part
@@ -584,8 +604,22 @@ export interface RollbackFencedSession {
   release(): Promise<void>;
 }
 
+/** The export stream and the evidence of the snapshot it reads. */
+export type RollbackExportSource = Readonly<{
+  stream: PortableRecordStream;
+  canonicalDelta: MigrationCanonicalDelta;
+  censusVector: MigrationCensusVector;
+}>;
+
 export type OpenRollbackFencedSession = (
-  input: Readonly<{ homeDir: string; manifest: MigrationManifest }>,
+  input: Readonly<{
+    homeDir: string;
+    manifest: MigrationManifest;
+    /** The retained append-barrier token of the rollback window (quiescence is asserted under it). */
+    lockToken: BackendPublicationLockToken;
+    scratchParent?: string;
+    signal?: AbortSignal;
+  }>,
 ) => Promise<RollbackFencedSession>;
 
 // ---------------------------------------------------------------------------
@@ -725,8 +759,9 @@ export type MigrationWitnessBindingRecorder = (
 // ---------------------------------------------------------------------------
 
 export type ComputeRollbackTerminalEvidenceInput = Readonly<{
-  epochId: string | null;
-  attemptId: string | null;
+  /** The activation records the rollback unwinds; null for an unactivated rollback. */
+  epoch: MigrationActivationEpoch | null;
+  attempt: MigrationActivationAttempt | null;
   observation: RollbackEligibilityObservation;
   mode: "pre-write" | "post-write";
 }>;
@@ -1103,7 +1138,10 @@ export async function runMigrationRollback(
       }, token);
 
     // Step 3: acquire the fenced PostgreSQL session (Boundary F).
-    const session = await deps.openFencedSession({ homeDir: input.homeDir, manifest: working });
+    const session = await deps.openFencedSession({
+      homeDir: input.homeDir, manifest: working, lockToken: token,
+      scratchParent: input.scratchParent, signal: input.signal,
+    });
     try {
       // Step 4: authoritative readback in the dedicated snapshot.
       const observation = await session.captureReadback({
@@ -1281,6 +1319,25 @@ function highestRollbackGenerationBuildAttempt(
 }
 
 /**
+ * Why the fresh step-10 snapshot does not reproduce the export snapshot's
+ * evidence, or null when it does. Only reached for a post-write rollback,
+ * whose step 10 always captures the census; evaluateRollbackEligibility
+ * has already refused an authoritative observation without a delta.
+ */
+function describeExportDrift(
+  exported: Pick<RollbackExportSource, "canonicalDelta" | "censusVector">,
+  revalidated: RollbackEligibilityObservation,
+): string | null {
+  if (migrationCanonicalDeltaChanged(exported.canonicalDelta, revalidated.postEpochDelta!)) {
+    return "the destination changed between the export snapshot and revalidation (canonical delta differs)";
+  }
+  if (revalidated.postEpochCensus === null || !migrationCensusVectorsEqual(exported.censusVector, revalidated.postEpochCensus)) {
+    return "the destination changed between the export snapshot and revalidation (census differs)";
+  }
+  return null;
+}
+
+/**
  * Steps 9-12, shared by the fresh path (called from runMigrationRollback
  * right after step 8 completes, inside the same retained token and the
  * same fenced session opened at step 3) and the resumed path (called from
@@ -1327,8 +1384,20 @@ async function runPostPrepareSequence(
   // sidecars already sit beside the live database are untouched by this
   // rollback, exactly like the database itself.
   let built: Extract<RollbackGenerationOutcome, Readonly<{ state: "verified" }>> | null = null;
+  // Plan-v3.1 amendment A6. The census and canonical delta of the export
+  // snapshot the generation is built from; step 10's fresh snapshot must
+  // reproduce both exactly. Kept in the build record (the generation's
+  // witness.json) rather than the rollback authority artifact: that
+  // artifact is written once per generationId before maintenance is
+  // entered, long before any export snapshot exists, while a build record
+  // is per attempt and written atomically with the build it describes. A
+  // crash between steps 9 and 10 resumes with a fresh build from a fresh
+  // snapshot, so the comparison never needs to cross a process boundary.
+  let exportEvidence: Pick<RollbackExportSource, "canonicalDelta" | "censusVector"> | null = null;
   if (mode === "post-write") {
-    const source = await session.openPortableSource();
+    const exported = await session.openPortableSource();
+    const source = exported.stream;
+    exportEvidence = { canonicalDelta: exported.canonicalDelta, censusVector: exported.censusVector };
     // The build target must be a FRESH physical generation per attempt,
     // never reused: plan-v2 section 4's "Resumability, stated honestly"
     // requires "crash recovery creates a new generation under the
@@ -1360,6 +1429,7 @@ async function runPostPrepareSequence(
       generationId: input.generationId + "-rb" + working.revision + "-" + buildAttemptOrdinal,
       projectIdentity: input.projectIdentity,
       source,
+      exportEvidence,
       scratchParent: input.scratchParent,
       signal: input.signal,
     });
@@ -1377,6 +1447,7 @@ async function runPostPrepareSequence(
   const revalidated = await session.captureReadback({
     manifestDestinationWitnessSha256: working.destination.identitySha256,
     canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
+    requireCensus: mode === "post-write",
   });
   const revalidatedDecision = evaluateRollbackEligibility({
     authority,
@@ -1397,11 +1468,20 @@ async function runPostPrepareSequence(
     );
   }
 
+  // A6: a write that landed between the export snapshot and this one can
+  // leave the mode at post-write while changing what was exported. Compare
+  // the two snapshots' evidence directly rather than inferring from the
+  // mode; refuse before anything is installed or selected.
+  if (exportEvidence !== null) {
+    const drift = describeExportDrift(exportEvidence, revalidated);
+    if (drift !== null) throw new RollbackOrchestrationError("not-eligible", drift);
+  }
+
   const epochId = authority.status === "authoritative" ? authority.selection.epochId : null;
   const attemptId = authority.status === "authoritative" ? authority.selection.attemptId : null;
   const terminalEvidenceSha256 = session.computeRollbackTerminalEvidenceSha256({
-    epochId,
-    attemptId,
+    epoch: authoritativeContext?.epoch ?? null,
+    attempt: authoritativeContext?.attempt ?? null,
     observation: revalidated,
     mode: revalidatedDecision.mode,
   });
@@ -1633,7 +1713,10 @@ async function continueAfterPrepareRollback(
     // the coordinator's token branch (coordinator-seam-FROZEN.md section 3:
     // "a consumer-lock token is accepted... does NOT require
     // activeAppendBarrierTokens membership [pre-dating this call]").
-    const session = await deps.openFencedSession({ homeDir: input.homeDir, manifest: current });
+    const session = await deps.openFencedSession({
+      homeDir: input.homeDir, manifest: current, lockToken: token,
+      scratchParent: input.scratchParent, signal: input.signal,
+    });
     try {
       const observation = await session.captureReadback({
         manifestDestinationWitnessSha256: current.destination.identitySha256,

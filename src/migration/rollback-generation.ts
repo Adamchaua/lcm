@@ -87,6 +87,7 @@ import {
   normalizePortableTransferError,
   type PortableTransferProgress,
 } from "../storage/portable-transfer.js";
+import type { MigrationCanonicalDelta, MigrationCensusVector } from "./activation-witness.js";
 import { openSqlitePortableDestination } from "../storage/sqlite/portable-destination.js";
 import { openSqlitePortableSource, sqlitePortableFileSha256 } from "../storage/sqlite/portable-source.js";
 
@@ -135,6 +136,11 @@ function rollbackGenerationWitnessPath(homeDir: string, generationId: string): s
 
 type ManifestDomainDigest = Readonly<{ domain: string; recordCount: number; prefixSha256: string }>;
 
+export type RollbackGenerationExportEvidence = Readonly<{
+  canonicalDelta: MigrationCanonicalDelta;
+  censusVector: MigrationCensusVector;
+}>;
+
 export type RollbackGenerationWitness = Readonly<{
   version: 1;
   generationId: string;
@@ -144,6 +150,7 @@ export type RollbackGenerationWitness = Readonly<{
   recordCount: number | null;
   domains: readonly ManifestDomainDigest[] | null;
   reason: string | null;
+  exportEvidence: RollbackGenerationExportEvidence | null;
   checksumSha256: string;
 }>;
 
@@ -175,6 +182,14 @@ export interface BuildRollbackGenerationInput {
   readonly projectIdentity: PortableProjectIdentity;
   /** Caller-opened, caller-fenced source (e.g. the leased PostgreSQL snapshot). This function closes it via runPortableTransfer's own cleanup. */
   readonly source: PortableRecordStream;
+  /**
+   * The canonical delta and census vector of the snapshot `source` reads,
+   * derived once with the verification driver's own builders. Recorded in
+   * the build's witness so a later reader can compare it with any other
+   * snapshot (plan-v3.1 amendment A6). Absent for a source that is not a
+   * fenced PostgreSQL snapshot.
+   */
+  readonly exportEvidence?: RollbackGenerationExportEvidence;
   readonly scratchParent?: string;
   readonly signal?: AbortSignal;
   readonly onProgress?: (progress: PortableTransferProgress) => void;
@@ -209,6 +224,7 @@ function quarantine(
   databasePath: string,
   manifestSha256: string,
   reason: string,
+  exportEvidence: RollbackGenerationExportEvidence | null,
 ): RollbackGenerationOutcome {
   try { if (existsSync(databasePath)) chmodSync(databasePath, 0o400); } catch { /* best-effort; never block quarantine on this */ }
   const witness = writeWitness(homeDir, generationId, {
@@ -220,6 +236,7 @@ function quarantine(
     recordCount: null,
     domains: null,
     reason,
+    exportEvidence,
   });
   return { state: "quarantined", generationId, databasePath, reason, witness };
 }
@@ -298,6 +315,7 @@ export async function buildRollbackGeneration(
   input: BuildRollbackGenerationInput,
 ): Promise<RollbackGenerationOutcome> {
   assertGenerationId(input.generationId);
+  const exportEvidence = input.exportEvidence ?? null;
   const generationDir = rollbackGenerationPath(input.homeDir, input.generationId);
   const databasePath = rollbackGenerationDatabasePath(input.homeDir, input.generationId);
   const manifestPath = rollbackGenerationManifestPath(input.homeDir, input.generationId);
@@ -340,7 +358,7 @@ export async function buildRollbackGeneration(
     });
   } catch (error) {
     const normalized = normalizePortableTransferError(error);
-    return quarantine(input.homeDir, input.generationId, databasePath, sourceManifest.manifestSha256, "transfer:" + normalized.code);
+    return quarantine(input.homeDir, input.generationId, databasePath, sourceManifest.manifestSha256, "transfer:" + normalized.code, exportEvidence);
   }
 
   await input._afterTransferForTesting?.();
@@ -358,10 +376,10 @@ export async function buildRollbackGeneration(
     });
     readBackManifest = parsePortableManifest(Buffer.from(bytes.content, "utf8"));
   } catch (error) {
-    return quarantine(input.homeDir, input.generationId, databasePath, sourceManifest.manifestSha256, "independent-verification:manifest-readback-failed");
+    return quarantine(input.homeDir, input.generationId, databasePath, sourceManifest.manifestSha256, "independent-verification:manifest-readback-failed", exportEvidence);
   }
   if (readBackManifest.manifestSha256 !== transferResult.manifestSha256) {
-    return quarantine(input.homeDir, input.generationId, databasePath, sourceManifest.manifestSha256, "independent-verification:manifest-sha-mismatch");
+    return quarantine(input.homeDir, input.generationId, databasePath, sourceManifest.manifestSha256, "independent-verification:manifest-sha-mismatch", exportEvidence);
   }
 
   let freshManifest: PortableManifest;
@@ -374,10 +392,10 @@ export async function buildRollbackGeneration(
       input.signal,
     );
   } catch (error) {
-    return quarantine(input.homeDir, input.generationId, databasePath, sourceManifest.manifestSha256, "independent-verification:readback-failed");
+    return quarantine(input.homeDir, input.generationId, databasePath, sourceManifest.manifestSha256, "independent-verification:readback-failed", exportEvidence);
   }
   if (!manifestsAgree(readBackManifest, freshManifest)) {
-    return quarantine(input.homeDir, input.generationId, databasePath, sourceManifest.manifestSha256, "independent-verification:content-mismatch");
+    return quarantine(input.homeDir, input.generationId, databasePath, sourceManifest.manifestSha256, "independent-verification:content-mismatch", exportEvidence);
   }
 
   const witness = writeWitness(input.homeDir, input.generationId, {
@@ -389,6 +407,7 @@ export async function buildRollbackGeneration(
     recordCount: transferResult.recordCount,
     domains: domainDigests(freshManifest),
     reason: null,
+    exportEvidence,
   });
 
   return {

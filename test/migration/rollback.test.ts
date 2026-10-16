@@ -336,8 +336,16 @@ function fakeSession(input: Readonly<{
     postEpochCensus: ReturnType<typeof fixtureCensusVector> | null;
   }>[];
   source: () => Promise<PortableRecordStream>;
+  /** What the export snapshot reports; defaults to the first observation's delta and a fixed census. */
+  exportEvidence?: Readonly<{ canonicalDelta: ReturnType<typeof fixtureCanonicalDelta>; censusVector: ReturnType<typeof fixtureCensusVector> }>;
+  /** The census a requireCensus readback reports; defaults to the export census. */
+  requiredCensus?: ReturnType<typeof fixtureCensusVector>;
 }>): RollbackFencedSession {
   let call = 0;
+  const exportEvidence = input.exportEvidence ?? {
+    canonicalDelta: input.observations[0]!.postEpochDelta,
+    censusVector: fixtureCensusVector("fake-export-census"),
+  };
   return {
     selectionAuthority: {
       version: 1,
@@ -348,18 +356,22 @@ function fakeSession(input: Readonly<{
     },
     quiescenceFenceEvidenceSha256: "q".repeat(64),
     async renew(): Promise<void> {},
-    async captureReadback() {
+    async captureReadback(request) {
       const observed = input.observations[Math.min(call, input.observations.length - 1)]!;
       call += 1;
+      const census = observed.postEpochCensus
+        ?? (request.requireCensus === true ? (input.requiredCensus ?? exportEvidence.censusVector) : null);
       return {
-        observedPortableRecordSchemaSha256: observed.postEpochCensus === null ? "irrelevant" : PORTABLE_RECORD_SCHEMA_SHA256,
+        observedPortableRecordSchemaSha256: census === null ? "irrelevant" : PORTABLE_RECORD_SCHEMA_SHA256,
         destinationIdentity: observed.destinationIdentity,
         postEpochDelta: observed.postEpochDelta,
-        postEpochCensus: observed.postEpochCensus,
+        postEpochCensus: census,
         manifestDestinationWitnessSha256: observed.manifestDestinationWitnessSha256,
       };
     },
-    openPortableSource: input.source,
+    async openPortableSource() {
+      return { stream: await input.source(), ...exportEvidence };
+    },
     async release(): Promise<void> {},
     computeRollbackTerminalEvidenceSha256(evidence): string {
       return canonicalSha256(["test-terminal-evidence-v1", evidence]);
@@ -2008,6 +2020,122 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
         openFencedSession: async () => fakeSession({ observations: [postWrite], source: failing }),
       })).rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("was quarantined") });
       expect(existsSync(join(homeDir, "live.sqlite"))).toBe(false);
+    });
+
+
+    describe("build-to-revalidation equality (plan-v3.1 A6)", () => {
+      const refuseDeps = (homeDir: string, generationId: string, session: RollbackFencedSession, recorded: unknown[]) => ({
+        coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor(generationId)),
+        recordSelectionBinding: (call: { binding: unknown }) => { recorded.push(call.binding); },
+        recordWitnessBinding: (call: { binding: unknown }) => { recorded.push(call.binding); },
+        openFencedSession: async () => session,
+      });
+      const expectNothingInstalledOrSelected = (homeDir: string, recorded: unknown[]) => {
+        expect(existsSync(join(homeDir, "live.sqlite"))).toBe(false);
+        expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+        expect(recorded).toEqual([]);
+      };
+
+      it("refuses an unfenced write between build and revalidation that leaves the mode at post-write, installing and selecting nothing", async () => {
+        const homeDir = tempHome();
+        manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a6-delta");
+        const recorded: unknown[] = [];
+        // Step 4 and the export snapshot see one delta; step 10 sees another that is still not the baseline.
+        const session = fakeSession({
+          observations: [postWrite, { ...postWrite, postEpochDelta: fixtureCanonicalDelta("paths-changed-again") }],
+          source: sqliteSourceStream,
+          exportEvidence: { canonicalDelta: postWrite.postEpochDelta, censusVector: census },
+        });
+        await expect(runMigrationRollback(RUN(homeDir, "gen-a6-delta"), refuseDeps(homeDir, "gen-a6-delta", session, recorded)))
+          .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("canonical delta differs") });
+        expectNothingInstalledOrSelected(homeDir, recorded);
+      });
+
+      it("refuses a census that differs from the export snapshot's even when the delta is identical", async () => {
+        const homeDir = tempHome();
+        manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a6-census");
+        const recorded: unknown[] = [];
+        const session = fakeSession({
+          observations: [postWrite], source: sqliteSourceStream,
+          exportEvidence: { canonicalDelta: postWrite.postEpochDelta, censusVector: census },
+          requiredCensus: fixtureCensusVector("a-different-census"),
+        });
+        await expect(runMigrationRollback(RUN(homeDir, "gen-a6-census"), refuseDeps(homeDir, "gen-a6-census", session, recorded)))
+          .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("census differs") });
+        expectNothingInstalledOrSelected(homeDir, recorded);
+      });
+
+      it("refuses when the revalidation snapshot did not capture a census at all", async () => {
+        const homeDir = tempHome();
+        manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a6-missing");
+        const recorded: unknown[] = [];
+        const session = fakeSession({
+          observations: [postWrite], source: sqliteSourceStream,
+          exportEvidence: { canonicalDelta: postWrite.postEpochDelta, censusVector: census },
+        });
+        const real = session.captureReadback.bind(session);
+        let calls = 0;
+        session.captureReadback = async (request) => {
+          calls += 1;
+          const observation = await real(request);
+          return calls === 1 ? observation : { ...observation, postEpochCensus: null };
+        };
+        await expect(runMigrationRollback(RUN(homeDir, "gen-a6-missing"), refuseDeps(homeDir, "gen-a6-missing", session, recorded)))
+          .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("census differs") });
+        expectNothingInstalledOrSelected(homeDir, recorded);
+      });
+
+      it("control: the same run completes when revalidation reproduces the export snapshot's delta and census", async () => {
+        const homeDir = tempHome();
+        manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a6-control");
+        const recorded: unknown[] = [];
+        const session = fakeSession({
+          observations: [postWrite], source: sqliteSourceStream,
+          exportEvidence: { canonicalDelta: postWrite.postEpochDelta, censusVector: census },
+          requiredCensus: census,
+        });
+        const outcome = await runMigrationRollback(RUN(homeDir, "gen-a6-control"), refuseDeps(homeDir, "gen-a6-control", session, recorded));
+        expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+        expect(recorded).toHaveLength(2);
+      });
+
+      it("asks step 10 for the census only on a post-write rollback, and records the export evidence in the build's witness", async () => {
+        const homeDir = tempHome();
+        manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a6-plumbing");
+        const requests: Array<{ requireCensus?: boolean }> = [];
+        const session = fakeSession({ observations: [postWrite], source: sqliteSourceStream });
+        const real = session.captureReadback.bind(session);
+        session.captureReadback = async (request) => { requests.push(request); return real(request); };
+        const outcome = await runMigrationRollback(RUN(homeDir, "gen-a6-plumbing"), {
+          coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor("gen-a6-plumbing")),
+          recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+          openFencedSession: async () => session,
+        });
+        expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+        expect(requests.map((request) => request.requireCensus)).toEqual([undefined, true]);
+        const buildRoot = join(homeDir, ".lcm", "migration-rollback-generations");
+        const built = readdirSync(buildRoot).find((name) => name.startsWith("gen-a6-plumbing-rb"))!;
+        const witness = JSON.parse(readFileSync(join(buildRoot, built, "witness.json"), "utf8")) as {
+          exportEvidence: { canonicalDelta: unknown; censusVector: unknown } | null;
+        };
+        expect(witness.exportEvidence).toEqual({
+          canonicalDelta: postWrite.postEpochDelta,
+          censusVector: fixtureCensusVector("fake-export-census"),
+        });
+
+        const preHome = tempHome();
+        manifestAtVerified(new MigrationManifestStore({ homeDir: preHome }), "gen-a6-pre");
+        const preRequests: Array<{ requireCensus?: boolean }> = [];
+        const preSession = fakeSession({ observations: [unchanged], source: sqliteSourceStream });
+        const preReal = preSession.captureReadback.bind(preSession);
+        preSession.captureReadback = async (request) => { preRequests.push(request); return preReal(request); };
+        await runMigrationRollback(RUN(preHome, "gen-a6-pre"), {
+          coordinator: coordinatorFor(preHome), ...authoritativeDeps(scenarioFor("gen-a6-pre")),
+          recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+          openFencedSession: async () => preSession,
+        });
+        expect(preRequests.map((request) => request.requireCensus)).toEqual([undefined, false]);
+      });
     });
 
     it("counts only this generation and revision's well-formed attempt directories, and refuses an oversized build root", async () => {

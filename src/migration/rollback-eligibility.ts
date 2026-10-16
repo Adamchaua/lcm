@@ -282,8 +282,12 @@ export type RollbackEligibilityObservation = Readonly<{
   observedPortableRecordSchemaSha256: string;
   /** Fresh destination identity read in the same dedicated snapshot. */
   destinationIdentity: MigrationDestinationIdentity;
-  /** Fresh canonical delta read in the same dedicated snapshot. */
-  postEpochDelta: MigrationCanonicalDelta;
+  /**
+   * Fresh canonical delta read in the same dedicated snapshot. Null only for
+   * the unactivated readback, which captures identity alone; an authoritative
+   * decision refuses without one.
+   */
+  postEpochDelta: MigrationCanonicalDelta | null;
   /** Fresh census, present only when the delta was found equal to the baseline. */
   postEpochCensus: MigrationCensusVector | null;
   /**
@@ -335,6 +339,10 @@ export function evaluateRollbackEligibility(input: Readonly<{
       eligibility: "refused",
       reason: "authoritative attempt resolved but its epoch/attempt record was not supplied",
     };
+  }
+
+  if (observation.postEpochDelta === null) {
+    return { eligibility: "refused", reason: "an authoritative rollback needs a canonical delta from its readback" };
   }
 
   // Identity gate first and separately, refusing before any durable change
