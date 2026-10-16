@@ -13,9 +13,11 @@ import { readBoundedRegularFile } from "../security-files.js";
  *
  * The answer here is deliberately three-valued rather than boolean:
  *
- * - `satisfied`: authoritative absence. Either no pid file names a daemon,
- *   a named pid is not a running process, or a running daemon's own startup
- *   backend already matches the selection. There is nothing to restart.
+ * - `satisfied`: authoritative absence. Either no pid file names a daemon
+ *   AND nothing answers the daemon port, a named pid is not a running
+ *   process AND nothing answers the daemon port, or a running daemon's own
+ *   startup backend already matches the selection. There is nothing to
+ *   restart.
  * - `unsatisfied`: a running daemon's startup backend is stale against the
  *   completed selection. It will refuse local outbox requests until it is
  *   restarted.
@@ -35,6 +37,19 @@ import { readBoundedRegularFile } from "../security-files.js";
  * -- the daemon may be alive under a pid this verifier failed to obtain --
  * so both are `unresolvable`, never `satisfied`.
  *
+ * Absence of a pid file is likewise not absence of a daemon (plan-v7.1 R1).
+ * A daemon can be live before its pid file is written, or after the file
+ * was removed, so on ENOENT (and on a pid file naming a dead process) the
+ * verifier makes its own independent observation: it probes the configured
+ * daemon port. A refused connection is the positive absence that licenses
+ * `satisfied`. A daemon that answers is evaluated on its reported backend:
+ * a stale backend is `unsatisfied` / `backend-stale` exactly as on the
+ * pid-file path; a matching backend is `unresolvable` /
+ * `live-daemon-without-pid-file` and never `satisfied`, because a daemon
+ * no pid file accounts for cannot be attributed, and a live daemon on a pid
+ * other than the one a stale file names is the same situation. A timeout or
+ * any other answer is `unresolvable` / `health-unreachable`.
+ *
  * Collapsing `unresolvable` into either neighbour would either block a
  * correct cutover forever (folded into `unsatisfied`) or let a genuinely
  * stale daemon pass silently (folded into `satisfied`). Callers that need
@@ -53,6 +68,10 @@ export type ActivationRestartCheckReason =
    * (permission denied, a symlink refused by the no-follow reader, I/O
    * error); the daemon's pid could not be obtained. */
   | "pid-file-unreadable"
+  /** No pid file (or a pid file naming a dead process), yet a daemon whose
+   * backend matches the selection answered the daemon port: it cannot be
+   * attributed, so the cutover is not proven safe. */
+  | "live-daemon-without-pid-file"
   | "stale-pid-file"
   | "backend-matches"
   | "backend-stale"
@@ -169,8 +188,15 @@ function defaultIsProcessAlive(
 
 type HealthProbe =
   | Readonly<{ kind: "observed"; backend: StorageBackend }>
+  /** The connection was positively refused: nothing listens on the port. */
+  | Readonly<{ kind: "refused"; detail: string }>
   | Readonly<{ kind: "unreachable"; detail: string }>
   | Readonly<{ kind: "pid-mismatch"; detail: string }>;
+
+function isConnectionRefused(error: unknown): boolean {
+  const cause = (error as { cause?: unknown } | undefined)?.cause;
+  return (cause as NodeJS.ErrnoException | undefined)?.code === "ECONNREFUSED";
+}
 
 /**
  * Probe `/health` unauthenticated. The daemon reports its own startup
@@ -183,11 +209,16 @@ type HealthProbe =
  * The body must also report the pid named by the pid file: `/health` sends
  * `pid: process.pid` on every response, so a missing, non-numeric or
  * different pid means the listener on this port is not the daemon the pid
- * file names, and its backend is not accepted.
+ * file names, and its backend is not accepted. When no pid file names a
+ * daemon (expectedPid null), any reported pid is accepted as an observation
+ * and the caller attributes it.
+ *
+ * A refused connection is reported separately from every other failure:
+ * it is the one outcome that positively proves nothing is listening.
  */
 async function probeDaemonHealth(
   port: number,
-  expectedPid: number,
+  expectedPid: number | null,
   fetchFn: typeof globalThis.fetch,
   timeoutMs: number,
 ): Promise<HealthProbe> {
@@ -201,7 +232,7 @@ async function probeDaemonHealth(
       : undefined;
     if (typeof backend === "string" && (STORAGE_BACKENDS as readonly string[]).includes(backend)) {
       const reportedPid = (body as { pid?: unknown }).pid;
-      if (reportedPid !== expectedPid) {
+      if (expectedPid !== null && reportedPid !== expectedPid) {
         return {
           kind: "pid-mismatch",
           detail: "the /health response reported pid " + String(reportedPid) + " instead of " + String(expectedPid),
@@ -214,6 +245,9 @@ async function probeDaemonHealth(
       detail: "the /health response did not report a recognized storage backend",
     };
   } catch (error) {
+    if (isConnectionRefused(error)) {
+      return { kind: "refused", detail: "connection to port " + port + " was refused" };
+    }
     return {
       kind: "unreachable",
       detail: error instanceof Error ? error.message : String(error),
@@ -221,6 +255,55 @@ async function probeDaemonHealth(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * The independent observation plan-v7.1 R1 requires before an absent (or
+ * dead-process) pid file may be called satisfied: probe the daemon port
+ * with no expected pid and attribute what answers. absentReason is the
+ * satisfied reason to use when the port positively refuses.
+ */
+async function attributeWithoutPid(
+  absentReason: "no-pid-file" | "stale-pid-file",
+  absentDetail: string,
+  pid: number | null,
+  port: number,
+  selectedBackend: StorageBackend,
+  fetchFn: typeof globalThis.fetch,
+  timeoutMs: number,
+): Promise<ActivationRestartCheckResult> {
+  const probe = await probeDaemonHealth(port, null, fetchFn, timeoutMs);
+  if (probe.kind === "refused") {
+    return buildResult("satisfied", absentReason, absentDetail + "; " + probe.detail, pid, null, selectedBackend);
+  }
+  if (probe.kind === "observed") {
+    if (probe.backend !== selectedBackend) {
+      return buildResult(
+        "unsatisfied",
+        "backend-stale",
+        `a daemon not accounted for by a pid file answered /health on port ${port} with startup backend "${probe.backend}", which differs from the selected backend "${selectedBackend}"; it will refuse local outbox requests until it restarts`,
+        pid,
+        probe.backend,
+        selectedBackend,
+      );
+    }
+    return buildResult(
+      "unresolvable",
+      "live-daemon-without-pid-file",
+      `a daemon not accounted for by a pid file answered /health on port ${port} with startup backend "${probe.backend}"; it cannot be attributed, so the cutover is not proven safe`,
+      pid,
+      probe.backend,
+      selectedBackend,
+    );
+  }
+  return buildResult(
+    "unresolvable",
+    "health-unreachable",
+    `${absentDetail}, but /health on port ${port} neither refused nor answered: ${probe.detail}`,
+    pid,
+    null,
+    selectedBackend,
+  );
 }
 
 function buildResult(
@@ -254,13 +337,14 @@ export async function checkActivationRestartAdmission(
 
   const read = readPidFile(pidFilePath);
   if (read.kind === "absent") {
-    return buildResult(
-      "satisfied",
+    return attributeWithoutPid(
       "no-pid-file",
-      `no pid file at ${pidFilePath}; there is no live daemon to admit against the "${selectedBackend}" selection`,
+      `no pid file at ${pidFilePath}`,
       null,
-      null,
+      port,
       selectedBackend,
+      fetchFn,
+      timeoutMs,
     );
   }
   if (read.kind === "malformed") {
@@ -286,13 +370,14 @@ export async function checkActivationRestartAdmission(
   const pid = read.pid;
 
   if (!isProcessAlive(pid)) {
-    return buildResult(
-      "satisfied",
+    return attributeWithoutPid(
       "stale-pid-file",
-      `pid file at ${pidFilePath} names pid ${pid}, but that process is not running; there is no live daemon to admit`,
+      `pid file at ${pidFilePath} names pid ${pid}, but that process is not running`,
       pid,
-      null,
+      port,
       selectedBackend,
+      fetchFn,
+      timeoutMs,
     );
   }
 
@@ -307,7 +392,9 @@ export async function checkActivationRestartAdmission(
       selectedBackend,
     );
   }
-  if (probe.kind === "unreachable") {
+  if (probe.kind === "unreachable" || probe.kind === "refused") {
+    // On the pid-file path a refused connection is not absence: the named
+    // process is alive, so it was looked for and not found at the port.
     return buildResult(
       "unresolvable",
       "health-unreachable",

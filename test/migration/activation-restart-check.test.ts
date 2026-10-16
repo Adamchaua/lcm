@@ -54,6 +54,14 @@ async function unusedPort(): Promise<number> {
   return port;
 }
 
+/** An injected fetch whose rejection carries the ECONNREFUSED cause Node's
+ * real fetch attaches when nothing listens on the port. */
+function refusingFetch(): typeof globalThis.fetch {
+  return (() => Promise.reject(
+    Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }) }),
+  )) as unknown as typeof globalThis.fetch;
+}
+
 /** Spawn a process that exits immediately, then return its now-dead pid. */
 async function deadPid(): Promise<number> {
   const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
@@ -68,7 +76,7 @@ async function deadPid(): Promise<number> {
 }
 
 describe("checkActivationRestartAdmission", () => {
-  it("is satisfied with authoritative absence when no pid file names a daemon", async () => {
+  it("is satisfied with authoritative absence when no pid file names a daemon AND the daemon port refuses (R1 independent observation)", async () => {
     const root = newRoot();
     const result = await checkActivationRestartAdmission({
       selectedBackend: "sqlite",
@@ -78,10 +86,90 @@ describe("checkActivationRestartAdmission", () => {
     expect(result).toEqual({
       status: "satisfied",
       reason: "no-pid-file",
-      detail: expect.stringContaining("no pid file at"),
+      detail: expect.stringContaining("was refused"),
       pid: null,
       observedBackend: null,
       selectedBackend: "sqlite",
+    });
+  });
+
+  describe("R1: an absent pid file is not absence of a daemon", () => {
+    it("is unresolvable (live-daemon-without-pid-file), never satisfied, when no pid file exists but a daemon with the selected backend answers the port", async () => {
+      const root = newRoot();
+      const port = await listenEphemeral((_request, response) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ status: "ok", storageBackend: "postgresql", pid: 4242 }));
+      });
+      const result = await checkActivationRestartAdmission({ selectedBackend: "postgresql", pidFilePath: pidFileIn(root), port });
+      expect(result).toEqual({
+        status: "unresolvable",
+        reason: "live-daemon-without-pid-file",
+        detail: expect.stringContaining("not accounted for by a pid file"),
+        pid: null,
+        observedBackend: "postgresql",
+        selectedBackend: "postgresql",
+      });
+      expect(result.status).not.toBe("satisfied");
+    });
+
+    it("is unsatisfied (backend-stale) when no pid file exists but a daemon with a stale backend answers the port", async () => {
+      const root = newRoot();
+      const port = await listenEphemeral((_request, response) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ status: "ok", storageBackend: "sqlite", pid: 4242 }));
+      });
+      const result = await checkActivationRestartAdmission({ selectedBackend: "postgresql", pidFilePath: pidFileIn(root), port });
+      expect(result).toMatchObject({ status: "unsatisfied", reason: "backend-stale", pid: null, observedBackend: "sqlite" });
+    });
+
+    it("is unresolvable (health-unreachable), never satisfied, when no pid file exists and the port accepts but never answers", async () => {
+      const root = newRoot();
+      const port = await listenEphemeral(() => { /* never respond */ });
+      const result = await checkActivationRestartAdmission({
+        selectedBackend: "sqlite", pidFilePath: pidFileIn(root), port, healthTimeoutMs: 300,
+      });
+      expect(result).toMatchObject({ status: "unresolvable", reason: "health-unreachable", pid: null, observedBackend: null });
+      expect(result.detail).toContain("neither refused nor answered");
+    });
+
+    it("is unresolvable (health-unreachable) when no pid file exists and the port answers with an unrecognized body", async () => {
+      const root = newRoot();
+      const port = await listenEphemeral((_request, response) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ status: "ok" }));
+      });
+      const result = await checkActivationRestartAdmission({ selectedBackend: "sqlite", pidFilePath: pidFileIn(root), port });
+      expect(result).toMatchObject({ status: "unresolvable", reason: "health-unreachable", pid: null });
+    });
+
+    it("applies the same probe to a stale pid file: a live daemon on another pid with the selected backend is not satisfied", async () => {
+      const root = newRoot();
+      const pid = await deadPid();
+      const port = await listenEphemeral((_request, response) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ status: "ok", storageBackend: "sqlite", pid: process.pid }));
+      });
+      const result = await checkActivationRestartAdmission({ selectedBackend: "sqlite", pidFilePath: pidFileIn(root, String(pid)), port });
+      expect(result).toMatchObject({ status: "unresolvable", reason: "live-daemon-without-pid-file", pid, observedBackend: "sqlite" });
+    });
+
+    it("applies the same probe to a stale pid file: a live daemon on another pid with a stale backend is unsatisfied", async () => {
+      const root = newRoot();
+      const pid = await deadPid();
+      const port = await listenEphemeral((_request, response) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ status: "ok", storageBackend: "sqlite", pid: process.pid }));
+      });
+      const result = await checkActivationRestartAdmission({ selectedBackend: "postgresql", pidFilePath: pidFileIn(root, String(pid)), port });
+      expect(result).toMatchObject({ status: "unsatisfied", reason: "backend-stale", pid, observedBackend: "sqlite" });
+    });
+
+    it("keeps a refused connection on the pid-file path as health-unreachable (a live pid with nothing listening is still unresolvable)", async () => {
+      const root = newRoot();
+      const result = await checkActivationRestartAdmission({
+        selectedBackend: "sqlite", pidFilePath: pidFileIn(root, String(process.pid)), port: await unusedPort(),
+      });
+      expect(result).toMatchObject({ status: "unresolvable", reason: "health-unreachable", pid: process.pid });
     });
   });
 
@@ -167,6 +255,7 @@ describe("checkActivationRestartAdmission", () => {
       observedBackend: null,
       selectedBackend: "sqlite",
     });
+    expect(result.detail).toContain("was refused");
   });
 
   it("is satisfied when a live daemon's startup backend already matches the selection", async () => {
@@ -354,7 +443,7 @@ describe("checkActivationRestartAdmission", () => {
     };
     const result = await checkActivationRestartAdmission(
       { selectedBackend: "sqlite", pidFilePath: "/unused", port: 7 },
-      { readPidFile: () => ({ kind: "present", pid: 4242 } as const), killProcess },
+      { readPidFile: () => ({ kind: "present", pid: 4242 } as const), killProcess, fetchFn: refusingFetch() },
     );
     expect(result.status).toBe("satisfied");
     expect(result.reason).toBe("stale-pid-file");
@@ -393,7 +482,7 @@ describe("checkActivationRestartAdmission", () => {
     const isProcessAlive = () => false;
     const result = await checkActivationRestartAdmission(
       { selectedBackend: "sqlite", pidFilePath: "/unused", port: 1 },
-      { readPidFile, isProcessAlive },
+      { readPidFile, isProcessAlive, fetchFn: refusingFetch() },
     );
     expect(result.status).toBe("satisfied");
     expect(result.reason).toBe("stale-pid-file");
