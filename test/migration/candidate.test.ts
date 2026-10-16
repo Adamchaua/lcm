@@ -161,7 +161,7 @@ describe("resolveMigrationApplyCandidate: refusal paths", () => {
     const fixture = await enrolled();
     const result = await resolveMigrationApplyCandidate({
       cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base,
-      _operationsForTesting: { observeJournal: () => ({ kind: "publication" }) },
+      _operationsForTesting: { observeJournal: () => ({ kind: "publication", publicationId: "publication-1", phase: "preparing" }) },
     });
     expect(result).toEqual({ status: "refuse", reason: "publication-occupies-slot" });
   });

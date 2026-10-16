@@ -36,6 +36,7 @@ pins:
   - ["src/migration/journal-observation.ts", "unit-migration-cutover"]
   - ["src/migration/manifest-store.ts", "unit-migration-cutover"]
   - ["src/migration/refusal-mapping.ts", "unit-migration-cutover"]
+  - ["src/migration/routing.ts", "unit-migration-cutover"]
   - ["src/migration/target-config.ts", "unit-migration-cutover"]
   - ["src/migration/target-identity.ts", "unit-migration-cutover"]
   - ["src/migration/target-reachability.ts", "unit-migration-cutover"]

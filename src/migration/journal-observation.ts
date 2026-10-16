@@ -3,6 +3,7 @@ import {
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
   type BackendMaintenanceJournal,
+  type BackendPublicationPhase,
 } from "../storage/backend-publication.js";
 
 /**
@@ -22,7 +23,12 @@ import {
 
 export type MigrationJournalObservation =
   | Readonly<{ kind: "hold"; journal: BackendMaintenanceJournal }>
-  | Readonly<{ kind: "publication" }>
+  /**
+   * A live v2 publication journal. It carries the parsed journal's identity
+   * and phase (plan-v5 Part B (1)) because the router must tell the
+   * generation's own in-flight or completed publication from a stranger's.
+   */
+  | Readonly<{ kind: "publication"; publicationId: string; phase: BackendPublicationPhase }>
   | Readonly<{ kind: "absent" }>
   | Readonly<{ kind: "unresolvable"; evidence: string }>;
 
@@ -54,13 +60,13 @@ export function observeMigrationMaintenanceJournal(input: Readonly<{
     return { kind: "unresolvable", evidence: journalEvidence(error) };
   }
   if (maintenance !== null) return { kind: "hold", journal: maintenance };
-  let publication: unknown;
+  let publication: ReturnType<typeof readBackendPublicationJournal>;
   try {
     publication = readPublication(input.homeDir);
   } catch (error) {
     return { kind: "unresolvable", evidence: journalEvidence(error) };
   }
-  if (publication !== null) return { kind: "publication" };
+  if (publication !== null) return { kind: "publication", publicationId: publication.publicationId, phase: publication.phase };
   return { kind: "absent" };
 }
 

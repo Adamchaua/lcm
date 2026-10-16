@@ -138,7 +138,7 @@ describe("observeMigrationMaintenanceJournal (section 4.2 four-valued journal re
     expect(readBackendPublicationJournal(home)).toMatchObject({ phase: "preparing" });
     expect(readBackendMaintenanceJournal(home)).toBeNull();
     const result = observeMigrationMaintenanceJournal({ homeDir: home });
-    expect(result).toEqual({ kind: "publication" });
+    expect(result).toEqual({ kind: "publication", publicationId: "publication-1", phase: "preparing" });
   });
 
   it("is unresolvable, never absent, when the v3 reader itself throws (a corrupted v3 journal)", async () => {
