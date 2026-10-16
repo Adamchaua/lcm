@@ -110,7 +110,10 @@ function identityOf(context: BackendPublicationRemoteContext) {
  * A row that another machine holds, is still active and names this
  * publication, target backend and evidence is refused by this provider, so a
  * foreign fence is never journalled as ours. An inactive foreign row is
- * returned unchanged so the coordinator can reclaim it.
+ * returned unchanged. Only a RELEASED one can then be reclaimed, because
+ * `guard.acquire` replaces a released row; an expired but unreleased foreign
+ * row ends in the guard's `publication-conflict`, and the coordinator fails
+ * closed.
  */
 export function createPostgreSqlBackendPublicationRemoteGuard(
   options: CreatePostgreSqlBackendPublicationRemoteGuardOptions,

@@ -640,8 +640,9 @@ When the coordinator does ask it to acquire, the provider reads the row first:
   `publication-conflict` and the coordinator fails closed. A foreign
   machine's row that is still active and names this publication, target
   backend and evidence is refused by the provider itself, so a foreign fence
-  is never journalled as ours. An inactive foreign row is returned unchanged
-  so it can be reclaimed.
+  is never journalled as ours. An inactive foreign row is returned unchanged.
+  A released one can then be reclaimed by acquiring, but an expired row that
+  was never released fails closed with `publication-conflict`.
 
 The activation step's lease assertion before it drives the coordinator is a
 fail-fast check only. The coordinator re-reads the fence independently, so a
