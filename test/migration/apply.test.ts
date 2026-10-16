@@ -928,6 +928,22 @@ describe("performMigrationApplyThroughCapture, round-1 fixes (A-3/B-2, A-7, B-5,
     expect(result).toEqual({ status: "refuse", reason: "continuation-partial-snapshot", evidence: "snapshot-replaced" });
   });
 
+  it("A-7 (plan section 8): a held journal whose snapshot is tampered refuses continuation-snapshot-tampered (exit 5) and never retries capture over it", async () => {
+    const { fixture, coordinator, first } = await (async () => {
+      const f = await enrolled();
+      const c = coordinatorFor(f.homeDir);
+      const r = await capture({ cwd: f.cwd, homeDir: f.homeDir, base: f.base, coordinator: c });
+      if (r.status !== "captured") throw new Error("fixture setup expected a successful first capture");
+      return { fixture: f, coordinator: c, first: r };
+    })();
+    rmSync(join(fixture.homeDir, ".lcm", "migration-snapshots", "registrations", `${first.generationId}.intent.json`));
+    expect((await classifySqliteSnapshotArtifact(first.generationId, { homeDir: fixture.homeDir })).state).toBe("tampered");
+
+    const result = await capture({ cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator });
+
+    expect(result).toEqual({ status: "refuse", reason: "continuation-snapshot-tampered", evidence: "snapshot-tampered" });
+  });
+
   it("A-7: a held journal whose snapshot cannot be classified refuses snapshot-unresolvable rather than guessing (deterministic injection: a real classification failure needs an unsupported platform)", async () => {
     const { fixture, coordinator } = await (async () => {
       const f = await enrolled();

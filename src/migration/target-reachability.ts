@@ -37,7 +37,11 @@ import type { PostgreSqlConnectionSettings } from "../storage/postgresql/contrac
 
 export type MigrationTargetVerification =
   | Readonly<{ status: "verified" }>
-  | Readonly<{ status: "refuse"; reason: "migration-target-verification-failed" | "migration-target-verification-unresolvable"; evidence?: string }>;
+  | Readonly<{
+    status: "refuse";
+    reason: "invalid-expected-owner" | "migration-target-verification-failed" | "migration-target-verification-unresolvable";
+    evidence?: string;
+  }>;
 
 export type MigrationTargetVerificationOperations = Readonly<{
   createRuntime: (settings: PostgreSqlConnectionSettings) => PostgreSqlRuntime;
@@ -73,6 +77,12 @@ export async function verifyMigrationTargetReachability(input: Readonly<{
     await verifyTransferSchema(runtime, { expectedOwner: input.expectedOwner, signal: input.signal });
     return { status: "verified" };
   } catch (error) {
+    if (error instanceof PostgreSqlRuntimeReadinessError && error.reason === "invalid-expected-owner") {
+      // Round-1 B-10: a purely local shape check that runs before any
+      // connection, so it must not be reported as "the server was reached
+      // and failed verification".
+      return { status: "refuse", reason: "invalid-expected-owner", evidence: `readiness-${error.reason}` };
+    }
     if (error instanceof PostgreSqlRuntimeReadinessError && error.reason !== "server-preflight") {
       // A real connection was established and the check genuinely came
       // back negative -- answerable, and the operator has a real action.

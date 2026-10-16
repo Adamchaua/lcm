@@ -168,7 +168,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm migration apply --confirm-generation <id> --dry-run", "Stop after the confirmation fence; mutate nothing"],
       ["lcm migration abort --confirm-generation <id>", "Abort the held or entering migration whose generation id you pass"],
     ],
-    notes: "This project must already be linked to a PostgreSQL project (see docs/migration-operations.md). apply refuses unless --confirm-generation exactly matches the candidate a fresh plan resolves at the moment apply runs; a stale or missing token refuses rather than proceeding. Never a silent fallback: an unresolvable or unverified target, an unresolvable daemon presence, or a state that does not admit the operation all refuse with a distinct, closed reason. See docs/migration-operations.md for the full exit-class table, every refusal's remedy, and the fencing residue.",
+    notes: "This project must not be linked to a PostgreSQL project through `lcm project create` or `lcm project link` before you migrate: migration resolves or creates the destination identity itself, and a linked project makes apply refuse multi-machine-installation. apply refuses unless --confirm-generation exactly matches the candidate a fresh plan resolves at the moment apply runs; a stale or missing token refuses rather than proceeding. Never a silent fallback: an unresolvable or unverified target, an unresolvable daemon presence, or a state that does not admit the operation all refuse with a distinct, closed reason. See docs/migration-operations.md for the full exit-class table, every refusal's remedy, and the fencing residue.",
   },
 
   search: {

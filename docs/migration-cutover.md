@@ -6,6 +6,10 @@ which external effect is pending, and which immutable evidence was accepted at
 each step. A private durable journal makes an interrupted protocol run
 recoverable without guessing from timestamps or partially changed data.
 
+This document explains the mechanism. To run a migration, use the operator runbook,
+[Migration operations](migration-operations.md), which covers the `lcm migration` commands, their
+exit classes and refusals, and the maintenance hold they leave in place.
+
 The journal and immutable capture do not copy data or change the selected
 backend by themselves. The internal bounded copy API described below consumes
 those artifacts. Copy completion does not activate PostgreSQL or execute

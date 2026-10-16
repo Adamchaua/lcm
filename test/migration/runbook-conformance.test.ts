@@ -1,12 +1,13 @@
 import { readFileSync } from "node:fs";
 import { Command } from "commander";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   MIGRATION_EXIT_CLASSES,
   MIGRATION_COMMAND_CONTRACTS,
 } from "../../src/migration/exit-classes.js";
 import { MIGRATION_REFUSAL_REASONS } from "../../src/migration/refusal-mapping.js";
 import { registerMigrationCommand } from "../../bin/lcm.js";
+import { printHelp } from "../../src/cli-help.js";
 
 /**
  * Section 12's bidirectional conformance check: the runbook's own
@@ -176,5 +177,44 @@ describe("runbook obligations with no mechanical backstop (the inventory block c
 
   it("states that the maintenance window scales with the amount of data being migrated", () => {
     expect(runbookText).toMatch(/maintenance window scales with/iu);
+  });
+});
+describe("operator-facing surfaces cannot disagree with the runbook (round-1 A-13/B-7, A-12, A-14)", () => {
+  function migrationHelpText(): string {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      printHelp("migration");
+      return out.mock.calls.map((call) => String(call[0])).join("");
+    } finally {
+      out.mockRestore();
+    }
+  }
+
+  it("the help page states the project-linking rule the runbook states (must not be linked), never the inverse", () => {
+    const help = migrationHelpText();
+    expect(runbookText).toMatch(/must not be linked/u);
+    expect(help).toMatch(/must not be linked/u);
+    expect(help).toContain("lcm project link");
+    expect(runbookText).toContain("lcm project link");
+    expect(help).not.toMatch(/must already be linked/u);
+    expect(runbookText).not.toMatch(/must already be linked/u);
+  });
+
+  it("red: the rule is checked in both directions, so inverting either surface would fail", () => {
+    const inverted = "This project must already be linked to a PostgreSQL project";
+    expect(inverted).not.toMatch(/must not be linked/u);
+    expect(migrationHelpText().replace(/must not be linked/u, "must be linked")).not.toMatch(/must not be linked/u);
+  });
+
+  it("every other documentation entry point links the runbook: docs/cli.md and docs/migration-cutover.md", () => {
+    for (const relative of ["../../docs/cli.md", "../../docs/migration-cutover.md"]) {
+      expect(readFileSync(new URL(relative, import.meta.url), "utf8")).toContain("migration-operations.md");
+    }
+  });
+
+  it("the runbook promises only the help that exists: no per-command help page, and the group page is named", () => {
+    expect(runbookText).not.toMatch(/lcm migration <command> --help/u);
+    expect(runbookText).toContain("lcm migration --help");
+    expect(runbookText).not.toMatch(/generated from the\s+same source/u);
   });
 });

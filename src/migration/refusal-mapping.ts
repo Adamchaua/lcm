@@ -89,7 +89,7 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   }),
   Object.freeze({
     reason: "journal-unresolvable", exitClass: "refused-evidence",
-    remedy: "The maintenance journal could not be read. Run `lcm doctor` and inspect ~/.lcm/backend-publication before retrying.",
+    remedy: "The maintenance journal could not be read. Run `lcm doctor` and inspect the backend publication directory under your LCM home before retrying.",
   }),
 
   // --- Section 4.9 exposure 1: generation identity resolution ---
@@ -179,6 +179,10 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   Object.freeze({
     reason: "continuation-partial-snapshot", exitClass: "refused-precondition",
     remedy: "The held generation's snapshot is partial or replaced and cannot be resumed. Run `lcm migration abort` to release the hold; the captured evidence is preserved.",
+  }),
+  Object.freeze({
+    reason: "continuation-snapshot-tampered", exitClass: "refused-evidence",
+    remedy: "The held generation's snapshot failed its integrity classification. The captured evidence is preserved and no command repairs it. Run `lcm doctor` and inspect the snapshot before deciding; `lcm migration abort` releases the hold without touching the evidence.",
   }),
   Object.freeze({
     reason: "continuation-resume-required", exitClass: "refused-precondition",

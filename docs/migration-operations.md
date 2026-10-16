@@ -214,7 +214,8 @@ owner in their remedy.
 | `held`, matching | `complete` | copy in progress | `resume` (not implemented -- see below; `abort` also always available) | 2 |
 | `held`, mismatched with this project's current selection | any | any | `abort` | 2 |
 | terminal | any | not settled | `abort` or `resume` (not implemented; use `abort`) | 2 |
-| any | `tampered` | any | none -- exit 5 with evidence preserved; this is a security-relevant signal, not something any command resolves automatically | 5 |
+| `held`, matching | `tampered` | any | none -- `apply` refuses `continuation-snapshot-tampered` (exit 5) with evidence preserved; this is a security-relevant signal, not something any command resolves automatically. `abort` still releases the hold | 5 |
+| any other journal | `tampered` | any | none -- exit 5 with evidence preserved | 5 |
 | settled pair with no forward path | any | any | none -- exit 7; file an issue | 7 |
 
 A generation classifying `partial` or `replaced` is **never deleted**. Every failed or abandoned
@@ -330,7 +331,9 @@ guarantees it stays accurate; the test is. Do not hand-edit this block without r
 `status: "implemented"` means the command is registered and runnable today. `status: "outline"`
 means the command name and its eventual contract are documented for forward compatibility with the
 rest of this Epic, but the command itself does not exist yet -- see "Commands not available today"
-above.
+above. For an `outline` command, `canEmit` is the contract it will have once registered. It is
+not a claim that any registered command emits those classes today: exit 6 and exit 8, for example,
+are emitted by no registered command in this release.
 
 ```json
 {
@@ -563,7 +566,7 @@ above.
     {
       "reason": "journal-unresolvable",
       "exitClass": "refused-evidence",
-      "remedy": "The maintenance journal could not be read. Run `lcm doctor` and inspect ~/.lcm/backend-publication before retrying."
+      "remedy": "The maintenance journal could not be read. Run `lcm doctor` and inspect the backend publication directory under your LCM home before retrying."
     },
     {
       "reason": "generation-occupied-since-probe",
@@ -649,6 +652,11 @@ above.
       "reason": "continuation-partial-snapshot",
       "exitClass": "refused-precondition",
       "remedy": "The held generation's snapshot is partial or replaced and cannot be resumed. Run `lcm migration abort` to release the hold; the captured evidence is preserved."
+    },
+    {
+      "reason": "continuation-snapshot-tampered",
+      "exitClass": "refused-evidence",
+      "remedy": "The held generation's snapshot failed its integrity classification. The captured evidence is preserved and no command repairs it. Run `lcm doctor` and inspect the snapshot before deciding; `lcm migration abort` releases the hold without touching the evidence."
     },
     {
       "reason": "continuation-resume-required",
@@ -802,5 +810,7 @@ above.
 - `docs/backend-publication.md` -- the backend publication and maintenance-journal protocol
   `apply`'s hold is built on, including why a live daemon's frozen startup backend is a separate
   gate from durable state correctness.
-- `lcm migration <command> --help` -- flag-level reference for each command, generated from the
-  same source this document is checked against.
+- `docs/cli.md` -- the general command-line behavior this group follows.
+- `lcm migration --help` -- the group help page, which lists every command and flag. It is one page
+  for the whole group: `lcm migration apply --help` shows the same page, and the per-command flag
+  descriptions are in "Commands" above.

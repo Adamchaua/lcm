@@ -6,6 +6,17 @@ afterEach(() => {
 });
 
 describe("verifyMigrationTargetReachability: injected boundaries (real-PostgreSQL cases live in test/postgresql/target-reachability.integration.ts)", () => {
+  it("refuses invalid-expected-owner, not a verification failure, for an empty owner: the real local check runs before any connection (round-1 B-10)", async () => {
+    const fakeRuntime = { close: vi.fn(async () => undefined) };
+    const result = await verifyMigrationTargetReachability({
+      settings: { url: "postgresql://unused/lcm", caFile: "/unused", poolMax: 1, connectionTimeoutMs: 100, idleTimeoutMs: 100, statementTimeoutMs: 100 },
+      expectedOwner: "",
+      _operationsForTesting: { createRuntime: () => fakeRuntime as never },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "invalid-expected-owner", evidence: "readiness-invalid-expected-owner" });
+    expect(fakeRuntime.close).toHaveBeenCalledTimes(1);
+  });
+
   it("refuses migration-target-verification-unresolvable when the runtime cannot even be constructed", async () => {
     const result = await verifyMigrationTargetReachability({
       settings: { url: "postgresql://unused/lcm", caFile: "/unused", poolMax: 1, connectionTimeoutMs: 100, idleTimeoutMs: 100, statementTimeoutMs: 100 },

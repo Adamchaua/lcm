@@ -244,9 +244,10 @@ export type MigrationGenerationIdResolution = Readonly<{
  * reads by design. That means the free/occupied conclusion this function
  * reaches is a conclusion about one moment, and a concurrent local actor
  * could occupy the returned ordinal immediately afterward if nothing holds
- * the window shut. The caller (`apply`) is required to acquire the section
- * 4.8 retained append admission (`withBackendPublicationRetainedAppendAdmissionAsync`)
- * **before** calling this function, and to keep the hold and the capture
+ * the window shut. The caller (`apply`) is required to acquire the append
+ * barrier (`withBackendPublicationAppendBarrierAsync`, the seam plan-v2
+ * section 4.8 settled on; the retained-admission seam refuses once the
+ * caller's own hold exists) **before** calling this function, and to keep the hold and the capture
  * that consume its result inside that same retained span — never call this
  * function first and acquire the token afterward. This binds same-host
  * actors only, which is the only class the publication lock binds at all;

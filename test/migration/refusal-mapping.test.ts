@@ -30,6 +30,7 @@ const REASONS_APPLY_TS_AND_CANDIDATE_TS_CAN_EMIT = [
   "capture-contention",
   "capture-unresolvable",
   "continuation-partial-snapshot",
+  "continuation-snapshot-tampered",
   "hold-entry-readback-mismatch",
   "capture-failed",
   "continuation-mismatched-hold",
@@ -113,6 +114,8 @@ describe("round-1 classified reasons (B-5, A-9, A-11, A-7)", () => {
     ["capture-unresolvable", "refused-evidence"],
     ["capture-failed", "failed-operator-required"],
     ["continuation-partial-snapshot", "refused-precondition"],
+    ["continuation-snapshot-tampered", "refused-evidence"],
+    ["unexpected-failure", "refused-evidence"],
     ["abort-confirmation-missing", "refused-confirmation"],
     ["abort-confirmation-moved", "refused-confirmation"],
   ])("maps %s to %s", (reason, exitClass) => {

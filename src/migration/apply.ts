@@ -409,6 +409,11 @@ async function continueUnderBarrier(
     if (snapshot.state === "partial" || snapshot.state === "replaced") {
       return { status: "refuse", reason: "continuation-partial-snapshot", evidence: `snapshot-${snapshot.state}` };
     }
+    if (snapshot.state === "tampered") {
+      // Plan section 8: tampered evidence is exit 5, preserved, and never
+      // something capture is allowed to retry over.
+      return { status: "refuse", reason: "continuation-snapshot-tampered", evidence: "snapshot-tampered" };
+    }
     return captureUnderBarrier(input, journal.generationId, disposition.observedChecksumSha256, token);
   }
   // disposition.action is "recover-entering" or "refuse" here, and both are
