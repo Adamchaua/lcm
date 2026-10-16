@@ -30,6 +30,14 @@ export type MigrationStorageWitness = Readonly<{
   schemaSha256: string;
   contentSha256: string;
   capturedAt: string;
+  /**
+   * PostgreSQL destinations only: pg_control_system()'s system_identifier as
+   * a canonical decimal string, recorded by the copy so verification can
+   * refuse a physical cluster other than the one that was copied to. Absent
+   * in manifests written before it was recorded; a manifest without it
+   * parses and keeps its checksum, but verification refuses it.
+   */
+  systemIdentifier?: string;
 }>;
 
 export type MigrationCheckpoint = Readonly<{
@@ -148,6 +156,7 @@ export class MigrationProtocolError extends Error {
 }
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;
+const SYSTEM_IDENTIFIER_PATTERN = /^(0|[1-9][0-9]{0,19})$/u;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const PHASES: readonly MigrationPhase[] = [
   "planned", "dry-run-verified", "copying", "copied", "verified",
@@ -199,6 +208,10 @@ function isIsoTimestamp(value: unknown): value is string {
   if (typeof value !== "string" || !value.endsWith("Z")) return false;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function isSystemIdentifier(value: unknown): value is string {
+  return typeof value === "string" && SYSTEM_IDENTIFIER_PATTERN.test(value);
 }
 
 function deepFreeze<T>(value: T): T {
@@ -312,10 +325,13 @@ function parseWitness(
   label: string,
   reason: MigrationProtocolReason = "malformed-manifest",
 ): MigrationStorageWitness {
-  const witness = assertExactObject(value, ["backend", "capturedAt", "contentSha256", "identitySha256", "schemaSha256", "version"], label, reason);
+  const keys = ["backend", "capturedAt", "contentSha256", "identitySha256", "schemaSha256", "version"];
+  const recordsSystemIdentifier = isRecord(value) && Object.hasOwn(value, "systemIdentifier");
+  const witness = assertExactObject(value, recordsSystemIdentifier ? [...keys, "systemIdentifier"] : keys, label, reason);
   if (witness.version !== 1 || !BACKENDS.includes(witness.backend as MigrationStorageWitness["backend"])
     || !isHash(witness.identitySha256) || !isHash(witness.schemaSha256) || !isHash(witness.contentSha256)
-    || !isIsoTimestamp(witness.capturedAt)) {
+    || !isIsoTimestamp(witness.capturedAt)
+    || (recordsSystemIdentifier && (witness.backend !== "postgresql" || !isSystemIdentifier(witness.systemIdentifier)))) {
     protocolError(reason, `${label} is invalid`);
   }
   return {
@@ -325,6 +341,7 @@ function parseWitness(
     schemaSha256: witness.schemaSha256 as string,
     contentSha256: witness.contentSha256 as string,
     capturedAt: witness.capturedAt as string,
+    ...(recordsSystemIdentifier ? { systemIdentifier: witness.systemIdentifier as string } : {}),
   };
 }
 

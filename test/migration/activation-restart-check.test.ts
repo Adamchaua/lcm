@@ -97,6 +97,41 @@ describe("checkActivationRestartAdmission", () => {
     expect(result.pid).toBeNull();
   });
 
+  it.each([
+    "123junk",
+    "123.5",
+    "0x7b",
+    "+123",
+    "-123",
+    "1e3",
+    "007",
+    "0",
+    "123 456",
+    "9007199254740993",
+  ])("treats the malformed pid file content %j as unusable", async (content) => {
+    const root = newRoot();
+    const result = await checkActivationRestartAdmission({
+      selectedBackend: "sqlite",
+      pidFilePath: pidFileIn(root, content),
+      port: await unusedPort(),
+    });
+    expect(result.status).toBe("satisfied");
+    expect(result.reason).toBe("no-pid-file");
+    expect(result.pid).toBeNull();
+  });
+
+  it("accepts a canonical pid surrounded by whitespace", async () => {
+    const root = newRoot();
+    const pid = await deadPid();
+    const result = await checkActivationRestartAdmission({
+      selectedBackend: "sqlite",
+      pidFilePath: pidFileIn(root, `  ${pid}\n`),
+      port: await unusedPort(),
+    });
+    expect(result.reason).toBe("stale-pid-file");
+    expect(result.pid).toBe(pid);
+  });
+
   it("is satisfied with authoritative absence when the pid file names a process that is not running", async () => {
     const root = newRoot();
     const pid = await deadPid();

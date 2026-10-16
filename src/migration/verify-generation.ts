@@ -139,18 +139,30 @@ export async function captureDestinationIdentity(
  * The live witness is bound to the sealed manifest first, so evidence cannot
  * be minted for a destination other than the one the copy recorded, whatever
  * the caller supplies; the caller's expected values are then compared as
- * well. systemIdentifier is caller-bound only: the copy does not record it.
+ * well. The system identifier is bound the same way: the copy records it in
+ * the manifest's destination witness, and the live value must equal that
+ * recorded value before the caller's expectation is compared, so an expected
+ * value read from a since-changed cluster cannot admit it. A manifest written
+ * before the copy recorded it cannot bind the cluster and is refused; recopy
+ * to produce a bound manifest.
  */
 export function assertDestinationIdentityMatches(
   destinationIdentity: MigrationDestinationIdentity,
   expected: Readonly<{ expectedDestinationIdentitySha256: string; expectedSystemIdentifier: string }>,
   manifestDestinationIdentitySha256: string,
+  manifestSystemIdentifier: string | undefined,
 ): void {
   if (destinationIdentity.sealedWitnessSha256 !== manifestDestinationIdentitySha256) {
     driverError("destination-drift", "destination identity does not match the sealed manifest");
   }
   if (destinationIdentity.sealedWitnessSha256 !== expected.expectedDestinationIdentitySha256) {
     driverError("destination-drift", "destination identity does not match the expected witness");
+  }
+  if (manifestSystemIdentifier === undefined) {
+    driverError("destination-drift", "copy did not record the destination system identifier");
+  }
+  if (destinationIdentity.systemIdentifier !== manifestSystemIdentifier) {
+    driverError("destination-drift", "destination system identifier does not match the sealed manifest");
   }
   if (destinationIdentity.systemIdentifier !== expected.expectedSystemIdentifier) {
     driverError("destination-drift", "destination system identifier does not match the expected value");
@@ -1769,12 +1781,9 @@ export interface VerifyMigrationGenerationInput {
    */
   readonly expectedDestinationIdentitySha256: string;
   /**
-   * Caller-bound: the copy does not record system_identifier, so the
-   * manifest cannot verify this value.
-   *
-   * pg_control_system()'s system_identifier, recorded as a sibling of the
-   * sealed five-field identity witness (per plan-v4 section 4) rather than
-   * inside it. Comparing it live-to-live is what catches a destination
+   * pg_control_system()'s system_identifier, compared in addition to the
+   * value the copy recorded in manifest.destination.systemIdentifier (the
+   * live value must equal both). Comparing it live catches a destination
    * whose underlying physical cluster changed -- a failover to a standby
    * with a different system_identifier -- while the application-level
    * five-field witness happened to stay identical.
@@ -1937,7 +1946,9 @@ async function computeVerificationReport(
     // the identity comparison, which binds the live destination to it.
     const manifest = new MigrationManifestStore({ homeDir: input.homeDir }).read(input.generationId);
     await receipted("identity", undefined, () => (
-      assertDestinationIdentityMatches(destinationIdentity, input, manifest.destination.identitySha256)
+      assertDestinationIdentityMatches(
+        destinationIdentity, input, manifest.destination.identitySha256, manifest.destination.systemIdentifier,
+      )
     ));
 
     // Ledger operand, obtained rather than reimplemented: the same

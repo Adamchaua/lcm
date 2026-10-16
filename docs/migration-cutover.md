@@ -628,8 +628,13 @@ Verification refuses outright, before any report is written, when:
   this is what catches a same-data verification run pointed at the wrong
   database, such as a misconfigured connection string or a restored clone.
   The caller's expected identity must agree with the manifest as well. The
-  PostgreSQL system identifier is not recorded by the copy, so it is compared
-  only against the value the caller supplies. Resuming an interrupted
+  copy records the destination's PostgreSQL system identifier in the
+  manifest's destination witness, and the live identifier must equal that
+  recorded value (and the caller's expected value), so a failover to a
+  different physical cluster is refused even when the caller re-reads its
+  expectation from the new cluster. A manifest written before the copy
+  recorded the system identifier is refused with `destination-drift`; copy
+  again to produce a manifest that binds the cluster. Resuming an interrupted
   verification also refuses a persisted report whose destination identity
   differs from the manifest's;
 - the destination's search configuration is absent, malformed, or present

@@ -170,9 +170,9 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
   },
   {
     id: "destination-system-identifier", bodyField: "destinationIdentity",
-    description: "pg_control_system()'s system_identifier, recorded as a sibling of the sealed witness, captured once before the fenced window opens.",
+    description: "pg_control_system()'s system_identifier, captured once before the fenced window opens and compared with the value the copy recorded in the manifest's destination witness.",
     comparison: "compared-live",
-    consequence: "caller-bound, because the copy does not record the system identifier and the manifest cannot verify it: refuses destination-drift when it disagrees with expectedSystemIdentifier (compared pre-window); round-4 also rechecks it live-to-live from inside the fenced window, on the same borrowed read-only session as the census, refusing destination-drift on a failover between the pre-lease read and the window that the pre-window comparison alone cannot see",
+    consequence: "refuses destination-drift when the manifest's destination witness has no recorded system identifier (a manifest written before the copy recorded it; recopy), when it disagrees with that recorded value, or when it disagrees with expectedSystemIdentifier (all compared pre-window); round-4 also rechecks it live-to-live from inside the fenced window, on the same borrowed read-only session as the census, refusing destination-drift on a failover between the pre-lease read and the window that the pre-window comparison alone cannot see",
     mismatchClasses: ["identity"],
     receipts: ["identity", "schema"],
   },

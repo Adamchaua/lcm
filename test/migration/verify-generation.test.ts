@@ -24,6 +24,7 @@ import {
 } from "../../src/migration/protocol.js";
 import {
   MigrationVerificationDriverError,
+  assertDestinationIdentityMatches,
   assertPermanentReadOnlyGuard,
   inspectMigrationVerification,
   readFencedDestinationCensus,
@@ -91,7 +92,9 @@ const MANIFEST_FIXTURE_SOURCE_WITNESS = {
   version: 1 as const, backend: "sqlite" as const, identitySha256: HASH_A,
   schemaSha256: HASH_A, contentSha256: HASH_A, capturedAt: MANIFEST_FIXTURE_AT,
 };
-const MANIFEST_FIXTURE_DESTINATION_WITNESS = { ...MANIFEST_FIXTURE_SOURCE_WITNESS, backend: "postgresql" as const };
+const MANIFEST_FIXTURE_DESTINATION_WITNESS = {
+  ...MANIFEST_FIXTURE_SOURCE_WITNESS, backend: "postgresql" as const, systemIdentifier: "7123456789",
+};
 
 /**
  * A manifest at phase "copied" with the given checkpoints, built by
@@ -562,7 +565,7 @@ function stubDestinationPrimitives(options: {
   vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
   vi.spyOn(portableDestination, "probePostgreSqlPortableDestination").mockResolvedValue({
     destinationWitnessSha256: HASH_A, identityFingerprintSha256: options.identityFingerprintSha256 ?? HASH_A,
-    nonIdentityDomainsEmpty: true, existingRun: null,
+    systemIdentifier: "7123456789", nonIdentityDomainsEmpty: true, existingRun: null,
   } as never);
   const manifestCheckpoints = options.manifestCheckpoints
     ?? PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain));
@@ -2727,6 +2730,56 @@ describe("verifyMigrationGeneration: system-identifier comparison", () => {
       baseInput({ homeDir: "/tmp/lcm-verify-system-identifier-drift", expectedSystemIdentifier: "9999999999" }),
       dependencies,
     )).rejects.toMatchObject({ reason: "destination-drift" });
+  });
+
+  it("refuses when the caller's expected identifier equals the live cluster but the copy recorded another", async () => {
+    // The caller re-reads its expectation from the live destination after a
+    // physical cluster change, so expected === live; only the identifier the
+    // copy recorded in the manifest can still tell the clusters apart.
+    const manifest = stubDestinationPrimitives();
+    const recorded = manifest.current;
+    manifest.current = {
+      ...recorded, destination: { ...recorded.destination, systemIdentifier: "7000000001" },
+    };
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(fakeCopySource(), runtime);
+    const persistSpy = vi.spyOn(MigrationVerificationReportStore.prototype, "persist");
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-recorded-system-identifier-drift", expectedSystemIdentifier: "7123456789" }),
+      dependencies,
+    )).rejects.toMatchObject({
+      reason: "destination-drift", message: expect.stringContaining("sealed manifest"),
+    });
+    expect(persistSpy).not.toHaveBeenCalled();
+    expect(runtime.openReadOnlySnapshot).not.toHaveBeenCalled();
+  });
+
+  it("refuses a manifest written before the copy recorded the destination system identifier", async () => {
+    const manifest = stubDestinationPrimitives();
+    const { systemIdentifier: _omitted, ...legacyDestination } = manifest.current.destination;
+    manifest.current = { ...manifest.current, destination: legacyDestination };
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(fakeCopySource(), runtime);
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-legacy-system-identifier" }), dependencies,
+    )).rejects.toMatchObject({
+      reason: "destination-drift",
+      message: expect.stringContaining("copy did not record the destination system identifier"),
+    });
+    expect(runtime.openReadOnlySnapshot).not.toHaveBeenCalled();
+  });
+
+  it("compares the recorded identifier before the caller's expectation", () => {
+    const live = { version: 1 as const, sealedWitnessSha256: HASH_A, systemIdentifier: "7123456789" };
+    const expected = { expectedDestinationIdentitySha256: HASH_A, expectedSystemIdentifier: "7123456789" };
+    expect(() => assertDestinationIdentityMatches(live, expected, HASH_A, "7123456789")).not.toThrow();
+    expect(() => assertDestinationIdentityMatches(live, expected, HASH_A, "7000000001"))
+      .toThrow("does not match the sealed manifest");
+    expect(() => assertDestinationIdentityMatches(live, expected, HASH_A, undefined))
+      .toThrow("copy did not record");
+    expect(() => assertDestinationIdentityMatches(
+      live, { ...expected, expectedSystemIdentifier: "9999999999" }, HASH_A, "7123456789",
+    )).toThrow("does not match the expected value");
   });
 });
 

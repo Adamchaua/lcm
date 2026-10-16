@@ -31,7 +31,8 @@ it("opens authenticated local captures under the target identity and retains mai
     expect(batch.records[0]?.value).toMatchObject({ content: "captured instructions" });
     const api = await import('../../src/migration/copy-source.js');
     const binding = api.bindMigrationCopySource(source, { expectedOwner:'owner', expectedIdentity,
-      destinationCapturedAt:'2026-09-07T03:04:05.000Z', targetProbe:{destinationWitnessSha256:'a'.repeat(64),identityFingerprintSha256:'b'.repeat(64),nonIdentityDomainsEmpty:true,existingRun:null} });
+      destinationCapturedAt:'2026-09-07T03:04:05.000Z', targetProbe:{destinationWitnessSha256:'a'.repeat(64),identityFingerprintSha256:'b'.repeat(64),systemIdentifier:'7123456789',nonIdentityDomainsEmpty:true,existingRun:null} });
+    expect(binding.destinationWitness).toMatchObject({ backend: 'postgresql', systemIdentifier: '7123456789' });
     expect(binding.runId).toMatch(/^migration-copy-[a-f0-9]{64}$/);
     expect(binding.binding.generationId).toBe(snapshot.artifact.generationId);
     expect(binding.binding.portableManifestSha256).toBe(source.stream.describe().manifestSha256);
@@ -165,6 +166,6 @@ it.each([null,{checksumSha256:'f'.repeat(64)}])('refuses binding after maintenan
  const {input}=await captureFixture();const source=await openMigrationCopySource(input);
  try{
   const api=await import('../../src/migration/copy-source.js');vi.spyOn(publicationApi,'readBackendMaintenanceJournal').mockReturnValue(changed as never);
-  expect(()=>api.bindMigrationCopySource(source,{expectedOwner:'owner',expectedIdentity:input.expectedIdentity,destinationCapturedAt:'2026-09-14T03:00:00.000Z',targetProbe:{destinationWitnessSha256:'a'.repeat(64),identityFingerprintSha256:'b'.repeat(64),nonIdentityDomainsEmpty:true,existingRun:null}})).toThrow('authority');
+  expect(()=>api.bindMigrationCopySource(source,{expectedOwner:'owner',expectedIdentity:input.expectedIdentity,destinationCapturedAt:'2026-09-14T03:00:00.000Z',targetProbe:{destinationWitnessSha256:'a'.repeat(64),identityFingerprintSha256:'b'.repeat(64),systemIdentifier:'7123456789',nonIdentityDomainsEmpty:true,existingRun:null}})).toThrow('authority');
  }finally{await source.stream.close();}
 });
