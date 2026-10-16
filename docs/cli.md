@@ -16,7 +16,8 @@ lcm project link --help
 lcm connectors install --help
 ```
 
-The `lcm migration` group (`plan`, `dry-run`, `apply`, `abort`) performs the
+The `lcm migration` group (`plan`, `dry-run`, `apply`, `resume`, `verify`, `report`,
+`abort`) performs the
 reversible SQLite-to-PostgreSQL cutover. Read the operator runbook,
 [Migration operations](migration-operations.md), before running `apply`: it leaves a
 maintenance hold that only `abort` can currently release.

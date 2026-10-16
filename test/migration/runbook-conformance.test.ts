@@ -76,12 +76,12 @@ describe("runbook machine-readable inventory (section 12 bidirectional conforman
   it("red: commands no longer matches once one entry's status is flipped on either side (the exact defect this test exists to catch: report was once marked implemented with no CLI wiring)", () => {
     const inventory = extractInventory();
     const sourceCopy = jsonRoundTrip(MIGRATION_COMMAND_CONTRACTS) as Array<{ command: string; status: string }>;
-    const reportEntry = sourceCopy.find((entry) => entry.command === "report");
+    const reportEntry = sourceCopy.find((entry) => entry.command === "activate");
     expect(reportEntry).toBeDefined();
     reportEntry!.status = "implemented";
     expect(inventory.commands).not.toEqual(sourceCopy);
     const docCopy = JSON.parse(JSON.stringify(inventory.commands)) as Array<{ command: string; status: string }>;
-    const docReportEntry = docCopy.find((entry) => entry.command === "report");
+    const docReportEntry = docCopy.find((entry) => entry.command === "activate");
     expect(docReportEntry).toBeDefined();
     docReportEntry!.status = "implemented";
     expect(docCopy).not.toEqual(jsonRoundTrip(MIGRATION_COMMAND_CONTRACTS));

@@ -26,7 +26,7 @@ import {
  * general-purpose config accessor a future caller might reasonably assume
  * is safe to reuse outside migration. If you are reading this because you
  * want PostgreSQL connection settings for something that is not `lcm
- * migration plan|dry-run|apply|abort`, this is very likely the wrong
+ * migration plan|dry-run|apply|resume|verify|report|abort`, this is very likely the wrong
  * function -- use `resolveStorageConfig` (or `loadIdentityStorageConfig`)
  * instead, which correctly refuses while sqlite is active.
  */

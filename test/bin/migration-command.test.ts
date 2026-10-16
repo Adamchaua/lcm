@@ -8,6 +8,9 @@ const state = vi.hoisted(() => ({
   dryRun: vi.fn(),
   apply: vi.fn(),
   abort: vi.fn(),
+  resume: vi.fn(),
+  verify: vi.fn(),
+  report: vi.fn(),
 }));
 
 vi.mock("node:process", async (importOriginal) => ({
@@ -36,6 +39,18 @@ vi.mock("../../src/migration/cli-apply.js", async (importOriginal) => ({
 
 vi.mock("../../src/migration/cli-abort.js", () => ({
   performMigrationAbortCommand: state.abort,
+}));
+
+vi.mock("../../src/migration/cli-resume.js", () => ({
+  performMigrationResumeCommand: state.resume,
+}));
+
+vi.mock("../../src/migration/cli-verify.js", () => ({
+  performMigrationVerifyCommand: state.verify,
+}));
+
+vi.mock("../../src/migration/cli-report.js", () => ({
+  performMigrationReportCommand: state.report,
 }));
 
 const { runCli } = await import("../../bin/lcm.js");
@@ -296,12 +311,91 @@ describe("lcm migration command group", () => {
     expect(state.dryRun).not.toHaveBeenCalled();
     expect(state.apply).not.toHaveBeenCalled();
     expect(state.abort).not.toHaveBeenCalled();
+    expect(state.resume).not.toHaveBeenCalled();
+    expect(state.verify).not.toHaveBeenCalled();
+    expect(state.report).not.toHaveBeenCalled();
+  });
+
+  it("abort: passes --generation through", async () => {
+    state.abort.mockResolvedValueOnce({ status: "refuse", reason: "route-resume-required", generationId: "gen-1", next: "resume" });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "abort", "--generation", "gen-1", "--confirm-generation", "gen-1", "--json");
+    expect(state.abort).toHaveBeenCalledWith(expect.objectContaining({ generation: "gen-1", confirmGenerationId: "gen-1" }));
+    expect(process.exitCode).toBe(6);
+    expect(JSON.parse(stdoutText(out))).toMatchObject({ command: "abort", exitCode: 6, next: "resume" });
+  });
+
+  it("verify: passes --generation, --confirm-generation and --dry-run through and prints the envelope", async () => {
+    state.verify.mockResolvedValueOnce({
+      status: "ok", generationId: "gen-1", manifestPhase: "verified", applied: true, next: "report", evidence: { cell: 23 },
+    });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "verify", "--generation", "gen-1", "--confirm-generation", "gen-1", "--dry-run", "--json");
+    expect(state.verify).toHaveBeenCalledWith(expect.objectContaining({ generation: "gen-1", confirmGenerationId: "gen-1", dryRun: true }));
+    expect(process.exitCode).toBe(0);
+    expect(JSON.parse(stdoutText(out))).toMatchObject({ command: "verify", applied: true, manifestPhase: "verified", evidence: { cell: 23 } });
+  });
+
+  it("verify: the fresh path's closed refusal exits 7", async () => {
+    state.verify.mockResolvedValueOnce({ status: "refuse", reason: "requires-625-project-map-witness", generationId: "gen-1" });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "verify", "--confirm-generation", "gen-1");
+    expect(process.exitCode).toBe(7);
+    expect(stdoutText(out)).toContain("requires-625-project-map-witness");
+  });
+
+  it("resume: passes the generation, token, dry-run and copy bounds through", async () => {
+    state.resume.mockResolvedValueOnce({
+      status: "ok", generationId: "gen-1", manifestPhase: "dry-run-verified", applied: true, next: "resume", evidence: { cell: 19 },
+    });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "resume", "--generation", "gen-1", "--confirm-generation", "gen-1", "--max-records", "7", "--max-bytes", "99", "--json");
+    expect(state.resume).toHaveBeenCalledWith(expect.objectContaining({
+      generation: "gen-1", confirmGenerationId: "gen-1", maxRecords: 7, maxBytes: 99, cwd: process.cwd(),
+    }));
+    expect(JSON.parse(stdoutText(out))).toMatchObject({ command: "resume", applied: true, evidence: { cell: 19 } });
+  });
+
+  it("resume: --dry-run is passed through, and a non-number copy bound is a usage error before anything runs", async () => {
+    state.resume.mockResolvedValueOnce({
+      status: "ok", generationId: "gen-1", manifestPhase: "planned", applied: false, next: null, evidence: { predictive: false },
+    });
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "resume", "--confirm-generation", "gen-1", "--dry-run");
+    expect(state.resume).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
+    state.resume.mockClear();
+    await expect(invoke("migration", "resume", "--max-records", "x")).rejects.toThrow();
+    await expect(invoke("migration", "resume", "--max-bytes", "x")).rejects.toThrow();
+    expect(state.resume).not.toHaveBeenCalled();
+  });
+
+  it("report: a read report exits 0 with the sections and the restart observations in the envelope", async () => {
+    state.report.mockResolvedValueOnce({
+      generationId: "gen-1", manifestPhase: "copied", next: "verify", evidence: { cell: 22 }, restart: { answer: "satisfied", presence: "absent" },
+    });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "report", "--generation", "gen-1", "--json");
+    expect(state.report).toHaveBeenCalledWith(expect.objectContaining({ generation: "gen-1" }));
+    expect(process.exitCode).toBe(0);
+    expect(JSON.parse(stdoutText(out))).toMatchObject({
+      command: "report", applied: false, next: "verify", evidence: { cell: 22 }, restart: { answer: "satisfied", presence: "absent" },
+    });
+  });
+
+  it("report: a stale running daemon exits 8 and still prints in human mode", async () => {
+    state.report.mockResolvedValueOnce({
+      reason: "report-restart-required", generationId: "gen-1", manifestPhase: "active", next: null, evidence: {}, restart: { answer: "unsatisfied", presence: "running" },
+    });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "report");
+    expect(process.exitCode).toBe(8);
+    expect(stdoutText(out)).toContain("report-restart-required");
   });
 
   it("lcm migration --help routes to the custom help page rather than any subcommand action", async () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     await expect(invoke("migration", "--help")).rejects.toThrow("exit:0");
-    expect(stdoutText(out)).toContain("lcm migration <plan|dry-run|apply|abort> [--json]");
+    expect(stdoutText(out)).toContain("lcm migration <plan|dry-run|apply|resume|verify|report|abort> [--json]");
     expect(state.plan).not.toHaveBeenCalled();
   });
 });

@@ -61,11 +61,11 @@ describe("MIGRATION_COMMAND_CONTRACTS (section 5.1's per-command postcondition a
     expect(MIGRATION_COMMAND_CONTRACTS.map((entry) => entry.command)).toEqual(expectedCommands);
   });
 
-  it("marks exactly plan, dry-run, apply and abort as implemented, and the rest (including report) as outline -- section 13's implementable-now list names exactly these four, and report has no CLI wiring in this candidate (no cli-report.ts, no bin/lcm.ts registration)", () => {
+  it("marks plan, dry-run, apply, resume, verify, report and abort as implemented, and activate and rollback (which wait for #625 and #626) as outline", () => {
     const implemented = MIGRATION_COMMAND_CONTRACTS.filter((entry) => entry.status === "implemented").map((entry) => entry.command);
-    expect(implemented.sort()).toEqual(["abort", "apply", "dry-run", "plan"].sort());
+    expect(implemented.sort()).toEqual(["abort", "apply", "dry-run", "plan", "report", "resume", "verify"].sort());
     const outline = MIGRATION_COMMAND_CONTRACTS.filter((entry) => entry.status === "outline").map((entry) => entry.command);
-    expect(outline.sort()).toEqual(["activate", "report", "resume", "rollback", "verify"].sort());
+    expect(outline.sort()).toEqual(["activate", "rollback"].sort());
   });
 
   it("gives every command a non-empty, never-'nothing threw' exit-zero postcondition, and every command can emit 0", () => {
@@ -106,8 +106,18 @@ describe("MIGRATION_COMMAND_CONTRACTS (section 5.1's per-command postcondition a
     expect(migrationCommandContract("apply").canEmit).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
   });
 
-  it("abort's canEmit matches exactly section 5.1's row: 0,1,2,3,4,5,7, never 6 (abort is never itself resumable) or 8", () => {
-    expect(migrationCommandContract("abort").canEmit).toEqual([0, 1, 2, 3, 4, 5, 7]);
+  it("abort's canEmit is 0,1,2,3,4,5,6,7, never 8: it exits 6 only as a non-owner naming resume or verify (owner rulings R7 and the router)", () => {
+    expect(migrationCommandContract("abort").canEmit).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+  });
+
+  it("verify never emits 6 (it finishes its own pending effect) and resume never emits 6 or 8 (plan-v5 Part A item 2)", () => {
+    expect(migrationCommandContract("verify").canEmit).toEqual([0, 1, 2, 3, 4, 5, 7]);
+    expect(migrationCommandContract("resume").canEmit).toEqual([0, 1, 2, 3, 4, 5, 7]);
+  });
+
+  it("report emits exactly 0,1,2,4,5,8 and rollback gains 8 (plan-v5 Part A item 2)", () => {
+    expect(migrationCommandContract("report").canEmit).toEqual([0, 1, 2, 4, 5, 8]);
+    expect(migrationCommandContract("rollback").canEmit).toContain(8);
   });
 
   it("plan and dry-run's canEmit never include 3, 6, 7 or 8: neither command mutates, confirms a boundary, or reaches a durable-recoverable or restart-required state", () => {

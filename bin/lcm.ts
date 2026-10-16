@@ -18,11 +18,17 @@ import { performMigrationPlan } from "../src/migration/cli-plan.js";
 import { performMigrationDryRunCheck } from "../src/migration/cli-dry-run.js";
 import { performMigrationApply } from "../src/migration/cli-apply.js";
 import { performMigrationAbortCommand } from "../src/migration/cli-abort.js";
+import { performMigrationVerifyCommand } from "../src/migration/cli-verify.js";
+import { performMigrationResumeCommand } from "../src/migration/cli-resume.js";
+import { performMigrationReportCommand } from "../src/migration/cli-report.js";
 import {
   renderMigrationPlanEnvelope,
   renderMigrationDryRunEnvelope,
   renderMigrationApplyEnvelope,
   renderMigrationAbortEnvelope,
+  renderMigrationVerifyEnvelope,
+  renderMigrationResumeEnvelope,
+  renderMigrationReportEnvelope,
   renderMigrationUnexpectedFailureEnvelope,
 } from "../src/migration/cli-render.js";
 import type { MigrationCommandName } from "../src/migration/exit-classes.js";
@@ -2069,9 +2075,9 @@ export function registerMachineCommand(program: Command): void {
 
 /**
  * Section 3's `lcm migration` command group -- `plan`, `dry-run`, `apply`,
- * `abort` (this candidate's scope per issue #627 section 13; `resume`,
- * `verify`, `report`'s full body, `activate` and `rollback` are not
- * wired here). Modelled on `registerPostgreSqlCommand` above.
+ * `resume`, `verify`, `report` and `abort`. `activate` (#625) and
+ * `rollback` (#626, #1433) are not registered until those land. Modelled on
+ * `registerPostgreSqlCommand` above.
  *
  * Every action handler is thin glue by design: call the orchestration
  * function from `src/migration/cli-*.ts`, call the matching `render*`
@@ -2125,16 +2131,17 @@ export function registerMigrationCommand(program: Command): void {
   type MigrationJsonOptions = { help?: boolean; json?: boolean };
   type MigrationApplyOptions = MigrationJsonOptions & {
     confirmGeneration?: string;
+    generation?: string;
     dryRun?: boolean;
     maxRecords?: string;
     maxBytes?: string;
   };
 
   const migrationCmd = new Command("migration")
-    .description("Reversible SQLite-to-PostgreSQL cutover (plan, dry-run, apply, abort)");
+    .description("Reversible SQLite-to-PostgreSQL cutover (plan, dry-run, apply, resume, verify, report, abort)");
   migrationCmd.helpOption(false).option("-h, --help", "Show help");
   migrationCmd.action(async () => {
-    writeCliError("Usage: lcm migration <plan|dry-run|apply|abort> [--json]\n");
+    writeCliError("Usage: lcm migration <plan|dry-run|apply|resume|verify|report|abort> [--json]\n");
     exit(1);
   });
 
@@ -2193,8 +2200,69 @@ export function registerMigrationCommand(program: Command): void {
     });
 
   migrationCmd
+    .command("resume")
+    .description("Run the next step of a held generation: genesis and dry-run, copy, or finishing a carried effect")
+    .option("--generation <id>", "The generation to resume (default: the live maintenance hold)")
+    .option("--confirm-generation <id>", "The resolved generation id")
+    .option("--dry-run", "Name the step resume would run; run nothing and predict nothing")
+    .option("--max-records <n>", "Maximum records per copy batch")
+    .option("--max-bytes <n>", "Maximum bytes per copy batch")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      const maxRecords = opts.maxRecords === undefined ? undefined : parsePositiveInteger(opts.maxRecords, "--max-records");
+      const maxBytes = opts.maxBytes === undefined ? undefined : parsePositiveInteger(opts.maxBytes, "--max-bytes");
+      writeCliError("Resolving the generation to resume...\n");
+      const outcome = await performMigrationResumeCommand({
+        cwd: process.cwd(),
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+        maxRecords,
+        maxBytes,
+      });
+      writeCliError("Migration resume finished.\n");
+      emitMigrationEnvelope("resume", () => renderMigrationResumeEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("verify")
+    .description("Verify a copied generation from persisted evidence, or confirm one that is already verified")
+    .option("--generation <id>", "The generation to verify (default: the live maintenance hold)")
+    .option("--confirm-generation <id>", "The resolved generation id")
+    .option("--dry-run", "Name what verify would do; take no lease and write nothing")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Verifying the migration generation...\n");
+      const outcome = await performMigrationVerifyCommand({
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+      });
+      writeCliError("Migration verify finished.\n");
+      emitMigrationEnvelope("verify", () => renderMigrationVerifyEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("report")
+    .description("Read-only account of one generation: what exists, what owns it, and what to run next")
+    .option("--generation <id>", "The generation to report (default: the live or terminal journal's own)")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Reading the migration generation...\n");
+      const outcome = await performMigrationReportCommand({ homeDir: homedir(), generation: opts.generation });
+      writeCliError("Migration report finished.\n");
+      emitMigrationEnvelope("report", () => renderMigrationReportEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
     .command("abort")
     .description("Abort a held or entering migration, completing whichever recovery write is missing")
+    .option("--generation <id>", "The generation to abort (default: the journal's own generation)")
     .option("--confirm-generation <id>", "The generation id of the live maintenance hold")
     .option("--dry-run", "Run every read and check, then stop before changing anything")
     .option("--json", "Output structured JSON")
@@ -2203,6 +2271,7 @@ export function registerMigrationCommand(program: Command): void {
       writeCliError("Aborting the migration hold...\n");
       const outcome = await performMigrationAbortCommand({
         homeDir: homedir(),
+        generation: opts.generation,
         confirmGenerationId: opts.confirmGeneration,
         dryRun: opts.dryRun,
       });

@@ -18,25 +18,25 @@ storage operations on this installation — hook writes, memory search, compacti
 touches local storage as a consumer — are fenced and will refuse or retry rather than proceed.
 
 **`activate` (the command that would complete the cutover by switching your installation over to
-the copied PostgreSQL data and releasing the hold) is not implemented in this release.** It ships in
-a later integration candidate of this Epic, alongside `resume`, `verify`, `report`, `rollback`, and the
-restart-verification step `activate` depends on. Until then, the only way to leave the hold `apply`
-creates is `lcm migration abort`, which discards the hold and the captured snapshot and returns your
-installation to normal, unfenced SQLite operation. Nothing about your PostgreSQL destination is
-affected by `abort`; the copy, if it reached PostgreSQL, is simply not used.
+the copied PostgreSQL data and releasing the hold) is not implemented in this release.** It ships
+with the activation work of this Epic, alongside `rollback` and the restart-verification step both
+depend on. Until then, the only way to leave the hold `apply` creates is `lcm migration abort`,
+which discards the hold and the captured snapshot and returns your installation to normal, unfenced
+SQLite operation. Nothing about your PostgreSQL destination is affected by `abort`; the copy, if it
+reached PostgreSQL, is simply not used.
 
-
-**What exists today, plainly:** `plan`, `dry-run`, `apply`, and `abort` are registered, working
-commands. `report`, `verify`, `activate`, and `rollback` are **not registered and not
+**What exists today, plainly:** `plan`, `dry-run`, `apply`, `resume`, `verify`, `report` and
+`abort` are registered, working commands. `activate` and `rollback` are **not registered and not
 available** -- there is no CLI command by those names to run, regardless of what this document or
 the CLI's internal contract data name them as (they are named because this Epic's design covers
-all nine eventual commands; naming a command is not the same as registering it). Forward
-completion of a cutover past capture-and-copy is not available. **`abort` is the only exit from
-a hold.**
+all nine eventual commands; naming a command is not the same as registering it). `resume` and
+`verify` carry a held generation through its dry-run, copy and verification checkpoints, and
+`report` tells you which of them to run next, but the final step past verification is not
+available. **`abort` is the only exit from a hold.**
 
 So: `apply` is not yet a step toward a completed cutover you can run today. It is currently useful
-for two things — proving that capture, manifest genesis and copy work correctly against your real
-PostgreSQL target, and for testing the mechanism ahead of the integration release that adds
+for two things — proving that capture, manifest genesis, copy and verification work correctly
+against your real PostgreSQL target, and testing the mechanism ahead of the release that adds
 `activate`. If you need your installation to keep operating normally, either do not run `apply` yet,
 or run `abort` immediately afterward once you have confirmed what you needed to confirm.
 
@@ -64,10 +64,27 @@ capture refuse (`multi-machine-installation`) rather than proceed.
 
 ## Commands
 
-All four commands accept `--json`, which prints exactly one JSON document to stdout (see
+Every command accepts `--json`, which prints exactly one JSON document to stdout (see
 "The JSON envelope" below) and sends progress and human-readable text to stderr instead. Without
 `--json`, a short human-readable summary line goes to stdout; progress still goes to stderr either
 way.
+
+**Which command next.** Run `lcm migration report` first: it names the cell your installation is in
+(see "State routing" below) and the command that owns it. `resume`, `verify` and `abort` act on
+one generation, the live maintenance hold's by default. A hold that has already ended names no
+generation, so pass `--generation <id>` (`abort` and `report` use the journal's own generation).
+A mutating command also needs `--confirm-generation <id>`, equal to the generation it resolved; an
+omitted or different id refuses exit 3 with the home byte-identical, and the refusal reports the id
+to pass. If the generation's state belongs to another command the refusal names it (exit 2), or
+names `resume`/`verify` when a begun effect only that command can finish (exit 6).
+
+**What `--dry-run` promises.** No migration state is written: not the journal, the manifest, the
+report store, the project map, or PostgreSQL project and alias rows. Coordination effects are
+listed in the envelope's `evidence.coordinationEffects`. `plan` and `apply --dry-run` read the
+candidate under the source append barrier; `resume --dry-run` and `verify --dry-run` take none (the
+fresh-verification lease and barrier belong to a path this release does not have). `resume
+--dry-run` is route-only and `verify --dry-run` at a pending effect is too: they name the step and
+set `predictive: false`, because completing the step is what performs the checks.
 
 ### `lcm migration plan [--json]`
 
@@ -75,6 +92,10 @@ Non-mutating. Checks every precondition `apply` will check — target configurat
 reachability and TLS/role verification, daemon presence, and the candidate migration generation —
 and prints the result without taking any hold, capturing anything, or writing anything. Run this
 first. Its printed generation id is the exact value `apply --confirm-generation` must be given.
+
+Identity is previewed, never minted: the evidence says whether the destination project `exists` or
+`will-be-created-at-apply`, and whether the local project map entry is `persisted`. Only `apply`,
+after its confirmation fence, writes either.
 
 Exit 0 postcondition: every precondition read succeeded and the emitted evidence is complete,
 including a positively established daemon-presence answer and a computed candidate generation id.
@@ -104,6 +125,13 @@ sees the same closed vocabulary regardless of how the token went missing. The id
 `apply` (because local state changed), `apply` refuses `confirmation-generation-moved` (exit 3)
 rather than silently applying against a different generation.
 
+**Nothing is written before that fence.** The local project map entry and the destination
+PostgreSQL project and alias rows are created only after `--confirm-generation` matches; a missing
+or mismatched token leaves them, and the home, as they were. While a hold exists, `apply` never
+creates either: it reads the persisted local identity and selects the destination project, and
+refuses `local-identity-not-persisted` or `destination-project-absent` (exit 5) rather than
+mint under a hold.
+
 `--dry-run` stops immediately after the confirmation fence, before the hold is taken or anything is
 captured. The emitted envelope reports the confirmed candidate with `applied: false`.
 
@@ -113,25 +141,90 @@ phase (`copied`) -- the phase the envelope reports is the one read, not the copy
 
 **Read "Before you run apply" above before using this command for real.**
 
-### `lcm migration abort --confirm-generation <id> [--dry-run] [--json]`
+### `lcm migration resume [--generation <id>] --confirm-generation <id> [--dry-run] [--max-records <n>] [--max-bytes <n>] [--json]`
+
+Mutating (unless `--dry-run` is given). Runs the one step the router gives `resume` for a held
+generation and stops at the next durable checkpoint; it never chains into the following step. Run it
+again, or follow `report`'s `next`, to continue.
+
+| Cell | State | What `resume` runs |
+| --- | --- | --- |
+| 19 | manifest `planned`, nothing pending | begins and completes the dry-run effect (contacts PostgreSQL), reading `dry-run-verified` back |
+| 20 | pending dry-run effect | completes that carried effect only; a different effect id writes nothing |
+| 21 | `dry-run-verified` or `copying`, or a pending copy effect | the copy only, stopping at `copied` |
+| 23 | pending verification effect | completes it from the persisted report, as `verify` does (no PostgreSQL) |
+| 6 | journal aborted, pending abort effect | completes the carried abort effect, as `abort` does |
+| 11, 12 | activation or rollback re-entry | refuses exit 7: those commands are not available in this release |
+
+The destination identity is the held one: the persisted local project identity and a read of the
+existing destination project. `resume` never creates either. `--dry-run` names the cell and runs
+nothing: it calls no step, takes no lease or barrier, claims no prediction (`predictive: false`),
+and exits 0 when routing itself succeeded.
+
+Exit 0 postcondition: the manifest was read back at the checkpoint the cell produces.
+
+### `lcm migration verify [--generation <id>] --confirm-generation <id> [--dry-run] [--json]`
+
+Mutating (unless `--dry-run` is given or the generation is already verified).
+
+- **Pending verification** (cell 23): completes it from the persisted, activation-eligible report.
+  This never reopens PostgreSQL, so it works with the destination down. It refuses
+  `verify-report-identity-conflict` when the pending effect does not name that report and
+  `verify-destination-drift` when the report does not match the destination the copy sealed; both
+  exit 5 with nothing written.
+- **Already verified** (cell 24): confirms from the persisted report and writes nothing.
+- **Copied, nothing pending** (cell 22): the fresh verification needs the project-map witness that the
+  activation work (#625) provides. It is not in this release, so `verify` refuses
+  `requires-625-project-map-witness` (exit 7) and changes nothing; no value is invented in its place.
+  `abort` remains available from this cell.
+
+`verify` never exits 6: it finishes its own pending effect.
+
+Exit 0 postcondition: the manifest reads `verified` with nothing pending and its verification report
+reference names a persisted, activation-eligible report.
+
+### `lcm migration report [--generation <id>] [--json]`
+
+Read-only. It takes no lock, barrier or lease, runs no preflight and writes nothing, so it is safe to
+run at any time, including while another command works. It prints, as ids, digests, phases and
+booleans only: the journal and its phase, the snapshot class, the manifest phase, revision and
+pending effect, the verification report summary (clean, eligible, mismatch total, coverage), the
+router cell and `next`, and — when a selection is already durable — the daemon restart check.
+Readers that belong to the activation and rollback work print `not-available-in-this-build`.
+
+A non-zero exit still prints everything it read: 2 when no generation can be resolved, 4 for a
+foreign publication in flight, 5 for contradictory or unreadable evidence (including either restart
+observation failing), 8 when only a daemon restart is outstanding.
+
+Exit 0 postcondition: every reader that exists in this build was read and no contradiction was found.
+
+### `lcm migration abort [--generation <id>] --confirm-generation <id> [--dry-run] [--json]`
 
 Mutating (unless `--dry-run` is given). The only way to leave a maintenance hold in this release.
 Classifies the live maintenance journal and the manifest first, and only then completes whichever
-of the journal termination and the manifest settlement is still outstanding — idempotent under
-repetition, so running it again against an already-aborted state is safe and simply confirms the
-terminal state. Discards the captured snapshot's standing as a migration-in-progress; nothing on
-the PostgreSQL side is deleted or undone, since `abort` never reaches PostgreSQL at all.
+of the journal termination and the manifest settlement is still outstanding. Discards the captured
+snapshot's standing as a migration-in-progress; nothing on the PostgreSQL side is deleted or undone,
+since `abort` never reaches PostgreSQL at all. `--generation` defaults to the journal's own, live or
+already terminal.
 
-`abort` writes nothing unless it can finish the whole recovery. If the manifest carries an
-in-progress copy effect that only `resume` can settle, `abort` refuses
-(`abort-manifest-needs-resume`) while the hold is still intact, rather than releasing the hold and
-leaving a manifest nothing can settle.
+**Repeating `abort` only confirms.** When the journal is already `maintenance-aborted` and the
+manifest is absent or aborted, `abort` writes nothing, exits 0 with `applied: false`, and reads the
+settled pair back. A crash between the two writes is finished by running `abort` again: with the
+journal aborted and the manifest copied, planned or similar, it settles the manifest; with the abort
+effect already begun, it completes that carried effect without aborting the journal a second time.
 
-`--confirm-generation <id>` must equal the generation id of the live maintenance hold. Omitting it
-refuses `abort-confirmation-missing` and a different id refuses `abort-confirmation-moved` (both
-exit 3, nothing changed); either refusal reports the live generation id in its `generation` field,
-so you can re-run with it. `--dry-run` runs every read and check, reports `applied: false`, and
-changes nothing; it still requires the token and refuses with the class the real run would get.
+`abort` writes nothing unless it can finish the whole recovery. A manifest with a begun effect that
+`resume` (or `verify`) owns — a pending copy, dry-run or verification effect — is refused
+`route-resume-required` (exit 6, `next` names the command) while the hold is still intact, rather
+than releasing the hold and leaving a manifest nothing can settle. `abort` settles both sides from
+`planned`, `dry-run-verified`, `copying` and `copied` (nothing pending) and from a hold with no
+manifest yet. An aborted journal beside a pending copy effect is `route-operator-required` (exit 7).
+
+`--confirm-generation <id>` must equal the generation id of the journal. Omitting it refuses
+`abort-confirmation-missing` and a different id refuses `abort-confirmation-moved` (both exit 3,
+nothing changed); either refusal reports the generation id in its `generation` field, so you can
+re-run with it. `--dry-run` runs every read and check, reports `applied: false`, and changes
+nothing; it still requires the token and refuses with the class the real run would get.
 
 Exit 0 postcondition: the maintenance journal reads terminal and the manifest reads settled, both
 read back after the operation, not assumed from the operation reporting success.
@@ -163,10 +256,19 @@ knowing by name:
   not running is **not** a refusal here — see "Daemon presence" below.
 - `multi-machine-installation` (exit 2): this project is already linked to a PostgreSQL project
   (see "Configuration" above). Migration requires an unlinked, single-machine project.
+- `route-not-owner` (exit 2), `route-resume-required` (exit 6), `route-publication-in-flight` (exit 4),
+  `route-requires-activation` / `route-requires-rollback` / `route-operator-required` (exit 7),
+  `route-unresolvable` / `route-foreign-publication` / `route-contradiction` (exit 5): the router
+  looked at the journal, manifest and snapshot of the generation and this command does not own that
+  cell. The envelope's `next` names the command that does, when one does. Nothing was changed.
+- `existing-confirmation-missing` / `existing-confirmation-moved` (exit 3): `resume` or `verify` was not
+  given the resolved generation id. The refusal reports it in `generation`.
+- `generation-required` / `generation-unknown` (exit 2), `generation-invalid` (exit 1): pass
+  `--generation` naming a generation that exists.
 - `abort-nothing-to-abort` (exit 2): there is no hold to leave. Nothing to do.
 - `unexpected-failure` (exit 5): something threw that no command classified. The command still prints
   exactly one envelope; its evidence is only the error's name. Check `applied` (reported `true` for
-  `apply` and `abort`, which cannot rule out an earlier write), run `lcm doctor`, and re-run
+  every command that can write, which cannot rule out an earlier write), run `lcm doctor`, and re-run
   `lcm migration plan` to see the current state.
 - Anything ending `-unresolvable` or classed `refused-evidence` (exit 5): the command could not
   establish the state it needed to decide anything — this is different from the state actively
@@ -194,29 +296,37 @@ would tell an operator a definite "no" when the honest answer was "unknown".
 | 3 | `refused-confirmation` | A mutating boundary was not confirmed |
 | 4 | `refused-contention` | Another actor holds the lock, barrier or lease |
 | 5 | `refused-evidence` | Evidence is absent, unattributable, or failed its comparison |
-| 6 | `incomplete-recoverable` | Durably begun, not terminal, and `resume` can finish it (not reachable in this release -- see "Commands not available today") |
+| 6 | `incomplete-recoverable` | Durably begun, not terminal, and `resume` (or `verify`) can finish it; only a command that is not the owner of the cell exits 6, naming the one that is |
 | 7 | `failed-operator-required` | No automatic path resolves this; a human must decide. Check `applied` for whether anything mutated |
-| 8 | `restart-required` | Durable state correct; a live daemon holds a stale startup backend (not reachable in this release -- see "Commands not available today") |
+| 8 | `restart-required` | Durable state correct; a live daemon holds a stale startup backend; only `report` exits 8 in this release (see "Restarting the daemon after a selection") |
 
 ## State routing: which command owns which situation
 
 This table exists so that every state your installation can be in has exactly one command that
-owns getting you out of it. Commands not listed as the owner for a row refuse exit 2, naming the
-owner in their remedy.
+owns getting you out of it. `report` prints the cell number and `next`; every command that is not
+the owner refuses naming it (exit 2), or exit 6 when a begun effect only the owner can finish is
+pending. The same router decides for all of them, so they cannot disagree.
 
-| Maintenance journal | Snapshot | Manifest | Owning command | Other commands return |
-| --- | --- | --- | --- | --- |
-| absent, or terminal with a settled pair | absent | absent | `apply` (fresh cutover) | 2 |
-| `entering`, matching this project | any | any | `apply` (recovers automatically) or `abort` | 2 |
-| `held`, matching | absent | absent | `apply` (continues to capture) | 2 |
-| `held`, matching | `partial` or `replaced` | any | **`abort` only** | 2, remedy `abort`, never 6 |
-| `held`, matching | `complete` | absent | `apply` (mints the manifest and copies) | 2 |
-| `held`, matching | `complete` | copy in progress | `resume` (not implemented -- see below; `abort` also always available) | 2 |
-| `held`, mismatched with this project's current selection | any | any | `abort` | 2 |
-| terminal | any | not settled | `abort` or `resume` (not implemented; use `abort`) | 2 |
-| `held`, matching | `tampered` | any | none -- `apply` refuses `continuation-snapshot-tampered` (exit 5) with evidence preserved; this is a security-relevant signal, not something any command resolves automatically. `abort` still releases the hold | 5 |
-| any other journal | `tampered` | any | none -- exit 5 with evidence preserved | 5 |
-| settled pair with no forward path | any | any | none -- exit 7; file an issue | 7 |
+| Cell | Maintenance journal | Snapshot | Manifest | Owner | Also allowed |
+| --- | --- | --- | --- | --- | --- |
+| 14-16 | `entering`/`held`, matching | absent or complete | absent | `apply` (recovers, continues, mints the manifest and copies) | `abort` |
+| 17 | `entering`/`held`, matching | `partial`, `replaced`, `tampered` | absent, or nothing pending | **`abort` only** | -- |
+| 18 | `entering`/`held`, matching | `partial`, `replaced`, `tampered` | an effect is pending | none -- exit 7, evidence preserved | -- |
+| 19 | `held` | complete | `planned` | `resume` | `abort` |
+| 20 | `held` | complete | pending dry-run effect | `resume` | -- |
+| 21 | `held` | complete | `dry-run-verified`/`copying`, or a pending copy effect | `resume` | `abort` only with nothing pending |
+| 22 | `held` | complete | `copied` | `verify` (fresh: waits for #625) | `abort` |
+| 23 | `held` | any | pending verification effect | `verify` | `resume` |
+| 24 | `held` | complete | `verified` | `activate` (not available) | `verify` (confirms), `rollback`, `abort` |
+| 4 | `entering`/`held`, another generation | any | any | `abort` (acts on that live hold) | -- |
+| 5 | `maintenance-aborted` | any | absent or `aborted` | none -- settled; `apply` starts a fresh cutover | `abort` (confirms only) |
+| 6 | `maintenance-aborted` | any | pending abort effect | `abort` | `resume` |
+| 7 | `maintenance-aborted` | any | pending copy, dry-run or verification effect | none -- exit 7 | -- |
+| 8 | `maintenance-aborted` | any | begun-nothing phase before `verified` | `abort` (settles the manifest) | -- |
+| 9 | `maintenance-aborted` | any | anything else | none -- exit 5; `abort` is never called | -- |
+| 10-13 | publication or selection states, activation and rollback | any | `verified`, `active`, `rolling-back`, `rolled-back` | `activate`/`rollback` (not available): exit 7 | `resume` |
+| 2, 3 | a v2 publication | any | any | none -- exit 4 while in flight, exit 5 when foreign and finished | -- |
+| 1, 25 | unresolvable, or no row matches | -- | -- | none -- exit 5 | -- |
 
 A generation classifying `partial` or `replaced` is **never deleted**. Every failed or abandoned
 capture attempt is preserved on disk exactly as-is; `abort` releases the hold without touching that
@@ -228,25 +338,25 @@ expected and not a sign of a leak.
 
 ## Commands not available today
 
-`resume`, `verify`, `activate`, and `rollback` are named in this Epic's design and in the state-
-routing table above, because the design covers all nine eventual commands -- naming a command is
-not the same as registering it. **None of the four is registered as a CLI command in this release.**
-There is nothing to run by those names. Where the table above names one of them as the owner of a
-state, `abort` remains available as the actual, working exit from that state today.
+`activate` and `rollback` are named in this Epic's design and in the state-routing table above,
+because the design covers all nine eventual commands -- naming a command is not the same as
+registering it. **Neither is registered as a CLI command in this release.** There is nothing to run
+by those names. Where the table above names one of them as the owner of a state, `abort` (from a
+hold) remains the actual, working exit from that state today, and `resume` and `verify` refuse
+exit 7 rather than guess.
 
 `rollback` specifically is not merely deferred by sequencing: its underlying orchestration has a
 known safety gap (tracked separately, issue #1433) that makes it safe to exist unregistered in this
 codebase but unsafe to expose as a runnable command. It will not be registered until that gap is
-closed, independent of when `resume`, `verify` and `activate` become available.
+closed, independent of when `activate` becomes available.
 
-`report` is also not registered as a CLI command in this release, despite being named in this
-Epic's design as manifest-level-only for now; it and its fuller verification-report body readback
-both land with the `verify` integration.
+The fresh form of `verify` (a `copied` generation with nothing pending) also waits: it needs the
+project-map witness the activation work provides, and refuses `requires-625-project-map-witness`
+until then.
 
 Do not read any of this as "coming soon": it is a statement of what you can and cannot do with this
-release, today. When `resume`, `verify`, `report`, `activate` and `rollback` do become available,
-this document will say so in the command reference above, the same way `plan`, `dry-run`, `apply`
-and `abort` are documented there now.
+release, today. When `activate` and `rollback` do become available, this document will say so in
+the command reference above, the same way the other commands are documented there now.
 
 ## The maintenance hold, in more detail
 
@@ -276,6 +386,25 @@ exit 5). A daemon not running is **not** a precondition failure -- nothing in th
 daemon, and refusing on its absence would force you to start one immediately before a hold that
 would then make that daemon's own sweeps fail, which is the exact situation this check exists to
 warn about, not require.
+
+### Restarting the daemon after a selection
+
+A durable selection can be correct while a daemon that started earlier still holds the previous
+startup backend; it refuses local requests until it restarts. `report` checks this only when a
+selection is already durable (an `active` manifest names postgresql; a `rolled-back` manifest or a
+settled abort names sqlite; a completed selection in the journal names its own target backend). It
+combines two independent observations, and neither decides alone:
+
+| Restart check | Daemon presence | Exit |
+| --- | --- | --- |
+| satisfied | none, or running on the selected backend | 0 |
+| satisfied | running on a stale backend, or unresolvable | 5 |
+| unsatisfied | running on a stale backend | 8 |
+| unsatisfied | anything else | 5 |
+| unresolvable | any | 5 |
+
+If either observation cannot be made, `report` exits 5. The loop is: run `lcm migration report`; on
+exit 8 run `lcm daemon restart`; run `report` again until it exits 0.
 
 ## What is preserved, and what the probe bound means
 
@@ -426,8 +555,8 @@ are emitted by no registered command in this release.
     },
     {
       "command": "resume",
-      "status": "outline",
-      "exitZeroPostcondition": "The state it routed to reached its next durable checkpoint, read back.",
+      "status": "implemented",
+      "exitZeroPostcondition": "The router cell it executed reached its next durable checkpoint, and the manifest was read back at it. With --dry-run, the cell was named and nothing was run or predicted.",
       "canEmit": [
         0,
         1,
@@ -435,14 +564,13 @@ are emitted by no registered command in this release.
         3,
         4,
         5,
-        6,
         7
       ]
     },
     {
       "command": "verify",
-      "status": "outline",
-      "exitZeroPostcondition": "Verification report persisted and re-read; manifest at verified.",
+      "status": "implemented",
+      "exitZeroPostcondition": "The manifest reads verified with nothing pending and its verification report reference names a persisted, activation-eligible report. A verified generation is confirmed from that persisted evidence without writing.",
       "canEmit": [
         0,
         1,
@@ -450,18 +578,18 @@ are emitted by no registered command in this release.
         3,
         4,
         5,
-        6,
         7
       ]
     },
     {
       "command": "report",
-      "status": "outline",
-      "exitZeroPostcondition": "Every read succeeded and evidence is complete. Manifest-level only in this candidate; the verification-report body readback lands with #624's integration.",
+      "status": "implemented",
+      "exitZeroPostcondition": "Every reader that exists in this build was read without taking any lock, and no contradiction was found. Readers that belong to unmerged work print not-available-in-this-build.",
       "canEmit": [
         0,
         1,
         2,
+        4,
         5,
         8
       ]
@@ -485,7 +613,7 @@ are emitted by no registered command in this release.
     {
       "command": "rollback",
       "status": "outline",
-      "exitZeroPostcondition": "Manifest read back at rolled-back.",
+      "exitZeroPostcondition": "Manifest read back at rolled-back and the restart verifier answered satisfied.",
       "canEmit": [
         0,
         1,
@@ -494,13 +622,14 @@ are emitted by no registered command in this release.
         4,
         5,
         6,
-        7
+        7,
+        8
       ]
     },
     {
       "command": "abort",
       "status": "implemented",
-      "exitZeroPostcondition": "Journal terminal and manifest settled, both read back.",
+      "exitZeroPostcondition": "Journal terminal and manifest settled, both read back. Repeating it against a settled pair writes nothing and reads the pair back again.",
       "canEmit": [
         0,
         1,
@@ -508,6 +637,7 @@ are emitted by no registered command in this release.
         3,
         4,
         5,
+        6,
         7
       ]
     }
