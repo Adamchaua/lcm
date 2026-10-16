@@ -509,3 +509,11 @@ it("requires native JSON types before extracting passive-event envelope text",()
   for(const key of ["sessionId","category","data","sourceHook","createdAt"]) expect(sql).toContain(`pg_catalog.jsonb_typeof(r.payload->'${key}') = 'string'`);
   for(const key of ["sessionSequence","priority"]) expect(sql).toContain(`pg_catalog.jsonb_typeof(r.payload->'${key}') = 'number'`);
 });
+
+it("budgets a batch item as its row bytes plus its two UTF-8 locator copies",()=>{
+  expect(mapping.canonicalBatchItemBytes(1000n,'["12"]')).toBe(1000n+2n*6n);
+  // Buffer.byteLength, not UTF-16 length: "é" is two bytes and "€" is three.
+  expect(mapping.canonicalBatchItemBytes(7n,'["é€"]')).toBe(7n+2n*BigInt(Buffer.byteLength('["é€"]')));
+  expect(Buffer.byteLength('["é€"]')).toBe(9);
+  expect(mapping.canonicalBatchItemBytes(5n,"")).toBe(5n);
+});
