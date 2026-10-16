@@ -1,0 +1,12 @@
+references: ["#1509"]
+rationale: >-
+  #1509 recovers rows that were replicated to a previous remote project after a
+  relink: the worker re-queues or settles them, the repository withdraws this
+  machine's copies from other projects, and the local outbox gains the
+  replicated-to-pending transition. Every changed file keeps its current owner.
+pins:
+  - ["src/daemon/passive-event-replication.ts", "integration-postgresql-passive-events"]
+  - ["src/daemon/passive-event-replication-pass.ts", "unit-daemon-events"]
+  - ["src/storage/postgresql/passive-event-repository.ts", "integration-postgresql-passive-events"]
+  - ["src/hooks/events-db.ts", "unit-hooks"]
+  - ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"]

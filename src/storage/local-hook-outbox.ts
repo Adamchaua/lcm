@@ -171,6 +171,7 @@ export interface LocalHookOutboxRepository {
     claimOwner: string,
     remoteInboxId: bigint,
   ): Promise<boolean>;
+  requeueReplicated(eventUuid: string, remoteInboxId: bigint): Promise<boolean>;
   markDeliveryRetry(
     eventUuid: string,
     claimOwner: string,
@@ -494,6 +495,11 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
   ): Promise<boolean> {
     this.assertOpen("markReplicated");
     return this.admitted(() => this.database.markReplicated(eventUuid, claimOwner, remoteInboxId));
+  }
+
+  async requeueReplicated(eventUuid: string, remoteInboxId: bigint): Promise<boolean> {
+    this.assertOpen("requeueReplicated");
+    return this.admitted(() => this.database.requeueReplicated(eventUuid, remoteInboxId));
   }
 
   async markDeliveryRetry(

@@ -221,7 +221,8 @@ event-delivery worker for the local outbox, distinct from the daemon's selected
 7. prunes only the exact applied inbox row, recording local prune completion
    after deletion or missing-row proof.
 
-Per-machine ordering is preserved. Independent machines can progress
+Per-machine ordering is preserved within a project binding; a project relink
+is the exception (see below). Independent machines can progress
 concurrently. Retry delay uses bounded exponential backoff with deterministic
 jitter, stale claims are recoverable, and poison events remain inspectable
 until exact replay.
@@ -287,7 +288,14 @@ still replaces the daemon through the `/health` backend comparison in
 Replication drains the sidecar the sweep scanned for the project, at that exact
 path. It opens an existing sidecar only: when the file is missing, or cannot be
 opened while a backend switch is in progress, the project is skipped quietly and
-no sidecar or project identity evidence is created.
+no sidecar or project identity evidence is created. The sidecar is opened
+before the pass resolves the project's identity, so a missing sidecar never
+reaches identity resolution, which could otherwise create and publish a
+project-map entry. On a PostgreSQL daemon this means a project that is not
+linked to a remote project opens and closes its existing sidecar once per
+sweep (opening may migrate an existing sidecar, as the sweep's own open
+does). Only a project that is linked to a remote project and whose storage is
+healthy goes on to create a remote repository and run a pass.
 
 Each pass reads the project's remote binding once, before its first phase, and
 binds its remote repository to it. Every admitted phase then re-reads the
@@ -297,12 +305,47 @@ reports one error and uploads no further rows to the previous project. It
 keeps working on what that project already holds (claims, reconcile and prune)
 for the rest of the pass, so rows it uploaded there are not abandoned
 mid-pass. Rows the pass did not upload stay pending locally and upload to the
-new binding on the next sweep. Rows that are still awaiting the previous
-project when the pass ends are not reconciled after the next sweep binds the
-new project; this is a known limitation tracked in
-[#1509](https://github.com/donadiosolutions/lcm/issues/1509). A pass run
-without a publication admission checks the binding too, but without the
-admission's lock, so that check is best effort.
+new binding on the next sweep. A pass run without a publication admission
+checks the binding too, but without the admission's lock, so that check is
+best effort.
+
+#### After a project relink
+
+Rows that were uploaded to the previous remote project and are still awaiting
+it when the project is relinked are not left behind. During the reconcile
+phase of every pass, a row that the bound project does not know about is
+looked up in the other projects of the same machine, and only this machine's
+own rows are ever examined or changed:
+
+- a copy that was never delivered (waiting, scheduled for retry, or claimed by
+  a drainer that stopped renewing its claim) is withdrawn from the previous
+  project and the local row goes back to the pending queue, so the next pass
+  uploads it to the new project;
+- a copy the previous project already applied is deleted and the local row is
+  acknowledged, so it is pruned like any other delivered row;
+- a copy the previous project quarantined stays there as evidence and the local
+  row is quarantined the same way;
+- a copy that another drainer is working on right now is left alone and looked
+  at again on the next pass; and
+- a copy that differs from the local row is never changed. One error naming the
+  rows is reported per pass while it persists.
+
+A row that exists nowhere is queued again as well, which also completes a
+recovery that was interrupted between withdrawing the remote copy and updating
+the local row. A pass that sees the binding move does not run this recovery
+for the rest of that pass; the next pass, bound to the new project, does. When
+nothing awaits the previous project the recovery costs no extra query, and a
+row that stays unresolved (a live claim or a mismatch) costs one query per
+pass.
+
+Withdrawing a copy does not wait for the previous project's drain lease. That
+is safe because applying a passive event has no remote effect and a drainer
+whose claim went stale fails its completion before it applies anything.
+
+Per-machine ordering holds while a project stays bound. After a relink a
+recovered older row is uploaded after rows that were still pending locally, so
+the new project can receive a newer event before an older one from the same
+machine.
 
 The storage health check receives the daemon's shutdown signal, so stopping the
 daemon cancels a health check that is still waiting on a PostgreSQL connection

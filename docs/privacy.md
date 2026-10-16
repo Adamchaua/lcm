@@ -542,9 +542,11 @@ The `Security` section of the doctor output shows:
   the same pass. In unquoted file URLs, whitespace and the existing path
   delimiters, including later colons, `?`, and `#`, end the redacted span, so
   text after those delimiters can remain visible. In an unquoted exact file
-  URL, a rooted path that directly follows the URL path through `&` or `&?` is
-  redacted on the first pass, so `file://h/a&?/Users/A/secret.db` becomes
-  `file://h<path>&?<path>`; the query of a bracketed public URL child stays
+  URL, a rooted path that directly follows the URL path through `&`, `&?`, `?`,
+  or `=` is redacted on the first pass, so `file://h/a&?/Users/A/secret.db`
+  becomes `file://h<path>&?<path>` and `file://h/a?q=/Users/A/secret.db`
+  becomes `file://h<path>?q=<path>`; the query of a bracketed public URL child
+  and the own `?` and `=` values of an unbracketed public URL after the path stay
   readable. Before the first path separator, semicolons, commas, apostrophes,
   closing parentheses, and closing braces remain part of an exact `file://`
   authority. In a single-quoted exact
