@@ -12,8 +12,15 @@ rationale: >-
   Materially changes the activation artifact store, which gains the durable
   generation -> publication link record (immutable, byte-identical reuse,
   typed conflict, shared crash-twin recovery) and its three-valued reader,
-  and the migration index, which exports the new public API.
+  and the migration index, which exports the new public API. Phase 2 adds
+  the project-map witness (one definition, pre/post-publication modes, no
+  writing read seam), extends the coverage module with the G8 stored-data
+  inventory and single-project verdict, attributes pid-file read failures
+  in the restart check, and adjusts the report body and generation link.
 pins:
+  - ["src/migration/project-map-witness.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-coverage.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-restart-check.ts", "unit-migration-cutover"]
   - ["src/migration/activation-publication-id.ts", "unit-migration-cutover"]
   - ["src/migration/target-health.ts", "unit-migration-cutover"]
   - ["src/migration/activation-artifact-store.ts", "unit-migration-cutover"]

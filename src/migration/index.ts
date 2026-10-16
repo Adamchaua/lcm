@@ -234,3 +234,14 @@ export type {
   MigrationProjectMapWitnessMode,
   MigrationProjectMapWitnessReason,
 } from "./project-map-witness.js";
+
+export {
+  enumerateStoredDataProjectHashes,
+  evaluateActivationSingleProjectCoverage,
+} from "./activation-coverage.js";
+export type {
+  ActivationSingleProjectReason,
+  ActivationSingleProjectVerdict,
+  StoredDataProjectEnumeration,
+  StoredDataProjectEnumerationReason,
+} from "./activation-coverage.js";
