@@ -298,7 +298,7 @@ async function exercise(path: ControlPath, backend: Backend, fixture: Fixture, c
   };
   const selected = selectedSeam[path];
   if (selected) expectedCalls[selected] = 1;
-  if (path === "config get" || path === "install") expectedCalls.createInstallerPublicationConvergence = 1;
+  if (path === "config get" || path === "install" || path === "mcp") expectedCalls.createInstallerPublicationConvergence = 1;
   expect(callCounts()).toEqual(expectedCalls);
   if (path === "daemon start" || path === "daemon restart") {
     const call = (path === "daemon start" ? seams.ensureDaemon : seams.restartDaemon).mock.calls[0]![0];
@@ -311,7 +311,7 @@ async function exercise(path: ControlPath, backend: Backend, fixture: Fixture, c
   if (path === "connectors doctor" || path === "connectors list") expect(seams.listConnectorInventory).toHaveBeenCalledWith(fixture.home);
   if (path === "install") expect(seams.install).toHaveBeenCalledWith(undefined, undefined);
   if (path === "uninstall") expect(seams.uninstall).toHaveBeenCalledWith();
-  if (path === "mcp") expect(seams.startMcpServer).toHaveBeenCalledWith();
+  if (path === "mcp") expect(seams.startMcpServer).toHaveBeenCalledWith({ withPublicationAdmissionRetry: expect.any(Function) });
   const after = snapshot(fixture.root);
   if (path === "config set") {
     const configKey = relative(fixture.root, fixture.config);
