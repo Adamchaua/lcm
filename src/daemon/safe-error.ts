@@ -114,6 +114,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let exactFileScheme = false;
   let foundFilePath = false;
   let filePathBracketDepth = 0;
+  let filePathStartedInBrackets = false;
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
   let quotedQueryTail = false;
@@ -681,7 +682,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         foundFilePath &&
         char === "/" &&
         nestedPublicUrlBracketDepth === 0 &&
-        (chars[index - 1] === "&" || (chars[index - 1] === "?" && chars[index - 2] === "&")) &&
+        (chars[index - 1] === "&" ||
+          (chars[index - 1] === "?" && chars[index - 2] === "&") ||
+          // A question mark or equals sign after a path that did not start
+          // inside an authority bracket also starts a fresh root.
+          ((chars[index - 1] === "?" || chars[index - 1] === "=") && !filePathStartedInBrackets)) &&
         scanAbsolutePath(chars, index, false, -1, true, nestedFileSchemeStarts).sawNonSeparator
       ) {
         // An ampersand after the path starts a fresh root, not URL authority.
@@ -705,6 +710,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         fileQuote[index] = schemeQuote;
         foundFilePath = true;
         filePathBracketDepth = brackets;
+        filePathStartedInBrackets = brackets > 0;
       }
       continue;
     }

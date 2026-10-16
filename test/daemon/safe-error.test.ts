@@ -2630,18 +2630,18 @@ describe("sanitizeError", () => {
   it.each([
     [
       "file://remote.invalid/Users/canary/private.db?next=/etc/private.db",
-      "file://remote.invalid<path>?next=/etc/private.db",
       "file://remote.invalid<path>?next=<path>",
     ],
     [
       "file://remote.invalid/Users/canary/private.db#next=/etc/private.db",
-      "file://remote.invalid<path>#next=/etc/private.db",
       "file://remote.invalid<path>#next=<path>",
     ],
-  ] as const)("redacts file URL delimiter residuals monotonically %#", (input, firstPass, secondPass) => {
-    expect(sanitizeError(input)).toBe(firstPass);
-    expect(sanitizeError(firstPass)).toBe(secondPass);
-    expect(sanitizeError(secondPass)).toBe(secondPass);
+  ] as const)("redacts file URL delimiter residuals on the first pass %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
   it("redacts Bug #1294 Windows tails after nested public URL brackets in one pass", () => {
@@ -4112,6 +4112,59 @@ describe("sanitizeError", () => {
 
     expect(result).toBe("file://h<path>");
     // Linear takes milliseconds; the quadratic rescan took several seconds.
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  it.each([
+    ["question mark", "file://h/a?/Users/x", "file://h<path>?<path>"],
+    ["query parameter", "file://h/a?q=/Users/x", "file://h<path>?q=<path>"],
+    ["surrounding text", "see file://h/a?q=/Users/x end", "see file://h<path>?q=<path> end"],
+    ["empty authority", "file:///a?q=/Users/x", "file://<path>?q=<path>"],
+    ["repeated question marks", "file://h/a??/Users/x", "file://h<path>??<path>"],
+    ["repeated equals signs", "file://h/a?q==/Users/x", "file://h<path>?q==<path>"],
+    ["fragment parameter", "file://h/a#q=/Users/x", "file://h<path>#q=<path>"],
+    ["Unicode symbol component", "file://h/a?q=/📁/secret.db", "file://h<path>?q=<path>"],
+  ] as const)("redacts a root after an unbracketed file URL path query delimiter on the first pass: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "bracketed public child query",
+      "file://h/a?q=[https://e.test/t?key=/public]",
+      "file://h<path>?q=[https://e.test/t?key=/public]",
+    ],
+    [
+      "bracketed public child query question mark",
+      "file://h/a?q=[https://e.test/t?/public]",
+      "file://h<path>?q=[https://e.test/t?/public]",
+    ],
+    ["top-level public URL question mark", "https://h/a?/word", "https://h/a?/word"],
+    ["top-level public URL equals sign", "https://h/a?q=/word", "https://h/a?q=/word"],
+    ["plain text equals sign", "a=/b", "a=<path>"],
+    ["trailing bare slash after question mark", "file://h/a?/", "file://h<path>?/"],
+    ["trailing bare slash after equals sign", "file://h/a?q=/", "file://h<path>?q=/"],
+    ["bracketed query value", "file://h/a?[q=/Users/x]", "file://h<path>?[q=<path>]"],
+  ] as const)("keeps the first-pass output of a non-private query delimiter successor: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("does not rescan a long file URL path suffix at every query delimiter slash", () => {
+    const input = `file://h${"/a?".repeat(16384)}${"=/a".repeat(16384)}`;
+    const started = performance.now();
+    const result = sanitizeError(input);
+    const elapsed = performance.now() - started;
+
+    expect(result).not.toContain("/a");
+    // Linear takes milliseconds; a rescan at every delimiter would take seconds.
     expect(elapsed).toBeLessThan(1000);
   });
 
