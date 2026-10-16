@@ -187,6 +187,8 @@ interface SessionEntry {
   path: string;
   sessionId: string;
   cwd: string;
+  /** Project identity used to dedup the unbound-project remedy line. */
+  projectKey: string;
   client: TranscriptClient;
 }
 
@@ -214,14 +216,18 @@ async function ingestSessionList(
   const total = sessions.length;
 
   // Remedy lines are printed at most once per project per import. The set is
-  // owned by importSessions and shared across every call, keyed by cwd.
-  function reportProjectFailure(cwd: string, remedy: string | undefined): void {
-    if (remedy === undefined || reportedProjectFailures.has(cwd)) return;
-    reportedProjectFailures.add(cwd);
+  // owned by importSessions and shared across every call, keyed by project
+  // identity. A remedy prints only for an unbound PostgreSQL project, and
+  // listCliProjects degrades an unbound entry to its local identity, so its
+  // id equals the Codex local projectHash. A binding removed between
+  // enumeration and ingest can still print twice (accepted residual).
+  function reportProjectFailure(projectKey: string, cwd: string, remedy: string | undefined): void {
+    if (remedy === undefined || reportedProjectFailures.has(projectKey)) return;
+    reportedProjectFailures.add(projectKey);
     console.error(`  ${sanitizeTerminalText(cwd)}: ${remedy}`);
   }
 
-  for (const { path, sessionId, cwd, client: clientName } of sessions) {
+  for (const { path, sessionId, cwd, projectKey, client: clientName } of sessions) {
     if (options.dryRun) {
       if (options.verbose) {
         const replayNote = options.replay ? " (would compact)" : "";
@@ -309,7 +315,7 @@ async function ingestSessionList(
       result.failed++;
       if (options.replay) previousSummaries.delete(replayKey); // chain broken for this project/client
       const remedy = unboundImportDiagnostic(error);
-      reportProjectFailure(cwd, remedy);
+      reportProjectFailure(projectKey, cwd, remedy);
       if (options.verbose) {
         console.error(`  \u274c ${sanitizeTerminalText(sessionId)}: ${remedy ?? "ingest failed"}`);
       }
@@ -332,6 +338,9 @@ export async function importSessions(
   selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
   const provider: ImportProvider = options.provider ?? "claude";
   const reportedProjectFailures = new Set<string>();
+  // Without --all every transcript belongs to the one requested project, so a
+  // single key serves both providers.
+  const currentProjectKey = "current-project";
   const result: ImportResult = {
     imported: 0,
     skippedEmpty: 0,
@@ -348,7 +357,7 @@ export async function importSessions(
   if (provider === "claude" || provider === "all") {
     const claudeProjectsDir = options._claudeProjectsDir ?? join(homedir(), '.claude', 'projects');
 
-    const projectDirs: { dir: string; cwd: string }[] = [];
+    const projectDirs: { dir: string; cwd: string; projectKey: string }[] = [];
 
     if (options.all) {
       if (existsSync(claudeProjectsDir)) {
@@ -379,7 +388,11 @@ export async function importSessions(
             }
             continue;
           }
-          projectDirs.push({ dir, cwd: [...candidates.values()][0] });
+          projectDirs.push({
+            dir,
+            cwd: [...candidates.values()][0],
+            projectKey: [...candidates.keys()][0],
+          });
         }
       }
     } else {
@@ -387,15 +400,15 @@ export async function importSessions(
       const hash = cwdToProjectHash(cwd);
       const dir = join(claudeProjectsDir, hash);
       if (existsSync(dir)) {
-        projectDirs.push({ dir, cwd });
+        projectDirs.push({ dir, cwd, projectKey: currentProjectKey });
       }
     }
 
-    for (const { dir, cwd } of projectDirs) {
+    for (const { dir, cwd, projectKey } of projectDirs) {
       const sessionFiles = findSessionFiles(dir);
       await ingestSessionList(
         client,
-        sessionFiles.map(f => ({ ...f, cwd, client: "claude" as const })),
+        sessionFiles.map(f => ({ ...f, cwd, projectKey, client: "claude" as const })),
         options,
         result,
         reportedProjectFailures,
@@ -466,6 +479,7 @@ export async function importSessions(
         path: session.path,
         sessionId: session.metadata?.threadId ?? session.sessionId,
         cwd: resolution.canonical,
+        projectKey: options.all ? resolution.projectHash : currentProjectKey,
         client: "codex",
       });
     }
