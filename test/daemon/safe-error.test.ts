@@ -4104,6 +4104,17 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it("does not rescan a long file URL path suffix at every non-ampersand slash", () => {
+    const input = `file://h${"/a".repeat(16384)}`;
+    const started = performance.now();
+    const result = sanitizeError(input);
+    const elapsed = performance.now() - started;
+
+    expect(result).toBe("file://h<path>");
+    // Linear takes milliseconds; the quadratic rescan took several seconds.
+    expect(elapsed).toBeLessThan(1000);
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");
