@@ -367,6 +367,10 @@ export type ComposeBackendPublicationMaterialResult = Readonly<{
  * - sqlite target: the entry is currently bound to exactly the stated remote
  *   and becomes unbound.
  *
+ * `bindings` must be non-empty. That is a limit of this composer, which
+ * exists to bind or unbind projects: `prepare()` itself still accepts a
+ * publication with no projects.
+ *
  * A stated remote that a different map entry already holds is refused in
  * both directions. Every entry that is not listed is carried through
  * unchanged apart from the project map's own normalization. Its existing
@@ -425,6 +429,11 @@ export type ReadRetainedBackendPublicationMaterialInput = Readonly<{
  *   does not filter on `targetBackend`: that check belongs to the
  *   consumer (contract section 16), which has more information than this
  *   reader does about what it is eligible to roll back.
+ *
+ * Read this BEFORE the consumer's own `prepare()`. The completed journal
+ * stays in the live slot only until the next `prepare()` archives it, and
+ * this reader looks at the live slot only, never at `history/`. After a new
+ * `prepare()` the previous publication is no longer reachable through it.
  *
  * Mechanism: the coordinator does not delete the material file on the
  * completed path (only the abort path consumes it), and the completed

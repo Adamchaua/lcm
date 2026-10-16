@@ -603,7 +603,9 @@ The enforced invariant is that the project-map entries whose remote binding
 differs between the live map and the composed target map are exactly the
 bindings, which are exactly `projects`. The live map is parsed with the
 project map's own rules, so an entry the map layer would reject is refused
-here too. The list must be non-empty and name no project or remote twice. A
+here too. The list must be non-empty (a limit of this composer; `prepare()` itself
+still accepts a publication with no projects) and name no project or remote
+twice. A
 PostgreSQL target binds projects that are currently unbound, and a SQLite
 target unbinds projects that are currently bound to exactly the stated remote.
 A stated remote that another map entry already holds is refused.
@@ -629,10 +631,17 @@ When the coordinator does ask it to acquire, the provider reads the row first:
   its own lapsed lease by naming that row's token, so the token advances and
   the new fence is recorded in the journal. The journal's earlier token is
   never used;
+- a row that names another target backend or evidence is a different
+  generation, not a failed read, while acquiring: a released one is replaced
+  by a new generation, and an unreleased one ends in the guard's
+  `publication-conflict` below. Reading for release still reports the
+  mismatch;
 - an unreleased row of any other generation: the guard refuses with
-  `publication-conflict` and the coordinator fails closed. A row held by a
-  different machine under this publication id is refused by the provider
-  itself, so a foreign fence is never journalled as ours.
+  `publication-conflict` and the coordinator fails closed. A foreign
+  machine's row that is still active and names this publication, target
+  backend and evidence is refused by the provider itself, so a foreign fence
+  is never journalled as ours. An inactive foreign row is returned unchanged
+  so it can be reclaimed.
 
 The activation step's lease assertion before it drives the coordinator is a
 fail-fast check only. The coordinator re-reads the fence independently, so a
@@ -640,6 +649,11 @@ lease that lapses in between is taken over by the coordinator's own
 acquisition as described above rather than failing there.
 
 ### Reading retained material
+
+Read the retained material before the consumer's own `prepare()`. The
+completed journal stays in the live slot only until the next `prepare()`
+archives it, and the reader never looks in `history/`, so after a new
+`prepare()` the previous publication is no longer reachable through it.
 
 `readRetainedBackendPublicationMaterial` answers `present` (with the journal
 and the authenticated material), `authoritatively-absent` (the publication
