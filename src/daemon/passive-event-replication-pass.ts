@@ -10,6 +10,7 @@ import {
   BackendPublicationAppendBarrierTimeoutError,
   BackendPublicationJournalError,
   withBackendPublicationAppendBarrierAsync,
+  type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
 import { safeLogError } from "../hooks/hook-errors.js";
 import type { PostgreSqlPassiveEventRepository } from "../storage/postgresql/passive-event-repository.js";
@@ -33,13 +34,26 @@ export async function applyReplicatedPassiveEvent(): Promise<void> {
 }
 
 interface RuntimeLike {
-  health(): Promise<{ status: string; error?: Error }>;
+  health(signal?: AbortSignal): Promise<{ status: string; error?: Error }>;
   close(): Promise<void>;
 }
 
 interface OutboxFactoryLike {
-  open(dbPath: string): Promise<LocalHookOutboxRepository>;
+  openExisting(dbPath: string): Promise<LocalHookOutboxRepository | null>;
   close(): Promise<void>;
+}
+
+/**
+ * The project's remote binding changed, or disappeared, after the pass
+ * resolved it (#1473). It is a plain error on purpose: it belongs to this
+ * project's pass, so the pass reports it once and returns instead of letting
+ * it halt the sweep like a publication failure would.
+ */
+export class ReplicationBindingChangedError extends Error {
+  constructor(cwd: string) {
+    super(`passive-event replication stopped: the remote project binding of ${cwd} changed during the pass`);
+    this.name = "ReplicationBindingChangedError";
+  }
 }
 
 interface WorkerLike {
@@ -50,7 +64,14 @@ export interface PassiveEventReplicationModules {
   readonly ensureWorktreeProjectReconciled: (cwd: string) => unknown;
   readonly resolveProjectIdentity: (cwd: string) => { readonly remoteProjectId?: string | null };
   readonly readMachineIdentity: () => StoredMachineIdentity | null;
-  readonly eventsDbPath: (cwd: string) => string;
+  /**
+   * Read-only re-resolution of the persisted binding; it never creates or
+   * publishes a project-map entry.
+   */
+  readonly resolveExistingProjectIdentity: (
+    cwd: string,
+    publicationLockToken?: BackendPublicationLockToken,
+  ) => { readonly remoteProjectId?: string | null } | null;
   readonly createRuntime: (settings: ResolvedPostgreSqlConfig["postgresql"]) => RuntimeLike;
   readonly createOutboxFactory: () => OutboxFactoryLike;
   readonly createRepository: (
@@ -96,8 +117,16 @@ export interface PassiveEventReplicationPassOptions {
 }
 
 export interface PassiveEventReplicationPass {
-  /** Returns null when replication is not applicable to this project. */
-  run(cwd: string, signal?: AbortSignal): Promise<PassiveEventReplicationResult | null>;
+  /**
+   * Returns null when replication is not applicable to this project.
+   * `sidecarPath` is the events database the sweep scanned for `cwd`: the
+   * pass opens exactly that file and never derives or creates another (#1488).
+   */
+  run(
+    cwd: string,
+    signal: AbortSignal | undefined,
+    sidecarPath: string,
+  ): Promise<PassiveEventReplicationResult | null>;
   close(): Promise<void>;
 }
 
@@ -110,7 +139,6 @@ export interface PassiveEventReplicationImports {
   readonly runtime: typeof import("../storage/postgresql/runtime.js");
   readonly repository: typeof import("../storage/postgresql/passive-event-repository.js");
   readonly outbox: typeof import("../storage/local-hook-outbox.js");
-  readonly paths: typeof import("../db/events-path.js");
 }
 
 /** Bind imported namespaces to the seams the pass calls. */
@@ -121,7 +149,7 @@ export function buildReplicationModules(
     ensureWorktreeProjectReconciled: imported.reconciliation.ensureWorktreeProjectReconciled,
     resolveProjectIdentity: imported.projectMap.resolveProjectIdentity,
     readMachineIdentity: imported.identity.readMachineIdentity,
-    eventsDbPath: imported.paths.eventsDbPath,
+    resolveExistingProjectIdentity: imported.projectMap.resolveExistingProjectIdentity,
     createRuntime: settings => new imported.runtime.PostgreSqlRuntime(settings),
     createOutboxFactory: () => new imported.outbox.SQLiteLocalHookOutboxFactory(),
     createRepository: (executor, projectId, machineId) =>
@@ -137,7 +165,7 @@ export function buildReplicationModules(
 
 /** PostgreSQL modules load only on a daemon that actually replicates. */
 export async function loadReplicationModules(): Promise<PassiveEventReplicationModules> {
-  const [projectMap, reconciliation, identity, replication, runtime, repository, outbox, paths] =
+  const [projectMap, reconciliation, identity, replication, runtime, repository, outbox] =
     await Promise.all([
       import("../project-map.js"),
       import("../worktree-reconciliation.js"),
@@ -146,10 +174,9 @@ export async function loadReplicationModules(): Promise<PassiveEventReplicationM
       import("../storage/postgresql/runtime.js"),
       import("../storage/postgresql/passive-event-repository.js"),
       import("../storage/local-hook-outbox.js"),
-      import("../db/events-path.js"),
     ]);
   return buildReplicationModules({
-    projectMap, reconciliation, identity, replication, runtime, repository, outbox, paths,
+    projectMap, reconciliation, identity, replication, runtime, repository, outbox,
   });
 }
 
@@ -184,12 +211,19 @@ export function createPassiveEventReplicationPass(
   let modules: Promise<PassiveEventReplicationModules> | null = null;
   let runtime: RuntimeLike | null = null;
   let outboxFactory: OutboxFactoryLike | null = null;
+  let factoryCloseFailed = false;
+  // Repositories whose close rejected, by sidecar path: at most one per path.
+  const retained = new Map<string, LocalHookOutboxRepository>();
 
   return {
-    async run(cwd, signal) {
+    async run(cwd, signal, sidecarPath) {
       // Gate 1: a SQLite daemon never loads a PostgreSQL module at all.
       const storage = config.storage;
       if (storage.backend !== "postgresql") return null;
+      // A factory whose close failed is closed to new opens and still owns
+      // its repositories until a later close() succeeds, so opening through
+      // it, or beside it, would only add connections.
+      if (factoryCloseFailed) return null;
       try {
         modules ??= loadModules();
         const loaded = await modules;
@@ -211,14 +245,45 @@ export function createPassiveEventReplicationPass(
 
         // Gate 4: refuse to claim a lease against unhealthy storage.
         runtime ??= loaded.createRuntime(storage.postgresql);
-        const health = await runtime.health();
+        const health = await runtime.health(signal);
         if (health.status !== "healthy") {
           await report(health.error ?? new Error("PostgreSQL passive-event storage is unavailable"));
           return null;
         }
 
         outboxFactory ??= loaded.createOutboxFactory();
-        const local = await outboxFactory.open(loaded.eventsDbPath(cwd));
+        // A repository whose close failed on an earlier pass is closed again
+        // before this path is opened, so each sidecar keeps at most one open
+        // outbox (#1478). Any failure here, publication errors included,
+        // belongs to this project's retry rather than to the daemon.
+        const stale = retained.get(sidecarPath);
+        if (stale !== undefined) {
+          try {
+            await stale.close();
+            retained.delete(sidecarPath);
+          } catch (error) {
+            await report(error);
+            return null;
+          }
+        }
+        // The sweep already scanned and promoted this exact sidecar, so open
+        // it as it is: never derive another path, never create a file.
+        const local = await outboxFactory.openExisting(sidecarPath);
+        if (local === null) return null;
+        // The remote repository is bound to one project id for the whole
+        // pass. Each admitted phase re-reads the persisted binding before it
+        // touches that repository and stops the pass when it moved (#1473).
+        // The check is read-only. Where the admission supplies a token it
+        // reads under that token; the publication home is assumed to equal
+        // the project-map home, as it is for the daemon (both homedir()).
+        // Without an admission there is no lock to be atomic with, so the
+        // check is best effort.
+        const assertBinding = (publicationLockToken?: BackendPublicationLockToken): void => {
+          const current = loaded.resolveExistingProjectIdentity(cwd, publicationLockToken);
+          if (current === null || (current.remoteProjectId ?? null) !== remoteProjectId) {
+            throw new ReplicationBindingChangedError(cwd);
+          }
+        };
         // Each worker phase runs under its own publication admission so the
         // consumer lock is released between phases and hook appends can
         // proceed. Without an admission the phases run directly, as a
@@ -226,13 +291,19 @@ export function createPassiveEventReplicationPass(
         const admit = options.withPublicationAdmission;
         const admitPhase: PassiveEventReplicationDependencies["admitPhase"] =
           admit === undefined
-            ? operation => operation()
+            ? async operation => {
+              assertBinding();
+              return operation();
+            }
             : async operation => admit(
-              publicationLockToken => withBackendPublicationAppendBarrierAsync(
-                options.publicationHome,
-                () => operation(),
-                publicationLockToken,
-              ),
+              publicationLockToken => {
+                assertBinding(publicationLockToken);
+                return withBackendPublicationAppendBarrierAsync(
+                  options.publicationHome,
+                  () => operation(),
+                  publicationLockToken,
+                );
+              },
             );
         try {
           const remote = loaded.createRepository(runtime, remoteProjectId, identity.machineId);
@@ -251,10 +322,13 @@ export function createPassiveEventReplicationPass(
           // one when that repository closes, so a sweep that kept its outbox
           // would add a SQLite connection per project every five minutes for
           // the life of the daemon. Releasing here cannot fail the pass: the
-          // durable work is already committed by the time we get here.
+          // durable work is already committed by the time we get here. A
+          // repository that refuses to close is kept for the next pass's
+          // retry instead of being dropped while the factory still holds it.
           try {
             await local.close();
           } catch (error) {
+            retained.set(sidecarPath, local);
             await report(error);
           }
         }
@@ -274,10 +348,19 @@ export function createPassiveEventReplicationPass(
     },
     async close() {
       const closing = [outboxFactory?.close(), runtime?.close()];
-      outboxFactory = null;
       runtime = null;
       modules = null;
       const settled = await Promise.allSettled(closing);
+      // The factory closes every repository it registered, retained ones
+      // included, so it and the retained set are released together and only
+      // once that close succeeded. A failed close keeps both for a retry.
+      if (settled[0].status === "fulfilled") {
+        outboxFactory = null;
+        retained.clear();
+        factoryCloseFailed = false;
+      } else {
+        factoryCloseFailed = true;
+      }
       for (const outcome of settled) {
         if (outcome.status === "rejected") await report(outcome.reason);
       }

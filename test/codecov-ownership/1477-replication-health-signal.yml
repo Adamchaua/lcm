@@ -1,0 +1,6 @@
+references: ["#1477"]
+rationale: >-
+  #1477 hands the shutdown signal to the storage health check inside the
+  replication pass, which keeps its daemon-events owner.
+pins:
+  - ["src/daemon/passive-event-replication-pass.ts", "unit-daemon-events"]

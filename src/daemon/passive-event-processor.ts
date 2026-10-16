@@ -62,7 +62,8 @@ export interface PassiveEventReplicationDiagnostics {
 
 export type PassiveEventReplicationPassRunner = (
   cwd: string,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  sidecarPath: string,
 ) => Promise<PassiveEventReplicationResult | null>;
 
 export interface PassiveEventProcessorDeps {
@@ -325,7 +326,7 @@ export class PassiveEventProcessor {
         // separately (see above), so the consumer lock is never held across
         // the whole sweep. A frozen-backend refusal from any phase still
         // reaches this catch and halts below.
-        result = await replicate(cwd, this.backgroundSignal);
+        result = await replicate(cwd, this.backgroundSignal, sidecar.path);
       } catch (error) {
         if (isFrozenBackendMismatch(error)) {
           await this.haltForBackendMismatch(error);

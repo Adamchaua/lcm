@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,7 @@ import {
   createPassiveEventReplicationPass,
   buildReplicationModules,
   loadReplicationModules,
+  ReplicationBindingChangedError,
   type PassiveEventReplicationImports,
   type PassiveEventReplicationModules,
 } from "../../src/daemon/passive-event-replication-pass.js";
@@ -28,6 +29,9 @@ import {
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 type Modules = PassiveEventReplicationModules;
+
+/** The sidecar the sweep scanned; the pass opens exactly this path. */
+const SIDECAR = "/events/project.db";
 
 const PENDING_IDENTITY_KEY = `machine:${"7".repeat(64)}`;
 const REGISTERED_IDENTITY = {
@@ -85,13 +89,13 @@ function postgresConfig() {
   } as unknown as ReturnType<typeof sqliteConfig>;
 }
 
-function modules(overrides: Partial<Modules> = {}): { modules: Modules; runtime: { health: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }; factory: { open: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> } } {
+function modules(overrides: Partial<Modules> = {}): { modules: Modules; runtime: { health: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }; factory: { openExisting: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> } } {
   const runtime = {
     health: vi.fn().mockResolvedValue({ status: "healthy" }),
     close: vi.fn().mockResolvedValue(undefined),
   };
   const factory = {
-    open: vi.fn().mockImplementation(async () => ({
+    openExisting: vi.fn().mockImplementation(async () => ({
       close: vi.fn().mockResolvedValue(undefined),
     })),
     close: vi.fn().mockResolvedValue(undefined),
@@ -103,7 +107,7 @@ function modules(overrides: Partial<Modules> = {}): { modules: Modules; runtime:
       ensureWorktreeProjectReconciled: vi.fn(),
       resolveProjectIdentity: vi.fn().mockReturnValue({ remoteProjectId: "project-uuid" }),
       readMachineIdentity: vi.fn().mockReturnValue(REGISTERED_IDENTITY),
-      eventsDbPath: vi.fn().mockReturnValue("/events/project.db"),
+      resolveExistingProjectIdentity: vi.fn().mockReturnValue({ remoteProjectId: "project-uuid" }),
       createRuntime: vi.fn().mockReturnValue(runtime),
       createOutboxFactory: vi.fn().mockReturnValue(factory),
       createRepository: vi.fn().mockReturnValue({}),
@@ -138,11 +142,10 @@ describe("passive-event replication pass", () => {
     const PostgreSqlPassiveEventRepository = vi.fn();
     const Worker = vi.fn();
     const imported = {
-      projectMap: { resolveProjectIdentity: vi.fn() },
+      projectMap: { resolveProjectIdentity: vi.fn(), resolveExistingProjectIdentity: vi.fn() },
       reconciliation: { ensureWorktreeProjectReconciled: vi.fn() },
       identity: { readMachineIdentity: vi.fn() },
       replication: { PassiveEventReplicationWorker: Worker },
-      paths: { eventsDbPath: vi.fn() },
       runtime: { PostgreSqlRuntime },
       outbox: { SQLiteLocalHookOutboxFactory },
       repository: { PostgreSqlPassiveEventRepository },
@@ -153,7 +156,8 @@ describe("passive-event replication pass", () => {
     expect(bound.ensureWorktreeProjectReconciled)
       .toBe(imported.reconciliation.ensureWorktreeProjectReconciled);
     expect(bound.readMachineIdentity).toBe(imported.identity.readMachineIdentity);
-    expect(bound.eventsDbPath).toBe(imported.paths.eventsDbPath);
+    expect(bound.resolveExistingProjectIdentity)
+      .toBe(imported.projectMap.resolveExistingProjectIdentity);
 
     const settings = { url: "postgresql://example.test/lcm" } as never;
     expect(bound.createRuntime(settings)).toBeInstanceOf(PostgreSqlRuntime);
@@ -177,7 +181,7 @@ describe("passive-event replication pass", () => {
     expect(typeof loaded.resolveProjectIdentity).toBe("function");
     expect(typeof loaded.ensureWorktreeProjectReconciled).toBe("function");
     expect(typeof loaded.readMachineIdentity).toBe("function");
-    expect(typeof loaded.eventsDbPath).toBe("function");
+    expect(typeof loaded.resolveExistingProjectIdentity).toBe("function");
     expect(typeof loaded.createRuntime).toBe("function");
     expect(typeof loaded.createRepository).toBe("function");
     expect(typeof loaded.createWorker).toBe("function");
@@ -195,7 +199,7 @@ describe("passive-event replication pass", () => {
       processId: "lcm-daemon:test",
       loadModules,
     });
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
     expect(loadModules).not.toHaveBeenCalled();
     await expect(pass.close()).resolves.toBeUndefined();
   });
@@ -208,7 +212,7 @@ describe("passive-event replication pass", () => {
       loadModules: vi.fn().mockRejectedValue(failure),
       onError,
     });
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
     expect(onError).toHaveBeenCalledWith(failure);
   });
 
@@ -218,7 +222,7 @@ describe("passive-event replication pass", () => {
       loadModules: vi.fn().mockRejectedValue(new Error("module load failed")),
     });
     // The default reporter must contain its own failures like the injected one.
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
   });
 
   // A daemon that has never run `lcm machine register` is unconfigured, not
@@ -232,7 +236,7 @@ describe("passive-event replication pass", () => {
       loadModules: async () => harness.modules,
       onError,
     });
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
     expect(onError).not.toHaveBeenCalled();
     expect(harness.modules.ensureWorktreeProjectReconciled).not.toHaveBeenCalled();
     expect(harness.modules.createRuntime).not.toHaveBeenCalled();
@@ -252,7 +256,7 @@ describe("passive-event replication pass", () => {
       loadModules: async () => harness.modules,
       onError,
     });
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
     expect(onError).not.toHaveBeenCalled();
     expect(harness.modules.ensureWorktreeProjectReconciled).not.toHaveBeenCalled();
     expect(harness.modules.createRuntime).not.toHaveBeenCalled();
@@ -269,7 +273,7 @@ describe("passive-event replication pass", () => {
       loadModules: async () => harness.modules,
       onError,
     });
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({
       name: "MachineIdentityFileError",
       message: expect.stringContaining("machine.json contains invalid JSON"),
@@ -287,7 +291,7 @@ describe("passive-event replication pass", () => {
       processId: "lcm-daemon:bundle",
       loadModules: async () => harness.modules,
     });
-    await expect(pass.run("/proj")).resolves.toEqual(summary);
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toEqual(summary);
     expect(createWorker).toHaveBeenCalledWith(
       expect.objectContaining({ applyEvent: applyReplicatedPassiveEvent }),
       "lcm-daemon:bundle",
@@ -319,7 +323,7 @@ describe("passive-event replication pass", () => {
       loadModules: async () => harness.modules,
       onError,
     });
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
     // Reconciliation runs first so a linked worktree resolves canonically.
     expect(harness.modules.ensureWorktreeProjectReconciled).toHaveBeenCalledWith("/proj");
     expect(harness.modules.createRuntime).not.toHaveBeenCalled();
@@ -332,7 +336,7 @@ describe("passive-event replication pass", () => {
       processId: "lcm-daemon:test",
       loadModules: async () => harness.modules,
     });
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
     expect(harness.modules.createRuntime).not.toHaveBeenCalled();
   });
 
@@ -346,9 +350,9 @@ describe("passive-event replication pass", () => {
       loadModules: async () => harness.modules,
       onError,
     });
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
     expect(onError).toHaveBeenCalledWith(failure);
-    expect(harness.factory.open).not.toHaveBeenCalled();
+    expect(harness.factory.openExisting).not.toHaveBeenCalled();
   });
 
   it("reports unhealthy storage that offers no error", async () => {
@@ -360,7 +364,7 @@ describe("passive-event replication pass", () => {
       loadModules: async () => harness.modules,
       onError,
     });
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({
       message: "PostgreSQL passive-event storage is unavailable",
     }));
@@ -377,8 +381,8 @@ describe("passive-event replication pass", () => {
     });
     const signal = new AbortController().signal;
 
-    await expect(pass.run("/proj", signal)).resolves.toEqual(summary);
-    await expect(pass.run("/proj", signal)).resolves.toEqual(summary);
+    await expect(pass.run("/proj", signal, SIDECAR)).resolves.toEqual(summary);
+    await expect(pass.run("/proj", signal, SIDECAR)).resolves.toEqual(summary);
 
     // One connection and one outbox factory serve every pass.
     expect(harness.modules.createRuntime).toHaveBeenCalledTimes(1);
@@ -403,14 +407,14 @@ describe("passive-event replication pass", () => {
     const local = {};
     const remote = { acquireDrainLease: vi.fn().mockResolvedValue(null) };
     const harness = modules({ createRepository: vi.fn().mockReturnValue(remote) });
-    harness.factory.open.mockResolvedValue(local);
+    harness.factory.openExisting.mockResolvedValue(local);
     const pass = createPassiveEventReplicationPass(postgresConfig(), {
       processId: "lcm-daemon:real",
       loadModules: async () => harness.modules,
     });
 
     // No lease is available, so the shipped worker returns an empty summary.
-    await expect(pass.run("/proj")).resolves.toMatchObject({
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({
       leaseAcquired: false,
       uploaded: 0,
       pruned: 0,
@@ -421,14 +425,14 @@ describe("passive-event replication pass", () => {
   it("reports a drain failure and skips the project", async () => {
     const failure = new Error("outbox is locked");
     const harness = modules();
-    harness.factory.open.mockRejectedValue(failure);
+    harness.factory.openExisting.mockRejectedValue(failure);
     const onError = vi.fn();
     const pass = createPassiveEventReplicationPass(postgresConfig(), {
       processId: "lcm-daemon:test",
       loadModules: async () => harness.modules,
       onError,
     });
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
     expect(onError).toHaveBeenCalledWith(failure);
   });
 
@@ -439,7 +443,7 @@ describe("passive-event replication pass", () => {
       loadModules: async () => harness.modules,
       onError: () => { throw new Error("diagnostic failed"); },
     });
-    await expect(pass.run("/proj")).resolves.toBeNull();
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
   });
 
   it("closes without a session and reports a failing close", async () => {
@@ -456,12 +460,12 @@ describe("passive-event replication pass", () => {
       onError,
       createWorker: () => ({ runOnce: vi.fn().mockResolvedValue(summary) }),
     });
-    await pass.run("/proj");
+    await pass.run("/proj", undefined, SIDECAR);
     await expect(pass.close()).resolves.toBeUndefined();
     expect(onError).toHaveBeenCalledWith(failure);
 
     // A closed pass reopens cleanly rather than reusing a dead connection.
-    await pass.run("/proj");
+    await pass.run("/proj", undefined, SIDECAR);
     expect(harness.modules.createRuntime).toHaveBeenCalledTimes(2);
   });
 
@@ -483,7 +487,7 @@ describe("passive-event replication pass", () => {
       const observed: Record<string, boolean> = {};
       const probe = (name: string) => { observed[name] = existsSync(lockPath); };
       const harness = modules();
-      harness.factory.open.mockResolvedValue({
+      harness.factory.openExisting.mockResolvedValue({
         claimDeliveries: vi.fn().mockImplementation(async () => { probe("upload"); return []; }),
         listAwaitingRemote: vi.fn().mockImplementation(async () => { probe("reconcile"); return []; }),
         listAcknowledgedForRemotePrune: vi.fn().mockImplementation(async () => { probe("prune"); return []; }),
@@ -507,7 +511,7 @@ describe("passive-event replication pass", () => {
         publicationHome: home,
       });
 
-      await expect(pass.run("/proj")).resolves.toMatchObject({ leaseAcquired: true });
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ leaseAcquired: true });
       // Every remote and local phase ran admitted, including the lease
       // acquisition; only the cleanup release ran outside all admissions.
       expect(observed).toMatchObject({
@@ -549,7 +553,7 @@ describe("passive-event replication pass", () => {
           },
         }),
       });
-      await expect(pass.run("/proj")).resolves.toEqual(summary);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toEqual(summary);
       expect(heldDuringPhase).toBe(true);
       await pass.close();
     } finally {
@@ -574,7 +578,7 @@ describe("passive-event replication pass", () => {
         onError,
         createWorker: () => ({ runOnce: vi.fn().mockRejectedValue(failure) }),
       });
-      await expect(pass.run("/proj")).rejects.toBe(failure);
+      await expect(pass.run("/proj", undefined, SIDECAR)).rejects.toBe(failure);
       expect(onError).not.toHaveBeenCalledWith(failure);
       await pass.close();
     }
@@ -584,10 +588,14 @@ describe("passive-event replication pass", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-replication-outbox-"));
     const factory = new SQLiteLocalHookOutboxFactory();
     const opened: LocalHookOutboxRepository[] = [];
-    const harness = modules({
-      createOutboxFactory: () => factory,
-      eventsDbPath: (cwd: string) => join(directory, `${cwd.replaceAll("/", "_")}.db`),
-    });
+    const harness = modules({ createOutboxFactory: () => factory });
+    // The pass only opens sidecars that already exist.
+    const sidecars = new Map<string, string>();
+    for (const cwd of ["/alpha", "/beta"]) {
+      const path = join(directory, `${cwd.replaceAll("/", "_")}.db`);
+      sidecars.set(cwd, path);
+      await (await factory.open(path)).close();
+    }
     const pass = createPassiveEventReplicationPass(postgresConfig(), {
       processId: "lcm-daemon:test",
       loadModules: async () => harness.modules,
@@ -599,8 +607,8 @@ describe("passive-event replication pass", () => {
 
     try {
       for (let sweep = 0; sweep < 3; sweep += 1) {
-        await expect(pass.run("/alpha")).resolves.toEqual(summary);
-        await expect(pass.run("/beta")).resolves.toEqual(summary);
+        await expect(pass.run("/alpha", undefined, sidecars.get("/alpha")!)).resolves.toEqual(summary);
+        await expect(pass.run("/beta", undefined, sidecars.get("/beta")!)).resolves.toEqual(summary);
       }
 
       // Six real repositories were opened, and none of them is still held.
@@ -620,7 +628,7 @@ describe("passive-event replication pass", () => {
   it("reports a failing outbox close without losing the pass result", async () => {
     const failure = new Error("outbox close failed");
     const harness = modules();
-    harness.factory.open.mockResolvedValue({
+    harness.factory.openExisting.mockResolvedValue({
       close: vi.fn().mockRejectedValue(failure),
     });
     const onError = vi.fn();
@@ -631,7 +639,515 @@ describe("passive-event replication pass", () => {
       createWorker: () => ({ runOnce: vi.fn().mockResolvedValue(summary) }),
     });
 
-    await expect(pass.run("/proj")).resolves.toEqual(summary);
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toEqual(summary);
     expect(onError).toHaveBeenCalledWith(failure);
+  });
+
+  it("opens exactly the scanned sidecar the sweep passed in", async () => {
+    // #1488: the pass used to derive eventsDbPath(cwd) and could open or
+    // create a different sidecar than the one the sweep scanned.
+    const harness = modules();
+    const createWorker = vi.fn().mockReturnValue({ runOnce: vi.fn().mockResolvedValue(summary) });
+    const pass = createPassiveEventReplicationPass(postgresConfig(), {
+      processId: "lcm-daemon:sidecar",
+      loadModules: async () => harness.modules,
+      createWorker,
+    });
+    await expect(pass.run("/proj", undefined, "/events/legacy-key.db")).resolves.toEqual(summary);
+    expect(harness.factory.openExisting).toHaveBeenCalledTimes(1);
+    expect(harness.factory.openExisting).toHaveBeenCalledWith("/events/legacy-key.db");
+    await pass.close();
+  });
+
+  it("skips quietly when the scanned sidecar can no longer be opened", async () => {
+    const harness = modules();
+    harness.factory.openExisting.mockResolvedValue(null);
+    const onError = vi.fn();
+    const createWorker = vi.fn();
+    const pass = createPassiveEventReplicationPass(postgresConfig(), {
+      processId: "lcm-daemon:missing",
+      loadModules: async () => harness.modules,
+      onError,
+      createWorker,
+    });
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+    expect(createWorker).not.toHaveBeenCalled();
+    expect(harness.modules.createRepository).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+    await pass.close();
+  });
+
+  it("never creates a sidecar for a missing events database", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-replication-missing-"));
+    const missing = join(directory, "absent", "events.db");
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const harness = modules({ createOutboxFactory: () => factory });
+    const createWorker = vi.fn();
+    const pass = createPassiveEventReplicationPass(postgresConfig(), {
+      processId: "lcm-daemon:absent",
+      loadModules: async () => harness.modules,
+      createWorker,
+    });
+    try {
+      await expect(pass.run("/proj", undefined, missing)).resolves.toBeNull();
+      expect(createWorker).not.toHaveBeenCalled();
+      expect(existsSync(join(directory, "absent"))).toBe(false);
+      expect(retainedRepositories(factory)).toBe(0);
+    } finally {
+      await pass.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("hands the shutdown signal to the health check and stops when it aborts", async () => {
+    // #1477: the signal used to be dropped, so shutdown waited out the
+    // connection or statement timeout. The fake settles unavailable on abort,
+    // as the real runtime does, and can always be released by the test.
+    const harness = modules();
+    let seen: AbortSignal | undefined;
+    let entered!: () => void;
+    const hasEntered = new Promise<void>(resolve => { entered = resolve; });
+    let release: () => void = () => undefined;
+    harness.runtime.health.mockImplementation((signal?: AbortSignal) => new Promise(resolve => {
+      seen = signal;
+      release = () => resolve({ status: "unavailable" });
+      signal?.addEventListener("abort", release, { once: true });
+      entered();
+    }));
+    const onError = vi.fn();
+    const createWorker = vi.fn();
+    const pass = createPassiveEventReplicationPass(postgresConfig(), {
+      processId: "lcm-daemon:shutdown",
+      loadModules: async () => harness.modules,
+      onError,
+      createWorker,
+    });
+    const controller = new AbortController();
+    const running = pass.run("/proj", controller.signal, SIDECAR);
+    try {
+      await hasEntered;
+      expect(seen).toBe(controller.signal);
+      controller.abort();
+      await expect(running).resolves.toBeNull();
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+        message: "PostgreSQL passive-event storage is unavailable",
+      }));
+      expect(harness.factory.openExisting).not.toHaveBeenCalled();
+      expect(createWorker).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await running.catch(() => undefined);
+      await pass.close();
+    }
+  }, 10_000);
+
+  describe("outbox close failures", () => {
+    /** A fake repository whose close rejects once per supplied failure. */
+    function localWithCloseFailures(...failures: unknown[]) {
+      const close = vi.fn();
+      for (const failure of failures) close.mockRejectedValueOnce(failure);
+      close.mockResolvedValue(undefined);
+      return { close };
+    }
+
+    function closePass(harness: ReturnType<typeof modules>, onError = vi.fn()) {
+      const createWorker = vi.fn().mockReturnValue({ runOnce: vi.fn().mockResolvedValue(summary) });
+      return {
+        onError,
+        createWorker,
+        pass: createPassiveEventReplicationPass(postgresConfig(), {
+          processId: "lcm-daemon:close",
+          loadModules: async () => harness.modules,
+          onError,
+          createWorker,
+        }),
+      };
+    }
+
+    it("retries a failed close before it opens that sidecar again", async () => {
+      const failure = new Error("close contended");
+      const first = localWithCloseFailures(failure);
+      const second = localWithCloseFailures();
+      const harness = modules();
+      harness.factory.openExisting.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+      const { pass, onError } = closePass(harness);
+
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toEqual(summary);
+      expect(onError).toHaveBeenCalledWith(failure);
+      expect(first.close).toHaveBeenCalledTimes(1);
+      expect(harness.factory.openExisting).toHaveBeenCalledTimes(1);
+
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toEqual(summary);
+      // The held repository was closed before the second open.
+      expect(first.close).toHaveBeenCalledTimes(2);
+      expect(first.close.mock.invocationCallOrder[1])
+        .toBeLessThan(harness.factory.openExisting.mock.invocationCallOrder[1]);
+      expect(harness.factory.openExisting).toHaveBeenCalledTimes(2);
+      expect(second.close).toHaveBeenCalledTimes(1);
+
+      // Nothing is held any longer, so the next pass does not retry anything.
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toEqual(summary);
+      expect(first.close).toHaveBeenCalledTimes(2);
+      expect(harness.factory.openExisting).toHaveBeenCalledTimes(3);
+      await pass.close();
+    });
+
+    it("keeps at most one outstanding repository per sidecar while close keeps failing", async () => {
+      const failure = new Error("close contended");
+      const stuck = localWithCloseFailures(failure, failure, failure, failure, failure);
+      const harness = modules();
+      harness.factory.openExisting.mockResolvedValue(stuck);
+      const { pass, onError, createWorker } = closePass(harness);
+
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toEqual(summary);
+      for (let sweep = 0; sweep < 4; sweep += 1) {
+        // The retry fails again: reported, project skipped, nothing reopened.
+        await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      }
+      expect(harness.factory.openExisting).toHaveBeenCalledTimes(1);
+      expect(createWorker).toHaveBeenCalledTimes(1);
+      expect(stuck.close).toHaveBeenCalledTimes(5);
+      expect(onError).toHaveBeenCalledTimes(5);
+      await pass.close();
+    });
+
+    it("keeps one retained repository per sidecar path", async () => {
+      const failure = new Error("close contended");
+      const alpha = localWithCloseFailures(failure);
+      const beta = localWithCloseFailures(failure);
+      const harness = modules();
+      harness.factory.openExisting.mockImplementation(async (path: string) => (
+        path === "/events/alpha.db" ? alpha : beta
+      ));
+      const { pass } = closePass(harness);
+      await pass.run("/alpha", undefined, "/events/alpha.db");
+      await pass.run("/beta", undefined, "/events/beta.db");
+      // Each path retries only its own held repository.
+      await pass.run("/alpha", undefined, "/events/alpha.db");
+      expect(alpha.close).toHaveBeenCalledTimes(3);
+      expect(beta.close).toHaveBeenCalledTimes(1);
+      await pass.close();
+    });
+
+    it("skips the sidecar when the retried close succeeds but it can no longer be opened", async () => {
+      const held = localWithCloseFailures(new Error("close contended"));
+      const harness = modules();
+      harness.factory.openExisting.mockResolvedValueOnce(held).mockResolvedValueOnce(null);
+      const { pass, createWorker } = closePass(harness);
+      await pass.run("/proj", undefined, SIDECAR);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      expect(held.close).toHaveBeenCalledTimes(2);
+      expect(createWorker).toHaveBeenCalledTimes(1);
+      await pass.close();
+    });
+
+    it("reports a failed retry of any kind instead of rethrowing it", async () => {
+      const barrier = new BackendPublicationAppendBarrierTimeoutError(
+        new PrivateMutationLockContentionError("busy"),
+      );
+      const journal = new BackendPublicationJournalError("backend-mismatch", "publication moved on");
+      for (const retryFailure of [barrier, journal]) {
+        const held = localWithCloseFailures(new Error("close contended"), retryFailure);
+        const harness = modules();
+        harness.factory.openExisting.mockResolvedValue(held);
+        const { pass, onError, createWorker } = closePass(harness);
+
+        await pass.run("/proj", undefined, SIDECAR);
+        await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+        expect(onError).toHaveBeenCalledWith(retryFailure);
+        expect(createWorker).toHaveBeenCalledTimes(1);
+        expect(harness.factory.openExisting).toHaveBeenCalledTimes(1);
+
+        // A later retry succeeds and the sidecar replicates again.
+        await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toEqual(summary);
+        expect(createWorker).toHaveBeenCalledTimes(2);
+        await pass.close();
+      }
+    });
+
+    it("keeps its factory for a later close and opens nothing meanwhile", async () => {
+      // Real factory and repositories: the registered count is the proof.
+      const directory = mkdtempSync(join(tmpdir(), "lcm-replication-close-"));
+      const sidecar = join(directory, "events.db");
+      const factories: SQLiteLocalHookOutboxFactory[] = [];
+      const failures: Error[] = [];
+      const harness = modules({
+        createOutboxFactory: () => {
+          const real = new SQLiteLocalHookOutboxFactory();
+          factories.push(real);
+          const factoryFailure = new Error("factory close failed");
+          failures.push(factoryFailure);
+          const close = vi.fn()
+            .mockRejectedValueOnce(factoryFailure)
+            .mockImplementation(() => real.close());
+          return {
+            close,
+            openExisting: async (path: string) => {
+              const repository = await real.openExisting(path);
+              if (repository === null) return null;
+              // The first close fails without releasing anything.
+              const closeFailure = new Error("repository close failed");
+              failures.push(closeFailure);
+              const closeOnce = vi.fn()
+                .mockRejectedValueOnce(closeFailure)
+                .mockImplementation(() => repository.close());
+              return { close: closeOnce } as unknown as LocalHookOutboxRepository;
+            },
+          };
+        },
+      });
+      await (await new SQLiteLocalHookOutboxFactory().open(sidecar)).close();
+      const { pass, onError, createWorker } = closePass(harness);
+      try {
+        await expect(pass.run("/proj", undefined, sidecar)).resolves.toEqual(summary);
+        expect(retainedRepositories(factories[0])).toBe(1);
+
+        // The factory refuses to close once: it and its repository are kept.
+        await expect(pass.close()).resolves.toBeUndefined();
+        expect(onError).toHaveBeenCalledWith(failures[0]);
+        expect(retainedRepositories(factories[0])).toBe(1);
+
+        // A pass in that window opens nothing, so no second database is held.
+        await expect(pass.run("/proj", undefined, sidecar)).resolves.toBeNull();
+        expect(factories).toHaveLength(1);
+        expect(retainedRepositories(factories[0])).toBe(1);
+        expect(createWorker).toHaveBeenCalledTimes(1);
+
+        // The retry closes the factory, and with it every registered repository.
+        await expect(pass.close()).resolves.toBeUndefined();
+        expect(retainedRepositories(factories[0])).toBe(0);
+
+        // The pass is usable again through a fresh factory.
+        await expect(pass.run("/proj", undefined, sidecar)).resolves.toEqual(summary);
+        expect(factories).toHaveLength(2);
+        expect(createWorker).toHaveBeenCalledTimes(2);
+      } finally {
+        await pass.close();
+        for (const factory of factories) await factory.close();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("project binding during a pass", () => {
+    const BOUND = { remoteProjectId: "project-a" };
+    const REBOUND = { remoteProjectId: "project-b" };
+    type Binding = { readonly remoteProjectId?: string | null } | null;
+
+    function publicationHome(): string {
+      const home = mkdtempSync(join(tmpdir(), "lcm-replication-binding-"));
+      mkdirSync(join(home, ".lcm"), { recursive: true });
+      writeFileSync(join(home, ".lcm", "config.json"), "{}\n", { mode: 0o600 });
+      onTestFinished(() => { rmSync(home, { recursive: true, force: true }); });
+      return home;
+    }
+
+    /**
+     * The shipped worker runs against fake repositories. The binding the
+     * pass re-reads is the bound one for `goodChecks` admissions and then
+     * becomes `after`, as if an operator relinked the project mid-pass.
+     */
+    function relinkHarness(goodChecks: number, after: Binding = REBOUND, claims: unknown[] = []) {
+      const fencingToken = 7n;
+      const state: { current: Binding } = { current: BOUND };
+      let checks = 0;
+      const resolveExistingProjectIdentity = vi.fn((_cwd: string, _token?: unknown) => {
+        checks += 1;
+        if (checks > goodChecks) state.current = after;
+        return state.current;
+      });
+      const local = {
+        claimDeliveries: vi.fn().mockResolvedValue([]),
+        listAwaitingRemote: vi.fn().mockResolvedValue([]),
+        listAcknowledgedForRemotePrune: vi.fn().mockResolvedValue([]),
+        markReplicated: vi.fn(),
+        markAcknowledged: vi.fn(),
+        close: vi.fn().mockResolvedValue(undefined),
+      };
+      const remote = {
+        machineId: "machine-uuid",
+        acquireDrainLease: vi.fn().mockResolvedValue({ fencingToken }),
+        renewDrainLease: vi.fn().mockResolvedValue({ fencingToken }),
+        claimEvents: vi.fn().mockResolvedValue(claims),
+        completeApplied: vi.fn(),
+        insertEvents: vi.fn(),
+        releaseDrainLease: vi.fn().mockResolvedValue(undefined),
+      };
+      const harness = modules({
+        resolveProjectIdentity: vi.fn(() => state.current ?? { remoteProjectId: null }),
+        resolveExistingProjectIdentity,
+        createRepository: vi.fn().mockReturnValue(remote),
+      });
+      harness.factory.openExisting.mockResolvedValue(local);
+      return { harness, local, remote, resolveExistingProjectIdentity, fencingToken };
+    }
+
+    function admittedPass(
+      harness: ReturnType<typeof modules>,
+      home: string,
+      onError = vi.fn(),
+      tokens: unknown[] = [],
+    ) {
+      return createPassiveEventReplicationPass(postgresConfig(), {
+        processId: "lcm-daemon:binding",
+        loadModules: async () => harness.modules,
+        onError,
+        withPublicationAdmission: async operation =>
+          withBackendPublicationConsumerLockAsync(home, token => {
+            tokens.push(token);
+            return operation(token);
+          }),
+        publicationHome: home,
+      });
+    }
+
+    function expectStoppedWithoutRemoteWork(
+      fixture: ReturnType<typeof relinkHarness>,
+      onError: ReturnType<typeof vi.fn>,
+    ): void {
+      const { local, remote, fencingToken } = fixture;
+      expect(local.markReplicated).not.toHaveBeenCalled();
+      expect(local.markAcknowledged).not.toHaveBeenCalled();
+      expect(remote.insertEvents).not.toHaveBeenCalled();
+      expect(remote.completeApplied).not.toHaveBeenCalled();
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(expect.any(ReplicationBindingChangedError));
+      expect(onError.mock.calls[0][0]).toMatchObject({
+        name: "ReplicationBindingChangedError",
+        message: expect.stringContaining("/proj"),
+      });
+      // The lease taken for this pass is released exactly once.
+      expect(remote.releaseDrainLease).toHaveBeenCalledTimes(1);
+      expect(remote.releaseDrainLease).toHaveBeenCalledWith("lcm-daemon:binding", fencingToken, undefined);
+    }
+
+    it("stops before the next phase when the project is relinked after the lease", async () => {
+      const home = publicationHome();
+      const fixture = relinkHarness(1);
+      const onError = vi.fn();
+      const tokens: unknown[] = [];
+      const pass = admittedPass(fixture.harness, home, onError, tokens);
+
+      // The relink lands after the lease admission, so the upload never runs.
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      expect(fixture.remote.acquireDrainLease).toHaveBeenCalledTimes(1);
+      expect(fixture.local.claimDeliveries).not.toHaveBeenCalled();
+      expect(fixture.remote.renewDrainLease).not.toHaveBeenCalled();
+      expect(fixture.remote.claimEvents).not.toHaveBeenCalled();
+      expect(fixture.local.listAwaitingRemote).not.toHaveBeenCalled();
+      expect(fixture.local.listAcknowledgedForRemotePrune).not.toHaveBeenCalled();
+      expectStoppedWithoutRemoteWork(fixture, onError);
+
+      // Each check read the binding under the token its admission granted.
+      expect(tokens).toHaveLength(2);
+      expect(fixture.resolveExistingProjectIdentity.mock.calls.map(call => call[0]))
+        .toEqual(["/proj", "/proj"]);
+      expect(fixture.resolveExistingProjectIdentity.mock.calls[0][1]).toBe(tokens[0]);
+      expect(fixture.resolveExistingProjectIdentity.mock.calls[1][1]).toBe(tokens[1]);
+      await pass.close();
+    });
+
+    it("stops a pass that is relinked before its first admission without taking a lease", async () => {
+      const home = publicationHome();
+      const fixture = relinkHarness(0);
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      expect(fixture.remote.acquireDrainLease).not.toHaveBeenCalled();
+      expect(fixture.remote.releaseDrainLease).not.toHaveBeenCalled();
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(expect.any(ReplicationBindingChangedError));
+      await pass.close();
+    });
+
+    it("stops before a later claim is applied", async () => {
+      const home = publicationHome();
+      // Checks: lease, upload, renew, claim fetch; the relink lands before
+      // the first claim's own admission.
+      const fixture = relinkHarness(4, REBOUND, [{ eventId: "event-1", eventVersion: 1 }]);
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      expect(fixture.remote.claimEvents).toHaveBeenCalledTimes(1);
+      expect(fixture.remote.renewDrainLease).toHaveBeenCalledTimes(1);
+      expect(fixture.local.listAwaitingRemote).not.toHaveBeenCalled();
+      expectStoppedWithoutRemoteWork(fixture, onError);
+      await pass.close();
+    });
+
+    it("stops before the local reconcile and prune phases", async () => {
+      const home = publicationHome();
+      const fixture = relinkHarness(4);
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      expect(fixture.remote.claimEvents).toHaveBeenCalledTimes(1);
+      expect(fixture.local.listAwaitingRemote).not.toHaveBeenCalled();
+      expect(fixture.local.listAcknowledgedForRemotePrune).not.toHaveBeenCalled();
+      expectStoppedWithoutRemoteWork(fixture, onError);
+      await pass.close();
+    });
+
+    it("stops when the project becomes unbound or loses its identity", async () => {
+      for (const after of [null, {}, { remoteProjectId: null }] as Binding[]) {
+        const home = publicationHome();
+        const fixture = relinkHarness(1, after);
+        const onError = vi.fn();
+        const pass = admittedPass(fixture.harness, home, onError);
+        await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+        expect(fixture.local.claimDeliveries).not.toHaveBeenCalled();
+        expectStoppedWithoutRemoteWork(fixture, onError);
+        await pass.close();
+      }
+    });
+
+    it("builds the next pass's repository for the new binding", async () => {
+      const home = publicationHome();
+      const fixture = relinkHarness(1);
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      expect(fixture.harness.modules.createRepository).toHaveBeenLastCalledWith(
+        fixture.harness.runtime,
+        "project-a",
+        "machine-uuid",
+      );
+
+      // The binding now resolves to project B at gate 3 and at every phase.
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ leaseAcquired: true });
+      expect(fixture.harness.modules.createRepository).toHaveBeenLastCalledWith(
+        fixture.harness.runtime,
+        "project-b",
+        "machine-uuid",
+      );
+      expect(onError).toHaveBeenCalledTimes(1);
+      await pass.close();
+    });
+
+    it("checks the binding best effort when no publication admission is supplied", async () => {
+      const fixture = relinkHarness(1);
+      const onError = vi.fn();
+      const pass = createPassiveEventReplicationPass(postgresConfig(), {
+        processId: "lcm-daemon:binding",
+        loadModules: async () => fixture.harness.modules,
+        onError,
+      });
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      expect(fixture.local.claimDeliveries).not.toHaveBeenCalled();
+      expect(fixture.resolveExistingProjectIdentity).toHaveBeenCalledWith("/proj", undefined);
+      expectStoppedWithoutRemoteWork(fixture, onError);
+      await pass.close();
+    });
+
+    it("runs every phase while the binding holds", async () => {
+      const home = publicationHome();
+      const fixture = relinkHarness(Number.MAX_SAFE_INTEGER);
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ leaseAcquired: true });
+      expect(fixture.local.listAcknowledgedForRemotePrune).toHaveBeenCalledTimes(1);
+      expect(onError).not.toHaveBeenCalled();
+      await pass.close();
+    });
   });
 });

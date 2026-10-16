@@ -1,0 +1,7 @@
+references: ["#1473"]
+rationale: >-
+  #1473 re-reads the persisted project binding inside every admitted
+  replication phase; the change lives in the sweep-driven pass, which keeps its
+  daemon-events owner.
+pins:
+  - ["src/daemon/passive-event-replication-pass.ts", "unit-daemon-events"]
