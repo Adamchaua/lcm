@@ -15,6 +15,12 @@ import type { MigrationEffectKind, MigrationPhase } from "./protocol.js";
  *   performs no write, exits 0 and reports `applied: false` with read-back
  *   evidence of the settled pair (plan-v2 section 4.6, finding PA-6).
  *
+ * - R9 (proposed to the owner, not yet ruled): `verify` is allowed at row 24
+ *   (held, `verified`, nothing pending) so that re-running it is the
+ *   idempotent confirmation from persisted evidence plan-v4 section 5 step 2
+ *   specifies ("verified, no pending: exit 0"), instead of exit 7. It writes
+ *   nothing there. Revert this one entry if the owner rules otherwise.
+ *
  * Plan-v5 Part B (1): the one pure router for an explicit existing
  * generation. It is shared by every existing-generation command (as the
  * owner check), by `resume` (which executes only the cells it owns) and by
@@ -244,7 +250,7 @@ const ROWS: readonly Row[] = [
       && present(i)?.phase === "copied" && present(i)?.pending === null },
   { row: 23, primary: "verify", allowed: ["resume"], exit: fixed(6),
     matches: (i) => holdMatches(i, ["maintenance-held"]) && present(i)?.pending === "verify-generation" },
-  { row: 24, primary: "activate", allowed: ["rollback", "abort"],
+  { row: 24, primary: "activate", allowed: ["rollback", "abort", "verify"],
     exit: (_i, availability) => availability.activation ? 2 : 7,
     matches: (i) => holdMatches(i, ["maintenance-held"]) && present(i)?.phase === "verified"
       && present(i)?.pending === null && i.snapshot === "complete" },

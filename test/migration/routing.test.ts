@@ -80,7 +80,7 @@ const ROW_CELLS: ReadonlyArray<readonly [string, MigrationRouteInput, Expectatio
   ["21 held, pending complete-copy", cell({ snapshot: "complete", manifest: manifest("copying", "complete-copy") }), { row: 21, primary: "resume", allowed: [], exit: 6 }],
   ["22 held, copied, no pending", cell({ snapshot: "complete", manifest: manifest("copied") }), { row: 22, primary: "verify", allowed: ["abort"], exit: 2 }],
   ["23 held, pending verify-generation (snapshot not consulted)", cell({ snapshot: "absent", manifest: manifest("copied", "verify-generation") }), { row: 23, primary: "verify", allowed: ["resume"], exit: 6 }],
-  ["24 held, verified, complete snapshot", cell({ snapshot: "complete", manifest: manifest("verified") }), { row: 24, primary: "activate", allowed: ["rollback", "abort"], exit: 7 }],
+  ["24 held, verified, complete snapshot", cell({ snapshot: "complete", manifest: manifest("verified") }), { row: 24, primary: "activate", allowed: ["rollback", "abort", "verify"], exit: 7 }],
   ["25 held, manifest present but snapshot absent (snapshot-absent implies manifest-absent)", cell({ manifest: manifest("copied") }), { row: 25, primary: "none", allowed: [], exit: 5 }],
   ["25 absent journal with a manifest", cell({ journal: { kind: "absent" }, manifest: manifest("copied"), snapshot: "complete" }), { row: 25, primary: "none", allowed: [], exit: 5 }],
 ];
