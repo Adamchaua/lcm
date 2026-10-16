@@ -284,10 +284,39 @@ is unhealthy is reported as a storage failure instead. The next hook run
 still replaces the daemon through the `/health` backend comparison in
 `ensureDaemon`.
 
+Replication drains the sidecar the sweep scanned for the project, at that exact
+path. It opens an existing sidecar only: when the file is missing, or cannot be
+opened while a backend switch is in progress, the project is skipped quietly and
+no sidecar or project identity evidence is created.
+
+Each pass reads the project's remote binding once, before its first phase, and
+binds its remote repository to it. Every admitted phase then re-reads the
+persisted binding before it touches that repository, until it sees the binding
+change. If the project was relinked or unbound in the meantime, the pass
+reports one error and uploads no further rows to the previous project. It
+keeps working on what that project already holds (claims, reconcile and prune)
+for the rest of the pass, so rows it uploaded there are not abandoned
+mid-pass. Rows the pass did not upload stay pending locally and upload to the
+new binding on the next sweep. Rows that are still awaiting the previous
+project when the pass ends are not reconciled after the next sweep binds the
+new project; this is a known limitation tracked in
+[#1509](https://github.com/donadiosolutions/lcm/issues/1509). A pass run
+without a publication admission checks the binding too, but without the
+admission's lock, so that check is best effort.
+
+The storage health check receives the daemon's shutdown signal, so stopping the
+daemon cancels a health check that is still waiting on a PostgreSQL connection
+instead of waiting for its timeout.
+
 Each pass releases its project outbox when it finishes. The local outbox
 factory registers every repository it opens and drops one only when that
 repository closes, so a daemon holds one SQLite connection per project while
-that project is replicating and none between passes.
+that project is replicating and none between passes. The exception is a close
+that fails, for example while a publication mutation holds the append barrier:
+the pass keeps that repository, at most one per sidecar, and closes it again at
+the start of the project's next outbox step, before opening the sidecar. If the
+retry fails too, it is reported and that project is skipped for the sweep.
+Shutdown closes any repository still held.
 
 `lcm status` reports what replication has done under `passiveEvents`: whether
 it is `enabled` at all, the `lastPassAt` timestamp, how many passes have run

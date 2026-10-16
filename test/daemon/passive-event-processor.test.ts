@@ -831,6 +831,9 @@ describe("PassiveEventProcessor", () => {
     // Only scannable projects with a cwd are offered to replication.
     expect(replicatePassiveEvents.mock.calls.map(call => call[0]))
       .toEqual(["/bound", "/unbound"]);
+    // The scanned sidecar path travels with its cwd (#1488).
+    expect(replicatePassiveEvents.mock.calls.map(call => call[2]))
+      .toEqual(["/events/bound.db", "/events/unbound.db"]);
     expect(processor.backgroundDiagnostics().replication).toMatchObject({
       enabled: true,
       passes: 1,
