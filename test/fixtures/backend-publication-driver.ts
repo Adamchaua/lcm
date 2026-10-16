@@ -1,4 +1,5 @@
 import {
+  BackendPublicationCoordinator,
   backendPublicationMaterialWitness,
   type BackendPublicationDriver,
   type BackendPublicationFenceRecord,
@@ -84,3 +85,43 @@ export function workingPublicationDriver(materialInput: BackendPublicationRecove
     },
   };
 }
+
+/** The covered project of the rollback fixtures: a 64-hex local id (the project map's key shape) and its PostgreSQL id. */
+export const FIXTURE_LOCAL_PROJECT_ID = "c".repeat(64);
+export const FIXTURE_REMOTE_PROJECT_ID = "01990000-0000-7000-8000-0000000000aa";
+
+function fixtureProjectMapFile(bound: boolean): BackendPublicationRecoveryFile {
+  return publicationRecoveryFile(JSON.stringify({
+    [FIXTURE_LOCAL_PROJECT_ID]: {
+      canonical: "/covered",
+      aliases: [],
+      ...(bound ? { remoteProjectId: FIXTURE_REMOTE_PROJECT_ID } : {}),
+    },
+  }));
+}
+
+/** The material of the rollback publication: postgresql config and bound map become sqlite config and unbound map. */
+export function rollbackPublicationMaterial(): BackendPublicationRecoveryMaterial {
+  return {
+    source: {
+      config: publicationRecoveryFile('{"storage":{"backend":"postgresql"}}'),
+      projectMap: fixtureProjectMapFile(true),
+    },
+    target: {
+      config: publicationRecoveryFile('{"storage":{"backend":"sqlite"}}'),
+      projectMap: fixtureProjectMapFile(false),
+    },
+  };
+}
+
+/** The retained material of the activation the rollback unwinds: the same files in the opposite direction. */
+export function activationPublicationMaterial(): BackendPublicationRecoveryMaterial {
+  const rollback = rollbackPublicationMaterial();
+  return { source: rollback.target, target: rollback.source };
+}
+
+/** A coordinator over the in-memory driver that publishes the rollback material. */
+export function rollbackFixtureCoordinator(homeDir: string): BackendPublicationCoordinator {
+  return new BackendPublicationCoordinator({ homeDir, driver: workingPublicationDriver(rollbackPublicationMaterial()) });
+}
+

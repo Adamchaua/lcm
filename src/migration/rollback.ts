@@ -45,6 +45,7 @@
  * reportId), per section 8's convergence rule.
  */
 
+import { createHash } from "node:crypto";
 import { opendirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
@@ -65,7 +66,9 @@ import {
   withBackendPublicationConsumerLockAsync,
   withBackendPublicationAppendBarrierAsync,
   BackendPublicationCoordinator,
+  type BackendPublicationJournal,
   type BackendPublicationLockToken,
+  type BackendPublicationRecoveryFile,
   type BackendMaintenanceRosterEntry,
   type BackendMaintenanceJournal,
 } from "../storage/backend-publication.js";
@@ -79,10 +82,13 @@ import {
   type MigrationReportReference,
 } from "./protocol.js";
 import { MigrationManifestStore } from "./manifest-store.js";
-import { readProjectMapSnapshot } from "../project-map.js";
+import { parseProjectMap, readProjectMapSnapshot, type ProjectMap } from "../project-map.js";
+import type { StorageBackendName } from "../storage/contracts.js";
 import {
+  createMigrationActivationWitness,
   migrationCanonicalDeltaChanged,
   migrationCensusVectorsEqual,
+  type MigrationActivationWitness,
   type MigrationActivationAttempt,
   type MigrationActivationEpoch,
   type MigrationCanonicalDelta,
@@ -91,8 +97,13 @@ import {
 } from "./activation-witness.js";
 import {
   readMigrationActivationEvidence,
+  recordMigrationActivationWitness,
   resolveRollbackAuthoritativeContext,
 } from "./activation-evidence-store.js";
+import {
+  composeBackendPublicationMaterial,
+  readRetainedBackendPublicationMaterial,
+} from "../storage/backend-publication-material.js";
 import {
   recordMigrationSelectionBinding,
   recordMigrationWitnessBinding,
@@ -260,6 +271,27 @@ function rollbackSelectionBinding(
   };
 }
 
+/**
+ * The rollback project evidence both the session's lease and the
+ * coordinator's compose step carry, so the coordinator adopts the session's
+ * lease instead of conflicting with it. One derivation.
+ */
+export function deriveRollbackProjectEvidenceSha256(input: Readonly<{
+  generationId: string;
+  publicationId: string;
+  localProjectId: string;
+  remoteProjectId: string;
+}>): string {
+  return canonicalSha256({
+    version: 1,
+    kind: "rollback-project-evidence",
+    generationId: input.generationId,
+    publicationId: input.publicationId,
+    localProjectId: input.localProjectId,
+    remoteProjectId: input.remoteProjectId,
+  });
+}
+
 const ROLLBACK_PUBLISH_EFFECT_ID_PATTERN = /^rollback-publish-([0-9a-f]{64})$/u;
 
 /**
@@ -344,8 +376,25 @@ export function deriveRollbackReportId(input: Readonly<{
 
 const MAX_ROLLBACK_AUTHORITY_ARTIFACT_BYTES = 4 * 1024;
 
+/**
+ * Plan-v3.1 A8. What the activation's retained publication says the
+ * installation looked like before it ran, persisted so a resume (after the
+ * rollback's own publication archives the retained one) compares against the
+ * same facts. Only identities and digests: no raw config or map content.
+ */
+export type RollbackPublicationSource = Readonly<{
+  /** The activation publication's id: equal to the activation selection binding's. */
+  publicationId: string;
+  /** The activation journal's sourceBackend: the backend the rollback must restore. */
+  sourceBackend: StorageBackendName;
+  /** The covered project's entry in the pre-activation project map. */
+  sourceProjectEntry: Readonly<{ localProjectId: string; remoteProjectId: string | null }>;
+  sourceConfigSha256: string;
+  sourceProjectMapSha256: string;
+}>;
+
 export type RollbackAuthorityArtifactBody = Readonly<{
-  version: 1;
+  version: 2;
   generationId: string;
   /**
    * The OperabilityFactResolution this generation's rollback resolved at
@@ -361,6 +410,8 @@ export type RollbackAuthorityArtifactBody = Readonly<{
   /** Present only when authorityStatus is "authoritative". */
   epochId: string | null;
   attemptId: string | null;
+  /** Present exactly when authorityStatus is "authoritative": an unactivated rollback publishes nothing. */
+  publication: RollbackPublicationSource | null;
   checksumSha256: string;
 }>;
 
@@ -439,6 +490,15 @@ export function readRollbackAuthorityArtifact(
   const { checksumSha256, ...rest } = parsed;
   if (rollbackAuthorityArtifactChecksum(rest) !== checksumSha256) {
     throw new MigrationProtocolError("checksum-mismatch", "rollback authority artifact checksum does not match");
+  }
+  if (parsed.version !== 2) {
+    // A version-1 artifact predates the retained publication source (A8); it is never rewritten, so a
+    // rollback that began under it cannot be continued.
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "the rollback authority artifact is version " + String(parsed.version)
+        + ", which predates the persisted publication source; it cannot be continued or rewritten",
+    );
   }
   return parsed;
 }
@@ -627,6 +687,12 @@ export interface RollbackFencedSession {
    * of the originally committed interface.
    */
   computeRollbackTerminalEvidenceSha256(input: ComputeRollbackTerminalEvidenceInput): string;
+  /**
+   * Call once, right before the coordinator can acquire the lease for the
+   * rollback publication. From then on release() only verifies that the row
+   * is present and released; it never releases it itself (seam section 19).
+   */
+  markCoordinatorAcquired(): void;
   release(): Promise<void>;
 }
 
@@ -680,6 +746,12 @@ export type RollbackReportBody = Readonly<{
   sealedPublicationMaterialDigestSha256: string | null;
   /** Present only for kind "abandonment". */
   reason: string | null;
+  /**
+   * The manifest revision the rollback selection binding was recorded at, persisted so terminal recovery
+   * rewrites the identical binding. Null for an unactivated rollback (it records no binding) and for an
+   * abandonment.
+   */
+  selectionBindingManifestRevision: number | null;
   checksumSha256: string;
 }>;
 
@@ -769,6 +841,10 @@ export function readRollbackReport(
 // the writer is trusted to store exactly what it is given.
 // ---------------------------------------------------------------------------
 
+export type MigrationActivationWitnessRecorder = (
+  input: Readonly<{ homeDir: string; generationId: string; witness: MigrationActivationWitness }>,
+) => void;
+
 export type MigrationWitnessBindingRecorder = (
   input: Readonly<{ homeDir: string; generationId: string; binding: MigrationWitnessBinding }>,
 ) => void;
@@ -847,6 +923,12 @@ export interface RunMigrationRollbackDependencies {
   readonly resolveAuthoritativeContext?: RollbackAuthoritativeContextResolver;
   /** The project map the single-project check (plan-v3.2 A14) reads. Defaults to readProjectMapSnapshot. */
   readonly readProjectMap?: typeof readProjectMapSnapshot;
+  /** The activation's retained publication (A8), read before the rollback's own publication. Defaults to readRetainedBackendPublicationMaterial. */
+  readonly readRetainedMaterial?: typeof readRetainedBackendPublicationMaterial;
+  /** Derives the rollback publication's material and projects from the live files. Defaults to composeBackendPublicationMaterial. */
+  readonly composePublication?: typeof composeBackendPublicationMaterial;
+  /** Records the rollback witness in the evidence store (A9 step 1). Defaults to recordMigrationActivationWitness. */
+  readonly recordActivationWitness?: MigrationActivationWitnessRecorder;
 }
 
 type ResolvedRollbackDependencies = Required<RunMigrationRollbackDependencies>;
@@ -863,6 +945,9 @@ function withDefaultDependencies(
     recordWitnessBinding: deps.recordWitnessBinding ?? recordMigrationWitnessBinding,
     resolveAuthoritativeContext: deps.resolveAuthoritativeContext ?? resolveRollbackAuthoritativeContext,
     readProjectMap: deps.readProjectMap ?? readProjectMapSnapshot,
+    readRetainedMaterial: deps.readRetainedMaterial ?? readRetainedBackendPublicationMaterial,
+    composePublication: deps.composePublication ?? composeBackendPublicationMaterial,
+    recordActivationWitness: deps.recordActivationWitness ?? recordMigrationActivationWitness,
   };
 }
 
@@ -880,7 +965,7 @@ function assertCoveredProjectIsSoleRemoteBinding(
   deps: Readonly<ResolvedRollbackDependencies>,
   input: Readonly<RunMigrationRollbackInput>,
   token?: BackendPublicationLockToken,
-): void {
+): string {
   let map: ReturnType<typeof readProjectMapSnapshot>;
   try {
     map = deps.readProjectMap(input.homeDir, token);
@@ -915,6 +1000,7 @@ function assertCoveredProjectIsSoleRemoteBinding(
         + "); reduce the installation to one remotely bound project first",
     );
   }
+  return covered.remoteProjectId;
 }
 
 export interface RunMigrationRollbackInput {
@@ -938,6 +1024,7 @@ export interface RunMigrationRollbackInput {
 
 export type RollbackOrchestrationErrorReason =
   | "not-eligible"
+  | "drift"
   | "unexpected-state"
   | "not-implemented";
 
@@ -1167,14 +1254,21 @@ export async function runMigrationRollback(
   // steps 7 and 8. Idempotent: a retry regenerates byte-identical
   // content (operabilityFact/authority above are unchanged from any
   // prior write for this generationId, per the cross-check just above).
-  writeRollbackAuthorityArtifact(input.homeDir, {
-    version: 1,
+  //
+  // Plan-v3.1 A8: the activation's retained publication is read here, before
+  // anything of this rollback can archive it, and only its identities and
+  // digests are persisted. A retry reads the persisted copy back instead.
+  const artifact = priorAuthorityArtifact ?? writeRollbackAuthorityArtifact(input.homeDir, {
+    version: 2,
     generationId: input.generationId,
     operabilityFactState: operabilityFact.state,
     operabilityFactValueSha256: operabilityFact.state === "present" ? operabilityFact.valueSha256 : null,
     authorityStatus: authority.status,
     epochId: authority.status === "authoritative" ? authority.selection.epochId : null,
     attemptId: authority.status === "authoritative" ? authority.selection.attemptId : null,
+    publication: authority.status === "authoritative"
+      ? resolveRollbackPublicationSource(deps, input, authority.selection)
+      : null,
   });
 
   return withBackendPublicationAppendBarrierAsync(input.homeDir, async (token) => {
@@ -1226,7 +1320,7 @@ export async function runMigrationRollback(
       homeDir: input.homeDir, manifest: working, lockToken: token,
       scratchParent: input.scratchParent, signal: input.signal,
     });
-    try {
+    return withFencedSession(session, async () => {
       // Step 4: authoritative readback in the dedicated snapshot.
       const observation = await session.captureReadback({
         manifestDestinationWitnessSha256: working.destination.identitySha256,
@@ -1304,12 +1398,10 @@ export async function runMigrationRollback(
         completedAt: now().toISOString(),
       }));
 
-      return await runPostPrepareSequence(
-        input, deps, store, working, session, authority, authoritativeContext, decision, token, now,
+      return runPostPrepareSequence(
+        input, deps, store, working, session, authority, authoritativeContext, artifact, decision, token, now,
       );
-    } finally {
-      await session.release();
-    }
+    });
   });
 }
 
@@ -1445,6 +1537,7 @@ async function runPostPrepareSequence(
   session: RollbackFencedSession,
   authority: ActivationAuthority,
   authoritativeContext: RollbackAuthoritativeContext | null,
+  artifact: RollbackAuthorityArtifactBody,
   decision: Exclude<RollbackEligibilityDecision, Readonly<{ eligibility: "refused" }>>,
   token: BackendPublicationLockToken,
   now: () => Date,
@@ -1545,7 +1638,7 @@ async function runPostPrepareSequence(
     // via continueAfterPrepareRollback. The generation this attempt built
     // is left in place, verified but unreferenced, never deleted.
     throw new RollbackOrchestrationError(
-      "not-eligible",
+      revalidatedDecision.eligibility === "refused" ? "not-eligible" : "drift",
       revalidatedDecision.eligibility === "refused"
         ? revalidatedDecision.reason
         : 'revalidation observed mode "' + revalidatedDecision.mode + '" where step 9 acted on "' + decision.mode + '"',
@@ -1558,7 +1651,7 @@ async function runPostPrepareSequence(
   // mode; refuse before anything is installed or selected.
   if (exportEvidence !== null) {
     const drift = describeExportDrift(exportEvidence, revalidated);
-    if (drift !== null) throw new RollbackOrchestrationError("not-eligible", drift);
+    if (drift !== null) throw new RollbackOrchestrationError("drift", drift);
   }
 
   const epochId = authority.status === "authoritative" ? authority.selection.epochId : null;
@@ -1570,60 +1663,63 @@ async function runPostPrepareSequence(
     mode: revalidatedDecision.mode,
   });
 
-  // Section 18: written BEFORE the selection is prepared. Gated on
-  // authority.status === "authoritative" rather than on mode, because the
-  // binding names the ACTIVATION epoch/attempt this rollback reverses
-  // (epochId/attemptId above), and "unactivated" authority carries
-  // neither -- rollback-eligibility.ts's ActivationAuthority "unactivated"
-  // variant is exactly `{ status: "unactivated" }`, no fields, so there
-  // is genuinely nothing to name.
-  //
-  // OPEN QUESTION flagged to the owner rather than guessed (see this
-  // item's status report). This continuation's instruction was "write
-  // the rollback witness binding" even for "unactivated", reasoning that
-  // "an unactivated rollback is still an attempt that happened" (section
-  // 18). That is correct in the witnessed-but-unpublished sub-case -- an
-  // activation attempt WAS witnessed (fixtureWitnessedButUnpublished
-  // proves this state is reachable) but never selected, and "unactivated"
-  // is exactly that sub-case's outcome -- but resolveActivationAuthority's
-  // current, already-tested return shape discards that witness and
-  // returns the bare unactivated status with no epochId/attemptId to
-  // bind. Widening it to carry the witness would also break
-  // rollback-eligibility.test.ts's existing exact
-  // `.toEqual({ status: "unactivated" })` assertions against that same
-  // fixture, which read as an intentional decision to keep "unactivated"
-  // dataless. This item does not silently pick a side: no witness
-  // binding is written for "unactivated" here, and the tension is
-  // reported rather than resolved by guessing.
   if (authority.status === "authoritative") {
-    deps.recordWitnessBinding({
-      homeDir: input.homeDir,
-      generationId: input.generationId,
-      binding: {
-        kind: "rollback",
-        epochId: epochId!,
-        attemptId: attemptId!,
-        manifestRevision: working.revision,
-        witnessChecksumSha256: terminalEvidenceSha256,
-      },
+    // Plan-v3.1 A9 step 1: the rollback witness is minted here from the stored epoch and attempt and must be
+    // exactly the evidence the session sealed. It is recorded in the evidence store and bound before anything
+    // is selected, so a resume reads it back (its mode included) instead of re-minting it.
+    const witness = createMigrationActivationWitness({
+      kind: "rollback",
+      epoch: authoritativeContext!.epoch,
+      attempt: authoritativeContext!.attempt,
+      postEpochDelta: revalidated.postEpochDelta!,
+      postEpochCensus: revalidated.postEpochCensus,
+      rollbackMode: revalidatedDecision.mode,
     });
+    if (witness.checksumSha256 !== terminalEvidenceSha256) {
+      throw new RollbackOrchestrationError(
+        "unexpected-state",
+        "the session's terminal evidence is not the rollback witness minted from the same records",
+      );
+    }
+    if (working.pendingEffect === null) {
+      deps.recordActivationWitness({ homeDir: input.homeDir, generationId: input.generationId, witness });
+      // Section 18: written BEFORE the selection is prepared. "unactivated" authority carries no epoch or
+      // attempt to name, so it records no witness or binding.
+      deps.recordWitnessBinding({
+        homeDir: input.homeDir,
+        generationId: input.generationId,
+        binding: {
+          kind: "rollback",
+          epochId: epochId!,
+          attemptId: attemptId!,
+          manifestRevision: working.revision,
+          witnessChecksumSha256: terminalEvidenceSha256,
+        },
+      });
+    }
   }
 
-  // Plan-v3.2 A16a order (supersedes plan-v3.1 A9's): the witness binding
-  // above, then begin publish-rollback, then install, the maintenance
-  // selection, the selection binding, the report, and the effect's
-  // completion. The effect is begun first so that every later crash leaves a
-  // pending publish-rollback whose input IS the terminal evidence, which
-  // recoverPendingPublishRollback needs to finish a selection that already
-  // completed.
-  const publishInputSha256 = terminalEvidenceSha256;
-  const publishEffectId = "rollback-publish-" + publishInputSha256;
-  working = publishManifest(store, input.generationId, working, beginMigrationEffect(working, {
-    effectId: publishEffectId,
-    kind: "publish-rollback",
-    inputSha256: publishInputSha256,
-    startedAt: now().toISOString(),
-  }));
+  // Plan-v3.2 A16a order (supersedes plan-v3.1 A9's): the witness and its
+  // binding above, then begin publish-rollback, then install, the
+  // maintenance selection, the selection binding, the coordinator's
+  // publication, the report, and the effect's completion. The effect is
+  // begun first so that every later crash leaves a pending publish-rollback
+  // whose input IS the terminal evidence, which recoverPendingPublishRollback
+  // resumes from. A resumed publication arrives with the effect already
+  // pending and must reproduce its evidence.
+  if (working.pendingEffect === null) {
+    working = publishManifest(store, input.generationId, working, beginMigrationEffect(working, {
+      effectId: "rollback-publish-" + terminalEvidenceSha256,
+      kind: "publish-rollback",
+      inputSha256: terminalEvidenceSha256,
+      startedAt: now().toISOString(),
+    }));
+  } else if (working.pendingEffect.inputSha256 !== terminalEvidenceSha256) {
+    throw new RollbackOrchestrationError(
+      "drift",
+      "the readback no longer reproduces the pending publish-rollback's terminal evidence",
+    );
+  }
 
   // Step 11: install precedes publication -- while PostgreSQL is still
   // the durably selected backend -- then flip maintenance selection to
@@ -1654,7 +1750,7 @@ async function runPostPrepareSequence(
   }
 
   // A14: the project map may have changed since the pre-maintenance check.
-  assertCoveredProjectIsSoleRemoteBinding(deps, input, token);
+  const remoteProjectId = assertCoveredProjectIsSoleRemoteBinding(deps, input, token);
 
   const heldChecksum = requireMaintenanceChecksum(input.homeDir);
   const prepared = await deps.coordinator.prepareMaintenanceSelection({
@@ -1669,72 +1765,13 @@ async function runPostPrepareSequence(
     terminalEvidenceSha256,
   }, token);
 
-  // Plan-v3.2 A16a: the selection binding is recorded immediately after the
-  // selection completes -- before the coordinator's publication (which
-  // archives the maintenance journal that replay admission would otherwise
-  // route from) and before the report. Authoritative eligibilities only: an
-  // unactivated rollback has no activation epoch or attempt to name.
-  if (authority.status === "authoritative") {
-    deps.recordSelectionBinding({
-      homeDir: input.homeDir,
-      generationId: input.generationId,
-      binding: rollbackSelectionBinding(input.generationId, {
-        epochId: epochId!,
-        attemptId: attemptId!,
-        manifestRevision: working.revision,
-        terminalEvidenceSha256,
-      }),
-    });
-  }
-
-  // "then the coordinator publication of project map and config" is NOT
-  // implemented here -- see this item's status report. coordinator.prepare()
-  // needs a BackendPublicationRecoveryMaterial and a projects list this
-  // item has no source for; that shape belongs to whichever item defines
-  // config/project-map publication content (#625's activation side, or a
-  // shared module neither item has authored yet), and inventing one here
-  // would be an undefined coupling guessed rather than asked about. The
-  // maintenance journal is already durably terminal at
-  // "selection-completed" above, which is what
-  // assertBackendPublicationConsumerAccessUnlocked keys on (section 6). Once
-  // the coordinator's publication archives that journal, replay admission
-  // routes from the selection binding recorded above (plan-v3.2 A15), which
-  // is why the binding must precede this step.
-
-  // Step 12: persist the report, then complete with the report and the
-  // exact mode. Order is begin (above), persist, complete (plan-v2 section
-  // 5's closing paragraph), so the report's createdAt falls inside
-  // [pending.startedAt, completedAt].
-  const reportId = deriveRollbackReportId({
-    generationId: input.generationId,
-    effectId: working.pendingEffect!.effectId,
-    kind: "rollback",
-  });
-  const reportCreatedAt = now().toISOString();
-  const report = writeRollbackReport(input.homeDir, {
-    version: 1,
-    reportId,
-    generationId: input.generationId,
-    effectId: working.pendingEffect!.effectId,
-    kind: "rollback",
+  return finishRollbackPublication({
+    input, deps, store, token, now, artifact, remoteProjectId, epochId, attemptId, terminalEvidenceSha256,
     eligibility: revalidatedDecision.eligibility,
     mode: revalidatedDecision.mode,
-    epochId,
-    attemptId,
-    sealedPublicationMaterialDigestSha256: null,
-    reason: null,
-  });
-
-  working = publishManifest(store, input.generationId, working, completeMigrationEffect(working, {
-    effectId: working.pendingEffect!.effectId,
-    completedAt: now().toISOString(),
-    report: { kind: "rollback", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: reportCreatedAt },
-    rollbackMode: revalidatedDecision.mode,
-  }));
-
-  return { manifest: working, report };
+    session,
+  }, working);
 }
-
 
 
 /**
@@ -1760,13 +1797,18 @@ async function runPostPrepareSequence(
  * authority is required to AGREE with the artifact's recorded
  * epoch/attempt rather than being trusted on its own.
  */
-async function continueAfterPrepareRollback(
+async function resolveContinuationAuthority(
   input: Readonly<RunMigrationRollbackInput>,
   deps: Readonly<ResolvedRollbackDependencies>,
-  store: MigrationManifestStore,
-  current: MigrationManifest,
-  now: () => Date,
-): Promise<RunMigrationRollbackOutcome> {
+): Promise<Readonly<
+  | { status: "refused"; reason: string }
+  | {
+    status: "resolved";
+    authority: Exclude<ActivationAuthority, Readonly<{ status: "refused"; reason: string }>>;
+    authoritativeContext: RollbackAuthoritativeContext | null;
+    artifact: RollbackAuthorityArtifactBody;
+  }
+>> {
   const { fact: operabilityFact, artifact: priorAuthorityArtifact } = await resolveRollbackOperabilityFact({
     homeDir: input.homeDir,
     generationId: input.generationId,
@@ -1780,10 +1822,11 @@ async function continueAfterPrepareRollback(
     generationId: input.generationId,
   });
   const authority = resolveActivationAuthority({ resolution: witnessResolution, evidence, operabilityFact });
-  if (authority.status === "refused") {
+  if (authority.status === "refused") return { status: "refused", reason: authority.reason };
+  if (priorAuthorityArtifact === null) {
     throw new RollbackOrchestrationError(
       "unexpected-state",
-      "continuing a prepared rollback: authority resolution now refuses: " + authority.reason,
+      "a rollback is in progress but its durable rollback authority artifact is absent",
     );
   }
   assertAuthorityAgreesWithArtifact(authority, priorAuthorityArtifact);
@@ -1803,6 +1846,40 @@ async function continueAfterPrepareRollback(
       );
     }
   }
+  return { status: "resolved", authority, authoritativeContext, artifact: priorAuthorityArtifact };
+}
+
+/**
+ * Runs the body with the fenced session and releases it afterwards. A
+ * release that fails after a failed body never masks the original failure.
+ */
+async function withFencedSession<T>(session: RollbackFencedSession, body: () => Promise<T>): Promise<T> {
+  let result: T;
+  try {
+    result = await body();
+  } catch (error) {
+    await session.release().catch(() => undefined);
+    throw error;
+  }
+  await session.release();
+  return result;
+}
+
+async function continueAfterPrepareRollback(
+  input: Readonly<RunMigrationRollbackInput>,
+  deps: Readonly<ResolvedRollbackDependencies>,
+  store: MigrationManifestStore,
+  current: MigrationManifest,
+  now: () => Date,
+): Promise<RunMigrationRollbackOutcome> {
+  const resolved = await resolveContinuationAuthority(input, deps);
+  if (resolved.status === "refused") {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "continuing a prepared rollback: authority resolution now refuses: " + resolved.reason,
+    );
+  }
+  const { authority, authoritativeContext, artifact } = resolved;
 
   return withBackendPublicationAppendBarrierAsync(input.homeDir, async (token) => {
     // No enterMaintenance call here: the durable maintenance journal is
@@ -1816,7 +1893,7 @@ async function continueAfterPrepareRollback(
       homeDir: input.homeDir, manifest: current, lockToken: token,
       scratchParent: input.scratchParent, signal: input.signal,
     });
-    try {
+    return withFencedSession(session, async () => {
       const observation = await session.captureReadback({
         manifestDestinationWitnessSha256: current.destination.identitySha256,
         canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
@@ -1829,13 +1906,264 @@ async function continueAfterPrepareRollback(
       if (decision.eligibility === "refused") {
         throw new RollbackOrchestrationError("not-eligible", decision.reason);
       }
-      return await runPostPrepareSequence(
-        input, deps, store, current, session, authority, authoritativeContext, decision, token, now,
+      return runPostPrepareSequence(
+        input, deps, store, current, session, authority, authoritativeContext, artifact, decision, token, now,
       );
-    } finally {
-      await session.release();
-    }
+    });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Publication phase (plan-v3.2 A16a, A9): the steps after the maintenance
+// selection completes -- the selection binding, the coordinator's
+// publication of the sqlite project map and config, the report, and the
+// manifest effect's completion. The fresh path, the continuation and every
+// resume row of recoverPendingPublishRollback reach it with the same facts.
+// ---------------------------------------------------------------------------
+
+type PublicationPhase = Readonly<{
+  input: Readonly<RunMigrationRollbackInput>;
+  deps: Readonly<ResolvedRollbackDependencies>;
+  store: MigrationManifestStore;
+  token: BackendPublicationLockToken;
+  now: () => Date;
+  artifact: RollbackAuthorityArtifactBody;
+  /** The covered project's PostgreSQL id, from the project map checked under the token. */
+  remoteProjectId: string;
+  epochId: string | null;
+  attemptId: string | null;
+  terminalEvidenceSha256: string;
+  eligibility: "unactivated" | "pre-write" | "post-write";
+  mode: "pre-write" | "post-write";
+  /** Null when no fenced session is open (a resume that starts after the selection). */
+  session: RollbackFencedSession | null;
+}>;
+
+type PublicationSlot =
+  | Readonly<{ kind: "empty" }>
+  | Readonly<{ kind: "maintenance"; journal: BackendMaintenanceJournal }>
+  | Readonly<{ kind: "publication"; journal: BackendPublicationJournal }>;
+
+/** The one live journal slot holds a maintenance journal or a publication journal, never both. */
+function readPublicationSlot(homeDir: string): PublicationSlot {
+  const maintenance = readBackendMaintenanceJournal(homeDir);
+  if (maintenance !== null) return { kind: "maintenance", journal: maintenance };
+  const journal = readBackendPublicationJournal(homeDir);
+  return journal === null ? { kind: "empty" } : { kind: "publication", journal };
+}
+
+function decodeProjectMapFile(file: BackendPublicationRecoveryFile): ProjectMap | null {
+  if (file.presence !== "present") return null;
+  try {
+    return parseProjectMap(new TextDecoder("utf-8", { fatal: true }).decode(file.content));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Plan-v3.1 A8. The activation's retained publication, read before the
+ * rollback's own prepare() can archive it: it must be the publication the
+ * activation selection binding names, and it carries the installation as it
+ * was before activation. Only identities and digests are kept.
+ */
+function resolveRollbackPublicationSource(
+  deps: Readonly<ResolvedRollbackDependencies>,
+  input: Readonly<RunMigrationRollbackInput>,
+  selection: MigrationSelectionBinding,
+): RollbackPublicationSource {
+  const retained = deps.readRetainedMaterial({ homeDir: input.homeDir });
+  if (retained.status === "authoritatively-absent") {
+    throw new RollbackOrchestrationError(
+      "not-eligible",
+      "retained-publication-absent: the activation's completed publication is not retained, so there is nothing to restore",
+    );
+  }
+  if (retained.status === "unresolvable") {
+    throw new RollbackOrchestrationError(
+      "not-eligible",
+      "retained-publication-unresolvable: " + retained.reason,
+    );
+  }
+  const { journal, material } = retained;
+  if (journal.publicationId !== selection.publicationId || journal.targetBackend !== "postgresql") {
+    throw new RollbackOrchestrationError(
+      "not-eligible",
+      "retained-publication-mismatch: the retained publication is not the activation publication the selection binding names",
+    );
+  }
+  const sourceMap = decodeProjectMapFile(material.source.projectMap);
+  const entry = sourceMap?.[input.localProjectId];
+  if (
+    sourceMap === null
+    || entry === undefined
+    || material.source.config.presence !== "present"
+    || material.source.projectMap.presence !== "present"
+  ) {
+    throw new RollbackOrchestrationError(
+      "not-eligible",
+      "retained-publication-source-unusable: the pre-activation config or project map cannot be read for the covered project",
+    );
+  }
+  return {
+    publicationId: journal.publicationId,
+    sourceBackend: journal.sourceBackend,
+    sourceProjectEntry: { localProjectId: input.localProjectId, remoteProjectId: entry.remoteProjectId ?? null },
+    sourceConfigSha256: createHash("sha256").update(material.source.config.content).digest("hex"),
+    sourceProjectMapSha256: createHash("sha256").update(material.source.projectMap.content).digest("hex"),
+  };
+}
+
+function expectedRollbackProject(phase: PublicationPhase): Readonly<{
+  localProjectId: string;
+  remoteProjectId: string;
+  evidenceSha256: string;
+}> {
+  const publicationId = deriveRollbackPublicationId(phase.input.generationId);
+  return {
+    localProjectId: phase.input.localProjectId,
+    remoteProjectId: phase.remoteProjectId,
+    evidenceSha256: deriveRollbackProjectEvidenceSha256({
+      generationId: phase.input.generationId,
+      publicationId,
+      localProjectId: phase.input.localProjectId,
+      remoteProjectId: phase.remoteProjectId,
+    }),
+  };
+}
+
+function assertComposedPublicationRestoresSource(
+  phase: PublicationPhase,
+  composed: ReturnType<typeof composeBackendPublicationMaterial>,
+): void {
+  const source = phase.artifact.publication!;
+  const targetMap = decodeProjectMapFile(composed.material.target.projectMap);
+  const entry = targetMap?.[phase.input.localProjectId];
+  if (
+    composed.sourceBackend !== "postgresql"
+    || composed.targetBackend !== source.sourceBackend
+    || targetMap === null
+    || entry === undefined
+    || (entry.remoteProjectId ?? null) !== source.sourceProjectEntry.remoteProjectId
+    || canonicalJson(composed.projects as unknown as Record<string, unknown>[])
+      !== canonicalJson([expectedRollbackProject(phase)] as unknown as Record<string, unknown>[])
+  ) {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "the composed rollback publication does not restore the pre-activation backend and the covered project's pre-activation map entry",
+    );
+  }
+}
+
+/**
+ * Drives the coordinator's publication of the sqlite config and project map
+ * to completion and returns the sealed material digest. Never prepares a
+ * second time: a journal for the rollback publicationId already in the live
+ * slot is resumed (or, completed, verified) rather than composed again.
+ */
+async function publishRollbackSelection(phase: PublicationPhase): Promise<string> {
+  const { input, deps, token } = phase;
+  const publicationId = deriveRollbackPublicationId(input.generationId);
+  const slot = readPublicationSlot(input.homeDir);
+  let journal: BackendPublicationJournal;
+  if (slot.kind === "publication") {
+    // Callers reach here with a publication in the slot only after establishing that it is this rollback's.
+    journal = slot.journal;
+  } else {
+    // The caller completed this rollback's maintenance selection (or verified that it had); prepare() archives
+    // that terminal journal and refuses any other state of the slot.
+    const composed = deps.composePublication({
+      homeDir: input.homeDir,
+      targetBackend: "sqlite",
+      bindings: [expectedRollbackProject(phase)],
+    });
+    assertComposedPublicationRestoresSource(phase, composed);
+    journal = await deps.coordinator.prepare({
+      publicationId,
+      sourceBackend: composed.sourceBackend,
+      targetBackend: composed.targetBackend,
+      material: composed.material,
+      projects: composed.projects,
+    }, token);
+  }
+  if (journal.phase === "aborted") {
+    throw new RollbackOrchestrationError("unexpected-state", "the rollback's coordinator publication was aborted");
+  }
+  if (journal.phase !== "completed") {
+    // The coordinator acquires the remote fence (adopting the session's lease) and releases it on completion;
+    // from here the session verifies instead of releasing.
+    phase.session?.markCoordinatorAcquired();
+    journal = await deps.coordinator.resume(token);
+  }
+  const project = expectedRollbackProject(phase);
+  if (
+    journal.phase !== "completed"
+    || journal.publicationId !== publicationId
+    || journal.sourceBackend !== "postgresql"
+    || journal.targetBackend !== phase.artifact.publication!.sourceBackend
+    || journal.projects.length !== 1
+    || journal.projects[0]!.localProjectId !== project.localProjectId
+    || journal.projects[0]!.remoteProjectId !== project.remoteProjectId
+    || journal.projects[0]!.evidenceSha256 !== project.evidenceSha256
+    || journal.recoveryReference === null
+  ) {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "the rollback's coordinator publication did not complete as composed",
+    );
+  }
+  return journal.recoveryReference.sealSha256;
+}
+
+/**
+ * The publication phase proper. working holds the pending publish-rollback
+ * effect; the maintenance selection is durably completed.
+ */
+async function finishRollbackPublication(
+  phase: PublicationPhase,
+  working: MigrationManifest,
+): Promise<RunMigrationRollbackOutcome> {
+  const { input, deps, store, now } = phase;
+  const authoritative = phase.artifact.authorityStatus === "authoritative";
+  // Plan-v3.2 A16a: the binding is recorded before the coordinator's prepare(), which archives the maintenance
+  // journal that replay admission would otherwise route from. It is rewritten idempotently on every resume.
+  if (authoritative) {
+    deps.recordSelectionBinding({
+      homeDir: input.homeDir,
+      generationId: input.generationId,
+      binding: rollbackSelectionBinding(input.generationId, {
+        epochId: phase.epochId!,
+        attemptId: phase.attemptId!,
+        manifestRevision: working.revision,
+        terminalEvidenceSha256: phase.terminalEvidenceSha256,
+      }),
+    });
+  }
+  const sealedDigest = authoritative ? await publishRollbackSelection(phase) : null;
+
+  const effectId = working.pendingEffect!.effectId;
+  const reportCreatedAt = now().toISOString();
+  const report = writeRollbackReport(input.homeDir, {
+    version: 1,
+    reportId: deriveRollbackReportId({ generationId: input.generationId, effectId, kind: "rollback" }),
+    generationId: input.generationId,
+    effectId,
+    kind: "rollback",
+    eligibility: phase.eligibility,
+    mode: phase.mode,
+    epochId: phase.epochId,
+    attemptId: phase.attemptId,
+    sealedPublicationMaterialDigestSha256: sealedDigest,
+    reason: null,
+    selectionBindingManifestRevision: authoritative ? working.revision : null,
+  });
+  const completed = publishManifest(store, input.generationId, working, completeMigrationEffect(working, {
+    effectId,
+    completedAt: now().toISOString(),
+    report: { kind: "rollback", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: reportCreatedAt },
+    rollbackMode: phase.mode,
+  }));
+  return { manifest: completed, report };
 }
 
 /**
@@ -1844,10 +2172,12 @@ async function continueAfterPrepareRollback(
  * write -- or a binding writer that died between link and unlink -- can
  * leave the durable selection binding missing, and replay admission routes
  * from that binding. This entry accepts such a manifest only to complete the
- * missing durable authority: it reconstructs the exact binding from the
- * persisted rollback report, the rollback-authority artifact and the manifest
- * revision, writes it through the idempotent recorder (a matching binding is
- * reused), and returns the settled outcome. It never mutates the manifest.
+ * missing durable authority: it rewrites the exact binding from the
+ * persisted rollback report (which carries the revision the binding was
+ * first recorded at), the rollback-authority artifact and the report's
+ * effect, through the idempotent recorder (a matching binding is reused). A
+ * stored revision that the manifest history contradicts refuses. It never
+ * mutates the manifest.
  */
 async function recoverRolledBackAuthority(
   input: Readonly<RunMigrationRollbackInput>,
@@ -1860,26 +2190,34 @@ async function recoverRolledBackAuthority(
   if (report === null || report.checksumSha256 !== reference.reportSha256) {
     throw new RollbackOrchestrationError(
       "unexpected-state",
-      `generation ${input.generationId} is rolled back but its rollback report cannot be read`,
+      "generation " + input.generationId + " is rolled back but its rollback report cannot be read",
     );
   }
   const artifact = readRollbackAuthorityArtifact(input.homeDir, input.generationId);
   if (artifact === null) {
     throw new RollbackOrchestrationError(
       "unexpected-state",
-      `generation ${input.generationId} is rolled back but its rollback authority artifact is absent`,
+      "generation " + input.generationId + " is rolled back but its rollback authority artifact is absent",
     );
   }
   if (artifact.authorityStatus === "unactivated") return { manifest: current, report };
   const terminalEvidenceSha256 = ROLLBACK_PUBLISH_EFFECT_ID_PATTERN.exec(report.effectId)?.[1];
   if (
     terminalEvidenceSha256 === undefined
-    || (report.epochId !== null && report.epochId !== artifact.epochId)
-    || (report.attemptId !== null && report.attemptId !== artifact.attemptId)
+    || report.epochId !== artifact.epochId
+    || report.attemptId !== artifact.attemptId
   ) {
     throw new RollbackOrchestrationError(
       "unexpected-state",
       "the rollback report does not agree with the rollback authority artifact",
+    );
+  }
+  // The effect completed one revision after it was begun, and the binding was recorded while it was pending:
+  // the stored revision must be exactly that, or the report and the manifest history disagree.
+  if (report.selectionBindingManifestRevision !== current.revision - 1) {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "the rollback report's selection binding revision does not match the manifest history",
     );
   }
   return withBackendPublicationAppendBarrierAsync(input.homeDir, async () => {
@@ -1889,8 +2227,7 @@ async function recoverRolledBackAuthority(
       binding: rollbackSelectionBinding(input.generationId, {
         epochId: artifact.epochId!,
         attemptId: artifact.attemptId!,
-        // The effect completed one revision after it was begun, which is where the binding was recorded.
-        manifestRevision: current.revision - 1,
+        manifestRevision: report.selectionBindingManifestRevision!,
         terminalEvidenceSha256,
       }),
     });
@@ -1900,38 +2237,31 @@ async function recoverRolledBackAuthority(
 
 /**
  * Recovers a rollback whose publish-rollback effect was pending when the
- * process died (classifyMigrationRecovery action "readback",
- * recovery === "authoritative-readback-required", per protocol.ts). This
- * is the hardest recovery path plan-v2 names, and this implementation is
- * intentionally conservative rather than clever, per plan-v2 section 12's
- * closing paragraph on abandonment reconciling the backend selection
- * explicitly:
+ * process died (plan-v3.2 A9 as amended by A16a, and the owner's decisions
+ * on S3c). The effect is begun before anything is installed or selected, so
+ * its pending input is the rollback's terminal evidence and the durable
+ * facts decide where the publication stopped:
  *
- *  - If the durable maintenance journal shows selection-completed,
- *    targeting sqlite, for exactly this generationId, step 11's install
- *    and selection flip are proven to have happened (that journal state
- *    is durable and is exactly what assertMigrationReplayAdmission keys
- *    on per section 6), so this path completes publish-rollback with a
- *    freshly derived report rather than abandoning a change that already
- *    happened.
- *  - Otherwise, nothing durable proves the flip happened. This path
- *    abandons the pending publish-rollback effect back to the sealed
- *    returnPhase and, if the maintenance journal is still non-terminal
- *    (held or entering), aborts it -- which is itself the "reconciliation"
- *    plan-v2 asks for in this branch, because nothing was ever durably
- *    selected away from postgresql to reconcile back to.
- *  - NOT IMPLEMENTED, refusing explicitly: the case where the maintenance
- *    journal is durably terminal at selection-completed/sqlite (so
- *    abortMaintenance is no longer legal -- it only accepts held/entering)
- *    but this item's own evidence says the rollback must still be
- *    abandoned (e.g. a config/project-map publication step 11 could not
- *    prove complete, once that step is implemented). Reconciling that
- *    case requires a second maintenance cycle re-selecting postgresql,
- *    which needs the original activation's own terminalEvidenceSha256 --
- *    plausibly the authoritative activation selection binding's own
- *    witnessChecksumSha256, per section 14 -- and this item flags that
- *    mechanism as unconfirmed rather than executing an unverified
- *    backend-selection mutation. See this item's status report.
+ *  - maintenance held: nothing was selected. The publication resumes in
+ *    place -- a fresh fenced readback, build and install (idempotent with
+ *    readback) -- and must reproduce the pending evidence. It is abandoned
+ *    only when that readback is unresolvable or contradicts the artifact or
+ *    the pending evidence;
+ *  - selection prepared with this generation, sqlite and this evidence: the
+ *    selection is completed, then the publication continues;
+ *  - selection completed likewise: the publication continues from the
+ *    selection binding;
+ *  - the live slot holds this rollback's coordinator publication (our own
+ *    prepare archived the maintenance journal): the binding was written
+ *    before it, so the coordinator is resumed (or, completed, verified)
+ *    and the report and the manifest completion follow;
+ *  - the slot holds nothing of this rollback and no rollback selection
+ *    binding exists: no selection could have completed, so the effect is
+ *    abandoned. With a binding the selection did complete and the journal
+ *    was archived by someone else, which refuses.
+ *
+ * An abandonment never assumes a fence: a coordinator publication of this
+ * rollback is always resumed, never abandoned (seam section 19).
  */
 async function recoverPendingPublishRollback(
   input: Readonly<RunMigrationRollbackInput>,
@@ -1944,129 +2274,180 @@ async function recoverPendingPublishRollback(
   if (pending === null || pending.kind !== "publish-rollback") {
     throw new RollbackOrchestrationError("unexpected-state", "recoverPendingPublishRollback called without a pending publish-rollback effect");
   }
-
-  const maintenance = readBackendMaintenanceJournal(input.homeDir);
-  const selectionProvenComplete = maintenance !== null
-    && maintenance.phase === "selection-completed"
-    && maintenance.generationId === input.generationId
-    && maintenance.targetBackend === "sqlite";
+  const artifact = readRollbackAuthorityArtifact(input.homeDir, input.generationId);
+  if (artifact === null) {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "a pending publish-rollback has no rollback authority artifact to finish or abandon it from",
+    );
+  }
+  const terminalEvidenceSha256 = pending.inputSha256;
+  const publicationId = deriveRollbackPublicationId(input.generationId);
 
   return withBackendPublicationAppendBarrierAsync(input.homeDir, async (token) => {
-    let working = current;
+    const slot = readPublicationSlot(input.homeDir);
 
-    if (selectionProvenComplete) {
-      // The authority this rollback unwound was fixed before maintenance was
-      // entered; the pending effect's input is the terminal evidence.
-      const artifact = readRollbackAuthorityArtifact(input.homeDir, input.generationId);
-      if (artifact === null) {
-        throw new RollbackOrchestrationError(
-          "unexpected-state",
-          "a completed rollback selection has no rollback authority artifact to finish the publication from",
-        );
+    /** Everything the publication phase needs when no fenced session is open. */
+    const storedPhase = (): PublicationPhase => {
+      const remoteProjectId = assertCoveredProjectIsSoleRemoteBinding(deps, input, token);
+      let mode: "pre-write" | "post-write" = "pre-write";
+      if (artifact.authorityStatus === "authoritative") {
+        // The mode is the stored rollback witness's, never inferred; no witness refuses.
+        const evidence = deps.resolveActivationEvidence({ homeDir: input.homeDir, generationId: input.generationId });
+        const witness = evidence.state === "resolved"
+          ? evidence.witnesses.find((candidate) => candidate.kind === "rollback" && candidate.checksumSha256 === terminalEvidenceSha256)
+          : undefined;
+        if (witness === undefined) {
+          throw new RollbackOrchestrationError(
+            "unexpected-state",
+            "the pending publish-rollback has no stored rollback witness to take its mode from",
+          );
+        }
+        mode = witness.rollbackMode!;
       }
-      const authoritative = artifact.authorityStatus === "authoritative";
-      // Plan-v3.2 A16: the selection binding comes first (replay admission routes from it), exactly as on
-      // the fresh path; a rewrite of an already recorded binding is reused.
-      if (authoritative) {
-        deps.recordSelectionBinding({
-          homeDir: input.homeDir,
-          generationId: input.generationId,
-          binding: rollbackSelectionBinding(input.generationId, {
-            epochId: artifact.epochId!,
-            attemptId: artifact.attemptId!,
-            manifestRevision: working.revision,
-            terminalEvidenceSha256: pending.inputSha256,
-          }),
-        });
+      return {
+        input, deps, store, token, now, artifact, remoteProjectId,
+        epochId: artifact.epochId, attemptId: artifact.attemptId, terminalEvidenceSha256,
+        eligibility: artifact.authorityStatus === "authoritative" ? mode : "unactivated",
+        mode, session: null,
+      };
+    };
+
+    const hasRollbackSelectionBinding = (): boolean => {
+      const resolution = deps.resolveWitnessBindings({ homeDir: input.homeDir, generationId: input.generationId });
+      return resolution.state === "resolved" && resolution.selections.some((selection) => selection.kind === "rollback");
+    };
+
+    /**
+     * Abandons the effect back to the sealed return phase. Only callers that have shown no selection was
+     * prepared or completed reach it; an unfinished maintenance of this generation is aborted first.
+     */
+    const abandon = async (
+      reason: string,
+      unfinished?: BackendMaintenanceJournal,
+    ): Promise<RunMigrationRollbackOutcome> => {
+      if (unfinished !== undefined) {
+        await deps.coordinator.abortMaintenance({
+          expectedChecksumSha256: unfinished.checksumSha256,
+          sourceSelectionSha256: input.sourceSelectionSha256,
+          abortEvidenceSha256: sha256(canonicalJson(["rollback-recovery-abort-v1", input.generationId, pending.effectId])),
+        }, token);
       }
-      const reportId = deriveRollbackReportId({
-        generationId: input.generationId,
-        effectId: pending.effectId,
-        kind: "rollback",
-      });
-      const reportCreatedAt = now().toISOString();
-      // An unactivated rollback always completes as pre-write; for an authoritative one the mode the
-      // fresh path decided is not persisted before completion, so the sealed lineage mode stands in.
-      const mode = authoritative ? working.rollbackLineage.mode ?? "post-write" : "pre-write";
       const report = writeRollbackReport(input.homeDir, {
         version: 1,
-        reportId,
+        reportId: deriveRollbackReportId({ generationId: input.generationId, effectId: pending.effectId, kind: "abandonment" }),
         generationId: input.generationId,
         effectId: pending.effectId,
-        kind: "rollback",
-        eligibility: authoritative ? mode : "unactivated",
-        mode,
-        epochId: artifact.epochId,
-        attemptId: artifact.attemptId,
-        sealedPublicationMaterialDigestSha256: null,
-        reason: null,
-      });
-      working = publishManifest(store, input.generationId, working, completeMigrationEffect(working, {
-        effectId: pending.effectId,
-        completedAt: now().toISOString(),
-        report: { kind: "rollback", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: reportCreatedAt },
-        rollbackMode: mode,
-      }));
-      return { manifest: working, report };
-    }
-
-    if (maintenance !== null && (maintenance.phase === "maintenance-held" || maintenance.phase === "maintenance-entering")) {
-      await deps.coordinator.abortMaintenance({
-        expectedChecksumSha256: maintenance.checksumSha256,
-        sourceSelectionSha256: input.sourceSelectionSha256,
-        abortEvidenceSha256: sha256(canonicalJson(["rollback-recovery-abort-v1", input.generationId, pending.effectId])),
-      }, token);
-    } else if (
-      maintenance !== null && maintenance.phase === "selection-prepared" && maintenance.generationId === input.generationId
-    ) {
-      // The selection was prepared but its completion is not proven. Finishing it from the pending effect's
-      // terminal evidence is the resume this item has not implemented; abandoning would leave the prepared
-      // selection behind, so refuse.
-      throw new RollbackOrchestrationError(
-        "not-implemented",
-        "publish-rollback was interrupted with its maintenance selection prepared but not completed; "
-          + "completing it requires the resume this item has not implemented",
-      );
-    } else if (maintenance !== null && maintenance.phase === "selection-completed") {
-      // The unimplemented reconciliation case -- see this function's doc
-      // comment. Refuse loudly rather than mutate an unverified selection.
-      throw new RollbackOrchestrationError(
-        "not-implemented",
-        "publish-rollback must be abandoned but the maintenance journal is already durably "
-          + "selection-completed for a different or ambiguous target; re-selecting postgresql "
-          + "requires a mechanism this item has not implemented -- see this item's status report",
-      );
-    }
-
-    const reportId = deriveRollbackReportId({
-      generationId: input.generationId,
-      effectId: pending.effectId,
-      kind: "abandonment",
-    });
-    const reportCreatedAt = now().toISOString();
-    const report = writeRollbackReport(input.homeDir, {
-      version: 1,
-      reportId,
-      generationId: input.generationId,
-      effectId: pending.effectId,
-      kind: "abandonment",
-      eligibility: null,
-      mode: null,
-      epochId: null,
-      attemptId: null,
-      sealedPublicationMaterialDigestSha256: null,
-      reason: "publish-rollback recovery could not prove the selection completed",
-    });
-    working = publishManifest(store, input.generationId, working, abandonMigrationEffect(working, {
-      effectId: pending.effectId,
-      abandonedAt: now().toISOString(),
-      report: {
         kind: "abandonment",
-        reportId: report.reportId,
-        reportSha256: report.checksumSha256,
-        createdAt: reportCreatedAt,
-      },
-    }));
-    return { manifest: working, report };
+        eligibility: null,
+        mode: null,
+        epochId: null,
+        attemptId: null,
+        sealedPublicationMaterialDigestSha256: null,
+        reason: "publish-rollback recovery could not prove the selection completed: " + reason,
+        selectionBindingManifestRevision: null,
+      });
+      const reportCreatedAt = now().toISOString();
+      const abandoned = publishManifest(store, input.generationId, current, abandonMigrationEffect(current, {
+        effectId: pending.effectId,
+        abandonedAt: now().toISOString(),
+        report: { kind: "abandonment", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: reportCreatedAt },
+      }));
+      return { manifest: abandoned, report };
+    };
+
+    if (slot.kind === "maintenance" && slot.journal.generationId === input.generationId) {
+      const maintenance = slot.journal;
+      if (maintenance.phase === "maintenance-held") {
+        const resumed = await resumeHeldPublication(input, deps, store, current, artifact, token, now);
+        return resumed.status === "completed" ? resumed.outcome : abandon(resumed.reason, maintenance);
+      }
+      if (maintenance.phase === "selection-prepared" || maintenance.phase === "selection-completed") {
+        if (maintenance.targetBackend !== "sqlite" || maintenance.terminalEvidenceSha256 !== terminalEvidenceSha256) {
+          throw new RollbackOrchestrationError(
+            "not-implemented",
+            "publish-rollback must be abandoned but the maintenance journal is already durably "
+              + maintenance.phase + " for a different or ambiguous target; re-selecting postgresql "
+              + "requires a mechanism this item has not implemented -- see this item's status report",
+          );
+        }
+        const phase = storedPhase();
+        if (maintenance.phase === "selection-prepared") {
+          await deps.coordinator.completeMaintenanceSelection({
+            expectedChecksumSha256: maintenance.checksumSha256,
+            generationId: input.generationId,
+            terminalEvidenceSha256,
+          }, token);
+        }
+        return finishRollbackPublication(phase, current);
+      }
+      // The only other phase a pending effect can meet is maintenance-aborted: no selection was ever prepared.
+      return abandon("the maintenance was " + maintenance.phase);
+    }
+    if (slot.kind === "publication" && slot.journal.publicationId === publicationId) {
+      if (artifact.authorityStatus !== "authoritative" || !hasRollbackSelectionBinding()) {
+        throw new RollbackOrchestrationError(
+          "unexpected-state",
+          "this rollback's coordinator publication is in the live slot without the selection binding that must precede it",
+        );
+      }
+      return finishRollbackPublication(storedPhase(), current);
+    }
+    if (hasRollbackSelectionBinding()) {
+      throw new RollbackOrchestrationError(
+        "unexpected-state",
+        "the rollback selection completed but its maintenance journal was archived by another publication",
+      );
+    }
+    return abandon("no journal of this rollback remains");
   });
 }
+
+/**
+ * The maintenance is held and the effect pending: nothing was selected. Reopens
+ * the fenced session and runs the publication again from the readback; the
+ * readback must reproduce the pending effect's terminal evidence. A refusal
+ * or a drift is a contradiction (the caller abandons); any other failure
+ * propagates and leaves the pending effect for the next attempt.
+ */
+async function resumeHeldPublication(
+  input: Readonly<RunMigrationRollbackInput>,
+  deps: Readonly<ResolvedRollbackDependencies>,
+  store: MigrationManifestStore,
+  current: MigrationManifest,
+  artifact: RollbackAuthorityArtifactBody,
+  token: BackendPublicationLockToken,
+  now: () => Date,
+): Promise<Readonly<{ status: "completed"; outcome: RunMigrationRollbackOutcome } | { status: "contradicted"; reason: string }>> {
+  const resolved = await resolveContinuationAuthority(input, deps);
+  if (resolved.status === "refused") {
+    return { status: "contradicted", reason: "the authority no longer resolves: " + resolved.reason };
+  }
+  const { authority, authoritativeContext } = resolved;
+  const session = await deps.openFencedSession({
+    homeDir: input.homeDir, manifest: current, lockToken: token,
+    scratchParent: input.scratchParent, signal: input.signal,
+  });
+  try {
+    const outcome = await withFencedSession(session, async () => {
+      const observation = await session.captureReadback({
+        manifestDestinationWitnessSha256: current.destination.identitySha256,
+        canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
+      });
+      const decision = evaluateRollbackEligibility({ authority, authoritativeContext, observation });
+      if (decision.eligibility === "refused") {
+        throw new RollbackOrchestrationError("not-eligible", decision.reason);
+      }
+      return runPostPrepareSequence(
+        input, deps, store, current, session, authority, authoritativeContext, artifact, decision, token, now,
+      );
+    });
+    return { status: "completed", outcome };
+  } catch (error) {
+    if (error instanceof RollbackOrchestrationError && (error.reason === "not-eligible" || error.reason === "drift")) {
+      return { status: "contradicted", reason: error.message };
+    }
+    throw error;
+  }
+}
+

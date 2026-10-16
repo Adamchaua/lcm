@@ -29,7 +29,7 @@ import {
   migrationWitnessSha256,
   type MigrationSelectionAuthority,
 } from "./activation-witness.js";
-import { deriveRollbackPublicationId } from "./rollback.js";
+import { deriveRollbackProjectEvidenceSha256, deriveRollbackPublicationId } from "./rollback.js";
 import type {
   ComputeRollbackTerminalEvidenceInput,
   OpenRollbackFencedSession,
@@ -112,26 +112,7 @@ export type RollbackSessionTarget = Readonly<{
   machineId: string;
 }>;
 
-/**
- * The rollback project evidence both this session's lease and the
- * coordinator's compose step (S4) must carry, so the coordinator adopts the
- * session's lease instead of conflicting with it. One derivation.
- */
-export function deriveRollbackProjectEvidenceSha256(input: Readonly<{
-  generationId: string;
-  publicationId: string;
-  localProjectId: string;
-  remoteProjectId: string;
-}>): string {
-  return canonicalSha256({
-    version: 1,
-    kind: "rollback-project-evidence",
-    generationId: input.generationId,
-    publicationId: input.publicationId,
-    localProjectId: input.localProjectId,
-    remoteProjectId: input.remoteProjectId,
-  });
-}
+export { deriveRollbackProjectEvidenceSha256 };
 
 export interface RollbackSessionRuntime extends PostgreSqlQueryExecutor {
   backendPublicationGuard(): ActivationLeasePublicationGuard;
