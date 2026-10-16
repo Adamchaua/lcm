@@ -307,6 +307,24 @@ describe("performMigrationApply: round-1 fixes", () => {
     expect(announced).toBe(false);
   });
 
+  it("A-16: reads the head through its own manifest store when none is injected, refusing manifest-unresolvable when the real store has no manifest", async () => {
+    const { mkdirSync, mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const home = mkdtempSync(join(tmpdir(), "lcm-cli-apply-head-"));
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    try {
+      const result = await performMigrationApply({
+        cwd: "/tmp/project", homeDir: home, confirmGenerationId: "generation-0",
+        _preflight: async () => readyPreflight(),
+        _operationsForTesting: { performCapture: captured, performGenesisAndCopy: copied },
+      });
+      expect(result).toMatchObject({ status: "refuse", reason: "manifest-unresolvable" });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("A-16: reports the phase it read back from the manifest head", async () => {
     const result = await performMigrationApply({
       cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore("copied"),

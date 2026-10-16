@@ -428,6 +428,20 @@ describe("performMigrationAbortCommand: applied tracks whether a durable write p
     expect(result).toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "manifest-unexpected-state", applied: true });
   });
 
+  it("a readback refusal after an idempotent repeat that wrote nothing reports no applied flag either", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const result = await performMigrationAbortCommand({
+      confirmGenerationId: held.generationId, homeDir: home, coordinator: coordinatorFor(home),
+      _operationsForTesting: {
+        observeJournal: () => ({ kind: "hold", journal: held }),
+        performAbort: async () => ({ status: "completed", mutated: false }),
+        readJournal: () => held, // still "maintenance-held", not terminal
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "abort-readback-mismatch" });
+  });
+
   it("a refusal before any write reports no applied flag (the pending-effect refusal leaves the journal held)", async () => {
     const home = makeHome();
     const held = await heldJournal(home);

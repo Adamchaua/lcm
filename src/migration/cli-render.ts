@@ -90,7 +90,7 @@ function okEnvelope(input: Readonly<{
   generation?: string | null;
   manifestPhase?: string | null;
   next?: string | null;
-  evidence?: MigrationEvidence;
+  evidence: MigrationEvidence;
 }>): MigrationEnvelope {
   return buildMigrationEnvelope({
     command: input.command,
@@ -100,7 +100,7 @@ function okEnvelope(input: Readonly<{
     manifestPhase: input.manifestPhase ?? null,
     applied: input.applied,
     next: input.next ?? null,
-    evidence: input.evidence ?? {},
+    evidence: input.evidence,
     refusal: null,
     restart: null,
   });

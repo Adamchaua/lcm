@@ -944,6 +944,18 @@ describe("performMigrationApplyThroughCapture, round-1 fixes (A-3/B-2, A-7, B-5,
     expect(result).toEqual({ status: "refuse", reason: "continuation-snapshot-tampered", evidence: "snapshot-tampered" });
   });
 
+  it("A-7: a non-Error classification failure is reported with the unknown-snapshot-failure evidence", async () => {
+    const fixture = await enrolled();
+    const coordinator = coordinatorFor(fixture.homeDir);
+    const first = await capture({ cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator });
+    expect(first.status).toBe("captured");
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
+      _operationsForTesting: { classifySnapshot: async () => { throw "not-an-error-object"; } },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "snapshot-unresolvable", evidence: "unknown-snapshot-failure" });
+  });
+
   it("A-7: a held journal whose snapshot cannot be classified refuses snapshot-unresolvable rather than guessing (deterministic injection: a real classification failure needs an unsupported platform)", async () => {
     const { fixture, coordinator } = await (async () => {
       const f = await enrolled();
