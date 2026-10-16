@@ -86,8 +86,9 @@ and the capture's modification and change times are more than two seconds older
 than the read that authenticated it; a capture still inside that window is
 re-hashed on every read. Once a capture has settled, a change that leaves its
 size and both timestamps identical can remain unseen by an intermediate raw
-read. This happens if the timestamps are restored afterwards, the clock steps
-forward, or the file carries future timestamps. Final transfer verification and
+read. This happens if the timestamps are restored afterwards or the wall clock
+steps forward. A capture whose timestamps are ahead of the read start stays
+unsettled and is re-hashed on every read. Final transfer verification and
 source close force a full-file SHA-256 check: a capture that still differs from
 the admitted bytes cannot pass as a completed transfer. These checks do not
 replace the snapshot producer's responsibility to keep the source quiescent and
@@ -185,8 +186,8 @@ domains also receive durable terminal checkpoints. Progress is emitted only
 for an exact acknowledged checkpoint. The final result requires all domain
 counts and hashes to agree with SQL readback and the source to remain stable.
 A captured SQLite source applies the capture-cache rule described under
-"Source and destination ownership". It holds on filesystems with timestamp
-granularity of one second or finer.
+"Source and destination ownership". That rule holds on filesystems with
+timestamp granularity of one second or finer.
 Completion compares two derivations of the data: the destination's
 `verifyComplete` reopens what it wrote and recomputes counts and digests
 from durable storage, and the runner requires the result to equal the

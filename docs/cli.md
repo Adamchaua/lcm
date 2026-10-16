@@ -51,9 +51,10 @@ project storage, so a clean dry-run never guarantees the following import
 will succeed; this is true of any project it cannot open, not only an
 unbound one.
 
-`lcm export --all` prints each failed project's path on its failure line and
-ends with a summary that reports the entries exported and, when any project
-failed, how many projects could not be exported.
+A failed export, direct or `--all`, prints a failure line of the form
+`  <project path>: <diagnostic>` on stderr. `lcm export --all` ends with a
+summary that reports the entries exported and, when any project failed, how
+many projects could not be exported.
 
 `lcm promote --all` processes the canonical paths from those bindings even when
 no local `meta.json` exists. `--verbose` reports each project's counts and
@@ -80,7 +81,9 @@ JSON document to stdout. Progress and status messages go to stderr. With
 `--all`, one file is written per project using a path-derived unique suffix;
 `--all --output <file>` is rejected because one file cannot represent multiple
 project exports. Any project failure makes the command exit with status 1,
-including partial exports; files already completed remain available. Successful
+including partial exports; files already completed remain available. A direct
+export failure prints the same project path and diagnostic failure line as
+`--all`. Successful
 commands exit with status 0. Native session import also exits with status 1
 when any session fails.
 

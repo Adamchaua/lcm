@@ -1,12 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { afterEach, beforeEach, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DaemonClient } from "../src/daemon/client.js";
 import { cwdToProjectHash, importSessions } from "../src/import.js";
-import { clearProjectMapCache, hashProjectPath, normalizeProjectPath, projectMapPath } from "../src/project-map.js";
+import {
+  addProjectAlias,
+  clearProjectMapCache,
+  hashProjectPath,
+  normalizeProjectPath,
+  projectMapPath,
+  resolveProjectIdentity,
+} from "../src/project-map.js";
 import {
   STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
   STORAGE_IDENTITY_REQUIRED_UNBOUND_REASON,
@@ -18,6 +26,23 @@ import { clearGitProjectAnchorCache } from "../src/git-project.js";
 import { clearWorktreeReconciliationCache } from "../src/worktree-reconciliation.js";
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
+
+function git(cwd: string, ...args: string[]): void {
+  execFileSync("git", args, { cwd, stdio: "ignore" });
+}
+
+function cloneRepository(root: string, name: string, remote: string): string {
+  const path = join(root, name);
+  mkdirSync(path);
+  git(path, "init", "-q");
+  git(path, "config", "user.email", "test@example.invalid");
+  git(path, "config", "user.name", "LCM Test");
+  git(path, "remote", "add", "origin", remote);
+  writeFileSync(join(path, "README.md"), name + "\n");
+  git(path, "add", "README.md");
+  git(path, "commit", "-qm", "initial");
+  return path;
+}
 
 describe("import names the unbound-project remedy", () => {
   let home: string;
@@ -90,23 +115,56 @@ describe("import names the unbound-project remedy", () => {
     return canonical;
   }
 
-  async function startUnboundDaemon(): Promise<{ client: DaemonClient; posts: string[] }> {
+  async function startUnboundDaemon(): Promise<{ client: DaemonClient; posts: string[]; cwds: string[] }> {
     const posts: string[] = [];
-    const daemon = createServer((_req, res) => {
-      posts.push("ingest");
-      res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        code: STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
-        reason: STORAGE_IDENTITY_REQUIRED_UNBOUND_REASON,
-        error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
-        storageBackend: "postgresql",
-      }));
+    const cwds: string[] = [];
+    const daemon = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        posts.push("ingest");
+        cwds.push((JSON.parse(Buffer.concat(chunks).toString("utf8")) as { cwd: string }).cwd);
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          code: STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
+          reason: STORAGE_IDENTITY_REQUIRED_UNBOUND_REASON,
+          error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+          storageBackend: "postgresql",
+        }));
+      });
     });
     server = daemon;
     await new Promise<void>(resolve => daemon.listen(0, "127.0.0.1", resolve));
     const address = daemon.address();
     if (address === null || typeof address === "string") throw new Error("daemon server did not bind");
-    return { client: new DaemonClient("http://127.0.0.1:" + address.port), posts };
+    return { client: new DaemonClient("http://127.0.0.1:" + address.port), posts, cwds };
+  }
+
+  function plantAliasCloneProject(): { main: string; aliasClone: string; codexDir: string } {
+    const remote = "https://example.invalid/import-remedy-alias.git";
+    const main = cloneRepository(home, "alias-main", remote);
+    const aliasClone = cloneRepository(home, "alias-clone", remote);
+    resolveProjectIdentity(main);
+    addProjectAlias(aliasClone, { canonical: main });
+    clearProjectMapCache();
+    const projectDir = join(claudeProjectsDir, cwdToProjectHash(main));
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, "claude-0.jsonl"), "");
+    const codexDir = makeTmpDir("lcm-import-remedy-codex-");
+    const archived = join(codexDir, "archived_sessions");
+    mkdirSync(archived, { recursive: true });
+    writeFileSync(join(archived, "codex-alias.jsonl"), JSON.stringify({
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "session_meta",
+      payload: {
+        id: "codex-alias",
+        cwd: aliasClone,
+        cli_version: "0.100.0",
+        model_provider: "openai",
+        git: { repository_url: remote, commit_hash: "abc123", branch: "feature" },
+      },
+    }));
+    return { main, aliasClone, codexDir };
   }
 
   it("prints one remedy line naming the unbound PostgreSQL project on a real run", async () => {
@@ -209,5 +267,54 @@ describe("import names the unbound-project remedy", () => {
     expect(daemon.posts).toHaveLength(3);
     expect(result).toMatchObject({ imported: 0, failed: 3 });
     expect(error).toHaveBeenCalledExactlyOnceWith("  " + unbound + ": " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
+  });
+
+  it("prints one remedy for a project whose Claude and Codex sessions use a canonical and a cloned alias", async () => {
+    const { main, aliasClone, codexDir } = plantAliasCloneProject();
+    const other = join(home, "other-unbound");
+    mkdirSync(other, { mode: PRIVATE_DIRECTORY_MODE });
+    const otherCanonical = normalizeProjectPath(other);
+    resolveProjectIdentity(otherCanonical);
+    clearProjectMapCache();
+    const otherDir = join(claudeProjectsDir, cwdToProjectHash(otherCanonical));
+    mkdirSync(otherDir, { recursive: true });
+    writeFileSync(join(otherDir, "other-0.jsonl"), "");
+    selectPostgresqlBackend();
+    const daemon = await startUnboundDaemon();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await importSessions(daemon.client, {
+      all: true,
+      provider: "all",
+      cwd: main,
+      _claudeProjectsDir: claudeProjectsDir,
+      _codexDir: codexDir,
+    });
+
+    expect(result).toMatchObject({ imported: 0, failed: 3 });
+    expect(new Set(daemon.cwds)).toEqual(new Set([normalizeProjectPath(main), normalizeProjectPath(aliasClone), otherCanonical]));
+    const lines = error.mock.calls.map(call => String(call[0]));
+    const remedyLines = lines.filter(line => line.endsWith(": " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE));
+    expect(remedyLines).toHaveLength(2);
+    expect(remedyLines.filter(line => line.includes(otherCanonical))).toHaveLength(1);
+  });
+
+  it("prints one remedy for the current project when its Claude and Codex sessions use different cwds", async () => {
+    const { main, aliasClone, codexDir } = plantAliasCloneProject();
+    selectPostgresqlBackend();
+    const daemon = await startUnboundDaemon();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await importSessions(daemon.client, {
+      provider: "all",
+      cwd: main,
+      _claudeProjectsDir: claudeProjectsDir,
+      _codexDir: codexDir,
+    });
+
+    expect(result).toMatchObject({ imported: 0, failed: 2 });
+    expect(new Set(daemon.cwds)).toEqual(new Set([main, normalizeProjectPath(aliasClone)]));
+    const lines = error.mock.calls.map(call => String(call[0]));
+    expect(lines.filter(line => line.endsWith(": " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE))).toHaveLength(1);
   });
 });

@@ -64,9 +64,10 @@ function inspect(path: string): { file: BigIntStats; parent: BigIntStats } {
  * "racily clean" rule of Git's index). A version that is not yet settled is
  * rehashed on every check; a matching rehash records a fresh read start, so
  * passage of time alone never settles it. The guarantee holds for filesystems
- * whose timestamp granularity is at most one second. A forward wall-clock step,
- * or file timestamps in the future of the authentication clock, can make a
- * still-racy timestamp look old enough to trust.
+ * whose timestamp granularity is at most one second. A forward wall-clock step
+ * can make a still-racy timestamp look old enough to trust. File timestamps in
+ * the future of the authentication clock are never trusted: they stay
+ * unsettled and are rehashed on every check.
  */
 export function createCapturedSqliteAuthority(path: string, expectedSha256: string): CapturedSqliteAuthority {
   try {
