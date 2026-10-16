@@ -1,0 +1,7 @@
+references: ["#1510"]
+rationale: >-
+  #1510 opens the scanned sidecar before the replication pass resolves the
+  project identity, so a missing sidecar never touches the project map; the
+  change lives in the sweep-driven pass, which keeps its daemon-events owner.
+pins:
+  - ["src/daemon/passive-event-replication-pass.ts", "unit-daemon-events"]

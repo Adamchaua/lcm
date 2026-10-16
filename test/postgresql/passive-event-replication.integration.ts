@@ -423,4 +423,93 @@ describe("PostgreSQL 18 passive-event replication", () => {
       }
     });
   });
+
+  it("moves rows that still await a previous project to the new one after a relink", async () => {
+    await withPostgreSqlTestDatabase("passive-relink", async (database) => {
+      await grantPassiveEventRuntimePrivileges(database);
+      const oldProjectId = await createProject(database, "Passive relink old project");
+      const newProjectId = await createProject(database, "Passive relink new project");
+      const machineId = await createMachine(database, "Passive relink machine");
+      await database.migrator.query({
+        text: `CREATE TABLE public.passive_event_effects(
+                 event_id uuid PRIMARY KEY,
+                 machine_id uuid NOT NULL
+               );
+               REVOKE ALL ON public.passive_event_effects FROM PUBLIC;
+               GRANT INSERT, SELECT ON public.passive_event_effects
+               TO lcm_test_runtime`,
+      }, { domain: "passive-events", operation: "createRelinkEffects" });
+      const inboxRows = async (projectId: string): Promise<number> => {
+        const result = await database.migrator.query<{ count: string }>({
+          text: `SELECT COUNT(*)::pg_catalog.text AS count
+                 FROM lcm.passive_event_inbox WHERE project_id = $1`,
+          values: [projectId],
+        }, { domain: "passive-events", operation: "countRelinkInbox" });
+        return Number(result.rows[0].count);
+      };
+      const directory = mkdtempSync(join(tmpdir(), "lcm-passive-relink-"));
+      const factory = new SQLiteLocalHookOutboxFactory();
+      try {
+        const path = join(directory, "events.db");
+        const local = await factory.open(path);
+        await insertLocalEvents(local, "relink", 3);
+        clearCapturedMachineIdentity(path);
+        const oldRemote = new PostgreSqlPassiveEventRepository(
+          database.runtime,
+          oldProjectId,
+          machineId,
+        );
+        const newRemote = new PostgreSqlPassiveEventRepository(
+          database.runtime,
+          newProjectId,
+          machineId,
+        );
+
+        // The previous project receives every row and never applies any.
+        const abandoned = new Proxy(oldRemote, {
+          get: (target, property) => {
+            if (property === "claimEvents") return async () => [];
+            const value: unknown = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        const beforeRelink = worker(local, abandoned, "replication-old");
+        await beforeRelink.runOnce();
+        await beforeRelink.runOnce();
+        expect((await local.getUnprocessed(500)).map((row) => row.delivery_state))
+          .toEqual(["replicated", "replicated", "replicated"]);
+        expect(await inboxRows(oldProjectId)).toBe(3);
+
+        // The relinked pass withdraws two copies and crashes before the local
+        // transition: the rows stay replicated and absent from every project.
+        const crashing = new Proxy(local, {
+          get: (target, property) => {
+            if (property === "requeueReplicated") {
+              return async () => { throw new Error("injected crash before requeue"); };
+            }
+            const value: unknown = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        await expect(worker(crashing, newRemote, "replication-new").runOnce())
+          .rejects.toThrow("injected crash before requeue");
+        expect(await inboxRows(oldProjectId)).toBe(1);
+        expect((await local.getUnprocessed(500)).map((row) => row.delivery_state))
+          .toEqual(["replicated", "replicated", "replicated"]);
+
+        // A later pass re-queues what is absent everywhere, withdraws the
+        // last copy, and delivers all rows to the new project.
+        await driveUntilPruned(worker(local, newRemote, "replication-new"), local, 3);
+        expect(await inboxRows(oldProjectId)).toBe(0);
+        expect(await inboxRows(newProjectId)).toBe(0);
+        const effects = await database.migrator.query<{ count: string }>({
+          text: "SELECT COUNT(*)::pg_catalog.text AS count FROM public.passive_event_effects",
+        }, { domain: "passive-events", operation: "countRelinkEffects" });
+        expect(effects.rows[0].count).toBe("3");
+      } finally {
+        await factory.close();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  });
 });
