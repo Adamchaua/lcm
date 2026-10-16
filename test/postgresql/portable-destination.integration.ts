@@ -3,11 +3,13 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
-import { Client, Query } from 'pg';
+import { Client, Query, type QueryConfig } from 'pg';
 import { createPortableRecordStream, PORTABLE_RECORD_DOMAIN_ORDER, type PortableRecordStream } from '../../src/storage/portable.js';
 import { runPortableTransfer } from '../../src/storage/portable.js';
 import { createPostgreSqlPortableSource } from '../../src/storage/portable.js';
 import { createPostgreSqlPortableDestination } from '../../src/storage/portable.js';
+import { listCanonicalHeaders } from '../../src/storage/postgresql/portable-mapping.js';
+import type { PostgreSqlQueryExecutor, PostgreSqlQueryOptions } from '../../src/storage/postgresql/contracts.js';
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase, type PostgreSqlTestDatabase } from './harness.js';
 import { seedPortablePostgreSql, grantPortablePostgreSql, PORTABLE_POSTGRESQL_FIXTURE } from './portable-fixture.js';
 
@@ -16,7 +18,7 @@ import { openSqlitePortableSource, sqlitePortableFileSha256 } from '../../src/st
 import { PostgreSqlRuntime } from '../../src/storage/postgresql/runtime.js';
 import { PostgreSqlPromotedMemoryRepository } from '../../src/storage/postgresql/memory-repositories.js';
 import { openSqlitePortableDestination } from '../../src/storage/sqlite/portable-destination.js';
-import { canonicalSha256 } from '../../src/storage/portable-record.js';
+import { canonicalSha256, PORTABLE_LIMITS } from '../../src/storage/portable-record.js';
 import { exportKnowledge, type ExportDocument } from '../../src/portable-knowledge.js';
 import { hashProjectPath } from '../../src/project-map.js';
 import { withSelectedPostgreSqlProject, restoreRuntimeGrants } from './operational-fixture.js';
@@ -139,6 +141,35 @@ describe('PostgreSQL canonical destination native persistence',()=>{
         await expect(destination.verifyComplete(manifest)).rejects.toMatchObject({code:'verification-failed'});
         const run=await targetDb.migrator.query({text:'SELECT state FROM lcm.transfer_runs'},context);
         expect(run.rows).toEqual([{state:'active'}]);
+      }finally{await destination.close();await source.close();}
+    }));
+  },120000);
+  it('refuses completion when another writer commits a canonical row after verification, then completes once it is gone',async()=>{
+    await withPostgreSqlTestDatabase('portable-foreign-source',async sourceDb=>withPostgreSqlTestDatabase('portable-foreign-target',async targetDb=>{
+      const {source,input,destination}=await setup(sourceDb,targetDb);
+      try{
+        const manifest=source.describe();
+        await destination.admit(manifest,await destination.preflight(manifest,source));
+        await applyEveryDomain(source,destination);
+        const machine=await targetDb.migrator.query({text:'SELECT machine_id FROM lcm.machines ORDER BY machine_id LIMIT 1'},context);
+        const insertForeign=()=>targetDb.migrator.query({text:"INSERT INTO lcm.session_instructions(project_id,machine_id,scope_hash,client_name,session_id,worktree_path,cwd_path,content,content_hash) VALUES ($1,$2,$3,'codex','foreign-session','/foreign','/foreign','Foreign instruction',$4)",values:[input.expectedIdentity.id,machine.rows[0]!.machine_id,'9'.repeat(64),'a'.repeat(64)]},context);
+        // The completion transaction is the first read-write transaction after the
+        // verification stream; a writer commits just before it begins.
+        const original=Client.prototype.query;
+        let armed=true;
+        const spy=vi.spyOn(Client.prototype,'query').mockImplementation(function(this:Client,...args:unknown[]){
+          if(armed && (args[0] as {text?:string})?.text==='BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE'){
+            armed=false;
+            return insertForeign().then(()=>Reflect.apply(original,this,args)) as never;
+          }
+          return Reflect.apply(original,this,args) as never;
+        });
+        try{await expect(destination.verifyComplete(manifest)).rejects.toMatchObject({code:'destination-unexpected-rows'});}finally{spy.mockRestore();}
+        expect(armed).toBe(false);
+        expect((await targetDb.migrator.query({text:'SELECT state FROM lcm.transfer_runs'},context)).rows).toEqual([{state:'active'}]);
+        await targetDb.migrator.query({text:"DELETE FROM lcm.session_instructions WHERE session_id='foreign-session'"},context);
+        await expect(destination.verifyComplete(manifest)).resolves.toMatchObject({contentSha256:manifest.contentSha256,complete:true});
+        expect((await targetDb.migrator.query({text:'SELECT state FROM lcm.transfer_runs'},context)).rows).toEqual([{state:'completed'}]);
       }finally{await destination.close();await source.close();}
     }));
   },120000);
@@ -377,3 +408,195 @@ it('retains historical source machine authority across unrelated registration, r
     }finally{await destination?.close();await source?.close();rmSync(root,{recursive:true,force:true});}
   }));
 },120000);
+
+/**
+ * Poll for the fate of the canonical writer launched inside the completion
+ * transaction: either it is waiting on the project advisory fence, or it
+ * already committed while completion was still open.
+ */
+let lastCanonicalWriterActivity='';
+async function observeCanonicalWriter(targetDb:PostgreSqlTestDatabase,settled:{value:boolean}):Promise<'blocked'|'committed'|'absent'>{
+  for(let attempt=0;attempt<120;attempt+=1){
+    if(settled.value)return 'committed';
+    // Require the wait to be on an advisory lock specifically. Counting any
+    // lock wait would let an unrelated heavyweight lock stand in for the
+    // fence and make a passing observation meaningless.
+    const waiting=await targetDb.migrator.query<{waiting:number;detail:string|null}>({text:"SELECT count(*) FILTER (WHERE wait_event_type='Lock' AND wait_event='advisory')::int AS waiting, pg_catalog.string_agg(pg_catalog.concat_ws(' ',pid::text,state,wait_event_type,wait_event,pg_catalog.left(query,40)),' | ') AS detail FROM pg_catalog.pg_stat_activity WHERE datname=pg_catalog.current_database() AND pid<>pg_catalog.pg_backend_pid()"},context);
+    lastCanonicalWriterActivity=waiting.rows[0]?.detail??'';
+    if((waiting.rows[0]?.waiting??0)>0)return 'blocked';
+    await new Promise(resolve=>setTimeout(resolve,25));
+  }
+  return 'absent';
+}
+
+it('fences a project-scoped canonical writer between the completion recheck and COMMIT',async()=>{
+  await withPostgreSqlTestDatabase('fence-source',async sourceDb=>withPostgreSqlTestDatabase('fence-target',async targetDb=>{
+    const {source,destination}=await setup(sourceDb,targetDb);
+    const settled={value:false};
+    let drift:Promise<unknown>=Promise.resolve();
+    let injected=false;
+    let sawSizes=false;
+    let observed:'blocked'|'committed'|'absent'|'unreached'='unreached';
+    try{
+      const manifest=source.describe();
+      await destination.admit(manifest,await destination.preflight(manifest,source));
+      await applyEveryDomain(source,destination);
+      const original=Client.prototype.query;
+      const spy=vi.spyOn(Client.prototype,'query').mockImplementation(function(this:Client,...args:unknown[]){
+        const promise=Reflect.apply(original,this,args) as Promise<unknown>;
+        const statement=(args[0] as {text?:string})?.text;
+        if(injected||typeof statement!=='string'||!statement.includes('FROM lcm.conversations r'))return promise as never;
+        // Building the portable source also batch-reads conversations with the
+        // same payload query, before the completion transaction. Only the
+        // recheck reads sizes first, so wait for its size read and inject on
+        // the payload read that follows, inside the fence.
+        if(statement.includes('__bytes')){sawSizes=true;return promise as never;}
+        if(!sawSizes||!statement.includes('__locator'))return promise as never;
+        injected=true;
+        return promise.then(async result=>{
+          // Passing projectId is what makes this a guarded canonical writer:
+          // PostgreSqlRuntime.query routes any query carrying a project scope
+          // through runTransaction, which takes the shared project publication
+          // guard for the whole transaction. The sibling test below drops the
+          // project scope and shows that the unguarded path is not fenced.
+          drift=targetDb.migrator.query({text:"UPDATE lcm.conversations SET title='fence-canary'"},{...context,projectId:PORTABLE_POSTGRESQL_FIXTURE.projectId});
+          void drift.catch(()=>undefined).finally(()=>{settled.value=true;});
+          observed=await observeCanonicalWriter(targetDb,settled);
+          return result;
+        }) as never;
+      });
+      try{await expect(destination.verifyComplete(manifest)).resolves.toMatchObject({complete:true});}
+      finally{spy.mockRestore();}
+      expect(injected).toBe(true);
+      expect(observed,lastCanonicalWriterActivity).toBe('blocked');
+    }finally{
+      await drift.catch(()=>undefined);
+      await destination.close();
+      await source.close();
+    }
+  }));
+},120000);
+
+it('refuses completion when an unguarded writer commits inside the recheck window',async()=>{
+  await withPostgreSqlTestDatabase('unguarded-source',async sourceDb=>withPostgreSqlTestDatabase('unguarded-target',async targetDb=>{
+    const {source,destination}=await setup(sourceDb,targetDb);
+    const settled={value:false};
+    let drift:Promise<unknown>=Promise.resolve();
+    let injected=false;
+    let observed:'blocked'|'committed'|'absent'|'unreached'='unreached';
+    try{
+      const manifest=source.describe();
+      await destination.admit(manifest,await destination.preflight(manifest,source));
+      await applyEveryDomain(source,destination);
+      const original=Client.prototype.query;
+      const spy=vi.spyOn(Client.prototype,'query').mockImplementation(function(this:Client,...args:unknown[]){
+        const promise=Reflect.apply(original,this,args) as Promise<unknown>;
+        const statement=(args[0] as {text?:string})?.text;
+        // The size read runs before the payload read for the same domain, so
+        // an unfenced commit here lands inside the recheck rather than after
+        // it.
+        if(injected||typeof statement!=='string'||!statement.includes('__bytes')||!statement.includes('FROM lcm.conversations r'))return promise as never;
+        injected=true;
+        return promise.then(async result=>{
+          // Nothing fences the migrator's autocommit path, so it commits while
+          // the completion transaction holds the exclusive lock. The content
+          // recheck is what has to refuse the completion.
+          drift=targetDb.migrator.query({text:"UPDATE lcm.conversations SET title='unguarded-canary'"},context);
+          void drift.catch(()=>undefined).finally(()=>{settled.value=true;});
+          observed=await observeCanonicalWriter(targetDb,settled);
+          return result;
+        }) as never;
+      });
+      try{await expect(destination.verifyComplete(manifest)).rejects.toMatchObject({code:'verification-failed'});}
+      finally{spy.mockRestore();}
+      expect(injected).toBe(true);
+      expect(observed,lastCanonicalWriterActivity).toBe('committed');
+      const runs=await targetDb.migrator.query({text:'SELECT state FROM lcm.transfer_runs'},context);
+      expect(runs.rows).toEqual([{state:'active'}]);
+    }finally{
+      await drift.catch(()=>undefined);
+      await destination.close();
+      await source.close();
+    }
+  }));
+},120000);
+
+it('revalidates project identity after acquiring the completion fence',async()=>{
+  await withPostgreSqlTestDatabase('fence-identity-source',async sourceDb=>withPostgreSqlTestDatabase('fence-identity-target',async targetDb=>{
+    const {source,destination}=await setup(sourceDb,targetDb);
+    let injected=false;
+    try{
+      const manifest=source.describe();
+      await destination.admit(manifest,await destination.preflight(manifest,source));
+      await applyEveryDomain(source,destination);
+      const original=Client.prototype.query;
+      const spy=vi.spyOn(Client.prototype,'query').mockImplementation(function(this:Client,...args:unknown[]){
+        const statement=(args[0] as {text?:string})?.text;
+        // Match the exclusive fence only; the shared guard spells its own
+        // function name with the _shared suffix.
+        if(injected||typeof statement!=='string'||!statement.includes('pg_advisory_xact_lock('))return Reflect.apply(original,this,args) as never;
+        injected=true;
+        return (async()=>{
+          // An identity change committed after the pre-lock identity check and
+          // before the fence is granted. What matters is the timing, not the
+          // writer's path: the ledger recheck skips IDENTITY_DOMAINS, so only
+          // the identity revalidation that runs under the fence can catch it.
+          await targetDb.migrator.query({text:'UPDATE lcm.machines SET identity_key=$2 WHERE machine_id=$1',values:[PORTABLE_POSTGRESQL_FIXTURE.machineId,'machine:'+'9'.repeat(64)]},context);
+          return await (Reflect.apply(original,this,args) as Promise<unknown>);
+        })() as never;
+      });
+      try{await expect(destination.verifyComplete(manifest)).rejects.toMatchObject({code:'destination-conflict'});}
+      finally{spy.mockRestore();}
+      expect(injected).toBe(true);
+      const runs=await targetDb.migrator.query({text:'SELECT state FROM lcm.transfer_runs'},context);
+      expect(runs.rows).toEqual([{state:'active'}]);
+    }finally{
+      await destination.close();
+      await source.close();
+    }
+  }));
+},120000);
+
+describe('PostgreSQL canonical source header pages',()=>{
+  it('cuts a multi-row header page by aggregate locator bytes in SQL and resumes without gaps or repeats (#1388)',async()=>{
+    await withPostgreSqlTestDatabase('portable-header-bound',async db=>{
+      const {projectId,machineId}=await seedPortablePostgreSql(db.migrator,{identityOnly:true});
+      // Five checkpoints whose only unbounded key column holds about 1 KiB each.
+      await db.migrator.query({text:`INSERT INTO lcm.ingest_checkpoints (project_id, machine_id, client_name, source_locator)
+        SELECT $1::uuid, $2::uuid, 'codex', chr(97 + i) || repeat('x', 1023) FROM generate_series(0, 4) AS i`,values:[projectId,machineId]},context);
+      const captured:QueryConfig<unknown[]>[]=[];
+      const recording:PostgreSqlQueryExecutor={query:(config:QueryConfig<unknown[]>,options:PostgreSqlQueryOptions)=>{captured.push(config);return db.migrator.query(config,options);}} as PostgreSqlQueryExecutor;
+      // Locators are PostgreSQL json text, which separates elements with ", ".
+      const expected=['a','b','c','d','e'].map(letter=>`["${machineId}", "codex", "${letter}${'x'.repeat(1023)}"]`);
+      // At the production bound the five ~1 KiB locators form one page in C order.
+      const full=await listCanonicalHeaders(recording,projectId,'native-transcript-checkpoints',null,500);
+      expect(full.map(header=>header.locator)).toEqual(expected);
+      expect(captured).toHaveLength(1);
+      expect(captured[0]!.values).toEqual([projectId,null,500,String(PORTABLE_LIMITS.maxBatchBytes)]);
+      // Every locator key column is a btree primary-key member, so PostgreSQL
+      // caps each key near 2.7 KiB and real rows cannot reach the 144 MiB
+      // aggregate. Prove the cut with the exact production SQL text and its
+      // bound parameter set to two locators: the third row of the ordered
+      // scan then exceeds the running sum, while a single row always fits.
+      const budget=Buffer.byteLength(expected[0]!)+Buffer.byteLength(expected[1]!);
+      const sql=captured[0]!.text;
+      const run=async(after:string|null,bound:number)=>(await db.migrator.query<{locator:string;byteLength:string}>({text:sql,values:[projectId,after===null?null:JSON.parse(after),500,String(bound)]},context)).rows;
+      const pages:string[][]=[];
+      for(let after:string|null=null;;){
+        const rows=await run(after,budget);
+        if(rows.length===0)break;
+        pages.push(rows.map(row=>row.locator));
+        after=rows.at(-1)!.locator;
+      }
+      expect(pages).toEqual([[expected[0],expected[1]],[expected[2],expected[3]],[expected[4]]]);
+      // Below every row's own size the single-row semantics are unchanged: the
+      // locator is suppressed, the real size still travels, and the empty
+      // locators add nothing to the running sum, so no row is hidden.
+      const suppressed=await run(null,1);
+      expect(suppressed.map(row=>row.locator)).toEqual(['','','','','']);
+      expect(suppressed.map(row=>row.byteLength)).toEqual(full.map(header=>header.byteLength));
+      expect(suppressed.every(row=>BigInt(row.byteLength)>1n)).toBe(true);
+      expect(await run(null,budget).then(rows=>rows.length)).toBe(2);
+    });
+  },60000);
+});

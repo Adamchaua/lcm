@@ -1,0 +1,16 @@
+references: ["#624"]
+rationale: >-
+  #624 adds the migration verification driver, report, store, activation
+  witness and witness audit under src/migration/, curates their exports in
+  index.ts, and lets the PostgreSQL portable source borrow a caller-owned
+  snapshot session with a domain-census accessor. The new files join the
+  whole-directory migration owner; the storage files keep their owners.
+pins:
+  - ["src/migration/activation-witness.ts", "unit-migration-cutover"]
+  - ["src/migration/index.ts", "unit-migration-cutover"]
+  - ["src/migration/verification-report.ts", "unit-migration-cutover"]
+  - ["src/migration/verification-store.ts", "unit-migration-cutover"]
+  - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/witness-audit.ts", "unit-migration-cutover"]
+  - ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"]
+  - ["src/storage/postgresql/portable-source.ts", "integration-postgresql-portable"]

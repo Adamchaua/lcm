@@ -1,0 +1,7 @@
+references: ["#1444", "PR #1452"]
+rationale: >-
+  The generation-binding store asserts the published file is single-link
+  after completing an interrupted scratch unlink; the store stays in the
+  migration cutover owner.
+pins:
+  - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]

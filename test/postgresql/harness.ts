@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { isAbsolute } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { QueryResultRow } from "pg";
 import {
   PostgreSqlRuntime,
@@ -54,6 +55,11 @@ const HARNESS_ROLES = {
   migrator: "lcm_test_migrator",
   runtime: "lcm_test_runtime",
 } as const;
+
+/** SQLSTATE object_in_use: DROP DATABASE found a session or prepared transaction still attached. */
+const DROP_DATABASE_IN_USE_SQLSTATE = "55006";
+const DROP_DATABASE_MAX_ATTEMPTS = 5;
+const DROP_DATABASE_RETRY_DELAY_MS = 200;
 
 const FORBIDDEN_ENV = [
   "LCM_POSTGRES_URL",
@@ -213,6 +219,9 @@ export function settings(
     connectionTimeoutMs: overrides.connectionTimeoutMs ?? 2_000,
     idleTimeoutMs: overrides.idleTimeoutMs ?? 1_000,
     statementTimeoutMs: overrides.statementTimeoutMs ?? 5_000,
+    ...(overrides.snapshotIdleTimeoutMs === undefined
+      ? {}
+      : { snapshotIdleTimeoutMs: overrides.snapshotIdleTimeoutMs }),
   };
 }
 
@@ -482,10 +491,23 @@ export async function createPostgreSqlTestDatabase(
         text: "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
         values: [name],
       }, { domain: "factory", operation: "drainTestDatabase" });
-      await control.query({ text: `DROP DATABASE ${identifier}` }, {
-        domain: "factory",
-        operation: "dropTestDatabase",
-      });
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          // FORCE closes the termination race: backends that were still exiting or
+          // reconnected after the drain are terminated by the server itself.
+          await control.query({ text: `DROP DATABASE ${identifier} WITH (FORCE)` }, {
+            domain: "factory",
+            operation: "dropTestDatabase",
+          });
+          break;
+        } catch (error) {
+          if (
+            attempt >= DROP_DATABASE_MAX_ATTEMPTS
+            || (error as { sqlState?: unknown }).sqlState !== DROP_DATABASE_IN_USE_SQLSTATE
+          ) throw error;
+          await delay(DROP_DATABASE_RETRY_DELAY_MS);
+        }
+      }
     } finally {
       await control.close();
     }

@@ -1,0 +1,9 @@
+references: ["#1396", "PR #1420"]
+rationale: >-
+  #1396 derives the verification report's class and probe coverage from
+  completion receipts recorded by the comparators that ran, and binds the
+  witness audit to those receipts; the driver and the audit keep their
+  migration owner.
+pins:
+  - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/witness-audit.ts", "unit-migration-cutover"]

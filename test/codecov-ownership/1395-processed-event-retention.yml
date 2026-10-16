@@ -1,0 +1,11 @@
+references: ["#1395", "PR #1408"]
+rationale: >-
+  Keeps the backend-conditional SessionStart retention gate, its
+  processed-event prune predicate and the fenced-backend read it relies on
+  hook-owned, and forwards the processed-event retention contract through the
+  existing local-event-storage owner. No file changes component.
+pins:
+  - ["src/hooks/restore.ts", "unit-hooks"]
+  - ["src/hooks/events-db.ts", "unit-hooks"]
+  - ["src/hooks/publication-fence.ts", "unit-hooks"]
+  - ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"]

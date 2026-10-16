@@ -9,7 +9,7 @@ import { hashProjectPath, applyBackendPublicationProjectMapFile } from "../../sr
 import {
   BackendPublicationCoordinator, assertBackendPublicationConsumerAccess,
   captureBackendPublicationState, readBackendPublicationJournal,
-  type BackendPublicationDriver, type BackendPublicationFileMutationContext,
+  type BackendPublicationDriver, type BackendPublicationFenceRecord, type BackendPublicationFileMutationContext,
   type BackendPublicationRecoveryFile,
 } from "../../src/storage/backend-publication.js";
 import { PostgreSqlIdentityRepository, type RegisteredMachine, type RemoteProject } from "../../src/storage/postgresql/identity-repository.js";
@@ -90,8 +90,39 @@ function recoveryFile(content: string): BackendPublicationRecoveryFile {
   };
 }
 
+export function inMemoryPublicationGuard(): Pick<
+  BackendPublicationDriver,
+  "acquireRemoteGuard" | "readRemoteGuard" | "releaseRemoteGuard"
+> {
+  const fences = new Map<string, BackendPublicationFenceRecord>();
+  return {
+    acquireRemoteGuard: async ({ journal, project }) => {
+      const fence: BackendPublicationFenceRecord = {
+        projectId: project.remoteProjectId,
+        machineId: "machine",
+        publicationId: journal.publicationId,
+        targetBackend: journal.targetBackend,
+        evidenceSha256: project.evidenceSha256,
+        fencingToken: "1",
+        acquiredAt: "2026-08-06T12:00:00.000Z",
+        renewedAt: "2026-08-06T12:00:00.000Z",
+        expiresAt: "2999-08-06T12:00:00.000Z",
+        releasedAt: null,
+        databaseExpired: false,
+      };
+      fences.set(project.remoteProjectId, fence);
+      return fence;
+    },
+    readRemoteGuard: async ({ project }) => fences.get(project.remoteProjectId) ?? null,
+    releaseRemoteGuard: async ({ project, fence }) => {
+      fences.set(project.remoteProjectId, { ...fence, releasedAt: "2026-08-06T12:01:00.000Z" });
+    },
+  };
+}
+
 function publicationDriver(homeDir: string): BackendPublicationDriver {
   return {
+    ...inMemoryPublicationGuard(),
     observeLocalState: async () => captureBackendPublicationState(homeDir),
     publishProjectMap: (input: BackendPublicationFileMutationContext) =>
       applyBackendPublicationProjectMapFile(input),

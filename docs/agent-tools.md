@@ -103,6 +103,15 @@ meaning across search modes or hit types. The input `sessionId` is a string
 filter resolved to a conversation and is not returned on hits, and neither hit
 type has a `type` field.
 
+Regex snippet handling is backend-specific. For each matching row, the default
+SQLite backend applies LCM's built-in credential redaction to the complete row
+before deriving the returned regex snippet. If redaction removes the requested
+match, the snippet is exactly `[REDACTED]`. SQLite then limits the snippet to 512
+Unicode code points; when truncation is needed, the visible truncation marker is
+included in that total. The PostgreSQL backend independently limits
+`regexp_substr` output to 512 characters without read-time credential redaction
+or a truncation marker. Other search modes keep their existing snippet behavior.
+
 Message timestamps stored by the local SQLite backend without a timezone
 designator (for example, `YYYY-MM-DD HH:mm:ss`) are UTC instants and are
 converted to the same UTC representation on reads. Fractional seconds are
@@ -329,6 +338,15 @@ With SQLite, `text` must be a string without an embedded NUL character
 (`U+0000`); LCM rejects it before persistence. Existing legacy rows containing
 that byte are refused when selected for reading, search, export, recall, or
 FTS replay. NUL characters in JSON-escaped tags remain supported.
+
+Storing content that already exists as an active memory in scope merges into
+that memory rather than creating a second one, including content with no
+searchable lexical terms that ranked search alone could not recall. The
+returned `id` is the existing memory's id, its tags are unioned with the
+supplied ones, and its confidence stays at the maximum. This is the same
+decision `lcm promote` and knowledge import make on every backend; see
+[portable-knowledge.md](portable-knowledge.md) for its scope and
+serialization on each backend.
 
 **Examples:**
 

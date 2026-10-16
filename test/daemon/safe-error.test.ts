@@ -4059,6 +4059,62 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it.each([
+    ["ampersand then query", "file://h/a&?/Users/A/secret.db", "file://h<path>&?<path>"],
+    ["query parameter then ampersand", "file://h/a?q=1&/Users/alice/secret.db", "file://h<path>?q=1&<path>"],
+    ["surrounding text", "see file://h/a&?/Users/A/secret.db end", "see file://h<path>&?<path> end"],
+    ["Unicode symbol component", "file://h/a&/📁/secret.db", "file://h<path>&<path>"],
+    ["Unicode symbol component after a question mark", "file://h/a&?/📁/secret.db", "file://h<path>&?<path>"],
+  ] as const)("redacts a root after an unbracketed file URL path ampersand on the first pass: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "bracketed public child query",
+      "file://h/a?q=[https://e.test/t?key=/public&/word]",
+      "file://h<path>?q=[https://e.test/t?key=/public&/word]",
+    ],
+    [
+      "bracketed public child query after a question mark",
+      "file://h/a?q=[https://e.test/t?key=/public&?/word]",
+      "file://h<path>?q=[https://e.test/t?key=/public&?/word]",
+    ],
+    ["top-level public URL", "https://h/a?x=1&/word", "https://h/a?x=1&/word"],
+    ["plain text", "a&/b", "a&<path>"],
+    ["repeated ampersand with a bare slash", "file:///a?q=&&/ end", "file://<path>?q=&&/ end"],
+    ["trailing bare slash", "file://h/a&/", "file://h<path>&/"],
+  ] as const)("keeps the first-pass output of a non-private ampersand successor: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("redacts a root after an ampersand in an unbracketed nested public URL query (intended stable-output change)", () => {
+    const first = sanitizeError("file://h/a?u=http://x/y&/Users/x/s.db");
+
+    expect(first).toBe("file://h<path>?u=http://x/y&<path>");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("does not rescan a long file URL path suffix at every non-ampersand slash", () => {
+    const input = `file://h${"/a".repeat(16384)}`;
+    const started = performance.now();
+    const result = sanitizeError(input);
+    const elapsed = performance.now() - started;
+
+    expect(result).toBe("file://h<path>");
+    // Linear takes milliseconds; the quadratic rescan took several seconds.
+    expect(elapsed).toBeLessThan(1000);
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");

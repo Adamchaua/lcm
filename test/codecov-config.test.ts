@@ -44,7 +44,19 @@ const expectedComponents = [
     // #1283 keeps renewal admission and bounded compact rendering CLI-owned.
     // #1132 keeps foreground PID publication at the CLI boundary.
     // #1233 keeps publication-contention restart recovery at the CLI boundary.
-    paths: ["bin/", "src/cli/", "^src/cli-help\\.ts$", "^src/cli-storage\\.ts$"],
+    paths: [
+      // #1413 keeps the unbound-project remedy for promote and import, and
+      // #1466 keeps per-project export failure attribution and the failed
+      // project count, in this existing CLI owner.
+      "bin/",
+      "src/cli/",
+      // #1393 keeps the project subcommand synopsis listing
+      // renew-retired-identity in this existing CLI owner.
+      "^src/cli-help\\.ts$",
+      // #1430 keeps the bound-identity split for project enumeration in
+      // this existing owner.
+      "^src/cli-storage\\.ts$",
+    ],
   },
   {
     component_id: "unit-installation",
@@ -116,8 +128,12 @@ const expectedComponents = [
     paths: [
       "^src/daemon/auth\\.ts$",
       "^src/daemon/client\\.ts$",
+      // #1410 adds the validated, persisted snapshotIdleTimeoutMs
+      // PostgreSQL tuning key here.
       "^src/daemon/config\\.ts$",
       "^src/daemon/content-fence\\.ts$",
+      // #1413 keeps the typed unbound-project 409 reason discriminator in
+      // this existing daemon-core owner.
       "^src/daemon/http-url\\.ts$",
       "^src/daemon/invocation-coordinator\\.ts$",
       "^src/daemon/cancellation\\.ts$",
@@ -125,6 +141,8 @@ const expectedComponents = [
       "^src/daemon/project-queue\\.ts$",
       "^src/daemon/publication-queue\\.ts$",
       // #1270/#1283 keep renewed hook identity selection daemon-core-owned.
+      // #1430 keeps the bound-identity split for hook identity resolution
+      // in this existing daemon-core owner.
       "^src/daemon/project\\.ts$",
       // #1106 keeps periodic transcript metadata admission daemon-core-owned.
       // Monotonic proxy startup polling remains daemon-core-owned.
@@ -157,12 +175,17 @@ const expectedComponents = [
     name: "Unit - Daemon Routes",
     // #1230 keeps route project close on the live request token.
     // #1247 keeps local queue preparation, acknowledgement, and cleanup route-owned.
+    // #1413 keeps the storage-identity-required reason discriminator on the
+    // unbound-project and machine-identity 409 responses route-owned.
     paths: ["src/daemon/routes/"],
   },
   {
     component_id: "unit-daemon-events",
     name: "Unit - Daemon Passive Events",
-    paths: ["^src/daemon/passive-event-processor\\.ts$"],
+    paths: [
+      "^src/daemon/passive-event-processor\\.ts$",
+      "^src/daemon/passive-event-replication-pass\\.ts$",
+    ],
   },
   {
     component_id: "unit-mcp",
@@ -212,11 +235,19 @@ const expectedComponents = [
       "^src/storage/errors\\.ts$",
       "^src/storage/factory\\.ts$",
       "^src/storage/home-lock-topology\\.ts$",
+      // #1413 keeps the typed unbound-project transport error and 409
+      // reason constants, and #1430 the bound-identity overloads, in this
+      // existing storage-abstractions owner.
       "^src/storage/identity-context\\.ts$",
       "^src/storage/index\\.ts$",
       // Curated portable package API remains storage-abstractions-owned.
       "^src/storage/portable\\.ts$",
+      // #1410 adds the optional, non-serialized PortableStreamError cause
+      // here.
       "^src/storage/portable-record\\.ts$",
+      // #1410 forwards the source's close cause here. #1442 classifies a
+      // read-path source-unavailable as retryable only when the source
+      // adapter marked it retryable, so the stream stays backend-neutral.
       "^src/storage/portable-record-stream\\.ts$",
       "^src/storage/portable-transfer\\.ts$",
       "^src/storage/portable-index\\.ts$",
@@ -253,6 +284,8 @@ const expectedComponents = [
       // admission stay within this import owner.
       "^src/codex-transcript\\.ts$",
       "^src/import-summary\\.ts$",
+      // #1413 keeps the unbound-project remedy for import in this existing
+      // import owner.
       "^src/import\\.ts$",
       "^src/transcript-provider\\.ts$",
       "^src/transcript\\.ts$",
@@ -279,6 +312,8 @@ const expectedComponents = [
     // #1283 keeps structured retired-fence discovery in this component.
     paths: [
       // #618 authenticated batch discovery remains within this compaction owner.
+      // #1413 keeps the compact --all message separating enumeration failure
+      // from per-project open failures in this existing compaction owner.
       "^src/batch-compact\\.ts$",
       "^src/compaction\\.ts$",
       "^src/large-files\\.ts$",
@@ -308,6 +343,7 @@ const expectedComponents = [
       // existing component; no taxonomy, status, or policy change.
       // #1270/#1283 retain exact fence classification and local successor
       // renewal in this existing project/worktree owner.
+      // #1430 keeps the bound project identity type in this existing owner.
       "^src/project-map\\.ts$",
       "^src/worktree-reconciliation-fence\\.ts$",
       // #1044 keeps the existing owner; no taxonomy, status, or policy change.
@@ -335,7 +371,16 @@ const expectedComponents = [
   {
     component_id: "unit-diagnostics",
     name: "Unit - Diagnostics",
-    paths: ["^src/diagnose\\.ts$", "^src/storage/diagnostics\\.ts$", "^src/storage/diagnostic-renderer\\.ts$", "^src/storage/diagnostic-project\\.ts$", "^src/storage/postgresql/diagnostics\\.ts$", "src/doctor/"],
+    paths: [
+      "^src/diagnose\\.ts$",
+      // #1410 threads snapshotIdleTimeoutMs into the diagnostics probe's
+      // connection settings here.
+      "^src/storage/diagnostics\\.ts$",
+      "^src/storage/diagnostic-renderer\\.ts$",
+      "^src/storage/diagnostic-project\\.ts$",
+      "^src/storage/postgresql/diagnostics\\.ts$",
+      "src/doctor/",
+    ],
   },
   {
     component_id: "integration-service-managers",
@@ -349,6 +394,8 @@ const expectedComponents = [
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
+      // #1450 keeps stable managed PATH canonicalization and direct executable
+      // admission in this existing service-manager owner.
       "^src/daemon/managed-path\\.ts$",
       "^src/daemon/supervisor\\.ts$",
     ],
@@ -359,11 +406,22 @@ const expectedComponents = [
     paths: [
       "^src/daemon/staged-postgresql\\.ts$",
       "^src/storage/postgresql/client-config\\.ts$",
+      // #1410 adds the optional snapshotIdleTimeoutMs connection setting
+      // here.
       "^src/storage/postgresql/contracts\\.ts$",
+      // #1410 adds the snapshot-local termination predicate, covering a
+      // captured async-diagnostic reattachment shape, here.
       "^src/storage/postgresql/errors\\.ts$",
+      // #1410 threads snapshotIdleTimeoutMs through resolved connection
+      // settings here.
       "^src/storage/postgresql/factory\\.ts$",
       "^src/storage/postgresql/index\\.ts$",
+      // #1410 attaches the snapshot checkout's async-failure listener and
+      // resolves the snapshot idle bound here. #1424 gives query and
+      // transaction checkouts the same observer.
       "^src/storage/postgresql/runtime\\.ts$",
+      // #1410 separates the snapshot's idle-in-transaction bound from
+      // statementTimeoutMs and captures its async FATAL diagnostic here.
       "^src/storage/postgresql/snapshot-session\\.ts$",
       "^src/storage/postgresql\\.ts$",
     ],
@@ -373,6 +431,9 @@ const expectedComponents = [
     name: "Integration - PostgreSQL Portable Transfer",
     paths: [
       // #618 canonical self-provenance stays in PostgreSQL portable transfer.
+      // #1410 narrows session-close tolerance to a real snapshot-
+      // termination diagnostic here. #1442 marks a genuine termination
+      // retryable on the source-unavailable it raises.
       "^src/storage/postgresql/portable-source\\.ts$",
       "^src/storage/postgresql/portable-destination\\.ts$",
       "^src/storage/postgresql/portable-mapping\\.ts$",
@@ -560,6 +621,136 @@ function forbiddenKeysIn(value: unknown, location = "config"): string[] {
   ]);
 }
 
+const ownershipFragmentDirectory = join(projectRoot, "test", "codecov-ownership");
+const legacyLedgerName = "0000-legacy-ledger.yml";
+const fragmentNamePattern = /^(\d+)-[a-z0-9]+(?:-[a-z0-9]+)*\.yml$/;
+const referencePattern = /^(?:#\d+|PR #\d+|[A-Z]\d{3}|[a-z][a-z0-9-]*[a-z0-9])$/;
+const fragmentKeys = "pins,rationale,references";
+
+type OwnershipPin = { readonly file: string; readonly component: string };
+
+type OwnershipFragment = {
+  readonly name: string;
+  readonly references: readonly string[];
+  readonly rationale: string;
+  readonly pins: readonly OwnershipPin[];
+};
+
+type FragmentContext = {
+  readonly productionFiles: readonly string[];
+  readonly componentIds: ReadonlySet<string>;
+};
+
+// <number>-<slug>.yml; an all-zero number is reserved for the legacy ledger.
+function isValidFragmentName(name: string): boolean {
+  const match = fragmentNamePattern.exec(name);
+  if (match === null) {
+    return false;
+  }
+  return /^0+$/.test(match[1]!) ? name === legacyLedgerName : true;
+}
+
+function fragmentNumber(name: string): number {
+  return Number(fragmentNamePattern.exec(name)?.[1] ?? "0");
+}
+
+// Pure validation so malformed fragments can be exercised with inline objects.
+function validateFragment(name: string, document: unknown, context: FragmentContext): string[] {
+  const errors: string[] = [];
+  if (!isValidFragmentName(name)) {
+    errors.push(`${name}: file name must match <number>-<slug>.yml (0000- is reserved for ${legacyLedgerName})`);
+  }
+  if (!isRecord(document)) {
+    return [...errors, `${name}: document must be a mapping`];
+  }
+  const keys = Object.keys(document).sort().join(",");
+  if (keys !== fragmentKeys) {
+    errors.push(`${name}: keys must be exactly references, rationale, pins (found ${keys})`);
+  }
+  const { references, rationale, pins } = document;
+  if (!Array.isArray(references) || references.length === 0) {
+    errors.push(`${name}: references must be a non-empty list`);
+  } else {
+    for (const reference of references) {
+      if (typeof reference !== "string" || !referencePattern.test(reference)) {
+        errors.push(`${name}: reference ${JSON.stringify(reference)} must be #<issue>, PR #<number>, a campaign code, or a kebab-case slug`);
+      }
+    }
+    const issue = fragmentNumber(name);
+    if (issue > 0 && !references.some((reference) => reference === `#${issue}` || reference === `PR #${issue}`)) {
+      errors.push(`${name}: references must include #${issue} or PR #${issue}`);
+    }
+  }
+  if (typeof rationale !== "string" || rationale.trim().length === 0) {
+    errors.push(`${name}: rationale must be a non-empty string`);
+  }
+  if (!Array.isArray(pins) || pins.length === 0) {
+    errors.push(`${name}: pins must be a non-empty list`);
+  } else {
+    pins.forEach((pin: unknown, index) => {
+      if (!Array.isArray(pin) || pin.length !== 2 || pin.some((entry) => typeof entry !== "string")) {
+        errors.push(`${name}: pin ${index} must be [file, component] with two strings`);
+        return;
+      }
+      const [file, component] = pin as [string, string];
+      if (!context.productionFiles.includes(file)) {
+        errors.push(`${name}: pin ${index} names ${file}, which is not a production TypeScript file`);
+      }
+      if (!context.componentIds.has(component)) {
+        errors.push(`${name}: pin ${index} names unknown component ${component}`);
+      }
+    });
+  }
+  return errors;
+}
+
+// Parse one fragment so a YAML error names the fragment instead of the loader.
+function parseFragment(name: string, text: string): { document: unknown } | { error: string } {
+  try {
+    return { document: loadYaml(text) };
+  } catch (error) {
+    return { error: `${name}: YAML parse error: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+function readOwnershipFragments(context: FragmentContext): { fragments: OwnershipFragment[]; errors: string[] } {
+  const errors: string[] = [];
+  const fragments: OwnershipFragment[] = [];
+  const entries = readdirSync(ownershipFragmentDirectory, { withFileTypes: true }).sort((left, right) =>
+    left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+  );
+  if (!entries.some((entry) => entry.name === legacyLedgerName)) {
+    errors.push(`${legacyLedgerName} is missing`);
+  }
+  for (const entry of entries) {
+    // Dirent reports a symlink as a symlink, so links and directories are rejected.
+    if (!entry.isFile()) {
+      errors.push(`${entry.name}: must be a regular file`);
+      continue;
+    }
+    const parsed = parseFragment(entry.name, readFileSync(join(ownershipFragmentDirectory, entry.name), "utf8"));
+    if ("error" in parsed) {
+      errors.push(parsed.error);
+      continue;
+    }
+    const { document } = parsed;
+    const fragmentErrors = validateFragment(entry.name, document, context);
+    if (fragmentErrors.length > 0) {
+      errors.push(...fragmentErrors);
+      continue;
+    }
+    const record = document as { references: string[]; rationale: string; pins: [string, string][] };
+    fragments.push({
+      name: entry.name,
+      references: record.references,
+      rationale: record.rationale,
+      pins: record.pins.map(([file, component]) => ({ file, component })),
+    });
+  }
+  return { fragments, errors };
+}
+
+
 describe("Codecov configuration", () => {
   test("matches the literal 31-component ownership contract", () => {
     const config = readCodecovConfig();
@@ -592,7 +783,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(243);
+    expect(productionFiles).toHaveLength(258);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -622,10 +813,10 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(243);
+    expect(ownershipCounts.size).toBe(258);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358 files in their intended components", () => {
+  test("keeps every recorded ownership decision in its intended component", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -633,263 +824,71 @@ describe("Codecov configuration", () => {
     }
 
     const components = validateComponents(configuredComponents(config));
-    // #792 keeps grep session filtering and #794 grep-since validation in the
-    // existing route component. #862 keeps recent limit validation, #863
-    // keeps expand depth validation in the same daemon-routes component.
-    // #930 keeps expand body-shape validation in that component as well.
-    // #969 keeps the route-family and passive notification body-shape
-    // validation in their existing route and daemon-events components.
-    // #1217 keeps native snapshot retries, preparation/admission and attempt lifetime route-owned.
-    // #888 keeps private final ingest and compact metadata writes route-owned.
-    // #890 keeps bounded best-effort status metadata reads route-owned.
-    // #1003 keeps preliminary metadata admission daemon-core-owned.
-    // #1050 keeps bounded preliminary metadata serialization there too.
-    // #1032 keeps the shared private-file writer's retained-parent checks and
-    // publication outcomes configuration-security-owned.
-    // #947 keeps promote metadata-parent resource handling and fail-closed
-    // topology behavior in the existing daemon-routes component.
-    // #948 keeps promote metadata parent-first admission, sampled read binding,
-    // and retained identity revalidation in the daemon-routes component.
-    // #964 keeps the path-bound root/projects/leaf metadata lifetime there too.
-    // #1062 keeps retained-parent create-if-absent filesystem semantics in
-    // configuration-security and promote collision handling in daemon-routes.
-    // #763 manifest and #816 checkpoint negative-zero taxonomies stay storage-abstractions-owned.
-    // #814 fresh-root descriptor and pre-handoff content checks remain
-    // configuration-security-owned.
-    const expectedOwners = [
-      // #866 export admission failures and sensitive result emission stay CLI-owned.
-      // #1081 keeps unsupported export-format admission CLI-owned.
-      // #1088 keeps unsupported connector-list-format admission CLI-owned.
-      // #978 keeps compact replacement runtime-digest admission CLI-owned.
-      // #1018 keeps bounded canonical lifecycle refusal warnings CLI-owned.
-      // #1201 keeps diagnostic identity admission CLI-owned.
-      ["bin/lcm.ts", "unit-cli"],
-      ["src/config-manager.ts", "unit-configuration-security"],
-      ["src/private-mutation-lock.ts", "unit-configuration-security"],
-      ["src/home-parent-auth.ts", "unit-configuration-security"],
-      // #1041 preserves bootstrap directory authentication errors when
-      // descriptor cleanup also fails in this existing owner.
-      // #1144 preserves admission callback failures while retaining ordered
-      // bootstrap-lock, home, and parent descriptor cleanup evidence here.
-      ["src/runtime-paths.ts", "unit-configuration-security"],
-      // #1195 strict module-relative asset resolution retains this owner.
-      ["src/runtime-root.ts", "unit-configuration-security"],
-      ["src/security-files.ts", "unit-configuration-security"],
-      ["src/sensitive.ts", "unit-configuration-security"],
-      // #1358 collapses redundant nested lazy prefixes in five generated
-      // Gitleaks rules and adds a structurally verified, fail-closed keyword
-      // prefilter to the scrub engine. Both files stay configuration-security
-      // owned and the component topology is unchanged; these pins name the
-      // mappings that decision covers.
-      ["src/scrub.ts", "unit-configuration-security"],
-      ["src/generated-patterns.ts", "unit-configuration-security"],
-      // #1335 supplementary-plane CJK column widths are a material change to
-      // terminal bounding that retains this owner, as in #1195 and #1203.
-      ["src/terminal-sanitize.ts", "unit-configuration-security"],
-      // #1049 keeps project metadata owner and single-link admission here.
-      ["src/project-map.ts", "unit-project-worktrees"],
-      // #1356/#1357 authenticate the project-map key before it becomes a
-      // storage identity, suppress alias-time metadata backfill until that
-      // authentication, and stop enumeration and preview presenting an
-      // identity storage refuses. The change is confined to existing files and
-      // adds no component, so every touched file keeps its established owner;
-      // these pins record that decision for materially changed files.
-      ["src/cli-storage.ts", "unit-cli"],
-      ["src/db/events-path.ts", "unit-local-persistence"],
-      ["src/identity-service.ts", "integration-postgresql-identity"],
-      // #889 keeps private import metadata publication in this owner.
-      // #1308 keeps import metadata convergence in this existing owner;
-      // canonical and collapsed metadata are now read live after the write
-      // that changes each row, not from a scan-time snapshot.
-      ["src/portable-knowledge.ts", "unit-project-worktrees"],
-      // #866 stats config retries and journal failures, plus #973 project
-      // database admission, retain this owner.
-      ["src/stats.ts", "unit-memory-retrieval"],
-      ["src/connectors/codex-hooks.ts", "unit-connectors"],
-      ["src/connectors/installer.ts", "unit-connectors"],
-      // #881 absent-config journal admission and #882 post-health identity
-      // fencing remain installer-owned.
-      ["installer/install.ts", "unit-installation"],
-      // #1201 observation parser/client, allowlist and server retain daemon-core ownership.
-      ["src/daemon/client.ts", "unit-daemon-core"],
-      ["src/daemon/http-url.ts", "unit-daemon-core"],
-      ["src/daemon/config.ts", "unit-daemon-core"],
-      ["src/daemon/project.ts", "unit-daemon-core"],
-      // Compact forwards current operation tokens; SQLite validates handle admission.
-      ["src/daemon/routes/compact.ts", "unit-daemon-routes"],
-      ["src/daemon/routes/describe.ts", "unit-daemon-routes"],
-      ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
-      ["src/daemon/routes/ingest.ts", "unit-daemon-routes"],
-      ["src/daemon/routes/store.ts", "unit-daemon-routes"],
-      ["src/daemon/routes/status.ts", "unit-daemon-routes"],
-      ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"],
-      ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
-      // #1148 keeps promoted created_at UTC parsing in the existing daemon
-      // routes owner; prompt-search and restore retain their route ownership.
-      // #1203 adds native recall evidence without changing component topology.
-      ["src/db/promoted-recall-evidence.ts", "unit-local-persistence"],
-      ["src/storage/postgresql/tsquery-evidence.ts", "integration-postgresql-search"],
-      ["src/storage/contracts.ts", "unit-storage-abstractions"],
-      ["src/storage/sqlite/repositories.ts", "unit-local-persistence"],
-      ["src/storage/postgresql/lexical-search-repository.ts", "integration-postgresql-search"],
-      ["src/daemon/routes/restore.ts", "unit-daemon-routes"],
-      ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"],
-      // #833 passive-event identity admission remains route-owned.
-      // #1158 keeps passive PostgreSQL promotion route behavior here; its
-      // deduplication helper remains owned by unit-promotion.
-      ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"],
-      // #793 search-limit validation, #863 expand depth validation, and #864
-      // search candidate recall remain owned by daemon routes.
-      ["src/daemon/routes/search.ts", "unit-daemon-routes"],
-      ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
-      ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
-      ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
-      ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
-      // #1153 exact identity and #1158 backend-guarded owner scope remain
-      // within the existing promotion component.
-      // #1354 serializes promoted-memory deduplication decisions with a
-      // project-scoped transaction advisory lock. The change is confined to
-      // existing files and adds no production file, so every touched file
-      // keeps its established owner and the component topology is unchanged;
-      // these pins record that decision.
-      ["src/promotion/dedup.ts", "unit-promotion"],
-      // #1106/#618 keep discovery-related files in their established owners.
-      ["src/daemon/server.ts", "unit-daemon-core"],
-      // #1343 and #1348 widen nested-public handoff ownership in the error
-      // sanitizer. This is a material change that retains its existing owner,
-      // as in #1195 and #1203.
-      ["src/daemon/safe-error.ts", "unit-daemon-core"],
-      ["src/import.ts", "unit-transcripts-import"],
-      // #1358 also drops the redundant residual scrub pass for strings the
-      // first pass left unchanged, which retains this existing owner.
-      ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"],
-      // #1338 replaces compact discovery's per-conversation native-transcript
-      // query with a batched project-level lookup and adds the contract member
-      // both backends implement. The change is confined to existing files, so
-      // every touched file keeps its established owner and the component
-      // topology is unchanged; these pins record that decision.
-      ["src/batch-compact.ts", "unit-compaction-summarization"],
-      // #1353 qualifies every equality comparison in the PostgreSQL memory
-      // repositories against pg_catalog so a hostile search_path cannot
-      // resolve a different operator. The change is confined to that existing
-      // file and adds no component, so it keeps its established owner; this
-      // pin records that decision for a materially changed file.
-      ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
-      ["src/storage/sqlite/native-transcript-repository.ts", "unit-local-persistence"],
-      ["src/storage/postgresql/native-transcript-repository.ts", "integration-postgresql-transcripts"],
-      ["src/daemon/version.ts", "unit-daemon-core"],
-      // #885 keeps the shared missing-Codex diagnostic and its resolver
-      // identity handling within the existing LLM component. #934 keeps
-      // caller-cancellation handling during resolver teardown in this owner.
-      // #1154/#1157 retain Spark protocol normalization, bounded upstream
-      // classification, and terminal sentinel handling in this owner.
-      // #1168 retains accepted HTTP body and SSE failure classification in
-      // this LLM-owned component.
-      ["src/llm/codex-process.ts", "unit-llm-prompts"],
-      ["src/llm/codex-config.ts", "unit-llm-prompts"],
-      ["src/llm/codex-responses-gateway.ts", "unit-llm-prompts"],
-      ["src/llm/process-utils.ts", "unit-llm-prompts"],
-      // #997 keeps doctor publication retry deadlines monotonic in this owner.
-      // #619 keeps observational doctor refusal guidance in this owner.
-      // #1201 identity observation and unverified queue readiness retain this owner.
-      ["src/doctor/doctor.ts", "unit-diagnostics"],
-      // #944/#950/#966 keep typed daemon-tmp diagnostics, authenticated restart
-      // convergence, and bounded birth samples in the service-manager component.
-      ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
-      ["src/daemon/lifecycle.ts", "integration-service-managers"],
-      ["src/daemon/supervisor.ts", "integration-service-managers"],
-      // #837 consumer-admission descriptor cleanup remains storage-owned.
-      // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
-      // #1307 explicit-only retained append admission for non-append mutation
-      // participants stays storage-abstractions-owned.
-      // #1347 lets a caller that already holds publication admission skip the
-      // in-process append tail wait while still taking the append file lock
-      // and the maintenance-phase check, and chains an admitted frame behind
-      // its unresolved admitted predecessor so a timed-out intermediate
-      // frame cannot release later same-token frames early. The change is
-      // confined to this existing file, so it keeps its established owner
-      // and the component topology is unchanged; this pin records that
-      // decision.
-      ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
-      // #1229 local outbox diagnostic admission stays local-event-storage-owned.
-      ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"],
-      ["src/storage/local-hook-outbox-schema.ts", "unit-local-event-storage"],
-      ["src/migration/manifest-store.ts", "unit-migration-cutover"],
-      ["src/migration/maintenance.ts", "unit-migration-cutover"],
-      // #1321 drops the Node 22 transaction-probe fallback from the receipts
-      // module; its cutover receipt logic keeps this owner.
-      ["src/migration/receipts.ts", "unit-migration-cutover"],
-      ["src/migration/queue-evidence.ts", "unit-migration-cutover"],
-      ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"],
-      ["src/storage/contracts.ts", "unit-storage-abstractions"],
-      ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
-      // #1354 supplies the promoted-memory decision serializer only from the
-      // PostgreSQL transaction scope. A component path regex already matched
-      // this file, but the owner list had never named it.
-      ["src/storage/postgresql/project-storage.ts", "unit-storage-abstractions"],
-      ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
-      // #1195 checksummed packaged migration loading remains schema-owned.
-      // #1306 adds the 0007 promoted-content digest migration and its
-      // schema snapshot, keeping the packaged migration manifest here.
-      ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"],
-      // #1306 indexes owner exact-content lookup by a generated SHA-256
-      // digest, retaining the raw-equality residual it always used.
-      // #1354 adds the promoted-memory decision serializer beside the
-      // repositories it serializes.
-      ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
-      ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
-      // #989 event-sidecar parent authentication stays local-persistence-owned.
-      // #1101 numeric skipped-sidecar counts stay local-persistence-owned.
-      // #1191 mutating sidecar scan lifetime stays local-persistence-owned.
-      // #1307 queue-before-consumer ordering for mutating sidecar scans stays
-      // local-persistence-owned.
-      ["src/db/event-sidecars.ts", "unit-local-persistence"],
-      ["src/db/diagnostic-sqlite.ts", "unit-local-persistence"],
-      ["src/db/diagnostic-sqlite-worker.ts", "unit-local-persistence"],
-      // #619 retained daemon pool observations stay diagnostics-owned.
-      ["src/storage/diagnostics.ts", "unit-diagnostics"],
-      ["src/storage/diagnostic-renderer.ts", "unit-diagnostics"],
-      ["src/storage/diagnostic-project.ts", "unit-diagnostics"],
-      ["src/storage/postgresql/diagnostics.ts", "unit-diagnostics"],
-      // #992 keeps pre-initialization SQLite leaf admission and final
-      // opened-identity fencing local-persistence-owned.
-      ["src/db/connection.ts", "unit-local-persistence"],
-      ["src/db/database-parent.ts", "unit-local-persistence"],
-      // Retained-handle token scopes and fresh factory health remain local persistence.
-      ["src/storage/sqlite/factory.ts", "unit-local-persistence"],
-      ["src/storage/sqlite/project-storage.ts", "unit-local-persistence"],
-      // #1020 keeps message timestamp mapping in the existing local-persistence
-      // component; conversation timestamps remain on their existing mapper.
-      ["src/store/conversation-store.ts", "unit-local-persistence"],
-      ["src/db/stored-timestamp.ts", "unit-local-persistence"],
-      ["src/hooks/event-scrubbing.ts", "unit-hooks"],
-      // #1229 local-enqueue health-token forwarding stays hook-owned.
-      ["src/hooks/local-enqueue.ts", "unit-hooks"],
-      ["src/hooks/post-tool.ts", "unit-hooks"],
-      ["src/hooks/publication-fence.ts", "unit-hooks"],
-      // #1155 retains SessionStart outbox pruning admission in the hook owner.
-      ["src/hooks/restore.ts", "unit-hooks"],
-      // Bounded Claude completion delivery remains within the hook component.
-      ["src/hooks/session-end.ts", "unit-hooks"],
-      // #793 search-limit schema remains owned by MCP tools.
-      ["src/mcp/tools/lcm-search.ts", "unit-mcp"],
-      ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],
-      // #863 expand-depth schema remains owned by MCP tools.
-      ["src/mcp/tools/lcm-expand.ts", "unit-mcp"],
-      // #972 search cwd client typing remains memory/retrieval-owned.
-      ["src/memory/index.ts", "unit-memory-retrieval"],
-      // #793 shared search-limit contract remains retrieval-owned.
-      ["src/retrieval.ts", "unit-memory-retrieval"],
-    ] as const;
+    const { fragments, errors } = readOwnershipFragments({
+      productionFiles,
+      componentIds: new Set(components.map((component) => component.component_id)),
+    });
+    expect(errors).toEqual([]);
 
-    for (const [file, expectedOwner] of expectedOwners) {
-      expect(productionFiles).toContain(file);
+    // Aggregate pins per file so competing owners report every fragment involved.
+    const pinsByFile = new Map<string, { fragment: string; component: string }[]>();
+    for (const fragment of fragments) {
+      for (const pin of fragment.pins) {
+        pinsByFile.set(pin.file, [...(pinsByFile.get(pin.file) ?? []), { fragment: fragment.name, component: pin.component }]);
+      }
+    }
+    const competingPins = [...pinsByFile.entries()]
+      .filter(([, pins]) => new Set(pins.map((pin) => pin.component)).size > 1)
+      .map(([file, pins]) => ({ file, pins }));
+    expect(competingPins).toEqual([]);
+
+    for (const [file, pins] of pinsByFile) {
       const owners = components
         .filter((component) => component.ownershipPaths.some((path) => matchesOwnershipPath(file, path)))
         .map((component) => component.component_id);
-      expect(owners).toEqual([expectedOwner]);
+      expect(owners, `${file} pinned by ${pins.map((pin) => pin.fragment).join(", ")}`).toEqual([pins[0]!.component]);
+    }
+
+    // Every production file is pinned somewhere, so a new file must bring its own fragment.
+    expect([...pinsByFile.keys()].sort()).toEqual([...productionFiles]);
+  });
+
+  test("rejects malformed ownership fragments", () => {
+    const context = { productionFiles: ["src/cli-help.ts"], componentIds: new Set(["unit-cli"]) };
+    const valid = { references: ["#1403"], rationale: "Keeps help rendering CLI-owned.", pins: [["src/cli-help.ts", "unit-cli"]] };
+    expect(validateFragment("1403-cli-help.yml", valid, context)).toEqual([]);
+    expect(validateFragment("1403-cli-help.yml", { ...valid, references: ["PR #1403", "G007", "response-fence"] }, context)).toEqual([]);
+    expect(isValidFragmentName(legacyLedgerName)).toBe(true);
+    expect(parseFragment("1403-cli-help.yml", "references: [")).toMatchObject({ error: expect.stringMatching(/^1403-cli-help\.yml: YAML parse error: /) });
+    expect(parseFragment("1403-cli-help.yml", "a: 1\na: 2\n")).toMatchObject({ error: expect.stringContaining("duplicated mapping key") });
+    expect(parseFragment("1403-cli-help.yml", "references: [\"#1403\"]\n")).toEqual({ document: { references: ["#1403"] } });
+    for (const name of ["0000-other.yml", "0-x.yml", "1403-Cli.yml", "1403-cli.yaml", "cli-1403.yml", "1403--cli.yml", ".1403-cli.yml", "1403-cli.yml.bak", "1403_cli.yml"]) {
+      expect(isValidFragmentName(name), name).toBe(false);
+    }
+
+    const malformed: [string, unknown][] = [
+      ["1403-cli-help.yml", "not a mapping"],
+      ["1403-cli-help.yml", { ...valid, extra: true }],
+      ["1403-cli-help.yml", { references: valid.references, pins: valid.pins }],
+      ["1403-cli-help.yml", { ...valid, references: [] }],
+      ["1403-cli-help.yml", { ...valid, references: [1403] }],
+      ["1403-cli-help.yml", { ...valid, references: ["issue 1403"] }],
+      ["1404-cli-help.yml", valid],
+      ["1403-cli-help.yml", { ...valid, rationale: "  " }],
+      ["1403-cli-help.yml", { ...valid, rationale: 2026 }],
+      ["1403-cli-help.yml", { ...valid, pins: [] }],
+      ["1403-cli-help.yml", { ...valid, pins: [["src/cli-help.ts"]] }],
+      ["1403-cli-help.yml", { ...valid, pins: [["src/cli-help.ts", "unit-cli", "extra"]] }],
+      ["1403-cli-help.yml", { ...valid, pins: [["src/cli-help.ts", 7]] }],
+      ["1403-cli-help.yml", { ...valid, pins: [["test/cli-help.test.ts", "unit-cli"]] }],
+      ["1403-cli-help.yml", { ...valid, pins: [["src/cli-help.ts", "unit-nope"]] }],
+      ["1403_cli_help.yml", valid],
+    ];
+    for (const [name, document] of malformed) {
+      expect(validateFragment(name, document, context).length, `${name}: ${JSON.stringify(document)}`).toBeGreaterThan(0);
     }
   });
+
 
   test("does not match non-production TypeScript files", () => {
     const config = readCodecovConfig();
@@ -919,11 +918,18 @@ describe("Codecov configuration", () => {
 });
 
 describe("Codecov maintenance guidance", () => {
-  test("requires the Codecov files to be updated atomically when classification can become stale", () => {
+  test("requires the literal map, fragments, frozen comments, and reviewer duty in AGENTS.md", () => {
     const agents = readFileSync(join(projectRoot, "AGENTS.md"), "utf8");
 
     expect(agents).toMatch(
-      /Update `codecov\.yml` and `test\/codecov-config\.test\.ts` atomically whenever\s+production TypeScript, features, or components are added, removed, moved,\s+materially changed, or otherwise make classification stale\./,
+      /Update them atomically whenever production TypeScript, features, or components are added, removed, moved, or otherwise make classification stale/,
     );
+    expect(agents).toMatch(
+      /Record every ownership decision for a materially changed, added, removed, moved, or re-owned production TypeScript file as one new file in `test\/codecov-ownership\/`/,
+    );
+    expect(agents).toMatch(
+      /Never append provenance to the test, its titles, or `codecov\.yml`: the comments already there are frozen history\./,
+    );
+    expect(agents).toMatch(/Reviewers confirm that every materially changed production TypeScript file gained a fragment pin/);
   });
 });

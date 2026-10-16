@@ -374,12 +374,15 @@ describe("compact surface parity evidence", () => {
       writeFileSync(log, `PostgreSQL harness allocated run: ${runId}\n RUN v4.1.10 /workspace\n${certificates.join("\n")}\n Duration 1s\n`);
       const env = { ...process.env };
       delete env.GITHUB_SHA;
+      // The retired per-leg label must neither appear in nor alter the certificate.
+      env.LCM_PARITY_LEG = "2";
       const extractFixture = () => {
         execFileSync(process.execPath, [join(root, "scripts/surface-parity-artifact.mjs"), log, output], { env, stdio: "pipe" });
         return JSON.parse(readFileSync(join(output, "provenance.json"), "utf8"));
       };
       const clean = extractFixture();
       expect(clean).toMatchObject({ workingTreeClean: true, testedShaMeaning: "checkout-revision" });
+      expect(clean).not.toHaveProperty("leg");
       writeFileSync(join(root, "fixture-note.txt"), "changed\n");
       const dirty = extractFixture();
       expect(dirty).toMatchObject({ workingTreeClean: false, testedShaMeaning: "base-checkout-metadata",

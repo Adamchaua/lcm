@@ -597,7 +597,7 @@ export function main(argv = process.argv.slice(2)) {
     command: "GITHUB_ACTIONS=true pnpm run test:postgresql", extractorRuntime: process.versions.node,
     images: { node: NODE_IMAGE, postgresql: POSTGRES_IMAGE }, runUrl: url,
     job: process.env.GITHUB_JOB ?? null, attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
-    leg: process.env.LCM_PARITY_LEG ?? null, normalizationVersion: 1,
+    normalizationVersion: 1,
     evidenceBudgetBytes: MAX_EVIDENCE_BYTES, harnessStreamCapBytes: 65536,
     capturedLogBytes: Buffer.byteLength(log), evidenceBytes: report.evidenceBytes ?? 0,
     capturedVitestSectionBytes: capturedVitestSectionBytes(log),

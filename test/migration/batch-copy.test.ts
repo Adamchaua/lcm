@@ -46,6 +46,7 @@ const remote = vi.hoisted(() => ({
     },
     receipts: new Map<string, { checkpoint: PortableBatch['checkpoint']; batchSha256: string }>(),
     empty: true,
+    systemIdentifier: '7123456789',
 }));
 
 vi.mock('../../src/storage/postgresql/portable-destination.js', async original => ({
@@ -53,6 +54,7 @@ vi.mock('../../src/storage/postgresql/portable-destination.js', async original =
     probePostgreSqlPortableDestination: async () => ({
         destinationWitnessSha256: 'a'.repeat(64),
         identityFingerprintSha256: 'b'.repeat(64),
+        systemIdentifier: remote.systemIdentifier,
         nonIdentityDomainsEmpty: remote.empty,
         existingRun: remote.run,
     }),
@@ -96,6 +98,7 @@ beforeEach(() => {
     remote.run = null;
     remote.receipts.clear();
     remote.empty = true;
+    remote.systemIdentifier = '7123456789';
 });
 
 async function prepared(multiple = false) {
@@ -341,6 +344,29 @@ it.each(['source', 'destination'] as const)('refuses a changed %s witness before
     vi.spyOn(MigrationManifestStore.prototype, 'read').mockImplementationOnce(function (...args) {
         const current = read.apply(this, args);
         return { ...current, [field]: { ...current[field], contentSha256: 'e'.repeat(64) } };
+    });
+    await expect(runSqliteMigrationCopy(input)).rejects.toThrow();
+    expect(remote.run).toBeNull();
+});
+
+it('records the destination system identifier at copy time and refuses a different cluster on resume', async () => {
+    const { input, store } = await prepared();
+    expect(store.read(input.generationId).destination).toMatchObject({
+        backend: 'postgresql', systemIdentifier: '7123456789',
+    });
+    remote.systemIdentifier = '7000000001';
+    await expect(runSqliteMigrationCopy(input)).rejects.toThrow();
+    expect(remote.run).toBeNull();
+    remote.systemIdentifier = '7123456789';
+    expect((await runSqliteMigrationCopy(input)).phase).toBe('copied');
+});
+
+it('refuses a legacy manifest whose destination witness has no recorded system identifier', async () => {
+    const { input } = await prepared();
+    const read = MigrationManifestStore.prototype.read;
+    vi.spyOn(MigrationManifestStore.prototype, 'read').mockImplementationOnce(function (...args) {
+        const { systemIdentifier: _omitted, ...destination } = read.apply(this, args).destination;
+        return { ...read.apply(this, args), destination };
     });
     await expect(runSqliteMigrationCopy(input)).rejects.toThrow();
     expect(remote.run).toBeNull();

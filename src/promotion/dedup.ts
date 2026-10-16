@@ -161,7 +161,16 @@ export async function deduplicateAndInsertInRepositories(
     undefined,
     candidateSourceProjectId,
   );
-  const exact = input.candidateScope === "owner" && input.backend === "postgresql"
+  // Every backend's promotedMemory.findExactContent is independent of
+  // lexical search, so this runs whenever the caller asked for owner-scoped
+  // dedup, not only on PostgreSQL. Content with no searchable lexical terms
+  // (e.g. punctuation-only) would otherwise never converge on SQLite, since
+  // the fuzzy candidate page above stays empty for it. PostgreSQL serves
+  // this lookup from its content-digest index; SQLite serves it from a
+  // partial (project_id, content, created_at) index over active rows, which
+  // is why the call below stays scoped to the source project there rather
+  // than the whole owner.
+  const exact = input.candidateScope === "owner"
     ? await repositories.promotedMemory.findExactContent(input.content, candidateSourceProjectId)
     : null;
   const exactCandidate = exact === null ? [] : [{

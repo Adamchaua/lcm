@@ -43,6 +43,28 @@ describe("PostgreSQL portable native mapping", () => {
     expect(query.mock.calls[1][0].text).toContain("token_count::text");
     await expect(mapping.listCanonicalHeaders(db,projectId,"messages",null,501)).rejects.toThrow();
   });
+  it("counts canonical rows database-side over the scope the header stream pages", async () => {
+    const {db, query} = executor([{count:"0"}]);
+    const signal = new AbortController().signal;
+    for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+      expect(await mapping.countCanonicalRows(db,projectId,domain,signal)).toBe(0);
+      await mapping.listCanonicalHeaders(db,projectId,domain,null,1);
+      const [count, headers] = query.mock.calls.slice(-2).map(call => (call as unknown as [{text:string;values:unknown[]}])[0]);
+      expect(headers!.text).toContain(count!.text.slice(count!.text.indexOf(" FROM ")));
+      expect(count!.text).toMatch(/^SELECT COUNT\(\*\)::text AS count FROM /);
+      expect(count!.text).not.toMatch(/octet_length|row_to_json|LIMIT|ORDER BY/);
+      expect(count!.values).toEqual([projectId]);
+    }
+    const options = (query.mock.calls[0] as unknown as [unknown, {operation:string;domain:string;projectId:string;signal:AbortSignal}])[1];
+    expect(options).toEqual({domain:"transaction",operation:"portable-count",projectId,signal});
+  });
+  it("parses counts exactly and refuses non-canonical results", async () => {
+    expect(await mapping.countCanonicalRows(executor([{count:"12"}]).db,projectId,"messages")).toBe(12);
+    for (const rows of [[], [{}], [{count:7}], [{count:""}], [{count:"-1"}], [{count:"01"}], [{count:"1.5"}], [{count:"9007199254740993"}]])
+      await expect(mapping.countCanonicalRows(executor(rows).db,projectId,"messages")).rejects.toMatchObject({code:"record-unrepresentable"});
+    const db = {query: vi.fn(async () => { throw new Error("driver"); })} as unknown as PostgreSqlQueryExecutor;
+    await expect(mapping.countCanonicalRows(db,projectId,"messages")).rejects.toThrow("driver");
+  });
   it("refuses nonrepresentable memory UUID and empty content before SQL", async () => {
     const {db, query} = executor([]);
     const record = createPortableRecord({domain:"promoted-memories",ordinal:0,context:{projectIdentity:{scope:"shared",projectId}},value:{memoryId:"legacy-memory",content:"",metadata:{},sourceProjectId:null,sourceSummaryId:null,sessionId:null,depth:0,confidence:1,createdAt:timestamp,archivedAt:null}});
@@ -182,6 +204,103 @@ it("bounds scoped header and payload queries for every native family including j
   for(const limit of [0,501,1.5]) await expect(mapping.listConversationMessageHeaders(db,projectId,"1",null,limit)).rejects.toThrow();
 });
 
+it("fingerprints a canonical row projection deterministically and sensitively to content",()=>{
+  const a=mapping.canonicalRowContentSha256({one:"1",two:"2"});
+  const b=mapping.canonicalRowContentSha256({two:"2",one:"1"});
+  const c=mapping.canonicalRowContentSha256({one:"1",two:"3"});
+  expect(a).toMatch(/^[0-9a-f]{64}$/);
+  expect(a).toBe(b);
+  expect(a).not.toBe(c);
+});
+it("batches canonical row reads by locator instead of one query per record",async()=>{
+  const locators=[0,1,2].map(index=>JSON.stringify(["key"+index]));
+  const {db,query}=executor([
+    {test:"payload-0",__locator:locators[0]},
+    {test:"payload-2",__locator:locators[2]},
+  ]);
+  const found=await mapping.readCanonicalContentRows(db,projectId,"machines",locators);
+  expect(query.mock.calls).toHaveLength(1);
+  expect(query.mock.calls[0][0].text).toContain('COLLATE "C" = ANY($2::text[])');
+  expect(query.mock.calls[0][0].values?.[1]).toEqual(locators);
+  expect(found.size).toBe(2);
+  expect(found.get(locators[0]!)).toEqual({test:"payload-0"});
+  expect(found.get(locators[2]!)).toEqual({test:"payload-2"});
+  expect(found.has(locators[1]!)).toBe(false);
+});
+it("compares batch locators under the C collation, exactly as the single-row read does",async()=>{
+  const single=executor([]);
+  await mapping.readCanonicalContentRows(single.db,projectId,"session-ingest",[JSON.stringify(["a"])]);
+  expect(single.query.mock.calls[0][0].text).toContain('json_build_array(r.ingest_key::text)::text COLLATE "C" = ANY($2::text[])');
+  const multi=executor([]);
+  await mapping.readCanonicalContentRows(multi.db,projectId,"promoted-memory-tags",[JSON.stringify(["a","1"])]);
+  expect(multi.query.mock.calls[0][0].text).toContain('json_build_array(r.memory_id::text, r.ordinal::text)::text COLLATE "C" = ANY($2::text[])');
+});
+it("returns an empty map without querying when there are no locators to check",async()=>{
+  const {db,query}=executor([]);
+  expect(await mapping.readCanonicalContentRows(db,projectId,"machines",[])).toEqual(new Map());
+  expect(query).not.toHaveBeenCalled();
+});
+it("refuses batches larger than the shared portable batch-record bound",async()=>{
+  const {db}=executor([]);
+  const {PORTABLE_LIMITS}=await import("../../src/storage/portable-record.js");
+  const oversized=Array.from({length:PORTABLE_LIMITS.maxBatchRecords+1},(_,index)=>JSON.stringify(["key"+index]));
+  await expect(mapping.readCanonicalContentRows(db,projectId,"machines",oversized)).rejects.toThrow();
+});
+it("refuses a malformed locator in a batch before issuing SQL",async()=>{
+  const {db,query}=executor([]);
+  for(const bad of ["bad",'{}','[]','[1]']) await expect(mapping.readCanonicalContentRows(db,projectId,"messages",[bad])).rejects.toThrow();
+  expect(query).not.toHaveBeenCalled();
+});
+it("reads canonical content sizes without projecting payload columns or bounding row size",async()=>{
+  const locators=[0,1,2].map(index=>JSON.stringify(["key"+index]));
+  const {db,query}=executor([
+    {__locator:locators[0],__bytes:"17"},
+    {__locator:locators[2],__bytes:"150994944"},
+  ]);
+  const sizes=await mapping.readCanonicalContentSizes(db,projectId,"machines",locators);
+  expect(query.mock.calls).toHaveLength(1);
+  expect(query.mock.calls[0][0].text).toContain('COLLATE "C" = ANY($2::text[])');
+  expect(query.mock.calls[0][0].text).toContain("octet_length");
+  expect(query.mock.calls[0][0].text).not.toContain("<= $3");
+  expect(query.mock.calls[0][0].values).toEqual([projectId,locators]);
+  expect(query.mock.calls[0][1].operation).toBe("portable-content-sizes");
+  expect(sizes.get(locators[0]!)).toBe(17n);
+  expect(sizes.get(locators[2]!)).toBe(150994944n);
+});
+it("omits a locator missing from the size result instead of reporting it as zero bytes",async()=>{
+  const locators=[0,1].map(index=>JSON.stringify(["key"+index]));
+  const {db,query}=executor([{__locator:locators[1],__bytes:"0"}]);
+  const sizes=await mapping.readCanonicalContentSizes(db,projectId,"session-instructions",locators);
+  expect(query.mock.calls[0][0].text).toContain("JOIN lcm.machines m");
+  expect(sizes.size).toBe(1);
+  expect(sizes.has(locators[0]!)).toBe(false);
+  expect(sizes.get(locators[1]!)).toBe(0n);
+});
+it("returns an empty size map without querying when there are no locators to size",async()=>{
+  const {db,query}=executor([]);
+  expect(await mapping.readCanonicalContentSizes(db,projectId,"machines",[])).toEqual(new Map());
+  expect(query).not.toHaveBeenCalled();
+});
+it("refuses size batches larger than the shared portable batch-record bound",async()=>{
+  const {db,query}=executor([]);
+  const {PORTABLE_LIMITS}=await import("../../src/storage/portable-record.js");
+  const oversized=Array.from({length:PORTABLE_LIMITS.maxBatchRecords+1},(_,index)=>JSON.stringify(["key"+index]));
+  await expect(mapping.readCanonicalContentSizes(db,projectId,"machines",oversized)).rejects.toThrow(/invalid-limit/);
+  expect(query).not.toHaveBeenCalled();
+});
+it("refuses a malformed locator before issuing a size query",async()=>{
+  const {db,query}=executor([]);
+  for(const bad of ["bad",'{}','[]','[1]']) await expect(mapping.readCanonicalContentSizes(db,projectId,"messages",[bad])).rejects.toThrow();
+  expect(query).not.toHaveBeenCalled();
+});
+it("refuses a non-numeric canonical size value instead of coercing or dropping it",async()=>{
+  const locator=JSON.stringify(["key0"]);
+  for(const bad of ["","17.5","-1","1e3","NaN",null]){
+    const {db}=executor([{__locator:locator,__bytes:bad}]);
+    await expect(mapping.readCanonicalContentSizes(db,projectId,"machines",[locator])).rejects.toThrow(/malformed-record/);
+  }
+});
+
 it("refuses missing decode evidence instead of inventing parent identities or duplicate occurrences",()=>{
   const context={projectIdentity:{scope:"shared" as const,projectId}};
   expect(()=>mapping.decodeCanonicalRow("messages",{},context)).toThrow();
@@ -281,6 +400,27 @@ it("suppresses oversized locator output in SQL while returning the measured row 
   expect(query.mock.calls[1][0].values).toEqual([projectId,"1",null,1,"150994944"]);
 });
 
+it("bounds a multi-row header page by aggregate locator bytes in SQL while always keeping its first row (#1388)",async()=>{
+  const {db,query}=executor([]);
+  await mapping.listCanonicalHeaders(db,projectId,"project-aliases",JSON.stringify(["m","/p"]),500);
+  const {text,values}=query.mock.calls[0][0];
+  expect(values).toEqual([projectId,["m","/p"],500,"150994944"]);
+  // The scan stops at the page limit before the window sees any row, in the
+  // same C-collated key order the window then accumulates over.
+  expect(text).toContain('ORDER BY ARRAY[r.machine_id::text COLLATE "C", r.normalized_path::text COLLATE "C"] COLLATE "C" LIMIT $3) sized WINDOW page_order AS (ORDER BY ARRAY[sized.machine_id::text COLLATE "C", sized.normalized_path::text COLLATE "C"] COLLATE "C" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)');
+  // Running projected-locator bytes cut the page against the shared batch
+  // budget; an oversized row still projects '' and adds nothing to the sum.
+  expect(text).toContain("row_number() OVER page_order AS page_row");
+  expect(text).toContain("sum(octet_length(CASE WHEN sized.byte_length <= $4::bigint THEN json_build_array(sized.machine_id::text, sized.normalized_path::text)::text ELSE '' END)) OVER page_order AS page_bytes");
+  expect(text).toContain("WHERE page.page_row = 1 OR page.page_bytes <= $4::bigint ORDER BY page.page_row");
+  // The projected row size is measured once per scanned row, inside the limited scan.
+  expect(text.split("row_to_json(portable_row)")).toHaveLength(2);
+  expect(text).toContain("AS byte_length FROM lcm.project_aliases r JOIN lcm.machines m ON m.machine_id = r.machine_id WHERE (r.project_id = $1::uuid)");
+  // The conversation closure keeps its one-row reads without the aggregate window.
+  await mapping.listConversationMessageHeaders(db,projectId,"1",null,1);
+  expect(query.mock.calls[1][0].text).not.toContain("OVER");
+});
+
 it("rejects IDs already owned by another project before any native insertion",async()=>{
   const records=buildRecords(postgresGeneration());
   expect(mapping.assertPostgreSqlExistingConstraints).toBeTypeOf("function");
@@ -368,4 +508,12 @@ it("requires native JSON types before extracting passive-event envelope text",()
   const sql=mapping.mappingForDomain("passive-events").selectColumns;
   for(const key of ["sessionId","category","data","sourceHook","createdAt"]) expect(sql).toContain(`pg_catalog.jsonb_typeof(r.payload->'${key}') = 'string'`);
   for(const key of ["sessionSequence","priority"]) expect(sql).toContain(`pg_catalog.jsonb_typeof(r.payload->'${key}') = 'number'`);
+});
+
+it("budgets a batch item as its row bytes plus its two UTF-8 locator copies",()=>{
+  expect(mapping.canonicalBatchItemBytes(1000n,'["12"]')).toBe(1000n+2n*6n);
+  // Buffer.byteLength, not UTF-16 length: "é" is two bytes and "€" is three.
+  expect(mapping.canonicalBatchItemBytes(7n,'["é€"]')).toBe(7n+2n*BigInt(Buffer.byteLength('["é€"]')));
+  expect(Buffer.byteLength('["é€"]')).toBe(9);
+  expect(mapping.canonicalBatchItemBytes(5n,"")).toBe(5n);
 });

@@ -1,0 +1,6 @@
+references: ["#1499"]
+rationale: >-
+  #1499 accepts only a canonical positive decimal pid from the activation
+  restart pid file; the file keeps its migration owner.
+pins:
+  - ["src/migration/activation-restart-check.ts", "unit-migration-cutover"]

@@ -125,6 +125,18 @@ and normalized path to match the local identity context. Publication or
 identity drift fails before any project repository is returned and never
 causes a SQLite fallback.
 
+Each witness is classified under the publication lock before strict admission:
+a publication directory that is confirmed absent is absent, a version-2
+journal that is not completed or does not target PostgreSQL is a mismatch
+carrying the journal's recorded phase and target, and a version-3 maintenance
+journal or a failed read or admission is unresolvable. An existing publication
+directory without `journal.json` is also unresolvable, with the same cause the
+consumer path reports: `publication-evidence-missing` for an empty,
+history-only or recognized-residue directory and `unsafe-storage` for unknown
+residue. Classification never creates the directory. Only a completed
+PostgreSQL journal that also passes strict admission is present. Every
+non-present outcome fails the open with the same initialization error.
+
 This coordination uses the existing `lcm.fenced_leases` table and advisory
 namespace. Chore #408 adds no schema object, `MAINTAIN` privilege, full-table
 lock, schema-creation privilege, ownership transfer, or broad future-object
@@ -141,6 +153,15 @@ root:
   <publication-id>.material
   history/
 ```
+
+A completed publication's `<publication-id>.material` is retained
+indefinitely by design. Nothing prunes it: each file is at most 8,388,608
+bytes, there is one file per completed publication, and there is no aggregate
+cap, so unbounded growth is accepted. Terminal admission authenticates the
+file today, and the planned rollback (#626 / #1433) will read it instead of
+re-deriving it. A future prune must keep what rollback reads or be designed
+with that path. Do not delete these files (see the warning below about
+recovery evidence).
 
 Migration snapshot maintenance uses a separate exact version-3 journal branch
 in this same coordinator and directory. It does not create a sibling lock or
@@ -254,6 +275,25 @@ own authoritative terminal readback.
 After an authenticated abort, SQLite consumer admission resumes. After selected-
 generation completion, only the recorded target backend is admitted.
 
+A daemon that is already running authenticates its startup backend once and
+keeps it for its whole lifetime. Changing the configured backend underneath it
+does not migrate that process: every later request and every background
+admission compares the freshly loaded configuration against the frozen startup
+backend and refuses with a `backend-mismatch` publication error. Only a
+restart can resolve that divergence, so the daemon's background passive-event
+work stops after the first refused admission instead of retrying on its
+five-minute sweep interval, records the halt, and reports it once. A sweep
+that admits nothing does not halt and writes nothing to the lost backend: no
+sidecar has unprocessed events, and no project passes the replication gates
+before its first phase. A project whose startup PostgreSQL is unhealthy is
+reported as a storage failure instead. Once the halt is raised, the
+unauthenticated `/health` response carries a `passiveEvents` object with
+`halted`, `haltedReason`, and `haltedMessage`; it is absent on a healthy
+daemon. Health is the surface to check for this, because read admission
+refuses `/status` and every other route under the same mismatch. The next
+hook run observes the `/health` backend mismatch through `ensureDaemon` and
+replaces the daemon, which clears the halt.
+
 Do not edit a held journal to release it. Preserve the journal and snapshot
 generation when capture, selection, or abort readback fails. A migration report,
 elapsed time, or apparently quiet outbox is not release evidence.
@@ -297,13 +337,13 @@ The normal forward sequence is:
 ```text
 preparing
   -> prepared
-  -> acquiring       (one persisted checkpoint per project, when remote fences are enabled)
+  -> acquiring       (one persisted checkpoint per project, when the publication has projects)
   -> guarded
   -> map-publishing
   -> map-published
   -> config-publishing
   -> config-published
-  -> releasing       (one persisted checkpoint per project, when remote fences are enabled)
+  -> releasing       (one persisted checkpoint per project, when the publication has projects)
   -> released
   -> completed
 ```
@@ -313,17 +353,32 @@ The phase groups have distinct recovery meanings:
 - **Preparation:** `preparing -> prepared` writes the deterministic journal,
   seals the material, authenticates it, and records the material reference.
 - **Admission:** `prepared -> acquiring -> guarded` acquires each project
-  fence in sorted project order. With no remote-guard driver, the coordinator
-  checkpoints directly to `guarded`; otherwise `acquiring` is rewritten for
-  each project as its authoritative fence is persisted.
+  fence in sorted project order, rewriting `acquiring` for each project as its
+  authoritative fence is persisted. A publication with projects requires a
+  complete remote guard provider (acquire, read, and release hooks):
+  `prepare` refuses with `invalid-input` otherwise, and `resume` refuses to
+  record `guarded` without the acquire and read hooks, leaving the journal at
+  `acquiring`. Only a publication with no projects checkpoints directly to
+  `guarded`.
 - **Publication:** `guarded -> map-publishing -> map-published ->
 config-publishing -> config-published` publishes the project map before the
   configuration. A recovered `*-publishing` phase rechecks witnesses and
   completes the mutation only when the expected state is not already present.
 - **Release/finalization:** `config-published -> releasing -> released ->
 completed` releases every project fence with authoritative readback, then
-  retains the completed material and writes the terminal journal. With no
-  remote-guard driver, `config-published` checkpoints directly to `released`.
+  writes the terminal journal. The completed material is retained
+  indefinitely by design; nothing prunes it, and operators must not delete it
+  (see the recovery-evidence warning below). Resume refuses, with
+  `unexpected-state` and without changing the phase, a journal with projects
+  at `guarded`, `map-publishing`, `map-published`, `config-publishing`,
+  `config-published`, `releasing`, or `released` that records no fence for a
+  project. Recovery for that refusal is abort. Release refuses to proceed
+  while a persisted fence exists without the release and read hooks, leaving
+  the journal at `releasing` (or `abort-releasing` for an abort). To recover
+  from the missing release or read hook refusal, or from the admission
+  refusal above, reconstruct the coordinator with a complete provider and
+  retry resume or abort. Only a publication with no projects checkpoints
+  directly to `released`. Journals that are already terminal are not migrated.
 
 The abort sequence is a separate forward-only state machine, never a rewind.
 When abort starts from the initial material-backed journal, its complete
@@ -375,6 +430,25 @@ The internal coordinator exposes `prepare`, `resume`, `abort`, and
 `recoverPending` seams for the activation workflow. Mutation permits are tied
 to the permit object and revoked when their callback ends, so an inherited
 asynchronous callback cannot reuse authority after a phase change or release.
+
+### Calling coordinator seams from inside a retained barrier
+
+The maintenance and publication coordinator methods -- `enterMaintenance`,
+`prepareMaintenanceSelection`, `completeMaintenanceSelection`,
+`abortMaintenance`, `prepare`, `resume`, `abort`, and `recoverPending` --
+accept an optional trailing lock token. That token exists for one calling
+mode: a caller already inside `withBackendPublicationAppendBarrierAsync`
+holding the publication lock. Passing the barrier token lets the seam skip
+re-acquiring the same lock; omitting it inside a retained barrier contends
+with the caller's own lock and fails with `PrivateMutationLockContentionError`,
+which refuses admission rather than silently sharing the lock.
+
+Only async-origin tokens authorize these seams. A token minted by a
+synchronous wrapper (`withBackendPublicationConsumerLock` or the synchronous
+append barrier) is refused with `permit-mismatch`, because the synchronous
+wrapper releases the lock when its callback returns while async coordinator
+work can still resume afterwards; accepting such a token would let a caller
+observe failure while a publication mutation escapes unlocked.
 
 If a process dies at any checkpoint, a present journal and its material are
 recovery evidence. Do not edit, delete, rename, or bulk-clean the directory.

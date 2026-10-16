@@ -1043,6 +1043,15 @@ export interface PortableStreamErrorOptions {
   readonly manifestSha256?: string;
   readonly checkpointSha256?: string;
   readonly retryable?: boolean;
+  /**
+   * The underlying already-sanitized storage error, when known. Deliberately
+   * excluded from {@link PortableStreamError.toJSON}: StorageOperationError
+   * is documented deliberately cause-free, and wholesale cause serialization
+   * is a log-hygiene regression. Callers that need the original failure
+   * (for example its PostgreSQL sqlState) read `error.cause` directly; never
+   * log it wholesale.
+   */
+  readonly cause?: unknown;
 }
 
 export type PortableStreamErrorCode =
@@ -1099,7 +1108,11 @@ export class PortableStreamError extends Error {
     const normalizedCode = PORTABLE_STREAM_ERROR_CODES.includes(code)
       ? code
       : "malformed-record";
-    super(`Portable record stream error: ${normalizedCode}`);
+    const cause = readErrorOption(options, "cause");
+    super(
+      `Portable record stream error: ${normalizedCode}`,
+      cause === undefined ? undefined : { cause },
+    );
     this.name = "PortableStreamError";
     this.code = normalizedCode;
     const retryable = readErrorOption(options, "retryable");
@@ -1994,6 +2007,25 @@ function conversationFingerprintFromOrder(order: CanonicalConversationOrder): st
 
 function conversationIdentityFromOrder(order: CanonicalConversationOrder): string {
   return identitySha256("conversations", [conversationFingerprintFromOrder(order), order[5]]);
+}
+
+/**
+ * The fingerprint and portable identity a conversation record gets from its
+ * header fields and occurrence ordinal. This is the derivation the record
+ * constructor and the record validator apply, exported so that a caller
+ * holding only header fields (a verification read of a copied destination)
+ * derives identities the same way instead of keeping a second copy of the
+ * rule. Timestamps may be six-digit microsecond text, which is what keeps
+ * sub-millisecond precision in the fingerprint; a JavaScript Date cannot.
+ */
+export function derivePortableConversationIdentity(
+  order: PortableRawConversationOrder,
+): Readonly<{ conversationFingerprint: string; identitySha256: string }> {
+  const canonical = normalizeConversationOrder(order, "raw");
+  return Object.freeze({
+    conversationFingerprint: conversationFingerprintFromOrder(canonical),
+    identitySha256: conversationIdentityFromOrder(canonical),
+  });
 }
 
 function messageIdentityFromOrder(order: CanonicalMessageOrder): string {

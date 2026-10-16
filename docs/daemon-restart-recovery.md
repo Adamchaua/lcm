@@ -425,7 +425,8 @@ The following contexts are intentionally outside managed recovery:
 - a container or remote session without an available per-user systemd/launchd
   manager; and
 - a service whose identity, state directory, token, listener, or manager
-  ownership is missing, replaced, or ambiguous.
+  ownership is missing, replaced, or ambiguous, including a daemon newer than
+  1.4.3 that does not report its storage backend.
 
 These cases are refused rather than force-recovered. Run `lcm doctor`, repair
 the host's user service manager, and then retry `lcm daemon restart`. Keep a

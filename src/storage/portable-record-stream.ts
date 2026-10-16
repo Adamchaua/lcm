@@ -312,7 +312,13 @@ function initialDomainPrefix(schemaSha256: string, domain: PortableDomain): stri
   return sha256(canonicalJson(["lcm-portable-domain-v1", schemaSha256, domain, 1]));
 }
 
-function aggregateContentSha256(schemaSha256: string, prefixes: readonly string[]): string {
+/**
+ * Exported so callers outside this module (the #624 verification driver's
+ * destination census) can bind their own aggregate to the exact same
+ * digest family the portable manifest uses, rather than inventing a
+ * second, unrelated content-digest family for the same concept.
+ */
+export function aggregateContentSha256(schemaSha256: string, prefixes: readonly string[]): string {
   let digest = sha256(canonicalJson(["lcm-portable-content-v1", schemaSha256]));
   for (const prefix of prefixes) digest = appendLengthPrefixed(digest, Buffer.from(prefix, "hex"));
   return digest;
@@ -822,8 +828,11 @@ export function createPortableBatch(input: CreatePortableBatchInput): PortableBa
   });
 }
 
-function sourceFailure(code: "source-changed" | "source-invalid" | "source-unavailable"): never {
-  fail(code, { retryable: code === "source-unavailable" });
+function sourceFailure(
+  code: "source-changed" | "source-invalid" | "source-unavailable",
+  cause?: unknown,
+): never {
+  fail(code, { retryable: code === "source-unavailable", cause });
 }
 
 function sourceDescription(source: PortableRecordSource): PortableSourceDescription {
@@ -848,7 +857,20 @@ async function readSourcePage(
     return await source.readDomainPage(input);
   } catch (error) {
     checkAbort(input.signal);
-    if (error instanceof PortableStreamError) sourceFailure("source-invalid");
+    if (error instanceof PortableStreamError) {
+      // A source-unavailable PortableStreamError is preserved as retryable
+      // only when the source adapter itself marked it retryable (for
+      // PostgreSQL: a genuine connection termination or idle-in-transaction
+      // kill). An adapter reports source-unavailable with retryable false
+      // for a non-transient failure it does not otherwise recognize (for
+      // example permission-denied); that must still fail fast as
+      // source-invalid, exactly like every other source-reported code, not
+      // retry indefinitely.
+      if (error.code === "source-unavailable" && error.retryable) {
+        sourceFailure("source-unavailable", error.cause);
+      }
+      sourceFailure("source-invalid");
+    }
     sourceFailure("source-unavailable");
   }
 }
@@ -1180,8 +1202,12 @@ export async function createPortableRecordStream(
       closePromise = operationTail.then(async () => {
         try {
           await source.close();
-        } catch {
-          sourceFailure("source-unavailable");
+        } catch (error) {
+          // portable-source attaches the already-sanitized underlying
+          // failure as cause on its own close-failure PortableStreamError;
+          // forward it here instead of discarding it, so a direct
+          // source.close() caller keeps that diagnostic.
+          sourceFailure("source-unavailable", error instanceof PortableStreamError ? error.cause : undefined);
         }
       });
       return closePromise;

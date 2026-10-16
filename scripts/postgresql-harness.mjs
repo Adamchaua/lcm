@@ -1549,9 +1549,12 @@ export function createHarnessCleanupOperations(context, dependencies = {}) {
   return { cleanup, teardown };
 }
 
-function createDockerRunnerEnvironment(environment) {
+function createDockerRunnerEnvironment(environment, censusCost = false) {
   return {
     ...environment,
+    // The opt-in census-cost measurement selects its file through this flag,
+    // so the separate runner process only sees it when the caller asked.
+    ...(censusCost ? { LCM_TEST_POSTGRES_CENSUS_COST: "true" } : {}),
     // The runner is a separate process and only receives the values written to
     // runner.env. Preserve CI's established Vitest pool there as well.
     CI: "true",
@@ -1640,20 +1643,25 @@ export async function runTests(context, ci, setupDocker = docker, testProcess = 
     }
   }
 
-  await runSanitizedProcess(process.execPath, [
-    join(repositoryRoot, "node_modules", "vitest", "vitest.mjs"),
-    "run", "--config", join(repositoryRoot, "vitest.postgresql.config.ts"),
-    join(repositoryRoot, "test", "postgresql", "signal.integration.ts"),
-  ], {
-    cwd: repositoryRoot,
-    env,
-    secrets,
-    processRunner: testProcess,
-    terminateOnStop: true,
-    terminateProcessTree: true,
-  });
+  // The census-cost configuration excludes the signal file, so the pre-run
+  // would collect nothing and fail; the measurement runs only in the runner.
+  const censusCost = env.LCM_TEST_POSTGRES_CENSUS_COST === "true";
+  if (!censusCost) {
+    await runSanitizedProcess(process.execPath, [
+      join(repositoryRoot, "node_modules", "vitest", "vitest.mjs"),
+      "run", "--config", join(repositoryRoot, "vitest.postgresql.config.ts"),
+      join(repositoryRoot, "test", "postgresql", "signal.integration.ts"),
+    ], {
+      cwd: repositoryRoot,
+      env,
+      secrets,
+      processRunner: testProcess,
+      terminateOnStop: true,
+      terminateProcessTree: true,
+    });
+  }
   const envFile = join(context.directory, "runner.env");
-  writeFileSync(envFile, Object.entries(createDockerRunnerEnvironment(context.environment))
+  writeFileSync(envFile, Object.entries(createDockerRunnerEnvironment(context.environment, censusCost))
     .map(([key, value]) => `${key}=${value}`).join("\n") + "\n", { mode: 0o600 });
   await setupDocker(createCiRunnerContainerArgs(context, envFile));
   await runSanitizedProcess("docker", ["start", "--attach", context.names.runner], {

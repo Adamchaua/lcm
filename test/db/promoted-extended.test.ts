@@ -351,6 +351,47 @@ describe("PromotedStore extended", () => {
     expect(prefixes).not.toContain("Will be archived");
   });
 
+  // ── insertion order for created_at ties ──────────────────────────────────
+  // created_at has one-second resolution, so rows stored together tie. The
+  // promoted_active_content_idx scan order is (project_id, content), which
+  // would reorder ties by content unless the queries tie-break on rowid.
+
+  function insertTiedRows(fts5Available: boolean) {
+    const db = makeDb(fts5Available);
+    const store = new PromotedStore(db, fts5Available);
+    const contents = ["zeta needle", "alpha needle", "mid needle", "beta needle"];
+    const ids = contents.map((content) => store.insert({ content, projectId: "p1" }));
+    db.prepare("UPDATE promoted SET created_at = '2020-01-01 00:00:00'").run();
+    return { store, ids, contents };
+  }
+
+  it("getAll keeps insertion order for rows sharing created_at", () => {
+    const { store, ids } = insertTiedRows(true);
+
+    expect(store.getAll().map((row) => row.id)).toEqual(ids);
+  });
+
+  it("findStale keeps insertion order for rows sharing created_at", () => {
+    const { store, ids } = insertTiedRows(true);
+
+    expect(
+      store.findStale({ staleAfterDays: 1, staleSurfacingWithoutUseLimit: 2 }).map((row) => row.id),
+    ).toEqual(ids);
+  });
+
+  it("fallback search keeps insertion order for equally ranked rows", () => {
+    const { store, ids } = insertTiedRows(false);
+
+    expect(store.search("needle", 10).map((result) => result.id)).toEqual(ids);
+  });
+
+  it("listContentPrefixes limited below the row count returns the first-inserted rows", () => {
+    const { store, contents } = insertTiedRows(true);
+
+    expect(store.listContentPrefixes(2)).toEqual(contents.slice(0, 2));
+    expect(store.listContentPrefixes(contents.length)).toEqual(contents);
+  });
+
   // ── update ───────────────────────────────────────────────────────────────
 
   it("update tags-only: changes tags without altering content", () => {
