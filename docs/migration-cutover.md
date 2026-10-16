@@ -498,13 +498,17 @@ An unresolved storage-publication lease blocks copy through normal project
 admission, including when that publication lease has expired. A copy lease
 never grants selection or activation authority.
 
-The copy also binds its writer to the cluster it probed. Every writer
+The copy also binds its writers to the cluster it probed. Every writer
 connection -- including a reconnect after an uncertain commit -- and every
 destination transaction compares the live PostgreSQL system identifier with the
 value recorded in the manifest's destination witness, and refuses with
-`destination-conflict` before writing anything when they differ. An endpoint
-that starts resolving to a different cluster after the probe therefore receives
-no writes, even if that cluster presents the same five-field identity witness.
+`destination-conflict` before writing anything when they differ. This covers
+the lease transactions that acquire, renew and release the copy lease (each
+checks the identifier first, in its own transaction, separate from the data
+transaction) and the readback transactions (checked before the lease
+serialization lock). An endpoint that starts resolving to a different cluster
+after the probe therefore receives no lease, data or receipt writes, even if
+that cluster presents the same five-field identity witness.
 
 Each local pending effect is durable before its destination mutation. Even a
 successful COMMIT response must be followed by exact durable receipt readback

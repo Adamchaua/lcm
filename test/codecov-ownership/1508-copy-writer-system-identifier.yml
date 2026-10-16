@@ -1,8 +1,9 @@
 references: ["#1508"]
 rationale: >-
-  #1508 makes the migration copy writer compare the live destination system
-  identifier with the recorded one on every connection and transaction; both
-  files keep their established owner.
+  #1508 makes the migration copy writer, its lease transactions and its
+  readbacks compare the live destination system identifier with the recorded
+  one before writing; all three files keep their established owner.
 pins:
+  - ["src/migration/copy-destination.ts", "unit-migration-cutover"]
   - ["src/migration/batch-copy.ts", "unit-migration-cutover"]
   - ["src/storage/postgresql/portable-destination.ts", "integration-postgresql-portable"]

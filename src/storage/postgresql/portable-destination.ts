@@ -99,14 +99,21 @@ function checkedState(authority:PortableRecordWriter):DestinationState {
   return state;
 }
 const SYSTEM_IDENTIFIER=/^(0|[1-9][0-9]{0,19})$/u;
-async function readSystemIdentifier(state:{input:Pick<PostgreSqlPortableDestinationInput,"expectedIdentity">},executor:PostgreSqlQueryExecutor,signal?:AbortSignal):Promise<string> {
-  const systemIdentifier=(await executor.query<{system_identifier:unknown}>({text:'SELECT system_identifier::text AS system_identifier FROM pg_catalog.pg_control_system()'},options(state,signal))).rows[0]?.system_identifier;
+async function readSystemIdentifier(projectId:string,executor:PostgreSqlQueryExecutor,signal?:AbortSignal):Promise<string> {
+  const systemIdentifier=(await executor.query<{system_identifier:unknown}>({text:'SELECT system_identifier::text AS system_identifier FROM pg_catalog.pg_control_system()'},{domain:'factory',operation:'portableTransfer',projectId,signal})).rows[0]?.system_identifier;
   if(typeof systemIdentifier!=='string'||!SYSTEM_IDENTIFIER.test(systemIdentifier))fail('destination-conflict');
   return systemIdentifier;
 }
+/**
+ * Refuses with destination-conflict unless the cluster behind this executor
+ * has the expected system identifier. A no-op when none is expected. Callers
+ * run it as the first statement of a transaction, before any write.
+ */
+export async function assertPostgreSqlSystemIdentifier(executor:PostgreSqlQueryExecutor,expected:string|undefined,projectId:string,signal?:AbortSignal):Promise<void> {
+  if(expected!==undefined&&await readSystemIdentifier(projectId,executor,signal)!==expected)fail('destination-conflict');
+}
 async function assertSystemIdentifier(state:DestinationState,executor:PostgreSqlQueryExecutor,signal?:AbortSignal):Promise<void> {
-  const expected=state.input.expectedSystemIdentifier;
-  if(expected!==undefined&&await readSystemIdentifier(state,executor,signal)!==expected)fail('destination-conflict');
+  await assertPostgreSqlSystemIdentifier(executor,state.input.expectedSystemIdentifier,state.input.expectedIdentity.id,signal);
 }
 function inputValid(input:PostgreSqlPortableDestinationInput): boolean {
   const identity=input?.expectedIdentity;
@@ -714,7 +721,7 @@ export async function probePostgreSqlPortableDestination(input:Pick<PostgreSqlPo
       const safety=await executor.query({text:"SELECT current_setting('server_version_num')::int AS version,current_setting('server_encoding') AS encoding,s.ssl AS tls FROM pg_catalog.pg_stat_ssl s WHERE s.pid=pg_backend_pid()"},options(state,input.signal));
       if(safety.rows[0]?.tls!==true||Math.floor(Number(safety.rows[0]?.version)/10000)!==18||safety.rows[0]?.encoding!=='UTF8')fail('destination-conflict');
       const destinationWitnessSha256=await readPostgreSqlPortableWitness(executor,input.expectedIdentity.id,input.signal);
-      const systemIdentifier=await readSystemIdentifier(state,executor,input.signal);
+      const systemIdentifier=await readSystemIdentifier(input.expectedIdentity.id,executor,input.signal);
       const identityFingerprintSha256=await readIdentityFingerprint(state,input.signal);
       let nonIdentityDomainsEmpty=true;
       for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.filter(domain=>!(IDENTITY_DOMAINS as readonly string[]).includes(domain))){

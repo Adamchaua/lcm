@@ -1352,7 +1352,7 @@ describe('expected destination system identifier (#1508)', () => {
     await expect(writer.applyBatch(first)).rejects.toMatchObject({ code: 'destination-conflict' });
     expect(db.snapshot()).toEqual(before);
   });
-  it('refuses every caller-transaction seam when the cluster changes', async () => {
+  it('refuses the admit, run, apply and receipt seams when the cluster changes', async () => {
     const api = await import('../../src/storage/postgresql/portable-destination.js');
     const writer = await open({ expectedSystemIdentifier: LIVE }); const stream = await source(); const manifest = stream.describe();
     const token = await writer.preflight(manifest, stream);
@@ -1372,6 +1372,18 @@ describe('expected destination system identifier (#1508)', () => {
     await expect(api.readPortableBatchReceiptInTransaction(executor, writer, next)).rejects.toMatchObject({ code: 'destination-conflict' });
     await db.query({ text: 'ROLLBACK' });
     expect(writes()).toEqual([]); expect(db.receipts).toEqual([]);
+  });
+  it('refuses the completion seams when the cluster changes', async () => {
+    const api = await import('../../src/storage/postgresql/portable-destination.js');
+    const { writer, stream, manifest } = await admittedBound(); await transferAll(writer, stream);
+    const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+    const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+    db.systemIdentifier = [{ system_identifier: OTHER }]; db.queryLog = [];
+    await db.query({ text: 'BEGIN' });
+    await expect(api.completePortableDestinationInTransaction(executor, writer, verified)).rejects.toMatchObject({ code: 'destination-conflict' });
+    await expect(api.readPortableCompletedRunInTransaction(executor, writer, verified)).rejects.toMatchObject({ code: 'destination-conflict' });
+    await db.query({ text: 'ROLLBACK' });
+    expect(writes()).toEqual([]); expect(db.run?.state).toBe('active');
   });
   it('does not accept a receipt after reconnecting to a different cluster', async () => {
     const { writer, stream } = await admittedBound(); db.commitFailure = 'after';
