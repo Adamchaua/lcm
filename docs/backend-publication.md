@@ -522,6 +522,45 @@ ordinary doctor/retry sequence only after evidence has been safely restored or
 resolved and a valid terminal publication, or a legitimately absent directory,
 has been re-established through the supported owning flow.
 
+## Constructing a coordinator and composing publication material
+
+Library callers (the migration activation and rollback work under Epic #92)
+do not construct a coordinator or build recovery material by hand. Three
+exports in `src/storage` cover that:
+
+- `createBackendPublicationCoordinator` (`backend-publication-driver.ts`) is
+  the one production construction site. It binds the coordinator to the merged
+  permit-gated config and project-map writers; it adds no file-mutation code
+  of its own. The caller must state a remote guard choice, and there is no
+  default:
+  - `{ mode: "delegated", provider }` wires the three remote-guard hooks to a
+    provider that fences each project's PostgreSQL row. Every publication
+    that binds or unbinds a project needs this, because the coordinator
+    refuses a publication that names projects without a complete remote
+    guard provider.
+  - `{ mode: "absent", acknowledged: true }` is valid only for a publication
+    that names no projects. A bare `{ mode: "absent" }` is refused.
+- `composeBackendPublicationMaterial` (`backend-publication-material.ts`)
+  reads the live `config.json` and `map.json` and returns
+  `{ sourceBackend, targetBackend, material, projects }`, which is the input
+  `prepare()` takes. `sourceBackend` comes from the live config (PostgreSQL
+  only when it selects PostgreSQL), and composing a target equal to the live
+  backend is refused. The live project map is parsed with the project map's
+  own rules, so an entry the map layer would reject is refused here too.
+- `readRetainedBackendPublicationMaterial` returns the retained recovery
+  material of the last completed publication. It answers `present` (with the
+  journal and the authenticated material), `authoritatively-absent` (the
+  publication directory is confirmed absent, or the journal is not at
+  `completed`), or `unresolvable` with a reason. A publication directory
+  that exists without a readable journal, and a completed journal whose
+  material file is missing or fails authentication, are `unresolvable`;
+  neither is treated as "nothing to reverse".
+
+The driver deliberately leaves `retainCompletedMaterial` and
+`cleanupAbortedMaterial` undefined. The coordinator already keeps a completed
+publication's material file and deletes an aborted one's with its own bounded,
+digest-verified removal; a driver hook would replace that removal.
+
 ## Hard limits and rejection behavior
 
 The persistence boundary is deliberately bounded. The implementation applies

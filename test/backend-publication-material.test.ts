@@ -175,7 +175,7 @@ describe("composeBackendPublicationMaterial", () => {
     writeConfig(home, { storage: { backend: "sqlite" } });
     const result = composeBackendPublicationMaterial({
       homeDir: home,
-      targetBackend: "sqlite",
+      targetBackend: "postgresql",
       bindings: [],
     });
     expect(result.material.source.projectMap.presence).toBe("absent");
@@ -370,8 +370,8 @@ describe("composeBackendPublicationMaterial", () => {
     writeConfig(home, { storage: { backend: "sqlite" } });
     writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({ [HASH_A]: "not-an-object" }), { mode: 0o600 });
     expect(() =>
-      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "sqlite", bindings: [] }),
-    ).toThrow(/is not an object/);
+      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [] }),
+    ).toThrow(/map entry .* must be an object/);
   });
 
   it("refuses a source project map whose top level is not an object", () => {
@@ -379,8 +379,130 @@ describe("composeBackendPublicationMaterial", () => {
     writeConfig(home, { storage: { backend: "sqlite" } });
     writeFileSync(join(home, ".lcm", "map.json"), "[]\n", { mode: 0o600 });
     expect(() =>
-      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "sqlite", bindings: [] }),
-    ).toThrow(/source project map is not a JSON object/);
+      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [] }),
+    ).toThrow(/map\.json must be an object/);
+  });
+});
+
+describe("composeBackendPublicationMaterial: source backend and project-map rules", () => {
+  it("returns the backends it derived: sourceBackend from the live config, targetBackend from the input", () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite" } });
+    writeMap(home, sampleMap());
+    const activation = composeBackendPublicationMaterial({
+      homeDir: home,
+      targetBackend: "postgresql",
+      bindings: [binding()],
+    });
+    expect(activation.sourceBackend).toBe("sqlite");
+    expect(activation.targetBackend).toBe("postgresql");
+
+    writeConfig(home, { storage: { backend: "postgresql" } });
+    writeMap(home, { [HASH_A]: { canonical: "/repos/one", aliases: [], remoteProjectId: REMOTE_ID_A } });
+    const rollback = composeBackendPublicationMaterial({
+      homeDir: home,
+      targetBackend: "sqlite",
+      bindings: [binding()],
+    });
+    expect(rollback.sourceBackend).toBe("postgresql");
+    expect(rollback.targetBackend).toBe("sqlite");
+  });
+
+  it("derives a sqlite source backend from a config with no storage selection", () => {
+    const home = makeHome();
+    writeConfig(home, { unrelated: true });
+    writeMap(home, sampleMap());
+    const result = composeBackendPublicationMaterial({
+      homeDir: home,
+      targetBackend: "postgresql",
+      bindings: [binding()],
+    });
+    expect(result.sourceBackend).toBe("sqlite");
+  });
+
+  it("refuses a target backend equal to the live config's backend", () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "postgresql" } });
+    writeMap(home, { [HASH_A]: { canonical: "/repos/one", aliases: [], remoteProjectId: REMOTE_ID_A } });
+    expect(() =>
+      composeBackendPublicationMaterial({
+        homeDir: home,
+        targetBackend: "postgresql",
+        bindings: [binding()],
+      }),
+    ).toThrow(/source backend and target backend must differ/);
+  });
+
+  it("refuses a source project map entry key that is not a project hash", () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite" } });
+    writeMap(home, { "not-a-hash": { canonical: "/repos/one", aliases: [] } });
+    expect(() =>
+      composeBackendPublicationMaterial({
+        homeDir: home,
+        targetBackend: "postgresql",
+        bindings: [binding()],
+      }),
+    ).toThrow(/64-character lowercase sha256 hash/);
+  });
+
+  it("refuses a __proto__ map key instead of dropping it", () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite" } });
+    writeFileSync(
+      join(home, ".lcm", "map.json"),
+      '{"__proto__": {"canonical": "/repos/one", "aliases": []}}\n',
+      { mode: 0o600 },
+    );
+    expect(() =>
+      composeBackendPublicationMaterial({
+        homeDir: home,
+        targetBackend: "postgresql",
+        bindings: [binding({ localProjectId: "__proto__" })],
+      }),
+    ).toThrow(/64-character lowercase sha256 hash/);
+  });
+
+  it("refuses a source project map entry whose canonical path is not absolute", () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite" } });
+    writeMap(home, { [HASH_A]: { canonical: "repos/one", aliases: [] } });
+    expect(() =>
+      composeBackendPublicationMaterial({
+        homeDir: home,
+        targetBackend: "postgresql",
+        bindings: [binding()],
+      }),
+    ).toThrow(/canonical must be an absolute path/);
+  });
+
+  it("refuses a source project map entry whose existing remoteProjectId is not a UUIDv7", () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite" } });
+    writeMap(home, {
+      [HASH_A]: { canonical: "/repos/one", aliases: [] },
+      [HASH_B]: { canonical: "/repos/two", aliases: [], remoteProjectId: "not-a-uuid" },
+    });
+    expect(() =>
+      composeBackendPublicationMaterial({
+        homeDir: home,
+        targetBackend: "postgresql",
+        bindings: [binding()],
+      }),
+    ).toThrow(/remoteProjectId must be a PostgreSQL UUIDv7/);
+  });
+
+  it("rejects a malformed project map as JSON syntax, not as an empty map", () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite" } });
+    writeFileSync(join(home, ".lcm", "map.json"), "{", { mode: 0o600 });
+    expect(() =>
+      composeBackendPublicationMaterial({
+        homeDir: home,
+        targetBackend: "postgresql",
+        bindings: [binding()],
+      }),
+    ).toThrow(expect.objectContaining({ name: "InvalidProjectMapError" }));
   });
 });
 
@@ -471,6 +593,42 @@ describe("readRetainedBackendPublicationMaterial", () => {
     expect(result.status).toBe("unresolvable");
     if (result.status === "unresolvable") {
       expect(result.reason.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("is unresolvable, not absent, when the publication directory exists without a journal", () => {
+    const home = makeHome();
+    mkdirSync(backendPublicationDirectory(home), { recursive: true, mode: 0o700 });
+    const result = readRetainedBackendPublicationMaterial({ homeDir: home });
+    expect(result.status).toBe("unresolvable");
+    if (result.status === "unresolvable") {
+      expect(result.reason).toMatch(/evidence is incomplete/);
+    }
+  });
+
+  it("is unresolvable, not absent, when retained material remains but the journal is gone", async () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite" } });
+    writeMap(home, sampleMap());
+    const composed = composeBackendPublicationMaterial({
+      homeDir: home,
+      targetBackend: "postgresql",
+      bindings: [binding()],
+    });
+    const coordinator = preparedCoordinator(home);
+    await coordinator.prepare({
+      publicationId: "pub-journal-gone",
+      sourceBackend: composed.sourceBackend,
+      targetBackend: composed.targetBackend,
+      material: composed.material,
+      projects: composed.projects,
+    });
+    await coordinator.resume();
+    unlinkSync(backendPublicationJournalPath(home));
+    const result = readRetainedBackendPublicationMaterial({ homeDir: home });
+    expect(result.status).toBe("unresolvable");
+    if (result.status === "unresolvable") {
+      expect(result.reason).toMatch(/evidence is incomplete/);
     }
   });
 

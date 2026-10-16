@@ -16,20 +16,10 @@ import {
 /**
  * Production adapter over the three optional remote-guard hooks a {@link
  * BackendPublicationDriver} may implement. Both current Epic #92 consumers
- * (#625 activation, #626 rollback) settled on delegation as the production
- * answer, shaped as an IDEMPOTENT SAME-TUPLE ADOPT: both consumers acquire
- * their PostgreSQL advisory lease before the coordinator is ever involved,
- * so {@link acquireRemoteGuard} is always reached with the lease already
- * existing and already owned by the caller. A production implementation
- * therefore adopts the existing tuple idempotently; it does not acquire a
- * fresh one.
- *
- * This module does not implement this interface. The module it would
- * delegate to (#625's activation-lease module) does not exist at the base
- * this driver was built against, and the exact adoption semantics are an
- * open joint question between #625 and #626. Defining the interface here,
- * ungrounded in an implementation, keeps that shape the obvious one for the
- * next author to satisfy rather than leaving it to be rediscovered.
+ * (#625 activation, #626 rollback) acquire their PostgreSQL fenced lease
+ * before the coordinator is involved, so {@link acquireRemoteGuard} is
+ * reached with a lease the caller already owns. A production implementation
+ * adopts that same generation idempotently; it does not take a fresh one.
  *
  * Two properties the provider must honour, load-bearing enough to repeat
  * here rather than leave to be rediscovered by reading the coordinator:
@@ -63,28 +53,16 @@ export interface BackendPublicationRemoteGuardProvider {
  * An EXPLICIT, no-default choice of remote-guard behaviour for a produced
  * driver or coordinator.
  *
- * There is no default because absence is not inert. When a driver leaves
- * `acquireRemoteGuard` or `readRemoteGuard` undefined, the coordinator's
- * internal `#acquireAll` transitions the journal straight to the
- * `"guarded"` phase (backend-publication.ts, around line 3975) without
- * ever contacting a remote fence. That does not disable the remote path —
- * it makes the coordinator DURABLY RECORD a positive result that the
- * publication is guarded, in the journal, while nothing guarded it, at a
- * moment when a real PostgreSQL fence row may already exist and may be held
- * by someone else. A journal entry that was never compared to anything is
- * not evidence, and recording it as though it were is the family of defect
- * this Epic keeps finding in new shapes.
- *
- * `{ mode: "absent", acknowledged: true }` therefore does not mean "no
- * remote backend is involved". It means: the caller explicitly acknowledges
- * that the resulting journal will record the publication as guarded without
- * a guard ever having run. A caller cannot reach this path by omitting a
- * choice; it has to name it, and the `acknowledged: true` field exists so
- * that naming it is not itself accidental (a stray `{ mode: "absent" }`
- * literal without the sibling field is not the same shape and is refused).
- *
- * `{ mode: "delegated", provider }` wires all three remote-guard hooks to
- * the caller-supplied {@link BackendPublicationRemoteGuardProvider}.
+ * There is no default because absence is not inert. The coordinator refuses
+ * a publication that names projects unless the driver supplies a complete
+ * remote guard provider, so `{ mode: "absent", acknowledged: true }` can only
+ * ever publish a ZERO-PROJECT publication: one that changes no project's
+ * remote binding. For such a publication the journal records the guarded
+ * phase although no remote guard ran, and the caller names that
+ * explicitly; a stray `{ mode: "absent" }` without the sibling field is
+ * refused. Every publication that binds or unbinds a project needs
+ * `{ mode: "delegated", provider }`, which wires all three remote-guard
+ * hooks to the caller-supplied {@link BackendPublicationRemoteGuardProvider}.
  */
 export type BackendPublicationRemoteGuardChoice =
   | Readonly<{ mode: "absent"; acknowledged: true }>

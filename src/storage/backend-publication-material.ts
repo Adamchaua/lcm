@@ -1,12 +1,12 @@
 import { dirname } from "node:path";
 import { normalizeUuidV7 } from "../machine-identity.js";
-import { projectMapPath } from "../project-map.js";
+import { parseProjectMap, projectMapPath, type ProjectMap } from "../project-map.js";
 import { configPath } from "../runtime-paths.js";
 import type { StorageBackendName } from "./contracts.js";
 import {
   captureBackendPublicationFileWitness,
   readAuthenticatedBackendPublicationMaterial,
-  readBackendPublicationJournal,
+  readBackendPublicationJournalForConsumer,
   withBackendPublicationReadRoot,
   type BackendPublicationFileSnapshot,
   type BackendPublicationJournal,
@@ -119,7 +119,7 @@ function validateBindingShape(
   // project-map.ts:1943-1946 (setRemoteProjectBinding) and
   // src/doctor/doctor.ts:494 both reject a project-map remoteProjectId that
   // fails normalizeUuidV7. backend-publication.ts's own project validation
-  // (assertProjects, backend-publication.ts:827-845) is generic over
+  // (validateInput, backend-publication.ts) is generic over
   // backends and accepts any non-empty string. Composing a value for the
   // project map means meeting the map's stricter rule, not the publication
   // layer's more permissive one: a target that satisfies only the
@@ -174,10 +174,15 @@ function validateBindings(
   return validated;
 }
 
+type ComposedTargetConfig = Readonly<{
+  file: BackendPublicationRecoveryFile;
+  sourceBackend: StorageBackendName;
+}>;
+
 function composeTargetConfigFile(
   source: BackendPublicationRecoveryFile,
   targetBackend: StorageBackendName,
-): BackendPublicationRecoveryFile {
+): ComposedTargetConfig {
   if (source.presence === "absent") {
     // BackendPublicationRecoveryFile's present arm requires an owner-only
     // mode (assertWitnessShape's isOwnerOnlyFileMode check, enforced via
@@ -197,6 +202,16 @@ function composeTargetConfigFile(
     throw new TypeError("backend publication source config is not a JSON object");
   }
   const storage = isRecord(parsed.storage) ? parsed.storage : {};
+  // The same rule as config-manager.ts's configBackend: the source backend
+  // is postgresql only when the live config selects it explicitly.
+  const sourceBackend: StorageBackendName = storage.backend === "postgresql"
+    ? "postgresql"
+    : "sqlite";
+  if (sourceBackend === targetBackend) {
+    throw new RangeError(
+      `backend publication source backend and target backend must differ: ${targetBackend}`,
+    );
+  }
   const targetParsed = {
     ...parsed,
     storage: { ...storage, backend: targetBackend },
@@ -204,32 +219,27 @@ function composeTargetConfigFile(
   const serialized = `${JSON.stringify(targetParsed, null, 2)}
 `;
   return {
-    presence: "present",
-    content: Buffer.from(serialized, "utf-8"),
-    mode: source.mode,
-    uid: source.uid,
-    gid: source.gid,
-    nlink: source.nlink,
-    dev: source.dev,
-    ino: source.ino,
-    parentDev: source.parentDev,
-    parentIno: source.parentIno,
+    sourceBackend,
+    file: {
+      presence: "present",
+      content: Buffer.from(serialized, "utf-8"),
+      mode: source.mode,
+      uid: source.uid,
+      gid: source.gid,
+      nlink: source.nlink,
+      dev: source.dev,
+      ino: source.ino,
+      parentDev: source.parentDev,
+      parentIno: source.parentIno,
+    },
   };
 }
 
-function parseSourceProjectMapObject(content: string): Record<string, Record<string, unknown>> {
-  const parsed: unknown = JSON.parse(content);
-  if (!isRecord(parsed)) {
-    throw new TypeError("backend publication source project map is not a JSON object");
-  }
-  const result: Record<string, Record<string, unknown>> = {};
-  for (const [hash, value] of Object.entries(parsed)) {
-    if (!isRecord(value)) {
-      throw new TypeError(`backend publication source project map entry ${hash} is not an object`);
-    }
-    result[hash] = value;
-  }
-  return result;
+function parseSourceProjectMap(source: BackendPublicationRecoveryFile): ProjectMap {
+  if (source.presence === "absent") return {};
+  // The project map's own parser is the only authority on what a valid map
+  // is: key shape, absolute paths and UUIDv7 remote bindings.
+  return parseProjectMap(new TextDecoder("utf-8", { fatal: true }).decode(source.content));
 }
 
 function composeTargetProjectMapFile(
@@ -237,9 +247,7 @@ function composeTargetProjectMapFile(
   targetBackend: StorageBackendName,
   bindings: readonly BackendPublicationProjectBinding[],
 ): BackendPublicationRecoveryFile {
-  const sourceMapObject = source.presence === "absent"
-    ? {}
-    : parseSourceProjectMapObject(new TextDecoder("utf-8", { fatal: true }).decode(source.content));
+  const sourceMapObject = parseSourceProjectMap(source);
 
   const missing = bindings.filter(
     (binding) => !Object.prototype.hasOwnProperty.call(sourceMapObject, binding.localProjectId),
@@ -261,9 +269,9 @@ function composeTargetProjectMapFile(
     return { presence: "absent" };
   }
 
-  const targetMapObject: Record<string, Record<string, unknown>> = {};
+  const targetMapObject: ProjectMap = {};
   for (const [hash, entry] of Object.entries(sourceMapObject)) {
-    targetMapObject[hash] = { ...entry };
+    targetMapObject[hash] = { ...entry, aliases: [...entry.aliases] };
   }
   for (const binding of bindings) {
     // project-map.ts:1543-1547 (resolveProjectIdentityUnlocked) indexes
@@ -272,7 +280,7 @@ function composeTargetProjectMapFile(
     // record's `localProjectId` as one value
     // (`"localProjectId" in identity ? identity.localProjectId : identity.id`).
     // That coupling is real in merged code but UNENFORCED by
-    // backend-publication.ts itself (assertProjects only requires a
+    // backend-publication.ts itself (validateInput only requires a
     // non-empty, <=256-character, array-unique string), so the refusal
     // above is load-bearing rather than defensive.
     if (targetBackend === "postgresql") {
@@ -305,6 +313,8 @@ export type ComposeBackendPublicationMaterialInput = Readonly<{
 }>;
 
 export type ComposeBackendPublicationMaterialResult = Readonly<{
+  sourceBackend: StorageBackendName;
+  targetBackend: StorageBackendName;
   material: BackendPublicationRecoveryMaterial;
   projects: readonly BackendPublicationProjectBinding[];
 }>;
@@ -326,9 +336,11 @@ export function composeBackendPublicationMaterial(
   const targetConfig = composeTargetConfigFile(source.config, input.targetBackend);
   const targetProjectMap = composeTargetProjectMapFile(source.projectMap, input.targetBackend, bindings);
   return {
+    sourceBackend: targetConfig.sourceBackend,
+    targetBackend: input.targetBackend,
     material: {
       source: { config: source.config, projectMap: source.projectMap },
-      target: { config: targetConfig, projectMap: targetProjectMap },
+      target: { config: targetConfig.file, projectMap: targetProjectMap },
     },
     projects: bindings,
   };
@@ -350,9 +362,12 @@ export type ReadRetainedBackendPublicationMaterialInput = Readonly<{
 /**
  * Read the retained material for #626's rollback target, THREE-VALUED:
  *
- * - the live journal slot read itself fails -> `unresolvable`, with the
- *   reason
- * - the read succeeds and there is no journal, or the journal is not at
+ * - the journal read fails -> `unresolvable`, with the reason. That
+ *   includes a publication directory that exists without a journal (empty,
+ *   history-only or leftover material): the consumer read refuses it as
+ *   incomplete evidence, and it is never a statement that nothing was
+ *   published
+ * - the publication directory is confirmed absent, or the journal is not at
  *   phase `completed` -> `authoritatively-absent`
  * - the journal is `completed` and the material read throws (including
  *   ENOENT) -> `unresolvable`, NOT absent. A completed journal asserts a
@@ -376,7 +391,7 @@ export function readRetainedBackendPublicationMaterial(
 ): RetainedBackendPublicationMaterialResult {
   let journal: BackendPublicationJournal | null;
   try {
-    journal = readBackendPublicationJournal(input.homeDir);
+    journal = readBackendPublicationJournalForConsumer(input.homeDir);
   } catch (error) {
     return { status: "unresolvable", reason: describeError(error) };
   }

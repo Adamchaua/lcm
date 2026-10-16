@@ -984,7 +984,7 @@ class InvalidProjectMapError extends Error {
   }
 }
 
-function parseProjectMap(content: string): ProjectMap {
+export function parseProjectMap(content: string): ProjectMap {
   let parsed: unknown;
   try {
     parsed = JSON.parse(content) as unknown;

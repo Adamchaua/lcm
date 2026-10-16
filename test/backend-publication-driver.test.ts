@@ -148,7 +148,31 @@ describe("createBackendPublicationCoordinator", () => {
         homeDir: makeHome(),
         remoteGuard: undefined as any,
       }),
-    ).toThrow(TypeError);
+    ).toThrow(/explicit object/);
+  });
+});
+
+describe("explicit absent remote guard", () => {
+  it("is refused for a publication that names projects, so absent is zero-project only", async () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite" } });
+    writeMap(home, { [HASH_A]: { canonical: "/repos/one", aliases: [] } });
+    const composed = composeBackendPublicationMaterial({
+      homeDir: home,
+      targetBackend: "postgresql",
+      bindings: [bindingA()],
+    });
+    const coordinator = createBackendPublicationCoordinator({
+      homeDir: home,
+      remoteGuard: { mode: "absent", acknowledged: true },
+    });
+    await expect(coordinator.prepare({
+      publicationId: "pub-absent-with-projects",
+      sourceBackend: composed.sourceBackend,
+      targetBackend: composed.targetBackend,
+      material: composed.material,
+      projects: composed.projects,
+    })).rejects.toThrow(/requires a complete remote guard provider/);
   });
 });
 
