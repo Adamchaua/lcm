@@ -1084,6 +1084,30 @@ it('bounds every canonical content read by an aggregate byte budget', async () =
   await db.query({ text: 'ROLLBACK' });
 });
 
+it('budgets each recheck item with its locator copies, not just its row bytes', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const { writer, stream, manifest } = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  // Rows whose projected bytes sum to exactly the batch budget fit only if the
+  // two locator copies per row are ignored, so they must not share a read.
+  const size = BigInt(PORTABLE_LIMITS.maxBatchBytes) / 2n;
+  boundaries.contentSizes.mockImplementation(async (_executor, _project, _domain: PortableDomain, locators: readonly string[]) => new Map(locators.map(locator => [locator, size])));
+  const perDomain = new Map<string, number>();
+  for (const entry of db.identityLedger.filter(entry => !identityDomains.has(entry.domain))) {
+    perDomain.set(entry.domain, (perDomain.get(entry.domain) ?? 0) + 1);
+  }
+  expect([...perDomain.values()].some(count => count > 1)).toBe(true);
+  await db.query({ text: 'BEGIN' });
+  boundaries.contentRows.mockClear();
+  await api.completePortableDestinationInTransaction(executor, writer, verified);
+  expect(db.run?.state).toBe('completed');
+  expect(boundaries.contentRows.mock.calls.length).toBeGreaterThan(0);
+  for (const call of boundaries.contentRows.mock.calls) expect((call[3] as readonly string[]).length).toBe(1);
+  await db.query({ text: 'ROLLBACK' });
+});
+
 it('compares a locator the size read omitted instead of skipping it', async () => {
   const api = await import('../../src/storage/postgresql/portable-destination.js');
   const { writer, stream, manifest } = await admitted();

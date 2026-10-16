@@ -129,8 +129,10 @@ export async function countCanonicalRows(executor:PostgreSqlQueryExecutor,projec
 }
 /**
  * Message closure traversal uses numeric seq, independently of opaque locator
- * order. Every caller reads one header per call, so the per-row bound already
- * caps each page; the aggregate bound of listCanonicalHeaders is not needed.
+ * order. Callers read pages of up to PORTABLE_LIMITS.maxBatchRecords headers.
+ * A messages locator is a single bigint key, so the per-row bound plus that
+ * record limit already caps a page; the aggregate locator bound of
+ * listCanonicalHeaders is not needed.
  */
 export async function listConversationMessageHeaders(executor:PostgreSqlQueryExecutor,projectId:string,conversationId:string,afterSeq:string|null,limit:number,signal?:AbortSignal):Promise<(CanonicalHeader & {readonly seq:string})[]> {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new PortableStreamError("invalid-limit");
@@ -147,6 +149,18 @@ export async function readCanonicalRow(executor:PostgreSqlQueryExecutor,projectI
 /** Deterministic fingerprint of the exact SQL projection readCanonicalRow(s) return. */
 export function canonicalRowContentSha256(row:Row):string {
   return sha256(canonicalJson(row));
+}
+/**
+ * Accounting model for one item of a batched content read: the projected row
+ * bytes plus the two incremental copies of its locator that
+ * readCanonicalContentRows (and its size-only companion) move for that item,
+ * the entry in the $2 text[] parameter and the returned __locator column.
+ * This budgets those copies; it is not an exact process-resident guarantee
+ * (driver encoding, JavaScript strings, Map overhead and the caller's own
+ * header strings are outside it).
+ */
+export function canonicalBatchItemBytes(byteLength:bigint,locator:string):bigint {
+  return byteLength+2n*BigInt(Buffer.byteLength(locator,"utf8"));
 }
 /**
  * Batched counterpart to readCanonicalRow, keyed by the same locator strings
@@ -168,7 +182,7 @@ export function canonicalRowContentSha256(row:Row):string {
  * and so completes no dependency cycle for SSI to detect. See
  * verifiedCompletionState for the fence the transfer completion uses.
  */
-export async function readCanonicalContentRows(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,locators:readonly string[],signal?:AbortSignal):Promise<ReadonlyMap<string,Row>> {
+export async function readCanonicalContentRows(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,locators:readonly string[],signal?:AbortSignal):Promise<Map<string,Row>> {
   if (locators.length===0) return new Map();
   if (locators.length>PORTABLE_LIMITS.maxBatchRecords) throw new PortableStreamError("invalid-limit");
   const mapping = mappingForDomain(domain);

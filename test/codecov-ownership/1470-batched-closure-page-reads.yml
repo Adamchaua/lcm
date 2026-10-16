@@ -1,0 +1,10 @@
+references: ["#1470", "#1489"]
+rationale: >-
+  The PostgreSQL portable source reads conversation messages and record
+  pages through batched content reads, and batch chunks and the destination
+  recheck groups now count each row's two locator copies. All three files
+  keep their integration-postgresql-portable owner.
+pins:
+  - ["src/storage/postgresql/portable-destination.ts", "integration-postgresql-portable"]
+  - ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"]
+  - ["src/storage/postgresql/portable-source.ts", "integration-postgresql-portable"]

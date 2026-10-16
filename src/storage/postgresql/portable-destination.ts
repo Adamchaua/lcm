@@ -20,7 +20,7 @@ import { createPortableIndex, type PortableIndex } from '../portable-index.js';
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlQueryOptions } from './contracts.js';
 import { buildPostgreSqlClientConfig } from './client-config.js';
 import { verifyPostgreSqlTransferSchema } from './runtime-readiness.js';
-import { assertPostgreSqlRecordCapability, countCanonicalRows, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, readCanonicalContentRows, readCanonicalContentSizes, canonicalRowContentSha256, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
+import { assertPostgreSqlRecordCapability, countCanonicalRows, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, readCanonicalContentRows, readCanonicalContentSizes, canonicalBatchItemBytes, canonicalRowContentSha256, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
 import { createPostgreSqlPortableSource, readPostgreSqlPortableWitness } from './portable-source.js';
 import { acquirePostgreSqlProjectPublicationLock } from './publication-guard.js';
 
@@ -577,7 +577,10 @@ async function assertRunContentUnchanged(state:DestinationState,executor:Postgre
  * originally wrote them, so the transfer's own per-batch byte budget does
  * not bound what a group of locators projects. Sizes come first from the
  * same rows without their payloads, which costs one extra round trip per
- * group and keeps every payload result set bounded.
+ * group and keeps every payload result set bounded. Each item is budgeted as
+ * its projected row plus its two locator copies (canonicalBatchItemBytes). A
+ * single item always forms its own group, so a lone row admitted at the
+ * per-row limit may exceed the budget by at most those two copies.
  */
 async function assertDomainContentUnchanged(state:DestinationState,executor:PostgreSqlQueryExecutor,domain:PortableDomain,entries:readonly {locator:string;expected:string}[],signal?:AbortSignal):Promise<void>{
   const sizes=await readCanonicalContentSizes(executor,state.input.expectedIdentity.id,domain,entries.map(entry=>entry.locator),signal);
@@ -596,7 +599,7 @@ async function assertDomainContentUnchanged(state:DestinationState,executor:Post
     // A locator missing from the size read was deleted or is no longer
     // projectable. Keep it in a group so the content read reports it as
     // the mismatch it is instead of dropping it here.
-    const size=sizes.get(entry.locator)??0n;
+    const size=canonicalBatchItemBytes(sizes.get(entry.locator)??0n,entry.locator);
     if(group.length>0&&bytes+size>budget)await compare();
     group.push(entry);bytes+=size;
   }

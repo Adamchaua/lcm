@@ -25,7 +25,7 @@ import { PortableTransferError } from "../portable-transfer.js";
 import { createPortableIndex, type PortableIndex } from "../portable-index.js";
 import {
   decodeCanonicalRow, listCanonicalHeaders, listConversationMessageHeaders,
-  readCanonicalContentRows, readCanonicalRow,
+  canonicalBatchItemBytes, readCanonicalContentRows, readCanonicalRow,
 } from "./portable-mapping.js";
 
 type Snapshot = PostgreSqlQueryExecutor & {
@@ -184,25 +184,28 @@ function assertHeaderLength(length: string): void {
 }
 
 /**
- * Splits locator picks into consecutive chunks whose aggregate SQL-measured
- * byteLength stays within PORTABLE_LIMITS.maxBatchBytes, so one batched read
- * never fetches more than one batch of payload. A single item at the limit
- * still forms its own chunk (assertHeaderLength already refused anything
- * larger). An item without a byteLength fails closed. Callers must pass a
- * non-empty list, so the final chunk is flushed unconditionally.
+ * Splits locator picks into consecutive chunks whose aggregate budget stays
+ * within PORTABLE_LIMITS.maxBatchBytes, so one batched read never fetches
+ * more than one batch of payload. Each item is budgeted as its SQL-measured
+ * byteLength plus its two locator copies (canonicalBatchItemBytes), so a
+ * multi-item chunk never exceeds the budget. A single item always forms its
+ * own chunk, which means a lone row admitted at the per-row limit
+ * (assertHeaderLength) may exceed the budget by at most those two locator
+ * copies; admission is deliberately unchanged. An item without a numeric
+ * byteLength fails closed. An empty list yields no chunks.
  */
-function splitByBytes<T extends {readonly byteLength?: string}>(items: readonly T[]): T[][] {
+function splitByBytes<T extends {readonly locator: string; readonly byteLength?: string}>(items: readonly T[]): T[][] {
   const budget=BigInt(PORTABLE_LIMITS.maxBatchBytes);
   const chunks:T[][]=[];
   let current:T[]=[];
   let currentBytes=0n;
   for (const item of items) {
-    if (item.byteLength === undefined) invalid();
-    const size=BigInt(item.byteLength);
+    if (item.byteLength === undefined || !/^(0|[1-9]\d*)$/u.test(item.byteLength)) invalid();
+    const size=canonicalBatchItemBytes(BigInt(item.byteLength),item.locator);
     if (current.length > 0 && currentBytes+size > budget) { chunks.push(current); current=[]; currentBytes=0n; }
     current.push(item); currentBytes+=size;
   }
-  chunks.push(current);
+  if (current.length > 0) chunks.push(current);
   return chunks;
 }
 
@@ -294,30 +297,55 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       conversationFingerprint:sha256(canonicalJson(["lcm-portable-conversation-value-v1",
         row.session_id,row.title,row.bootstrapped_at,row.created_at,row.updated_at]))}),ordinal:0,
   }) as PortableRecord<"conversations">;
-  const closure=async function* (locator: string, signal?: AbortSignal): AsyncGenerator<string> {
-    const row=await queryRow("conversations",locator,signal);
+  /**
+   * Walks one conversation's message closure in pages of up to maxBatchRecords
+   * headers, each page split into byte-bounded chunks that take one batched
+   * content read. It still yields exactly one token per message (plus the
+   * prefix and suffix), so segmentation and closure hashes do not depend on
+   * page or chunk boundaries. A chunk's rows are taken from its Map and
+   * dropped as they are consumed. Memory: the walk holds at most one fetched
+   * chunk of projected rows, and the paired closures of finalizeConversations
+   * (and the prepass conversation chunk plus its closure) may each hold one,
+   * so those paths peak at up to two batch-budget chunks where the per-message
+   * walk held a few individual rows.
+   */
+  const closureFromRow=async function* (row: Record<string,unknown>, signal?: AbortSignal): AsyncGenerator<string> {
     const conversation=draftConversation(row,"0");
     const value=conversation.value;
     yield `["lcm-portable-conversation-closure-v1",{"bootstrappedAt":${canonicalJson(value.bootstrappedAt)},"createdAt":${canonicalJson(value.createdAt)},"messages":[`;
-    let afterSeq: string | null=null;
+    let cursor: string | null=null;
     let first=true;
     while (true) {
       abort(signal); abort(options.signal);
-      const headers=await listConversationMessageHeaders(session,expectedIdentity.id,String(row.conversation_id),afterSeq,1,signal);
+      const headers=await listConversationMessageHeaders(session,expectedIdentity.id,String(row.conversation_id),cursor,PORTABLE_LIMITS.maxBatchRecords,signal);
       if (headers.length === 0) break;
-      const header=headers[0]; assertHeaderLength(header.byteLength);
-      const messageRow=await queryRow("messages",header.locator,signal);
-      const message=createPortableRecord({...decodeCanonicalRow("messages",messageRow,{projectIdentity,
-        conversation:{identitySha256:conversation.identitySha256,
-          order:rawOrder(conversation.order) as unknown as PortableRawConversationOrder}}),ordinal:0}) as PortableRecord<"messages">;
-      const m=message.value;
-      yield `${first ? "" : ","}${canonicalJson([m.seq,m.role,m.content,m.tokenCount,m.createdAt])}`;
-      first=false;
-      const next=m.seq.$integer;
-      if (afterSeq !== null && BigInt(next) <= BigInt(afterSeq)) invalid();
-      afterSeq=next;
+      if (headers.length > PORTABLE_LIMITS.maxBatchRecords) invalid();
+      for (const chunk of splitByBytes(headers)) {
+        // Only this chunk's headers are checked before its fetch, so a later
+        // oversized header cannot turn an earlier finalize mismatch into
+        // record-unrepresentable.
+        for (const header of chunk) assertHeaderLength(header.byteLength);
+        abort(signal); abort(options.signal);
+        const rows=await readCanonicalContentRows(session,expectedIdentity.id,"messages",chunk.map(header=>header.locator),signal);
+        for (const header of chunk) {
+          const messageRow=rows.get(header.locator) ?? invalid();
+          rows.delete(header.locator);
+          const message=createPortableRecord({...decodeCanonicalRow("messages",messageRow,{projectIdentity,
+            conversation:{identitySha256:conversation.identitySha256,
+              order:rawOrder(conversation.order) as unknown as PortableRawConversationOrder}}),ordinal:0}) as PortableRecord<"messages">;
+          const m=message.value;
+          const next=m.seq.$integer;
+          if (cursor !== null && BigInt(next) <= BigInt(cursor)) invalid();
+          cursor=next;
+          yield `${first ? "" : ","}${canonicalJson([m.seq,m.role,m.content,m.tokenCount,m.createdAt])}`;
+          first=false;
+        }
+      }
     }
     yield `],"sessionId":${canonicalJson(value.sessionId)},"title":${canonicalJson(value.title)},"updatedAt":${canonicalJson(value.updatedAt)}}]`;
+  };
+  const closure=async function* (locator: string, signal?: AbortSignal): AsyncGenerator<string> {
+    yield* closureFromRow(await queryRow("conversations",locator,signal),signal);
   };
   const eachHeaderPage=async (domain: PortableDomain,
     visitPage:(headers:readonly {readonly locator:string;readonly byteLength:string}[])=>Promise<void>) => {
@@ -340,16 +368,24 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       after=previous;
     }
   };
-  const eachHeader=(domain: PortableDomain, visit:(locator:string,byteLength:string)=>Promise<void>) =>
-    eachHeaderPage(domain,async(headers) => {
-      for (const header of headers) await visit(header.locator,header.byteLength);
-    });
-  await eachHeader("conversations",async (locator) => {
-    const row=await queryRow("conversations",locator,options.signal);
-    const record=draftConversation(row,"0");
-    const digest=createHash("sha256");
-    for await (const chunk of closure(locator,options.signal)) digest.update(chunk);
-    index.addConversation({locator,headerOrder:record.order.slice(0,5),closureSha256:digest.digest("hex")});
+
+  // Conversations are read one byte-bounded chunk per batched read. Each row
+  // is taken from its chunk Map before its closure is walked, so a consumed
+  // conversation is not retained while its messages stream; the prepass peaks
+  // at the remaining chunk rows plus one message chunk.
+  await eachHeaderPage("conversations",async(headers) => {
+    for (const chunk of splitByBytes(headers)) {
+      abort(options.signal);
+      const rows=await readCanonicalContentRows(session,expectedIdentity.id,"conversations",chunk.map(header=>header.locator),options.signal);
+      for (const header of chunk) {
+        const row=rows.get(header.locator) ?? invalid();
+        rows.delete(header.locator);
+        const record=draftConversation(row,"0");
+        const digest=createHash("sha256");
+        for await (const part of closureFromRow(row,options.signal)) digest.update(part);
+        index.addConversation({locator:header.locator,headerOrder:record.order.slice(0,5),closureSha256:digest.digest("hex")});
+      }
+    }
   });
   await index.finalizeConversations(async(left,right) => {
     const l=closure(left,options.signal),r=closure(right,options.signal);
@@ -522,11 +558,24 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
         const records:PortableRecord[]=[];let bytes=0;
         const entries=index.entries(request.domain,{afterOrdinal:request.afterOrdinal-1,limit:request.maxRecords,
           maxBytes:request.maxBytes,signal:request.signal});
-        for (const entry of entries) {
-          const record=await checkedRecordAt(request.domain,entry.locator,entry.ordinal,request.signal);
-          const length=serializePortableRecord(record).byteLength+8;
-          if (bytes+length > request.maxBytes) break;
-          records.push(record);bytes+=length;
+        // One batched read per byte-bounded chunk. Memory: the accumulated
+        // output (at most request.maxBytes) plus one fetched chunk of
+        // projected rows; each row is taken from its Map as its record is
+        // built. Records are checked in entry order and the page stops at the
+        // first record that does not fit, after its boundary check, so no
+        // later entry or chunk is examined or fetched.
+        pageChunks: for (const chunk of splitByBytes(entries)) {
+          abort(request.signal); abort(options.signal);
+          const rows=await readCanonicalContentRows(session,expectedIdentity.id,request.domain,chunk.map(entry=>entry.locator),request.signal);
+          for (const entry of chunk) {
+            const row=rows.get(entry.locator) ?? invalid();
+            rows.delete(entry.locator);
+            const record=recordFromRow(request.domain,row,entry.locator,entry.ordinal);
+            assertBoundaryMatches(request.domain,entry.ordinal,record);
+            const length=serializePortableRecord(record).byteLength+8;
+            if (bytes+length > request.maxBytes) break pageChunks;
+            records.push(record);bytes+=length;
+          }
         }
         if (records.length === 0 && request.afterOrdinal < counts.get(request.domain)!) throw new PortableStreamError("record-unrepresentable");
         await authenticate(request.signal);
