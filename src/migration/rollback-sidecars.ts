@@ -45,6 +45,25 @@
  * produced repeatedly; the caller (rollback.ts) already knows the local
  * project id independently and supplies it directly.
  *
+ * THE SQLITE SURFACES ARE MACHINE-LOCAL; THE ARCHIVE IS NOT. A PostgreSQL
+ * era archive holds every participating machine's rows, each keyed by
+ * machineIdentityKey, while both runtime surfaces belong to one machine
+ * by schema: session_instruction_cache has PRIMARY KEY (project_id,
+ * scope_hash) with no machine column, and the events table's
+ * machine_sequence is UNIQUE across the file and is drawn from this
+ * machine's own sequence file. Two machines can hold a session
+ * instruction under one scope hash and can each have issued the same
+ * machine sequence, so materializing the whole archive either collides
+ * (the second upsert overwrites the first, and verification reports
+ * `holds 1 rows ... materialization reported 2`) or imports another
+ * machine's events as if this one had written them. This module
+ * therefore materializes, counts, verifies and reconciles ONLY the rows
+ * whose machineIdentityKey resolves, through the archive's machines
+ * domain, to the explicit `machineId` the caller supplies (the A12
+ * roster's machine, which rollback already requires to equal this
+ * machine's identity). Other machines' rows are not lost: they stay in
+ * PostgreSQL and in the preserved source.
+ *
  * THE MACHINE-WIDE SEQUENCE FILE is reconciled via
  * local-hook-event-sequence.ts's own `reconcileCheckpoint` (added in
  * its own commit specifically for this), never written directly -- see
@@ -118,6 +137,12 @@ export interface MaterializeRollbackSidecarsInput {
   readonly databasePath: string;
   /** StorageIdentityContext.localProjectId for the project being rolled back -- see the module doc comment on why this is explicit. */
   readonly localProjectId: string;
+  /**
+   * This machine's machine_id (the A12 roster's machine, equal to the
+   * machine identity rollback requires). Only archive rows whose
+   * machineIdentityKey maps to it are materialized; see the module doc.
+   */
+  readonly machineId: string;
 }
 
 export interface MaterializeRollbackSidecarsOutcome {
@@ -162,7 +187,16 @@ type SessionInstructionReadbackRow = Readonly<{
   updated_at: string;
 }>;
 
-function materializeSessionInstructions(db: DatabaseSync, localProjectId: string): number {
+function isLocalMachineRow(
+  machineIds: ReadonlyMap<string, string | null>,
+  machineIdentityKey: string,
+  machineId: string,
+): boolean {
+  return machineIds.get(machineIdentityKey) === machineId;
+}
+
+function materializeSessionInstructions(db: DatabaseSync, localProjectId: string, machineId: string): number {
+  const machineIds = readMachineIdByIdentityKey(db);
   const insert = db.prepare(`INSERT INTO session_instruction_cache
     (project_id, scope_hash, client_name, session_id, worktree_path, cwd_path, content, content_hash, updated_at)
     VALUES (?,?,?,?,?,?,?,?,?)
@@ -174,6 +208,7 @@ function materializeSessionInstructions(db: DatabaseSync, localProjectId: string
   let count = 0;
   for (const row of readArchiveDomain(db, "session-instructions")) {
     const v = row.value;
+    if (!isLocalMachineRow(machineIds, v.machineIdentityKey, machineId)) continue;
     insert.run(
       localProjectId, v.scopeHash, v.clientName, v.sessionId,
       v.worktreePath, v.cwdPath, v.content, v.contentHash,
@@ -196,7 +231,9 @@ export function verifySessionInstructionsAgainstArchive(
   db: DatabaseSync,
   localProjectId: string,
   materializedCount: number,
+  machineId: string,
 ): void {
+  const machineIds = readMachineIdByIdentityKey(db);
   const readback = db.prepare(
     `SELECT scope_hash, client_name, session_id, worktree_path, cwd_path, content, content_hash, updated_at
      FROM session_instruction_cache WHERE project_id = ?`,
@@ -210,8 +247,9 @@ export function verifySessionInstructionsAgainstArchive(
   const byScopeHash = new Map(readback.map(row => [row.scope_hash, row]));
   let archiveCount = 0;
   for (const row of readArchiveDomain(db, "session-instructions")) {
-    archiveCount++;
     const v = row.value;
+    if (!isLocalMachineRow(machineIds, v.machineIdentityKey, machineId)) continue;
+    archiveCount++;
     const stored = byScopeHash.get(v.scopeHash);
     const expectedUpdatedAt = requireTimestamp(v.updatedAt, "session-instructions.updatedAt");
     if (
@@ -233,7 +271,7 @@ export function verifySessionInstructionsAgainstArchive(
   if (archiveCount !== materializedCount) {
     throw new RollbackSidecarError(
       "verification-failed",
-      `archive holds ${archiveCount} session-instructions rows but ${materializedCount} were materialized`,
+      `archive holds ${archiveCount} session-instructions rows for this machine but ${materializedCount} were materialized`,
     );
   }
 }
@@ -268,8 +306,12 @@ export function dispositionColumns(disposition: "pending" | "applied" | "quarant
   return { deliveryState: "pending", processedAt: null, quarantineReason: null };
 }
 
-function materializePassiveEvents(db: DatabaseSync, eventsDb: DatabaseSync): Readonly<{ count: number; highestSequence: bigint | null }> {
-  const machineIds = readMachineIdByIdentityKey(db);
+function materializePassiveEvents(
+  db: DatabaseSync,
+  eventsDb: DatabaseSync,
+  machineIds: ReadonlyMap<string, string | null>,
+  localMachineId: string,
+): Readonly<{ count: number; highestSequence: bigint | null }> {
   const insert = eventsDb.prepare(`INSERT INTO events
     (event_uuid, event_version, machine_id, machine_sequence, session_id, seq,
      type, category, data, priority, source_hook, created_at,
@@ -285,6 +327,7 @@ function materializePassiveEvents(db: DatabaseSync, eventsDb: DatabaseSync): Rea
       throw new RollbackSidecarError("invalid-input", `passive event references unknown machine identity key ${v.machineIdentityKey}`);
     }
     const machineId = machineIds.get(v.machineIdentityKey)!;
+    if (machineId !== localMachineId) continue;
     const sequence = requireInteger(v.machineSequence, "passive-events.machineSequence");
     const createdAt = requireTimestamp(v.createdAt, "passive-events.createdAt");
     const columns = dispositionColumns(v.disposition, createdAt);
@@ -334,6 +377,7 @@ export function verifyPassiveEventsAgainstArchive(
   db: DatabaseSync,
   eventsDb: DatabaseSync,
   machineIds: ReadonlyMap<string, string | null>,
+  localMachineId: string,
 ): number {
   const select = eventsDb.prepare(
     `SELECT event_version, machine_id, machine_sequence, session_id, seq, type, category, data,
@@ -342,9 +386,10 @@ export function verifyPassiveEventsAgainstArchive(
   );
   let archiveCount = 0;
   for (const row of readArchiveDomain(db, "passive-events")) {
-    archiveCount++;
     const v = row.value;
-    const machineId = machineIds.get(v.machineIdentityKey) ?? null;
+    const machineId = machineIds.get(v.machineIdentityKey);
+    if (machineId !== localMachineId) continue;
+    archiveCount++;
     const sequence = requireInteger(v.machineSequence, "passive-events.machineSequence");
     const createdAt = requireTimestamp(v.createdAt, "passive-events.createdAt");
     const expected = dispositionColumns(v.disposition, createdAt);
@@ -376,7 +421,7 @@ export function verifyPassiveEventsAgainstArchive(
   if (total !== archiveCount) {
     throw new RollbackSidecarError(
       "verification-failed",
-      `events table holds ${total} rows but archive contains ${archiveCount} passive events`,
+      `events table holds ${total} rows but archive contains ${archiveCount} passive events for this machine`,
     );
   }
   return archiveCount;
@@ -401,8 +446,8 @@ export function materializeRollbackSidecars(
   const targetEventsDbPath = join(eventsDir(input.homeDir), `${input.localProjectId}.db`);
   try {
     db.exec("PRAGMA foreign_keys=ON");
-    sessionInstructionsMaterialized = materializeSessionInstructions(db, input.localProjectId);
-    verifySessionInstructionsAgainstArchive(db, input.localProjectId, sessionInstructionsMaterialized);
+    sessionInstructionsMaterialized = materializeSessionInstructions(db, input.localProjectId, input.machineId);
+    verifySessionInstructionsAgainstArchive(db, input.localProjectId, sessionInstructionsMaterialized, input.machineId);
 
     try {
       ensurePrivateDirectory(eventsDir(input.homeDir));
@@ -419,9 +464,9 @@ export function materializeRollbackSidecars(
     try {
       eventsDb.exec("PRAGMA foreign_keys=ON");
       const machineIds = readMachineIdByIdentityKey(db);
-      const result = materializePassiveEvents(db, eventsDb);
+      const result = materializePassiveEvents(db, eventsDb, machineIds, input.machineId);
       passiveEventsMaterialized = result.count;
-      verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds);
+      verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, input.machineId);
       if (result.highestSequence !== null) {
         const allocator = new LocalHookEventSequenceAllocator(eventSequenceDbPath(input.homeDir));
         try {

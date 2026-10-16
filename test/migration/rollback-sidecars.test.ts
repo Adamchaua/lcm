@@ -5,14 +5,12 @@
  * postgresGeneration()), the same archive-record builder
  * sqlite-portable-archive.test.ts uses, rather than hand-deriving the
  * portable-record encoding rules a second time. Its default
- * session-instructions domain intentionally holds two machines sharing one
- * scopeHash (to exercise a different concern elsewhere); this module's
- * production caller only ever sees one machine's archive (plan-v2 section
- * 3: capture refuses unless the roster is exactly one machine), so tests
- * here filter to MACHINE_A's session-instructions row and add one
- * hand-built second row on the same machine to prove multi-row
- * materialization without reintroducing the two-machine scenario this
- * module is never actually asked to handle.
+ * session-instructions domain holds two machines sharing one scopeHash,
+ * exactly as a PostgreSQL-era archive does (issue #1518): the SQLite
+ * surfaces are machine-local, so this module materializes only the rows of
+ * the machine it is given (MACHINE_A_UUID) and the other machine's rows
+ * must be ignored, not collide with them. One hand-built second row on
+ * MACHINE_A proves multi-row materialization.
  *
  * Per the epic's standing rule: every check names the two independent
  * observations it compares and is proven breakable. Verification-failed
@@ -33,7 +31,7 @@ import {
   readArchiveDomain,
 } from "../../src/storage/sqlite/portable-archive.js";
 import { createPortableRecord, type PortableRecord } from "../../src/storage/portable-record.js";
-import { buildRecords, postgresGeneration, MACHINE_A } from "../fixtures/portable-records.js";
+import { buildRecords, postgresGeneration, MACHINE_A, MACHINE_B, MACHINE_A_UUID } from "../fixtures/portable-records.js";
 import { eventsDir, eventSequenceDbPath } from "../../src/db/events-path.js";
 import { LocalHookEventSequenceAllocator, formatLocalHookMachineSequence } from "../../src/storage/local-hook-event-sequence.js";
 import {
@@ -103,11 +101,13 @@ function seedGeneration(): {
     const all = buildRecords(postgresGeneration());
     for (const record of all.get("machines")!) writePortableArchiveRecord(db, record);
     const projectIdentity = (all.get("project")![0].value as { identity: unknown }).identity;
-    const machineAInstructions = all.get("session-instructions")!.filter(
-      (r) => (r.value as { machineIdentityKey: string }).machineIdentityKey === MACHINE_A,
-    );
-    const sessionInstructionRecords = [...machineAInstructions, extraSessionInstructionRecord(projectIdentity)];
-    for (const record of sessionInstructionRecords) writePortableArchiveRecord(db, record);
+    // Both machines' rows go into the archive; only MACHINE_A's are expected back.
+    const archivedInstructions = all.get("session-instructions")!;
+    const sessionInstructionRecords = [
+      ...archivedInstructions.filter((r) => (r.value as { machineIdentityKey: string }).machineIdentityKey === MACHINE_A),
+      extraSessionInstructionRecord(projectIdentity),
+    ];
+    for (const record of [...archivedInstructions, extraSessionInstructionRecord(projectIdentity)]) writePortableArchiveRecord(db, record);
     const passiveEventRecords = all.get("passive-events")!;
     for (const record of passiveEventRecords) writePortableArchiveRecord(db, record);
     return { path, sessionInstructionRecords, passiveEventRecords };
@@ -130,9 +130,9 @@ describe("materializeRollbackSidecars", () => {
     const homeDir = tempHome();
     const { path, sessionInstructionRecords, passiveEventRecords } = seedGeneration();
 
-    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID });
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
 
-    expect(outcome.sessionInstructionsMaterialized).toBe(2);
+    expect(outcome.sessionInstructionsMaterialized, MACHINE_A_UUID).toBe(2);
     expect(outcome.passiveEventsMaterialized).toBe(3);
     expect(outcome.eventsDbPath).toBe(join(eventsDir(homeDir), `${LOCAL_PROJECT_ID}.db`));
     const highest = passiveEventRecords.reduce((max, r) => {
@@ -182,12 +182,89 @@ describe("materializeRollbackSidecars", () => {
     }
   });
 
+  it("materializes only this machine's session instructions when another machine holds the same scope hash (#1518)", () => {
+    const homeDir = tempHome();
+    const { path, sessionInstructionRecords } = seedGeneration();
+    const archived = new DatabaseSync(path);
+    try {
+      const scopeHashes = [...readArchiveDomain(archived, "session-instructions")].map((r) => r.value.scopeHash);
+      const byMachine = [...readArchiveDomain(archived, "session-instructions")].map((r) => r.value.machineIdentityKey);
+      // Precondition: the archive really holds a row of each machine under one scope hash.
+      expect(byMachine).toContain(MACHINE_B);
+      expect(scopeHashes.filter((h) => h === (sessionInstructionRecords[0].value as { scopeHash: string }).scopeHash)).toHaveLength(2);
+    } finally {
+      archived.close();
+    }
+
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    expect(outcome.sessionInstructionsMaterialized).toBe(2);
+    const readback = new DatabaseSync(path, { readOnly: true });
+    try {
+      const rows = readback.prepare(
+        "SELECT scope_hash, client_name, session_id FROM session_instruction_cache WHERE project_id = ? ORDER BY scope_hash",
+      ).all(LOCAL_PROJECT_ID) as { scope_hash: string; client_name: string; session_id: string }[];
+      expect(rows).toHaveLength(2);
+      // The shared scope hash holds MACHINE_A's row (codex), not MACHINE_B's (claude).
+      const shared = rows.find((r) => r.scope_hash === (sessionInstructionRecords[0].value as { scopeHash: string }).scopeHash);
+      expect(shared?.client_name).toBe("codex");
+    } finally {
+      readback.close();
+    }
+  });
+
+  it("materializes, verifies and reconciles only this machine's passive events when another machine reuses its sequences (#1518)", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const db = new DatabaseSync(path);
+    try {
+      const other = "installation:second-machine";
+      writePortableArchiveRecord(db, createPortableRecord({
+        domain: "machines", ordinal: 50,
+        value: { identityKey: other, machineId: "018f7765-7b5c-7d92-8a2e-c6f6a15fcb99" }, context: null,
+      }));
+      // One event colliding with a MACHINE_A machine_sequence (UNIQUE in the
+      // events table) and one far beyond MACHINE_A's highest.
+      [0, 999].forEach((sequence, index) => {
+        writePortableArchiveRecord(db, createPortableRecord({
+          domain: "passive-events", ordinal: 50 + index,
+          value: {
+            machineIdentityKey: other, eventId: `018f7769-4c00-7f77-9b32-4a2f8f5c40${index}0`,
+            eventVersion: 1, machineSequence: sequence, eventType: "session.compacted",
+            sessionId: "session-other", sessionSequence: index, category: "intent", data: "{}", priority: 5,
+            sourceHook: "PreCompact", createdAt: "2026-01-01T00:00:00.000000Z", disposition: "pending",
+          },
+          context: { projectIdentity: { scope: "local", projectId: "a".repeat(64) } },
+        }));
+      });
+    } finally {
+      db.close();
+    }
+
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    expect(outcome.passiveEventsMaterialized).toBe(passiveEventRecords.length);
+    const highest = passiveEventRecords.reduce((max, r) => {
+      const seq = integerValue((r.value as { machineSequence: unknown }).machineSequence);
+      return seq > max ? seq : max;
+    }, -1n);
+    // The other machine's sequence 999 must not advance this machine's checkpoint.
+    expect(outcome.reconciledUpTo).toBe(highest.toString());
+    const eventsReadback = new DatabaseSync(outcome.eventsDbPath, { readOnly: true });
+    try {
+      const { n } = eventsReadback.prepare("SELECT count(*) AS n FROM events").get() as { n: number };
+      expect(n).toBe(passiveEventRecords.length);
+    } finally {
+      eventsReadback.close();
+    }
+  });
+
   it("is idempotent across a retry: no duplication, checkpoint does not regress", () => {
     const homeDir = tempHome();
     const { path } = seedGeneration();
 
-    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID });
-    const second = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID });
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const second = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
 
     expect(second.sessionInstructionsMaterialized).toBe(first.sessionInstructionsMaterialized);
     expect(second.reconciledUpTo).toBe(first.reconciledUpTo);
@@ -226,9 +303,9 @@ describe("materializeRollbackSidecars", () => {
       db.close();
     }
 
-    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID });
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
 
-    expect(outcome.sessionInstructionsMaterialized).toBe(0);
+    expect(outcome.sessionInstructionsMaterialized, MACHINE_A_UUID).toBe(0);
     expect(outcome.passiveEventsMaterialized).toBe(0);
     expect(outcome.reconciledUpTo).toBeNull();
   });
@@ -267,7 +344,7 @@ describe("materializeRollbackSidecars", () => {
       db.close();
     }
 
-    expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID }))
+    expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID }))
       .toThrow(expect.objectContaining({ reason: "invalid-input", message: expect.stringContaining("ghost-machine") }));
 
     // Positive control: the identical record, but with its machine
@@ -278,7 +355,7 @@ describe("materializeRollbackSidecars", () => {
     try {
       runLcmMigrations(okDb, { fts5Available: false });
       initializePortableArchive(okDb);
-      writePortableArchiveRecord(okDb, createPortableRecord({ domain: "machines", ordinal: 0, value: { identityKey: "ghost-machine", machineId: null }, context: null }));
+      writePortableArchiveRecord(okDb, createPortableRecord({ domain: "machines", ordinal: 0, value: { identityKey: "ghost-machine", machineId: MACHINE_A_UUID }, context: null }));
       writePortableArchiveRecord(okDb, createPortableRecord({
         domain: "passive-events", ordinal: 0,
         value: {
@@ -293,7 +370,7 @@ describe("materializeRollbackSidecars", () => {
       okDb.close();
     }
     const okHome = tempHome();
-    expect(() => materializeRollbackSidecars({ homeDir: okHome, databasePath: okPath, localProjectId: LOCAL_PROJECT_ID })).not.toThrow();
+    expect(() => materializeRollbackSidecars({ homeDir: okHome, databasePath: okPath, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID })).not.toThrow();
   });
 
   it("wraps a real events-directory creation failure as unsafe-storage", () => {
@@ -312,7 +389,7 @@ describe("materializeRollbackSidecars", () => {
     mkdirSync(join(homeDir, ".lcm"), { recursive: true });
     writeFileSync(join(homeDir, ".lcm", "events"), "not a directory");
 
-    expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID }))
+    expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID }))
       .toThrow(expect.objectContaining({ reason: "unsafe-storage" }));
   });
 
@@ -325,7 +402,7 @@ describe("materializeRollbackSidecars", () => {
       initializePortableArchive(db);
       writePortableArchiveRecord(db, createPortableRecord({
         domain: "machines", ordinal: 0,
-        value: { identityKey: "unordered-machine", machineId: null }, context: null,
+        value: { identityKey: "unordered-machine", machineId: MACHINE_A_UUID }, context: null,
       }));
       const sequences = [5, 2, 8];
       sequences.forEach((sequence, index) => {
@@ -346,7 +423,7 @@ describe("materializeRollbackSidecars", () => {
       db.close();
     }
 
-    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID });
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
     // The maximum (8), not merely a monotonic-order assumption: proves
     // this is a genuine max-reduction over every archived row, not code
     // that only works because archives happen to arrive sequence-sorted.
@@ -358,15 +435,15 @@ describe("verifySessionInstructionsAgainstArchive", () => {
   it("goes red when a stored row's content diverges from its archive row, and green when it matches", () => {
     const homeDir = tempHome();
     const { path } = seedGeneration();
-    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID });
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
 
     const db = new DatabaseSync(path);
     try {
       // Positive control first: the real, uncorrupted state passes.
-      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized)).not.toThrow();
+      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized, MACHINE_A_UUID)).not.toThrow();
 
       db.prepare("UPDATE session_instruction_cache SET content = 'corrupted' WHERE project_id = ?").run(LOCAL_PROJECT_ID);
-      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized))
+      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized, MACHINE_A_UUID))
         .toThrow(expect.objectContaining({ reason: "verification-failed" }));
     } finally {
       db.close();
@@ -376,13 +453,13 @@ describe("verifySessionInstructionsAgainstArchive", () => {
   it("goes red when the stored row count no longer matches the reported materialized count", () => {
     const homeDir = tempHome();
     const { path } = seedGeneration();
-    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID });
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
 
     const db = new DatabaseSync(path);
     try {
       db.prepare("DELETE FROM session_instruction_cache WHERE project_id = ? AND scope_hash = (SELECT scope_hash FROM session_instruction_cache WHERE project_id = ? LIMIT 1)")
         .run(LOCAL_PROJECT_ID, LOCAL_PROJECT_ID);
-      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized))
+      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized, MACHINE_A_UUID))
         .toThrow(expect.objectContaining({ reason: "verification-failed" }));
     } finally {
       db.close();
@@ -392,7 +469,7 @@ describe("verifySessionInstructionsAgainstArchive", () => {
   it("goes red when the archive holds more rows than were ever materialized, even if every materialized row still matches", () => {
     const homeDir = tempHome();
     const { path } = seedGeneration();
-    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID });
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
 
     const db = new DatabaseSync(path);
     try {
@@ -406,7 +483,7 @@ describe("verifySessionInstructionsAgainstArchive", () => {
         `INSERT INTO session_instruction_cache (project_id, scope_hash, client_name, session_id, worktree_path, cwd_path, content, content_hash, updated_at)
          VALUES (?, ?, 'codex', 'orphan-session', '/tmp', '/tmp', 'orphan content', ?, '2026-01-01T00:00:00.000000Z')`,
       ).run(LOCAL_PROJECT_ID, "f".repeat(64), "f".repeat(64));
-      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized + 1))
+      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized + 1, MACHINE_A_UUID))
         .toThrow(expect.objectContaining({ reason: "verification-failed" }));
     } finally {
       db.close();
@@ -418,16 +495,16 @@ describe("verifyPassiveEventsAgainstArchive", () => {
   it("goes red when a stored event's data diverges from its archive row, and green when it matches", () => {
     const homeDir = tempHome();
     const { path } = seedGeneration();
-    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID });
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
 
     const db = new DatabaseSync(path);
     const eventsDb = new DatabaseSync(outcome.eventsDbPath);
     try {
       const machineIds = readMachineIdByIdentityKey(db);
-      expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds)).not.toThrow();
+      expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, MACHINE_A_UUID)).not.toThrow();
 
       eventsDb.exec("UPDATE events SET data = '{\"tampered\":true}'");
-      expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds))
+      expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, MACHINE_A_UUID))
         .toThrow(expect.objectContaining({ reason: "verification-failed" }));
     } finally {
       db.close();
@@ -438,7 +515,7 @@ describe("verifyPassiveEventsAgainstArchive", () => {
   it("goes red when the events table holds a row the archive does not account for", () => {
     const homeDir = tempHome();
     const { path } = seedGeneration();
-    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID });
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
 
     const db = new DatabaseSync(path);
     const eventsDb = new DatabaseSync(outcome.eventsDbPath);
@@ -448,7 +525,7 @@ describe("verifyPassiveEventsAgainstArchive", () => {
         `INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook)
          VALUES ('018f7769-4c00-7f77-9b32-4a2f8f5cbeef', 1, '${formatLocalHookMachineSequence(999n)}', 'orphan', 'orphan.event', 'intent', '{}', 'Test')`,
       );
-      expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds))
+      expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, MACHINE_A_UUID))
         .toThrow(expect.objectContaining({ reason: "verification-failed" }));
     } finally {
       db.close();

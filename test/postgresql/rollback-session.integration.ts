@@ -204,13 +204,6 @@ async function runRollback(run: Run, scenario: Awaited<ReturnType<typeof activat
 async function prepared(database: PostgreSqlTestDatabase, generationId: string) {
   await applyAllRuntimeGrants(database);
   await seedPortablePostgreSql(database.migrator);
-  // The fixture's second machine holds a session instruction under the same scope hash as this
-  // machine's. The SQLite cache is machine-local and cannot represent both (issue #1518), so this
-  // suite rolls back a single-machine instruction set.
-  await database.migrator.query({
-    text: "DELETE FROM lcm.session_instructions WHERE machine_id = $1",
-    values: [fixture.secondaryMachineId],
-  }, factoryContext);
   const homeDir = tempHome();
   manifestAtVerified(new MigrationManifestStore({ homeDir }), generationId);
   return { homeDir, canonicalPath: join(homeDir, "live.sqlite"), scenario: await activationFor(database, generationId) };
@@ -281,6 +274,9 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
       try {
         const row = installed.prepare("SELECT count(*) AS n FROM conversations WHERE session_id = ?").get("raced-session") as { n: number };
         expect(row.n).toBe(1);
+        // Both machines hold a session instruction under one scope hash; the machine-local cache keeps this machine's only.
+        const cache = installed.prepare("SELECT content FROM session_instruction_cache WHERE project_id = ?").all("local-1");
+        expect(cache).toEqual([{ content: "Primary instruction" }]);
       } finally {
         installed.close();
       }

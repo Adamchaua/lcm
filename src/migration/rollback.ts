@@ -1546,6 +1546,10 @@ async function runPostPrepareSequence(
       homeDir: input.homeDir,
       databasePath: installOutcome.canonicalPath,
       localProjectId: input.localProjectId,
+      // The roster is single-machine (the fenced session's activation
+      // quiescence check refuses any other) and its machine is this machine;
+      // the SQLite surfaces hold only this machine's rows.
+      machineId: input.roster[0]!.machineId,
     });
   }
 
