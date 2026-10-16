@@ -40,3 +40,4 @@ pins:
   - ["src/migration/target-identity.ts", "unit-migration-cutover"]
   - ["src/migration/target-reachability.ts", "unit-migration-cutover"]
   - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
+  - ["src/project-map.ts", "unit-project-worktrees"]
