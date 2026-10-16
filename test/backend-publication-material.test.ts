@@ -64,6 +64,26 @@ function sampleMap(): Record<string, unknown> {
   };
 }
 
+type Composed = ReturnType<typeof composeBackendPublicationMaterial>;
+
+function mapFromFile(file: Composed["material"]["source"]["projectMap"]): Record<string, { remoteProjectId?: string }> {
+  if (file.presence !== "present") throw new Error("expected a present project map");
+  return JSON.parse(Buffer.from(file.content).toString("utf-8"));
+}
+
+function targetProjectMap(result: Composed): Record<string, { remoteProjectId?: string }> {
+  return mapFromFile(result.material.target.projectMap);
+}
+
+/** Keys whose remote binding differs between the source and target maps. */
+function changedBindingKeys(result: Composed): string[] {
+  const source = mapFromFile(result.material.source.projectMap);
+  const target = targetProjectMap(result);
+  return Object.keys({ ...source, ...target })
+    .filter((key) => source[key]?.remoteProjectId !== target[key]?.remoteProjectId)
+    .sort();
+}
+
 describe("captureBackendPublicationSourceMaterial", () => {
   it("captures present config and project map content and identity", () => {
     const home = makeHome();
@@ -170,20 +190,19 @@ describe("composeBackendPublicationMaterial", () => {
     }
   });
 
-  it("leaves the project map absent when the source map is absent and there are no bindings", () => {
+  it("refuses an absent source project map: there is nothing to bind or unbind", () => {
     const home = makeHome();
     writeConfig(home, { storage: { backend: "sqlite" } });
-    const result = composeBackendPublicationMaterial({
-      homeDir: home,
-      targetBackend: "postgresql",
-      bindings: [],
-    });
-    expect(result.material.source.projectMap.presence).toBe("absent");
-    expect(result.material.target.projectMap.presence).toBe("absent");
-    expect(result.projects).toEqual([]);
+    expect(() =>
+      composeBackendPublicationMaterial({
+        homeDir: home,
+        targetBackend: "postgresql",
+        bindings: [binding()],
+      }),
+    ).toThrow(/source project map is absent/);
   });
 
-  it("proves target projectMap and projects cannot disagree, across several bindings", () => {
+  it("changes exactly the bound projects' remote bindings, across several bindings", () => {
     const home = makeHome();
     writeConfig(home, { storage: { backend: "sqlite" } });
     writeMap(home, sampleMap());
@@ -196,22 +215,18 @@ describe("composeBackendPublicationMaterial", () => {
       targetBackend: "postgresql",
       bindings,
     });
-    expect(result.material.target.projectMap.presence).toBe("present");
-    if (result.material.target.projectMap.presence !== "present") throw new Error("unreachable");
-    const targetMap = JSON.parse(Buffer.from(result.material.target.projectMap.content).toString("utf-8"));
+    expect(changedBindingKeys(result)).toEqual(result.projects.map((entry) => entry.localProjectId).sort());
+    const targetMap = targetProjectMap(result);
     for (const projectBinding of result.projects) {
       expect(targetMap[projectBinding.localProjectId].remoteProjectId).toBe(projectBinding.remoteProjectId);
     }
-    // Every project binding is reflected and nothing extra was bound.
-    const boundHashes = Object.keys(targetMap).filter((hash) => "remoteProjectId" in targetMap[hash]);
-    expect(boundHashes.sort()).toEqual(result.projects.map((entry) => entry.localProjectId).sort());
   });
 
   it("refuses an absent source config rather than mint a config from nothing", () => {
     const home = makeHome();
     writeMap(home, sampleMap());
     expect(() =>
-      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [] }),
+      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [binding()] }),
     ).toThrow(/source config is absent/);
   });
 
@@ -306,10 +321,11 @@ describe("composeBackendPublicationMaterial", () => {
   it("composes a target config that mints storage from scratch when the source config has none", () => {
     const home = makeHome();
     writeConfig(home, { unrelated: true });
+    writeMap(home, sampleMap());
     const result = composeBackendPublicationMaterial({
       homeDir: home,
       targetBackend: "postgresql",
-      bindings: [],
+      bindings: [binding()],
     });
     expect(result.material.target.config.presence).toBe("present");
     if (result.material.target.config.presence === "present") {
@@ -361,7 +377,7 @@ describe("composeBackendPublicationMaterial", () => {
     const home = makeHome();
     writeFileSync(join(home, ".lcm", "config.json"), "[]\n", { mode: 0o600 });
     expect(() =>
-      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "sqlite", bindings: [] }),
+      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "sqlite", bindings: [binding()] }),
     ).toThrow(/JSON object/);
   });
 
@@ -370,7 +386,7 @@ describe("composeBackendPublicationMaterial", () => {
     writeConfig(home, { storage: { backend: "sqlite" } });
     writeFileSync(join(home, ".lcm", "map.json"), JSON.stringify({ [HASH_A]: "not-an-object" }), { mode: 0o600 });
     expect(() =>
-      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [] }),
+      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [binding()] }),
     ).toThrow(/map entry .* must be an object/);
   });
 
@@ -379,7 +395,7 @@ describe("composeBackendPublicationMaterial", () => {
     writeConfig(home, { storage: { backend: "sqlite" } });
     writeFileSync(join(home, ".lcm", "map.json"), "[]\n", { mode: 0o600 });
     expect(() =>
-      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [] }),
+      composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [binding()] }),
     ).toThrow(/map\.json must be an object/);
   });
 });
@@ -503,6 +519,118 @@ describe("composeBackendPublicationMaterial: source backend and project-map rule
         bindings: [binding()],
       }),
     ).toThrow(expect.objectContaining({ name: "InvalidProjectMapError" }));
+  });
+});
+
+describe("composeBackendPublicationMaterial: bindings change exactly the listed projects", () => {
+  function compose(
+    targetBackend: "sqlite" | "postgresql",
+    sourceMap: Record<string, unknown>,
+    bindings: readonly BackendPublicationProjectBinding[],
+  ): Composed {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: targetBackend === "postgresql" ? "sqlite" : "postgresql" } });
+    writeMap(home, sourceMap);
+    return composeBackendPublicationMaterial({ homeDir: home, targetBackend, bindings });
+  }
+
+  const bound = (hash: string, remote: string, canonical: string) => ({
+    [hash]: { canonical, aliases: [], remoteProjectId: remote },
+  });
+
+  it("refuses an empty binding list", () => {
+    expect(() => compose("postgresql", sampleMap(), [])).toThrow(/at least one project/);
+  });
+
+  it("refuses bindings that repeat a remoteProjectId", () => {
+    expect(() =>
+      compose("postgresql", sampleMap(), [
+        binding({ localProjectId: HASH_A }),
+        binding({ localProjectId: HASH_B }),
+      ]),
+    ).toThrow(/must not repeat remoteProjectId/);
+  });
+
+  it("refuses to bind a project that is already bound to the same remote", () => {
+    expect(() =>
+      compose("postgresql", bound(HASH_A, REMOTE_ID_A, "/repos/one"), [binding()]),
+    ).toThrow(/already bound to a remote project/);
+  });
+
+  it("refuses to bind a project that is already bound to a different remote", () => {
+    expect(() =>
+      compose("postgresql", bound(HASH_A, REMOTE_ID_B, "/repos/one"), [binding()]),
+    ).toThrow(/already bound to a remote project/);
+  });
+
+  it("refuses a remote project that another map entry already owns", () => {
+    expect(() =>
+      compose("postgresql", { ...sampleMap(), ...bound(HASH_B, REMOTE_ID_A, "/repos/two") }, [binding()]),
+    ).toThrow(/already owned by project map entry/);
+  });
+
+  it("refuses to unbind a project that is not bound", () => {
+    expect(() => compose("sqlite", sampleMap(), [binding()])).toThrow(
+      /is not bound to remote project/,
+    );
+  });
+
+  it("refuses to unbind a project bound to a different remote than the one stated", () => {
+    expect(() =>
+      compose("sqlite", bound(HASH_A, REMOTE_ID_B, "/repos/one"), [binding()]),
+    ).toThrow(/is not bound to remote project/);
+  });
+
+  it("refuses to unbind a remote that another map entry also holds", () => {
+    expect(() =>
+      compose("sqlite", {
+        ...bound(HASH_A, REMOTE_ID_A, "/repos/one"),
+        ...bound(HASH_B, REMOTE_ID_A, "/repos/two"),
+      }, [binding()]),
+    ).toThrow(/already owned by project map entry/);
+  });
+
+  it("binds only the listed project and leaves a different project's existing binding untouched", () => {
+    const result = compose(
+      "postgresql",
+      { ...sampleMap(), ...bound(HASH_B, REMOTE_ID_B, "/repos/two") },
+      [binding()],
+    );
+    expect(changedBindingKeys(result)).toEqual([HASH_A]);
+    expect(targetProjectMap(result)[HASH_A].remoteProjectId).toBe(REMOTE_ID_A);
+    expect(targetProjectMap(result)[HASH_B].remoteProjectId).toBe(REMOTE_ID_B);
+    expect(result.projects.map((entry) => entry.localProjectId)).toEqual([HASH_A]);
+  });
+
+  it("unbinds only the listed project and leaves a different project's remote binding in place", () => {
+    const result = compose(
+      "sqlite",
+      { ...bound(HASH_A, REMOTE_ID_A, "/repos/one"), ...bound(HASH_B, REMOTE_ID_B, "/repos/two") },
+      [binding()],
+    );
+    expect(changedBindingKeys(result)).toEqual([HASH_A]);
+    expect(targetProjectMap(result)[HASH_A].remoteProjectId).toBeUndefined();
+    expect(targetProjectMap(result)[HASH_B].remoteProjectId).toBe(REMOTE_ID_B);
+  });
+
+  it("carries a non-listed entry through map normalization unchanged otherwise", () => {
+    const result = compose(
+      "postgresql",
+      {
+        ...sampleMap(),
+        [HASH_B]: {
+          canonical: "/repos/two",
+          aliases: ["/repos/two-alias"],
+          remoteProjectId: REMOTE_ID_B.toUpperCase(),
+        },
+      },
+      [binding()],
+    );
+    expect(targetProjectMap(result)[HASH_B]).toEqual({
+      canonical: "/repos/two",
+      aliases: ["/repos/two-alias"],
+      remoteProjectId: REMOTE_ID_B,
+    });
   });
 });
 

@@ -547,6 +547,13 @@ exports in `src/storage` cover that:
   only when it selects PostgreSQL), and composing a target equal to the live
   backend is refused. The live project map is parsed with the project map's
   own rules, so an entry the map layer would reject is refused here too.
+  The listed projects are the only entries whose remote binding changes: a
+  PostgreSQL target binds projects that are currently unbound, a SQLite target
+  unbinds projects that are currently bound to exactly the stated remote, and
+  the list must be non-empty and name no project or remote twice. A stated
+  remote that another map entry already holds is refused. Every other entry is
+  carried through unchanged, and its existing remote binding is not part of the
+  publication and not fenced by it.
 - `readRetainedBackendPublicationMaterial` returns the retained recovery
   material of the last completed publication. It answers `present` (with the
   journal and the authenticated material), `authoritatively-absent` (the

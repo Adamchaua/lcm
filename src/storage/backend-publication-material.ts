@@ -161,15 +161,25 @@ function validateBindingShape(
 function validateBindings(
   bindings: readonly BackendPublicationProjectBinding[],
 ): readonly BackendPublicationProjectBinding[] {
+  if (bindings.length === 0) {
+    throw new TypeError("backend publication bindings must name at least one project");
+  }
   const validated = bindings.map(validateBindingShape);
-  const seen = new Set<string>();
+  const seenLocal = new Set<string>();
+  const seenRemote = new Set<string>();
   for (const binding of validated) {
-    if (seen.has(binding.localProjectId)) {
+    if (seenLocal.has(binding.localProjectId)) {
       throw new TypeError(
         `backend publication bindings must not repeat localProjectId: ${binding.localProjectId}`,
       );
     }
-    seen.add(binding.localProjectId);
+    if (seenRemote.has(binding.remoteProjectId)) {
+      throw new TypeError(
+        `backend publication bindings must not repeat remoteProjectId: ${binding.remoteProjectId}`,
+      );
+    }
+    seenLocal.add(binding.localProjectId);
+    seenRemote.add(binding.remoteProjectId);
   }
   return validated;
 }
@@ -235,8 +245,9 @@ function composeTargetConfigFile(
   };
 }
 
-function parseSourceProjectMap(source: BackendPublicationRecoveryFile): ProjectMap {
-  if (source.presence === "absent") return {};
+function parseSourceProjectMap(
+  source: Extract<BackendPublicationRecoveryFile, { presence: "present" }>,
+): ProjectMap {
   // The project map's own parser is the only authority on what a valid map
   // is: key shape, absolute paths and UUIDv7 remote bindings.
   return parseProjectMap(new TextDecoder("utf-8", { fatal: true }).decode(source.content));
@@ -247,6 +258,14 @@ function composeTargetProjectMapFile(
   targetBackend: StorageBackendName,
   bindings: readonly BackendPublicationProjectBinding[],
 ): BackendPublicationRecoveryFile {
+  if (source.presence === "absent") {
+    // Bindings are never empty, and every binding names a project that must
+    // exist in the live map; with no map there is nothing to bind or unbind,
+    // and no file mode to mint a map with.
+    throw new RangeError(
+      "backend publication cannot compose a target project map: the source project map is absent",
+    );
+  }
   const sourceMapObject = parseSourceProjectMap(source);
 
   const missing = bindings.filter(
@@ -260,33 +279,42 @@ function composeTargetProjectMapFile(
     );
   }
 
-  if (source.presence === "absent") {
-    // No binding could have survived the check above against an empty map,
-    // so the target map is legitimately absent too: there is nothing to
-    // write and, as with config, no mode to mint one with. This is reached
-    // as a natural consequence of the missing-binding refusal above rather
-    // than a second, separate refusal.
-    return { presence: "absent" };
-  }
-
   const targetMapObject: ProjectMap = {};
   for (const [hash, entry] of Object.entries(sourceMapObject)) {
     targetMapObject[hash] = { ...entry, aliases: [...entry.aliases] };
   }
   for (const binding of bindings) {
-    // project-map.ts:1543-1547 (resolveProjectIdentityUnlocked) indexes
-    // the live map directly with a project's `id`, and
-    // src/cli-storage.ts:106 treats that same `id` and a publication
-    // record's `localProjectId` as one value
-    // (`"localProjectId" in identity ? identity.localProjectId : identity.id`).
-    // That coupling is real in merged code but UNENFORCED by
+    // project-map.ts (resolveProjectIdentityUnlocked) indexes the live map
+    // directly with a project's `id`, and src/cli-storage.ts treats that
+    // same `id` and a publication record's `localProjectId` as one value.
+    // That coupling is real in merged code but unenforced by
     // backend-publication.ts itself (validateInput only requires a
-    // non-empty, <=256-character, array-unique string), so the refusal
-    // above is load-bearing rather than defensive.
+    // non-empty, <=256-character, array-unique string), so the refusals
+    // here are load-bearing rather than defensive.
+    const entry = targetMapObject[binding.localProjectId]!;
+    const owner = Object.entries(sourceMapObject).find(
+      ([hash, other]) => hash !== binding.localProjectId
+        && other.remoteProjectId === binding.remoteProjectId,
+    );
+    if (owner !== undefined) {
+      throw new RangeError(
+        `backend publication binding remote project ${binding.remoteProjectId} is already owned by project map entry ${owner[0]}`,
+      );
+    }
     if (targetBackend === "postgresql") {
-      targetMapObject[binding.localProjectId]!.remoteProjectId = binding.remoteProjectId;
+      if (entry.remoteProjectId !== undefined) {
+        throw new RangeError(
+          `backend publication binding project ${binding.localProjectId} is already bound to a remote project`,
+        );
+      }
+      entry.remoteProjectId = binding.remoteProjectId;
     } else {
-      delete targetMapObject[binding.localProjectId]!.remoteProjectId;
+      if (entry.remoteProjectId !== binding.remoteProjectId) {
+        throw new RangeError(
+          `backend publication binding project ${binding.localProjectId} is not bound to remote project ${binding.remoteProjectId}`,
+        );
+      }
+      delete entry.remoteProjectId;
     }
   }
 
@@ -321,11 +349,29 @@ export type ComposeBackendPublicationMaterialResult = Readonly<{
 
 /**
  * Derive a publication's `material` and `projects` from ONE input
- * (`bindings`) in one place. `material.target.projectMap` and `projects`
- * are two encodings of the same local-to-remote project binding fact; two
- * consumers composing them separately at two call sites is how they come
- * to disagree. Deriving both here, from the same validated bindings, makes
- * disagreement structurally unreachable rather than merely unlikely.
+ * (`bindings`) in one place. The result is directly the input of
+ * `BackendPublicationCoordinator.prepare()` and of the migration activation
+ * artifact: `sourceBackend` comes from the live config (postgresql only when
+ * it selects postgresql), `targetBackend` is the input, and equal backends
+ * are refused.
+ *
+ * The enforced invariant is: the set of project-map entries whose remote
+ * binding differs between the live map and the composed target map equals
+ * `bindings` equals `projects`. To hold it, the live map is parsed with the
+ * project map's own rules; `bindings` must be non-empty, with no repeated
+ * project or remote; and each binding must name an existing map entry that
+ * changes in the direction of the target:
+ *
+ * - postgresql target: the entry is currently unbound and becomes bound to
+ *   the stated remote;
+ * - sqlite target: the entry is currently bound to exactly the stated remote
+ *   and becomes unbound.
+ *
+ * A stated remote that a different map entry already holds is refused in
+ * both directions. Every entry that is not listed is carried through
+ * unchanged apart from the project map's own normalization. Its existing
+ * remote binding, if any, is not part of this publication and is not fenced
+ * by it.
  */
 export function composeBackendPublicationMaterial(
   input: ComposeBackendPublicationMaterialInput,
