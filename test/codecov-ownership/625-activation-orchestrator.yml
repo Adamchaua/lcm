@@ -1,0 +1,18 @@
+references: ["#625"]
+rationale: >-
+  Adds the phase-1 building blocks of the migration activation orchestrator
+  under src/migration/, so they stay in the directory-level migration cutover
+  owner; no topology change. New modules: the deterministic activation
+  publicationId derivation, the three-valued PostgreSQL target health check
+  (authenticated probe plus the factory's own schema readiness check, with
+  definite server refusals reported as unhealthy and transport, abort, closed
+  or ambiguous readiness reported as unresolvable), and the immutable
+  activation report (body, identity, protocol report reference, and a
+  content-addressed per-generation store with a three-valued reader).
+  Materially changes the activation artifact store, which gains the durable
+  generation -> publication link record (immutable, byte-identical reuse,
+  typed conflict, shared crash-twin recovery) and its three-valued reader,
+  and the migration index, which exports the new public API.
+pins:
+  - ["src/migration/activation-publication-id.ts", "unit-migration-cutover"]
+  - ["src/migration/index.ts", "unit-migration-cutover"]

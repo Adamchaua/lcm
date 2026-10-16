@@ -160,3 +160,14 @@ export type {
   VerifyMigrationGenerationDependencies,
   VerifyMigrationGenerationResult,
 } from "./verify-generation.js";
+
+// --- #625: activation orchestrator building blocks --------------------------
+//
+// Phase-1 pieces of the activation orchestrator (plan-v6 G5, G6, G7 and the
+// deterministic publicationId). The orchestrator itself (G1) is not here yet.
+
+export {
+  ActivationPublicationIdError,
+  deriveActivationPublicationId,
+} from "./activation-publication-id.js";
+
