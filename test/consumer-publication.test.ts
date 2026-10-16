@@ -19,6 +19,7 @@ import {
   withBackendPublicationConsumerLockAsync,
   withBackendPublicationPermit,
   type BackendPublicationDriver,
+  type BackendPublicationFenceRecord,
   type BackendPublicationFileMutationContext,
   type BackendPublicationRecoveryFile,
   type BackendPublicationRecoveryMaterial,
@@ -98,6 +99,7 @@ function driverFor(
   }> = {},
 ): BackendPublicationDriver {
   let failConfig = failConfigOnce;
+  const fences = new Map<string, BackendPublicationFenceRecord>();
   return {
     observeLocalState: async () => captureBackendPublicationState(home),
     publishProjectMap: async (input) => {
@@ -115,6 +117,27 @@ function driverFor(
     },
     restoreConfig: (input) => applyBackendPublicationConfigFile(input),
     restoreProjectMap: (input) => applyBackendPublicationProjectMapFile(input),
+    acquireRemoteGuard: async ({ journal, project }) => {
+      const fence: BackendPublicationFenceRecord = {
+        projectId: project.remoteProjectId,
+        machineId: "machine",
+        publicationId: journal.publicationId,
+        targetBackend: journal.targetBackend,
+        evidenceSha256: project.evidenceSha256,
+        fencingToken: "1",
+        acquiredAt: "2026-08-06T12:00:00.000Z",
+        renewedAt: "2026-08-06T12:00:00.000Z",
+        expiresAt: "2999-08-06T12:00:00.000Z",
+        releasedAt: null,
+        databaseExpired: false,
+      };
+      fences.set(project.remoteProjectId, fence);
+      return fence;
+    },
+    readRemoteGuard: async ({ project }) => fences.get(project.remoteProjectId) ?? null,
+    releaseRemoteGuard: async ({ project, fence }) => {
+      fences.set(project.remoteProjectId, { ...fence, releasedAt: "2026-08-06T12:01:00.000Z" });
+    },
   };
 }
 

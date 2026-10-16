@@ -362,6 +362,14 @@ bundled Gitleaks rules, built-in patterns, global `security.sensitivePatterns`,
 and the project's `sensitive-patterns.txt`. Previously captured passive events
 are scrubbed again before promotion.
 
+Errors returned through MCP redact supported credential assignments before
+they become tool-visible diagnostics. This includes quoted, unquoted, and
+ODBC-style brace-delimited values for password, token, API-key, authorization,
+and connection-user labels. Complete bounded assignments keep useful surrounding
+context. Malformed or oversized quoted or brace-delimited assignments fail
+closed: LCM keeps the label and redaction marker but discards the unparsed
+remainder so a credential suffix cannot appear in the diagnostic.
+
 The bundled Slack webhook (`hooks.slack.com`) and Sidekiq
 (`gems.contribsys.com` and `enterprise.contribsys.com`) service-hostname rules
 match their hostnames case-insensitively while treating dots literally. The
@@ -533,9 +541,13 @@ The `Security` section of the doctor output shows:
   slash or backslash path segment, that adjacent segment is also redacted in
   the same pass. In unquoted file URLs, whitespace and the existing path
   delimiters, including later colons, `?`, and `#`, end the redacted span, so
-  text after those delimiters can remain visible. Before the first path
-  separator, semicolons, commas, apostrophes, closing parentheses, and closing
-  braces remain part of an exact `file://` authority. In a single-quoted exact
+  text after those delimiters can remain visible. In an unquoted exact file
+  URL, a rooted path that directly follows the URL path through `&` or `&?` is
+  redacted on the first pass, so `file://h/a&?/Users/A/secret.db` becomes
+  `file://h<path>&?<path>`; the query of a bracketed public URL child stays
+  readable. Before the first path separator, semicolons, commas, apostrophes,
+  closing parentheses, and closing braces remain part of an exact `file://`
+  authority. In a single-quoted exact
   file URL, that includes an apostrophe matching the quote before the scheme;
   it closes the current URL only when immediately followed by a fresh,
   case-insensitive `file://` literal. That literal begins a separately quoted

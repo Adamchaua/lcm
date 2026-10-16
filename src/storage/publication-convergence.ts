@@ -77,7 +77,7 @@ function healthMatches(
     && health.status === "ok"
     && health.pid === identity.pid
     && health.version === identity.version
-    && (health.storageBackend ?? "sqlite") === identity.storageBackend
+    && health.storageBackend === identity.storageBackend
     && daemonEntrypointMatches(health.entrypoint, identity.entrypoint, platform)
     && health.runtimeDigest === identity.runtimeDigest;
 }
@@ -141,7 +141,7 @@ export async function capturePublicationIdentity(input: Readonly<{
     || !Number.isSafeInteger(health.pid)
     || health.pid <= 0
     || health.version !== input.expectedVersion
-    || (health.storageBackend ?? "sqlite") !== input.expectedStorageBackend
+    || health.storageBackend !== input.expectedStorageBackend
     || !daemonEntrypointMatches(health.entrypoint, input.expectedEntrypoint, deps.platform ?? process.platform)
     || health.runtimeDigest !== input.expectedRuntimeDigest
   ) return undefined;

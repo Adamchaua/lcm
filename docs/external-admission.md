@@ -1,14 +1,15 @@
 # External admission recovery
 
 The required `external-admission` commit status admits an exact pull request
-head only after authenticated CI and DCO checks succeed. Normal admission is
-automatic: every accepted authenticated DCO `check_run` event, canonical
-pull-request CI `workflow_run` event, or default-branch recovery dispatch wakes
-the reducer, which evaluates the latest exact-head snapshot without polling on
-a runner. Event IDs are never state authority. An accepted CI or DCO event ID
-also imposes a freshness lower bound: older visible evidence may be superseded,
-but newer or equal non-terminal event evidence remains pending until the
-corresponding current check or run is visible.
+head only after authenticated CI and DCO checks succeed.
+
+Normal admission is automatic: every accepted authenticated DCO `check_run`,
+canonical pull-request CI `workflow_run`, or default-branch recovery dispatch
+wakes the reducer, which evaluates the latest exact-head snapshot without
+polling on a runner. Event IDs are never state authority. Accepted CI and DCO
+event IDs impose a freshness lower bound: older visible evidence may be
+superseded, but newer or equal non-terminal event evidence remains pending
+until the corresponding current check or run is visible.
 
 DCO can also report against GitHub synthetic commits with an empty suite branch
 or a `gh-readonly-queue/` ref. External admission requires a non-empty suite
@@ -39,6 +40,10 @@ freshness rules, status context, protected-base patterns, and trusted evaluator
 behavior are repository policy. Changing them requires a reviewed workflow or
 policy change; `PR_NUMBER` and `HEAD_SHA` in the recovery example are one-shot
 operator variables, not configuration settings.
+
+Changesets version pull requests retain their existing maintainer-operated
+release path. This admission policy does not create a new automatic or
+administrator-bypass path for them.
 
 ## Find and dispatch the exact PR head SHA
 
@@ -78,10 +83,10 @@ and the `external-admission` status on `HEAD_SHA`.
   evaluation. It remains pending when the current authenticated CI or DCO
   evidence is missing, incomplete, transient, or changes during the
   three-snapshot evaluation. A newer event ID than the visible evidence, an
-  equal `requested`/`in_progress` CI event, or an equal DCO `created` or
-  `rerequested` event also remains pending. Transient branch-protection API
-  failures such as network errors, rate limits, and HTTP 5xx responses remain
-  pending so recovery can retry them.
+  equal `requested` or `in_progress` CI event, or an equal DCO `created` or
+  `rerequested` event also remains pending. A completed event may reconcile only
+  once its matching current run is visible. Transient branch-protection API
+  failures remain pending so recovery can retry them.
 - **Success:** three consecutive fresh snapshots prove authenticated CI and DCO
   success on the same exact head, while live base protection and pull-request
   eligibility remain valid. Exactly one open, non-draft pull request in the
@@ -172,15 +177,15 @@ only the commit SHA to evaluate and is never used as a checkout ref or executed
 as code.
 
 Every accepted event revokes stale admission before checkout or PR association,
-then evaluates the latest exact-head snapshot. Stale event IDs are wake-up
-context only; accepted CI/DCO IDs additionally impose the freshness lower bound
-described above. The evaluator paginates commit-associated pull requests and
-check runs, authenticates exact check names and application identities, reads
-live base-branch protection, caches each base-ref lookup only within one
-snapshot resolution, and revalidates PR eligibility, required checks, and CI
-provenance immediately before success. The evaluator never downloads CI
-artifacts or caches and never checks out or executes pull-request-controlled
-content.
+then evaluates the latest exact-head snapshot. Event IDs are wake-up context
+only; accepted CI and DCO IDs additionally impose the path-specific freshness
+lower bound described above. The evaluator paginates commit-associated pull
+requests and check runs. It authenticates exact check names and application
+identities, reads live base-branch protection, caches each base-ref lookup only
+within one snapshot resolution, and revalidates PR eligibility, required checks,
+and CI provenance immediately before success. The evaluator never reads the
+base tree, approval endpoints, CI artifacts, or caches and never checks out or
+executes pull-request-controlled content.
 
 Do not add or use `workflow_dispatch` for this recovery path. Its caller can
 select a branch or tag containing a different workflow revision, which is not

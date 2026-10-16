@@ -1,5 +1,5 @@
 import {
-  canonicalJson, canonicalSha256, PORTABLE_LIMITS, PortableStreamError,
+  canonicalJson, canonicalSha256, PORTABLE_LIMITS, PortableStreamError, sha256,
   type PortableDomain, type PortableProjectIdentity, type PortableRawConversationOrder,
   type PortableRawMessageOrder, type PortableRawRecordInput, type PortableRecord,
 } from "../portable-record.js";
@@ -49,8 +49,8 @@ function scalar(value: unknown): unknown {
 function locatorExpression(mapping: Mapping, alias = "r"): string {
   return `json_build_array(${mapping.keys.map((key) => `${alias}.${key}::text`).join(", ")})::text`;
 }
-function keyExpression(mapping: Mapping): string {
-  return `ARRAY[${mapping.keys.map((key) => `r.${key}::text COLLATE "C"`).join(", ")}]`;
+function keyExpression(mapping: Mapping, alias = "r"): string {
+  return `ARRAY[${mapping.keys.map((key) => `${alias}.${key}::text COLLATE "C"`).join(", ")}]`;
 }
 function parseLocator(locator: string, count: number): string[] {
   let parsed: unknown;
@@ -96,14 +96,44 @@ function sizeExpression(domain:PortableDomain,mapping:Mapping):string {
   return `(SELECT octet_length(row_to_json(portable_row)::text)::bigint FROM (SELECT ${projection(domain,mapping)}) portable_row)`;
 }
 export interface CanonicalHeader { readonly locator:string; readonly byteLength:string; }
+/**
+ * Lists up to `limit` headers after `after` in C-collated key order. Each
+ * locator is bounded individually (an oversized row projects '' plus its real
+ * byteLength, which the caller refuses), and the page is bounded in SQL by
+ * aggregate locator bytes: rows are kept while the running octet_length of
+ * their projected locators stays within PORTABLE_LIMITS.maxBatchBytes, so a
+ * multi-row page never leaves PostgreSQL carrying more than one batch of
+ * locator text (#1388). The first row is always kept, so a page is empty only
+ * when no row follows the cursor; the kept rows are a prefix of the ordered
+ * scan, so a caller that resumes after the last returned locator skips and
+ * repeats nothing. The LIMIT sits below the window: the scan stops after
+ * `limit` rows exactly as before, the size expression is evaluated once per
+ * scanned row, and the window and cut only ever see those rows.
+ */
 export async function listCanonicalHeaders(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,after:string|null,limit:number,signal?:AbortSignal):Promise<CanonicalHeader[]> {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new PortableStreamError("invalid-limit");
   const mapping = mappingForDomain(domain);
   const keys = after === null ? null : parseLocator(after,mapping.keys.length);
-  const result = await executor.query<{locator:string;byteLength:string}>({text:`SELECT CASE WHEN ${sizeExpression(domain,mapping)} <= $4::bigint THEN ${locatorExpression(mapping)} ELSE '' END AS locator, ${sizeExpression(domain,mapping)}::text AS "byteLength" FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ($2::text[] IS NULL OR ${keyExpression(mapping)} > $2::text[] COLLATE "C") ORDER BY ${keyExpression(mapping)} COLLATE "C" LIMIT $3`,values:[projectId,keys,limit,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-headers",projectId,signal});
+  const locator = `CASE WHEN sized.byte_length <= $4::bigint THEN ${locatorExpression(mapping,"sized")} ELSE '' END`;
+  const result = await executor.query<{locator:string;byteLength:string}>({text:`SELECT page.locator, page."byteLength" FROM (SELECT ${locator} AS locator, sized.byte_length::text AS "byteLength", row_number() OVER page_order AS page_row, sum(octet_length(${locator})) OVER page_order AS page_bytes FROM (SELECT ${mapping.keys.map((key) => `r.${key}::text AS ${key}`).join(", ")}, ${sizeExpression(domain,mapping)} AS byte_length FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ($2::text[] IS NULL OR ${keyExpression(mapping)} > $2::text[] COLLATE "C") ORDER BY ${keyExpression(mapping)} COLLATE "C" LIMIT $3) sized WINDOW page_order AS (ORDER BY ${keyExpression(mapping,"sized")} COLLATE "C" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) page WHERE page.page_row = 1 OR page.page_bytes <= $4::bigint ORDER BY page.page_row`,values:[projectId,keys,limit,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-headers",projectId,signal});
   return result.rows;
 }
-/** Message closure traversal uses numeric seq, independently of opaque locator order. */
+/** Database-side row count over the exact scope that listCanonicalHeaders pages, oversized rows included. */
+export async function countCanonicalRows(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,signal?:AbortSignal):Promise<number> {
+  const mapping = mappingForDomain(domain);
+  const result = await executor.query<{count:string}>({text:`SELECT COUNT(*)::text AS count FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)})`,values:[projectId]},{domain:"transaction",operation:"portable-count",projectId,signal});
+  const count = result.rows[0]?.count;
+  const parsed = typeof count === "string" && /^(0|[1-9][0-9]*)$/.test(count) ? Number(count) : Number.NaN;
+  if (!Number.isSafeInteger(parsed)) fail();
+  return parsed;
+}
+/**
+ * Message closure traversal uses numeric seq, independently of opaque locator
+ * order. Callers read pages of up to PORTABLE_LIMITS.maxBatchRecords headers.
+ * A messages locator is a single bigint key, so the per-row bound plus that
+ * record limit already caps a page; the aggregate locator bound of
+ * listCanonicalHeaders is not needed.
+ */
 export async function listConversationMessageHeaders(executor:PostgreSqlQueryExecutor,projectId:string,conversationId:string,afterSeq:string|null,limit:number,signal?:AbortSignal):Promise<(CanonicalHeader & {readonly seq:string})[]> {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new PortableStreamError("invalid-limit");
   const domain = "messages";
@@ -115,6 +145,85 @@ export async function readCanonicalRow(executor:PostgreSqlQueryExecutor,projectI
   const mapping = mappingForDomain(domain);
   const result = await executor.query({text:`SELECT ${mapping.selectColumns} FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ${keyExpression(mapping)} = $2::text[] COLLATE "C" AND ${sizeExpression(domain,mapping)} <= $3::bigint LIMIT 1`,values:[projectId,parseLocator(locator,mapping.keys.length),String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-read",projectId,signal});
   return result.rows[0] ?? null;
+}
+/** Deterministic fingerprint of the exact SQL projection readCanonicalRow(s) return. */
+export function canonicalRowContentSha256(row:Row):string {
+  return sha256(canonicalJson(row));
+}
+/**
+ * Accounting model for one item of a batched content read: the projected row
+ * bytes plus the two incremental copies of its locator that
+ * readCanonicalContentRows (and its size-only companion) move for that item,
+ * the entry in the $2 text[] parameter and the returned __locator column.
+ * This budgets those copies; it is not an exact process-resident guarantee
+ * (driver encoding, JavaScript strings, Map overhead and the caller's own
+ * header strings are outside it).
+ */
+export function canonicalBatchItemBytes(byteLength:bigint,locator:string):bigint {
+  return byteLength+2n*BigInt(Buffer.byteLength(locator,"utf8"));
+}
+/**
+ * Batched counterpart to readCanonicalRow, keyed by the same locator strings
+ * insertCanonicalRecord returns (and callers persist as native_key). One
+ * query answers up to PORTABLE_LIMITS.maxBatchRecords locators instead of
+ * one round trip per record, which matters for callers re-verifying many
+ * rows inside a single held transaction (see #1388 for the per-record
+ * shape this avoids). A locator absent from the source table is simply
+ * absent from the returned map; callers must treat that as a content
+ * mismatch (the portable source raises source-invalid), not skip it.
+ *
+ * This read takes no row locks and does not fence anything by itself. A
+ * caller that re-verifies content and then commits must already hold a
+ * writer fence for the project, because its transaction is READ COMMITTED
+ * and another transaction may otherwise modify a returned row and commit
+ * first. Measured against the harness, raising the isolation level does not
+ * help: READ COMMITTED, REPEATABLE READ and SERIALIZABLE all permit that
+ * interleaving, since a canonical writer never reads what the caller writes
+ * and so completes no dependency cycle for SSI to detect. See
+ * verifiedCompletionState for the fence the transfer completion uses.
+ */
+export async function readCanonicalContentRows(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,locators:readonly string[],signal?:AbortSignal):Promise<Map<string,Row>> {
+  if (locators.length===0) return new Map();
+  if (locators.length>PORTABLE_LIMITS.maxBatchRecords) throw new PortableStreamError("invalid-limit");
+  const mapping = mappingForDomain(domain);
+  for (const locator of locators) parseLocator(locator,mapping.keys.length);
+  const result = await executor.query<Row & {__locator:string}>({text:`SELECT ${mapping.selectColumns}, ${locatorExpression(mapping)} AS __locator FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ${locatorExpression(mapping)} COLLATE "C" = ANY($2::text[]) AND ${sizeExpression(domain,mapping)} <= $3::bigint`,values:[projectId,locators,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-read-batch",projectId,signal});
+  const found = new Map<string,Row>();
+  for (const {__locator,...row} of result.rows) found.set(__locator,row);
+  return found;
+}
+/**
+ * Size-only companion to readCanonicalContentRows, keyed by the same locator
+ * strings. A caller that must re-verify many records cannot ask for up to
+ * PORTABLE_LIMITS.maxBatchRecords payload projections at once, because each
+ * projection is individually allowed to reach PORTABLE_LIMITS.maxBatchBytes
+ * and the aggregate would be tens of gigabytes materialised client side.
+ * This read answers only how large each projection is, so the caller can
+ * group locators into aggregate-byte-bounded chunks before fetching payloads.
+ *
+ * Deliberately no <= maxBatchBytes predicate, unlike readCanonicalContentRows:
+ * an oversized row must be reported at its real size so the caller gives it
+ * its own chunk. readCanonicalContentRows then excludes that row and the
+ * caller treats it as a content mismatch. A locator absent from the source
+ * table is likewise simply absent from the returned map; callers must treat
+ * that as a mismatch, not as zero bytes.
+ *
+ * This read takes no row locks and does not fence anything by itself; see
+ * readCanonicalContentRows for why a re-verifying caller must already hold a
+ * writer fence for the project.
+ */
+export async function readCanonicalContentSizes(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,locators:readonly string[],signal?:AbortSignal):Promise<ReadonlyMap<string,bigint>> {
+  if (locators.length===0) return new Map();
+  if (locators.length>PORTABLE_LIMITS.maxBatchRecords) throw new PortableStreamError("invalid-limit");
+  const mapping = mappingForDomain(domain);
+  for (const locator of locators) parseLocator(locator,mapping.keys.length);
+  const result = await executor.query<{__locator:string;__bytes:string}>({text:`SELECT ${locatorExpression(mapping)} AS __locator, ${sizeExpression(domain,mapping)}::text AS __bytes FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ${locatorExpression(mapping)} COLLATE "C" = ANY($2::text[])`,values:[projectId,locators]},{domain:"transaction",operation:"portable-content-sizes",projectId,signal});
+  const sizes = new Map<string,bigint>();
+  for (const {__locator,__bytes} of result.rows) {
+    if (!/^\d+$/u.test(__bytes)) throw new PortableStreamError("malformed-record");
+    sizes.set(__locator,BigInt(__bytes));
+  }
+  return sizes;
 }
 export interface CanonicalDecodeContext {
   readonly projectIdentity:PortableProjectIdentity;

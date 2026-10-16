@@ -1,0 +1,6 @@
+references: ["#1478"]
+rationale: >-
+  #1478 keeps and retries a project outbox whose close failed inside the
+  replication pass, which keeps its daemon-events owner.
+pins:
+  - ["src/daemon/passive-event-replication-pass.ts", "unit-daemon-events"]

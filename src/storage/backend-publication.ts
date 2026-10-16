@@ -385,6 +385,7 @@ export type BackendPublicationLockToken = object;
 
 const activePublicationLockTokens = new WeakMap<BackendPublicationLockToken, {
   readonly rootPath: string;
+  readonly origin: "sync" | "async";
   active: boolean;
 }>();
 /**
@@ -1455,6 +1456,17 @@ export function readBackendPublicationJournal(homeDir?: string): BackendPublicat
   return readJournal(homeDir);
 }
 
+/**
+ * Read the v2 journal with the consumer's evidence rules: `null` only when
+ * the publication directory is confirmed absent. An existing directory
+ * without `journal.json` fails with `publication-evidence-missing` (empty,
+ * history-only or recognized residue) or `unsafe-storage` (unknown residue).
+ * Never creates the directory.
+ */
+export function readBackendPublicationJournalForConsumer(homeDir?: string): BackendPublicationJournal | null {
+  return readPublicationJournalForConsumer(homeDir);
+}
+
 /** Read the exact v3 migration-maintenance record without accepting v2 data. */
 export function readBackendMaintenanceJournal(homeDir?: string): BackendMaintenanceJournal | null {
   return withBackendPublicationDirectoryRead(
@@ -1702,9 +1714,12 @@ function contextualAppendLockToken(
   return inherited.token;
 }
 
-function newLockToken(homeDir: string | undefined): BackendPublicationLockToken {
+function newLockToken(
+  homeDir: string | undefined,
+  origin: "sync" | "async",
+): BackendPublicationLockToken {
   const token = {};
-  activePublicationLockTokens.set(token, { rootPath: rootPath(homeDir), active: true });
+  activePublicationLockTokens.set(token, { rootPath: rootPath(homeDir), origin, active: true });
   return token;
 }
 
@@ -1897,7 +1912,7 @@ function consumerLockCallback<T>(
   };
   const run = (): T => {
     refreshDirectories();
-    const token = newLockToken(homeDir);
+    const token = newLockToken(homeDir, "sync");
     if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
     if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
     try {
@@ -1961,7 +1976,7 @@ export async function withBackendPublicationConsumerLockAsync<T>(
   };
   const run = async (): Promise<T> => {
     refreshDirectories();
-    const token = newLockToken(homeDir);
+    const token = newLockToken(homeDir, "async");
     if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
     if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
     try {
@@ -3584,6 +3599,22 @@ function activeFence(fence: BackendPublicationFenceRecord | null): boolean {
   return fence !== null && fence.releasedAt === null && !fence.databaseExpired;
 }
 
+function hasCompleteGuardProvider(driver: BackendPublicationDriver): boolean {
+  return driver.acquireRemoteGuard !== undefined
+    && driver.readRemoteGuard !== undefined
+    && driver.releaseRemoteGuard !== undefined;
+}
+
+const GUARD_RECORDED_FORWARD_PHASES: readonly BackendPublicationPhase[] = [
+  "guarded",
+  "map-publishing",
+  "map-published",
+  "config-publishing",
+  "config-published",
+  "releasing",
+  "released",
+];
+
 function sameFenceIdentity(left: BackendPublicationFenceRecord, right: BackendPublicationFenceRecord): boolean {
   return left.projectId === right.projectId
     && left.machineId === right.machineId
@@ -3702,6 +3733,7 @@ export class BackendPublicationCoordinator {
 
   async prepareMaintenanceSelection(
     input: PrepareBackendMaintenanceSelectionInput,
+    lockToken?: BackendPublicationLockToken,
   ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
@@ -3731,11 +3763,12 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, prepared, journal.checksumSha256);
       return prepared;
-    });
+    }, lockToken);
   }
 
   async completeMaintenanceSelection(
     input: CompleteBackendMaintenanceSelectionInput,
+    lockToken?: BackendPublicationLockToken,
   ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
@@ -3763,10 +3796,13 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, completed, journal.checksumSha256);
       return completed;
-    });
+    }, lockToken);
   }
 
-  async abortMaintenance(input: AbortBackendMaintenanceInput): Promise<BackendMaintenanceJournal> {
+  async abortMaintenance(
+    input: AbortBackendMaintenanceInput,
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
       if (journal === null) return fail("publication-evidence-missing", "backend maintenance journal is missing");
@@ -3792,12 +3828,21 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, aborted, journal.checksumSha256);
       return aborted;
-    });
+    }, lockToken);
   }
 
-  async prepare(input: PrepareBackendPublicationInput): Promise<BackendPublicationJournal> {
+  async prepare(
+    input: PrepareBackendPublicationInput,
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendPublicationJournal> {
     return this.#locked(async (directoryHandle) => {
       const validated = validateInput(input);
+      if (validated.projects.length > 0 && !hasCompleteGuardProvider(this.#driver)) {
+        return fail(
+          "invalid-input",
+          "backend publication with projects requires a complete remote guard provider",
+        );
+      }
       const existing = readParsedJournalFromDirectory(
         this.#homeDir,
         directoryHandle,
@@ -3852,24 +3897,27 @@ export class BackendPublicationCoordinator {
       );
       this.#observer("after-prepared", backendPublicationJournalPath(this.#homeDir));
       return prepared;
-    });
+    }, lockToken);
   }
 
-  async resume(): Promise<BackendPublicationJournal> {
-    return this.#locked(async (directoryHandle) => this.#resumeUnlocked(directoryHandle));
+  async resume(lockToken?: BackendPublicationLockToken): Promise<BackendPublicationJournal> {
+    return this.#locked(async (directoryHandle) => this.#resumeUnlocked(directoryHandle), lockToken);
   }
 
-  async abort(): Promise<BackendPublicationJournal> {
-    return this.#locked(async (directoryHandle) => this.#abortUnlocked(directoryHandle));
+  async abort(lockToken?: BackendPublicationLockToken): Promise<BackendPublicationJournal> {
+    return this.#locked(async (directoryHandle) => this.#abortUnlocked(directoryHandle), lockToken);
   }
 
-  async recoverPending(options: RecoverPendingOptions = {}): Promise<BackendPublicationJournal | null> {
+  async recoverPending(
+    options: RecoverPendingOptions = {},
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendPublicationJournal | null> {
     return this.#locked(async (directoryHandle) => {
       const journal = readJournalFromDirectory(this.#homeDir, directoryHandle);
       if (journal === null) return null;
       if (options.disposition === "abort") return this.#abortUnlocked(directoryHandle);
       return this.#resumeUnlocked(directoryHandle);
-    });
+    }, lockToken);
   }
 
   async #locked<T>(
@@ -3894,6 +3942,12 @@ export class BackendPublicationCoordinator {
     };
     if (lockToken !== undefined) {
       assertLockToken(lockToken, this.#homeDir);
+      if (activePublicationLockTokens.get(lockToken)!.origin === "sync") {
+        return fail(
+          "permit-mismatch",
+          "synchronous-origin publication lock token cannot authorize an asynchronous coordinator seam because the synchronous wrapper releases the lock when its callback returns",
+        );
+      }
       return operation();
     }
     return withBackendPublicationLockAsync(this.#homeDir, operation);
@@ -3961,6 +4015,9 @@ export class BackendPublicationCoordinator {
       this.#driver.acquireRemoteGuard === undefined
       || this.#driver.readRemoteGuard === undefined
     ) {
+      if (journal.projects.length > 0) {
+        return fail("unexpected-state", "remote guard acquisition requires a complete remote guard provider");
+      }
       return transition(journal, "guarded", directoryHandle, this.#homeDir, this.#observer);
     }
     let current = journal;
@@ -3985,6 +4042,11 @@ export class BackendPublicationCoordinator {
     directoryHandle: BackendPublicationDirectoryHandle,
   ): Promise<BackendPublicationJournal> {
     const phase = aborting ? "abort-releasing" : "releasing" as const;
+    const releaseUnavailable = this.#driver.releaseRemoteGuard === undefined
+      || this.#driver.readRemoteGuard === undefined;
+    if (releaseUnavailable && journal.projects.some((project) => project.fence !== null)) {
+      return fail("unexpected-state", "remote guard release requires a complete remote guard provider");
+    }
     let current = aborting
       ? transition(journal, phase, directoryHandle, this.#homeDir, this.#observer)
       : journal;
@@ -4244,6 +4306,12 @@ export class BackendPublicationCoordinator {
       journal = transition(journal, "acquiring", directoryHandle, this.#homeDir, this.#observer);
     }
     if (journal.phase === "acquiring") journal = await this.#acquireAll(journal, directoryHandle);
+    if (
+      GUARD_RECORDED_FORWARD_PHASES.includes(journal.phase)
+      && journal.projects.some((project) => project.fence === null)
+    ) {
+      return fail("unexpected-state", "backend publication journal lacks a recorded remote guard fence");
+    }
     if (journal.phase === "guarded" || journal.phase === "map-publishing") journal = await this.#publishMap(journal, directoryHandle);
     if (journal.phase === "map-published" || journal.phase === "config-publishing") journal = await this.#publishConfig(journal, directoryHandle);
     if (journal.phase === "config-published") {

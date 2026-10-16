@@ -468,6 +468,46 @@ describe("compact invocation lifecycle", () => {
     expect(health).toHaveBeenCalledTimes(2);
   });
 
+  it("does not verify a replacement that omits its storage backend", async () => {
+    const oldHealth = {
+      status: "healthy" as const,
+      version: "1.4.2",
+      storageBackend: "sqlite" as const,
+      daemonInstanceId,
+      runtimeDigest: "old-runtime",
+      pid: 9,
+      uptime: 1,
+    };
+    const { storageBackend: _omitted, ...replacementHealth } = {
+      ...oldHealth,
+      daemonInstanceId: "33333333-3333-4333-8333-333333333333",
+      runtimeDigest: "new-runtime",
+    };
+    const health = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(replacementHealth);
+
+    const result = await (await import("../../bin/lcm.js")).cancelAndDrainCompactInvocation({
+      lifecycle: {
+        started: () => true,
+        stopHeartbeat: vi.fn(),
+        target: { invocationId, command: "compact" as const, daemonInstanceId },
+      },
+      createFreshClient: () => ({ cancelInvocation: vi.fn(async () => response("cancelling", 1)), health }),
+      originalHealth: oldHealth,
+      health,
+      restart: vi.fn(async () => ({ connected: false, restarted: true, stoppedPid: 9, pid: 10 })),
+      proveOldInstanceGone: async () => true,
+      proveProviderWitnessGone: async () => true,
+      expectedRuntimeDigest: "new-runtime",
+      expectedStorageBackend: "sqlite",
+      timeoutMs: 10_000,
+      awaitLocalWork: async () => undefined,
+    } as never);
+
+    expect(result).toMatchObject({ restartAttempted: true, replacementVerified: false });
+  });
+
   it("requires an exact nonempty invoking digest for replacement identity", async () => {
     const cases = [
       {

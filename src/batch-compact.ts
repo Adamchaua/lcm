@@ -18,6 +18,7 @@ import { projectPathsForIdentity } from "./daemon/project.js";
 import { CliProjectStorageMissingError, listCliProjects, withCliProjectStorage } from "./cli-storage.js";
 import { NATIVE_SOURCE_LOCATOR_BATCH_SIZE, type ProjectRepositories } from "./storage/contracts.js";
 import { createSqliteRepositories, createSqliteRepositoryStores } from "./storage/sqlite/repositories.js";
+import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "./storage/identity-context.js";
 import {
   RetiredProjectIdentityError,
   assertProjectStorageIdentityActive,
@@ -98,6 +99,9 @@ type ProjectScanFailure = {
 type UncompactedDiscovery = {
   conversations: UncompactedConversation[];
   failures: ProjectScanFailure[];
+  /** True when project enumeration itself threw; false when every selected
+   * project was enumerated but individual projects failed to open. */
+  discoveryFailed: boolean;
 };
 
 const MANUAL_COMPACT_LEAF_MIN_FANOUT = 3;
@@ -436,7 +440,7 @@ async function discoverUncompacted(
   } catch {
     onEvent?.({ type: "phase-failure", phase: "Compact", project: cwdFilter, message: "project discovery failed" });
     onEvent?.({ type: "discovery-clear" });
-    return { conversations, failures: [{ target: cwdFilter ?? "projects", message: "project discovery failed" }] };
+    return { conversations, failures: [{ target: cwdFilter ?? "projects", message: "project discovery failed" }], discoveryFailed: true };
   }
   const selectedProjects = projects.filter(project => cwdFilter === undefined
     || project.canonical === filterCanonical
@@ -480,9 +484,16 @@ async function discoverUncompacted(
           });
           continue;
         }
+        // Map the class to a static remedy, never to error.message: only
+        // RetiredProjectIdentityError's own diagnostic and the fixed
+        // UNBOUND_POSTGRESQL_PROJECT_MESSAGE constant are safe to surface
+        // here. StorageIdentityConfigurationError's constructor accepts an
+        // arbitrary string, so its message is not a static remedy.
         const message = error instanceof RetiredProjectIdentityError
           ? error.message
-          : "project storage discovery failed";
+          : error instanceof StorageIdentityConfigurationError
+            ? UNBOUND_POSTGRESQL_PROJECT_MESSAGE
+            : "project storage discovery failed";
         failures.push({ target: project.canonical, message });
         onEvent?.({
           type: "phase-failure",
@@ -503,7 +514,7 @@ async function discoverUncompacted(
   } finally {
     onEvent?.({ type: "discovery-clear" });
   }
-  return { conversations, failures };
+  return { conversations, failures, discoveryFailed: false };
 }
 
 /** Find conversations eligible for compaction, above the token threshold. */
@@ -567,7 +578,14 @@ export async function batchCompact(opts: {
     : { total: conversations.length });
 
   if (conversations.length === 0) {
-    console.error("No sessions were compacted because project discovery failed.");
+    // Enumeration itself failed (discoveryFailed) versus enumeration
+    // succeeded but every selected project failed to open: the leftover
+    // discovery-failed sentence used to print for both.
+    if (discovery.discoveryFailed) {
+      console.error("No sessions were compacted because project discovery failed.");
+    } else {
+      console.error(`No sessions were compacted because ${phaseErrors.length} selected project${phaseErrors.length === 1 ? "" : "s"} failed.`);
+    }
     return {
       compacted: 0,
       unchanged: 0,

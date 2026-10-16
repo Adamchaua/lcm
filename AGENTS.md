@@ -8,8 +8,9 @@
 ## Test Coverage Approval Gate
 
 - Maintain 100% line, branch, function, and statement coverage for every executable production TypeScript file matched by `bin/**/*.ts`, `installer/**/*.ts`, and `src/**/*.ts`.
-- A change must not be approved, merged, or released unless a fresh `pnpm run test:ci` reports 100% lines, 100% branches, 100% functions, and 100% statements and passes the per-file threshold for the complete collected scope.
-- For local development and pre-push verification, run only the tests relevant to the code being changed and its direct integration boundaries. If the impact is uncertain, err on the side of caution and widen the local test scope before pushing. Do not run unrelated local suites solely to duplicate the complete CI run; rely on CI to exercise the complete collected scope and enforce the 100% coverage gate.
+- The complete suite runs on every push to `main` and `release` and before every release: the sharded CI run merged by the `report` job, or a fresh `pnpm run test:ci`, must report 100% lines, 100% branches, 100% functions, and 100% statements and pass the per-file threshold for the complete collected scope. A release must not be cut unless the `main` run for its exact commit is green.
+- Pull requests and merge-queue entries run the test files that Vitest's module graph relates to the change, plus the files listed for graph-invisible inputs in `scripts/ci-plan.mjs`; any other change (workflows, scripts, configuration, dependencies, fixtures, `test/setup/**`) runs the complete suite without coverage. A green `ci` check is sufficient to merge; the complete coverage gate then runs on `main`.
+- For local development and pre-push verification, run only the tests relevant to the code being changed and its direct integration boundaries. If the impact is uncertain, err on the side of caution and widen the local test scope before pushing. Do not run unrelated local suites solely to duplicate the complete run; rely on the `main` run to exercise the complete collected scope and enforce the 100% coverage gate.
 - Do not use coverage exclusions, `v8 ignore` directives, skipped tests, or untested production wrappers to satisfy the gate. Cover behavior through observable public seams and deterministic failure injection.
 
 ## Agent Execution Invariants
@@ -28,11 +29,11 @@
 
 ## Codecov Components Maintenance
 
-- Update `codecov.yml` and `test/codecov-config.test.ts` atomically whenever production TypeScript, features, or components are added, removed, moved, materially changed, or otherwise make classification stale.
-- Require complete exclusive ownership and accurate stable IDs/names/paths: every covered production TypeScript file belongs to exactly one component.
-- Do not freeze the taxonomy at its current count; intentional additions/removals must update the literal map and count atomically.
+- `codecov.yml` holds the component map; `test/codecov-config.test.ts` holds the literal copy of that map, the literal component count, and the literal owned-file count. Update them atomically whenever production TypeScript, features, or components are added, removed, moved, or otherwise make classification stale, so that every covered production TypeScript file belongs to exactly one component with accurate stable IDs, names, and paths. Do not freeze the taxonomy at its current count.
+- Record every ownership decision for a materially changed, added, removed, moved, or re-owned production TypeScript file as one new file in `test/codecov-ownership/`, named `<issue-or-PR-number>-<slug>.yml`, with `references`, `rationale`, and `pins` as `[file, component]` pairs; the test rejects any other shape and requires every production file to be pinned by some fragment. Edit an existing fragment only to delete or amend a pin whose file was removed, moved, or re-owned, and delete a non-ledger fragment left without pins. The new fragment pins the surviving materially changed files, and its rationale names the removed path, its previous component, and any deleted fragment; a PR whose only production change removes a file adds no fragment and records those facts in the PR body. Never delete `0000-legacy-ledger.yml`. Never append provenance to the test, its titles, or `codecov.yml`: the comments already there are frozen history.
+- Reviewers confirm that every materially changed production TypeScript file gained a fragment pin; the test enforces only that every production file is pinned somewhere and that every pin agrees with `codecov.yml`.
 - Forbid Codecov flags, statuses, ignore/coverage exclusions, report-only runs, or reporting-topology changes without an explicit design change.
-- Preserve the existing 100% line, branch, function, and statement gate enforced by a fresh `pnpm run test:ci` over the complete collected scope.
+- Preserve the existing 100% line, branch, function, and statement gate enforced over the complete collected scope by the merged `main` CI report and by a fresh `pnpm run test:ci`.
 
 ## PR Review And Merge
 

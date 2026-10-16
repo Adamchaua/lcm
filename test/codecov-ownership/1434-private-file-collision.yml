@@ -1,0 +1,10 @@
+references: ["#1434", "PR #1452"]
+rationale: >-
+  The durable private-file writer now throws the typed collision error and
+  exports a predicate both migration stores branch on instead of message
+  text; the writer stays configuration-security-owned and both stores stay
+  in the migration cutover owner.
+pins:
+  - ["src/security-files.ts", "unit-configuration-security"]
+  - ["src/migration/activation-artifact-store.ts", "unit-migration-cutover"]
+  - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]

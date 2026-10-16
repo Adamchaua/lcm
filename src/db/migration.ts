@@ -867,6 +867,16 @@ export function runLcmMigrations(
     db.exec(`ALTER TABLE promoted ADD COLUMN archived_at TEXT DEFAULT NULL`);
   }
 
+  // Serves PromotedStore.findExactContent (project_id = ? AND content = ? AND
+  // archived_at IS NULL ORDER BY created_at DESC). Partial so its size follows
+  // active memories only; it must follow the archived_at column addition
+  // above. created_at is part of the key because, without it, the planner
+  // prefers promoted_project_idx to avoid sorting and scans the whole project.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS promoted_active_content_idx
+      ON promoted (project_id, content, created_at) WHERE archived_at IS NULL;
+  `);
+
   // Session ingest log — tracks which sessions are fully ingested
   db.exec(`
     CREATE TABLE IF NOT EXISTS session_ingest_log (

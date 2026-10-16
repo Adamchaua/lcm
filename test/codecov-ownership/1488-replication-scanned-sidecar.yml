@@ -1,0 +1,8 @@
+references: ["#1488"]
+rationale: >-
+  #1488 threads the scanned sidecar path from the processor sweep into the
+  replication pass, which now opens exactly that file; both files keep their
+  daemon-events owner.
+pins:
+  - ["src/daemon/passive-event-replication-pass.ts", "unit-daemon-events"]
+  - ["src/daemon/passive-event-processor.ts", "unit-daemon-events"]

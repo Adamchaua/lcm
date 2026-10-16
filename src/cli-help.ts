@@ -233,7 +233,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm store 'Auth uses JWT with 24h expiry' --tag 'type:solution' --tag 'scope:project' --tag 'project:lcm' --tag 'source:<actual-thread-uuid>'", "Store a canonically tagged memory"],
       ["lcm store 'Use ensureDaemon before background promote' --tag 'type:solution' --tag 'scope:project' --tag 'project:lcm' --tag 'source:<actual-thread-uuid>'", "Store another canonically tagged memory"],
     ],
-    notes: "Each --tag or --tags occurrence attaches one tag; the spellings may be mixed and preserve command-line order. This differs from export --tags, which accepts a comma-separated filter. For known commands, --help is resolved before required arguments and command actions.",
+    notes: "Each --tag or --tags occurrence attaches one tag; the spellings may be mixed and preserve command-line order. This differs from export --tags, which accepts a comma-separated filter. Storing content that already exists as an active memory in scope merges into that memory: the returned id is the existing memory's id, its tags are unioned with the new ones, and its confidence stays at the maximum, so repeating a store does not create a second memory. New content returns a fresh id. For known commands, --help is resolved before required arguments and command actions.",
   },
 
   compact: {
@@ -519,7 +519,7 @@ const GROUPS = [
       { name: "status [--json]", summary: "Daemon status and project memory stats" },
       { name: "doctor", summary: "Diagnostics: daemon, hooks, MCP, summarizer" },
       { name: "machine <register|show|recover>", summary: "Manage this machine's PostgreSQL identity" },
-      { name: "project <create|link|unlink|list|show|reconcile-worktrees>", summary: "Manage local and PostgreSQL project identities" },
+      { name: "project <create|link|unlink|list|show|reconcile-worktrees|renew-retired-identity>", summary: "Manage local and PostgreSQL project identities" },
       { name: "postgres migrate [--json]", summary: "Apply packaged PostgreSQL schema migrations" },
       { name: "migration <plan|dry-run|apply|abort> [--json]", summary: "Reversible SQLite-to-PostgreSQL cutover" },
       { name: "mcp", summary: "Start the MCP server (stdio transport)" },

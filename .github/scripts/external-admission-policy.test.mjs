@@ -15,9 +15,13 @@ import {
 const HEAD_SHA = "a".repeat(40);
 const REPOSITORY = "donadiosolutions/lcm";
 const eligibleMain = {
+  number: 123,
+  changed_files: 1,
+  commits: 1,
   state: "open",
   draft: false,
-  head: { sha: HEAD_SHA },
+  user: { id: 42, login: "contributor", type: "User" },
+  head: { sha: HEAD_SHA, ref: "feature/admission", repo: { full_name: REPOSITORY } },
   base: { ref: "main", repo: { full_name: REPOSITORY } },
 };
 const eligibleMaintenance = {
@@ -58,7 +62,7 @@ function actionsRun(overrides = {}) {
   };
 }
 
-test("defines only the authenticated CI and DCO identities", () => {
+test("defines only the exact authenticated CI and DCO identities", () => {
   assert.deepEqual(Object.keys(CHECK_IDENTITIES), ["dco", "ci"]);
   assert.deepEqual(CHECK_IDENTITIES.dco, { name: "DCO", appId: 1861, appSlug: "dco" });
   assert.deepEqual(CHECK_IDENTITIES.ci, {
@@ -319,6 +323,7 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
         eventSource: "workflow_run",
         workflowRunAction: "requested",
         workflowRunId: "99",
+        workflowRunPath: ".github/workflows/ci.yml",
         ciRunId: "100",
       },
       { ready: true },
@@ -329,6 +334,7 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
         eventSource: "workflow_run",
         workflowRunAction: "completed",
         workflowRunId: "100",
+        workflowRunPath: ".github/workflows/ci.yml",
         ciRunId: "100",
       },
       { ready: true },
@@ -339,6 +345,7 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
         eventSource: "workflow_run",
         workflowRunAction: "requested",
         workflowRunId: "100",
+        workflowRunPath: ".github/workflows/ci.yml",
         ciRunId: "100",
       },
       { ready: false, pending: true, reason: "event-freshness" },
@@ -349,6 +356,7 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
         eventSource: "workflow_run",
         workflowRunAction: "in_progress",
         workflowRunId: "100",
+        workflowRunPath: ".github/workflows/ci.yml",
         ciRunId: "100",
       },
       { ready: false, pending: true, reason: "event-freshness" },
@@ -359,6 +367,7 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
         eventSource: "workflow_run",
         workflowRunAction: "completed",
         workflowRunId: hugeEventId,
+        workflowRunPath: ".github/workflows/ci.yml",
         ciRunId: hugeVisibleId,
       },
       { ready: false, pending: true, reason: "event-freshness" },
@@ -427,8 +436,9 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
 
 test("fails closed for malformed or unauthenticated freshness metadata", () => {
   const malformedCases = [
-    { eventSource: "workflow_run", workflowRunAction: "completed", workflowRunId: "0", ciRunId: "1" },
-    { eventSource: "workflow_run", workflowRunAction: "unknown", workflowRunId: "1", ciRunId: "1" },
+    { eventSource: "workflow_run", workflowRunAction: "completed", workflowRunId: "0", workflowRunPath: ".github/workflows/ci.yml", ciRunId: "1" },
+    { eventSource: "workflow_run", workflowRunAction: "unknown", workflowRunId: "1", workflowRunPath: ".github/workflows/ci.yml", ciRunId: "1" },
+    { eventSource: "workflow_run", workflowRunAction: "completed", workflowRunId: "1", workflowRunPath: ".github/workflows/copilot.yml", ciRunId: "1" },
     { eventSource: "check_run", checkRunAction: "completed", checkRunId: "not-an-id", dcoCheckRunId: "1" },
     { eventSource: "check_run", checkRunAction: "unknown", checkRunId: "1", dcoCheckRunId: "1" },
     { eventSource: "unexpected", workflowRunAction: "completed", workflowRunId: "1", ciRunId: "1" },
@@ -445,7 +455,9 @@ test("fails closed for malformed or unauthenticated freshness metadata", () => {
     eventSource: "workflow_run",
     workflowRunAction: "completed",
     workflowRunId: "1",
-  }), { ready: false, pending: true, reason: "event-freshness" });
+    workflowRunPath: "dynamic/agents/copilot-pull-request-reviewer",
+    ciRunId: "1",
+  }), { ready: false, terminalFailure: "event-freshness" });
 });
 
 test("honors an explicit canonical CI workflow path override", () => {
@@ -525,18 +537,33 @@ test("exposes the complete policy through deterministic CLI commands", () => {
   )), { eligible: false, reason: "unprotected-base" });
   assert.deepEqual(JSON.parse(runPolicyCommand(
     "evaluate-freshness",
-    ["workflow_run", "completed", "100", "", "", "100", ""],
+    ["workflow_run", "completed", "100", ".github/workflows/ci.yml", "", "", "100", ""],
     "{}",
   )), { ready: true });
 
   assert.throws(() => runPolicyCommand("unknown", [], "{}"), /unknown policy command/u);
   assert.throws(() => runPolicyCommand("evaluate-checks", [], "{}"), /unknown policy command/u);
   assert.throws(() => runPolicyCommand(
+    "evaluate-dependabot-pr", [HEAD_SHA, REPOSITORY], JSON.stringify(eligibleMain),
+  ), /unknown policy command/u);
+  assert.throws(() => runPolicyCommand(
+    "evaluate-dependabot-commits", ["1"], "[]",
+  ), /unknown policy command/u);
+  assert.throws(() => runPolicyCommand(
     "evaluate-ci-run", ["123", HEAD_SHA], "{}",
   ), /unknown policy command/u);
   assert.throws(() => runPolicyCommand(
     "evaluate-ci-run", ["123", HEAD_SHA, REPOSITORY, "extra"], "{}",
   ), /unknown policy command/u);
+  for (const command of [
+    "classify-files",
+    "evaluate-file-binding",
+    "evaluate-review-check",
+    "evaluate-review-run",
+    "evaluate-sensitive-admission",
+  ]) {
+    assert.throws(() => runPolicyCommand(command, [], "{}"), /unknown policy command/u);
+  }
   assert.throws(() => runPolicyCommand("evaluate-checks", [
     HEAD_SHA,
     REPOSITORY,

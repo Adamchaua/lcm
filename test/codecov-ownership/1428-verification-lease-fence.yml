@@ -1,0 +1,9 @@
+references: ["#1428", "PR #1420"]
+rationale: >-
+  #1428 fences the verification lease after the census window and before the
+  report is persisted, and PR #1420 review hardening reconciles ledger record
+  digests, records unexpected ledger domains, refuses an unbound resume and
+  widens the search probe window; the verification driver keeps its migration
+  owner.
+pins:
+  - ["src/migration/verify-generation.ts", "unit-migration-cutover"]

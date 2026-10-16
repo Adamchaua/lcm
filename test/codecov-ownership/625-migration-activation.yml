@@ -1,0 +1,27 @@
+references: ["#625", "PR #1443"]
+rationale: >-
+  Adds the eight migration activation modules (absence attribution, restart
+  admission, quiescence, coverage, artifact store, PostgreSQL activation
+  lease, publication step and generation-binding writer) under src/migration/,
+  so they stay in the directory-level migration cutover owner; no topology
+  change. Also covers the review-thread hardening of those modules (#1443
+  threads, #1452 thread): publication journal gate, artifact directory and
+  digest authentication, scratch-twin directory durability, restart pid
+  attribution, events-database coverage and the maintenance-held quiescence
+  check. The activation lease reader also maps the guard's read-time
+  fence-mismatch (a decodable row naming a different targetBackend or
+  evidence digest, split from invalid-row by #1419) to identity-mismatch.
+  The publication step further refuses a journal that reuses this
+  publicationId with a different sourceBackend, targetBackend or project
+  coverage (publication-collision, before any coordinator call), and the
+  artifact reader authenticates the private LCM root before the artifact
+  directory, as the writer already did (#1443 follow-up threads).
+pins:
+  - ["src/migration/activation-absence.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-artifact-store.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-coverage.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-lease.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-publication.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-quiescence.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-restart-check.ts", "unit-migration-cutover"]
+  - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]

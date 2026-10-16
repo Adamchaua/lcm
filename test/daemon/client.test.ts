@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { createDaemon, type DaemonInstance } from "../../src/daemon/server.js";
-import { DaemonClient } from "../../src/daemon/client.js";
+import { DaemonClient, inferredHealthStorageBackend } from "../../src/daemon/client.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { ensureAuthToken } from "../../src/daemon/auth.js";
 import type { BackendDiagnosticSnapshot } from "../../src/storage/diagnostics.js";
@@ -52,6 +52,49 @@ describe("DaemonClient", () => {
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
+  });
+
+  it("does not infer a storage backend for a newer daemon that omits it", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ status: "ok", version: "1.4.4", uptime: 10, pid: 1234 }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("expected TCP server address");
+      const client = new DaemonClient(`http://127.0.0.1:${address.port}`);
+      const health = await client.health();
+      expect(health).toEqual({ status: "ok", version: "1.4.4", uptime: 10, pid: 1234 });
+      expect(health).not.toHaveProperty("storageBackend");
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it.each([
+    ["0.4.0"], ["1.4.1"], ["1.4.2"], ["1.4.3"],
+  ])("infers sqlite for a fieldless published release %s", (version) => {
+    expect(inferredHealthStorageBackend({ version })).toBe("sqlite");
+  });
+
+  it.each([
+    ["1.4.4"], ["1.5.0"], ["2.0.0"], ["1.10.0"], ["10.0.0"],
+    [undefined], [""], ["1.4"], ["v1.4.1"], ["1.4.1-rc.1"], [" 1.4.1"], ["01.4.1"],
+    ["99999999999999999999.0.0"], [141],
+  ])("does not infer a backend for fieldless version %j", (version) => {
+    expect(inferredHealthStorageBackend({ version })).toBeUndefined();
+  });
+
+  it.each([
+    ["sqlite", "1.4.4"], ["postgresql", "1.4.4"], ["sqlite", undefined], ["postgresql", "1.4.3"],
+  ] as const)("passes through reported backend %s for version %j", (storageBackend, version) => {
+    expect(inferredHealthStorageBackend({ storageBackend, version })).toBe(storageBackend);
+  });
+
+  it.each([["mysql"], [null], [""], [7]])("treats reported backend %j as unknown even for a legacy version", (storageBackend) => {
+    expect(inferredHealthStorageBackend({ storageBackend, version: "1.4.1" })).toBeUndefined();
   });
 
   it("recognizes only the structured staged PostgreSQL 503 health response", async () => {

@@ -118,7 +118,7 @@ export function bindMigrationCopySource(source: MigrationCopySource, input: {
         contentSha256: canonicalSha256({ version: 1, kind: 'admitted-empty-postgresql-copy-target',
             identityFingerprintSha256: input.targetProbe.identityFingerprintSha256,
             emptyDomains: PORTABLE_RECORD_DOMAIN_ORDER.filter(domain => !(IDENTITY_DOMAINS as readonly string[]).includes(domain)) }),
-        capturedAt: input.destinationCapturedAt };
+        capturedAt: input.destinationCapturedAt, systemIdentifier: input.targetProbe.systemIdentifier };
     const maintenance = readBackendMaintenanceJournal(source.homeDir);
     if (!maintenance || maintenance.checksumSha256 !== artifact.maintenanceChecksumSha256)
         refuse();

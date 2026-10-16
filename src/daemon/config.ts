@@ -110,6 +110,14 @@ export interface PostgreSqlStorageSettings {
   connectionTimeoutMs: number;
   idleTimeoutMs: number;
   statementTimeoutMs: number;
+  /**
+   * Bounds the longest single idle gap inside the read-only snapshot
+   * transaction opened for a portable transfer. Independent from
+   * statementTimeoutMs, which bounds one query's execution time: PostgreSQL
+   * resets this timer on every statement, so it does not bound total
+   * snapshot lifetime. See docs/configuration.md for full guidance.
+   */
+  snapshotIdleTimeoutMs: number;
   migrationRole?: string;
 }
 
@@ -138,6 +146,7 @@ export const DEFAULT_POSTGRESQL_STORAGE_SETTINGS: Readonly<PostgreSqlTuningSetti
   connectionTimeoutMs: 10_000,
   idleTimeoutMs: 30_000,
   statementTimeoutMs: 60_000,
+  snapshotIdleTimeoutMs: 300_000,
 });
 
 export interface SecurityConfig {
@@ -883,6 +892,7 @@ const POSTGRESQL_STORAGE_KEYS = new Set([
   "connectionTimeoutMs",
   "idleTimeoutMs",
   "statementTimeoutMs",
+  "snapshotIdleTimeoutMs",
   "migrationRole",
 ]);
 const POSTGRESQL_STORAGE_OVERRIDE_KEYS = new Set([
@@ -929,6 +939,9 @@ export function validateStorageSection(value: unknown, allowRuntimeSecrets: bool
   validateOptionalInteger(postgresql, "connectionTimeoutMs", "storage.postgresql", 1, 600_000);
   validateOptionalInteger(postgresql, "idleTimeoutMs", "storage.postgresql", 0, 3_600_000);
   validateOptionalInteger(postgresql, "statementTimeoutMs", "storage.postgresql", 1, 3_600_000);
+  // Zero disables the PostgreSQL bound and would void the requirement that
+  // an abandoned snapshot is always reclaimed, so the minimum is 1, not 0.
+  validateOptionalInteger(postgresql, "snapshotIdleTimeoutMs", "storage.postgresql", 1, 3_600_000);
   if (storage.backend === "postgresql" && postgresql.migrationRole !== undefined) {
     normalizePostgreSqlMigrationRole(postgresql.migrationRole, "storage.postgresql.migrationRole");
   }
@@ -1417,6 +1430,7 @@ export function resolvePostgreSqlStorageSettings(
     connectionTimeoutMs: (postgresql.connectionTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.connectionTimeoutMs) as number,
     idleTimeoutMs: (postgresql.idleTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.idleTimeoutMs) as number,
     statementTimeoutMs: (postgresql.statementTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.statementTimeoutMs) as number,
+    snapshotIdleTimeoutMs: (postgresql.snapshotIdleTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.snapshotIdleTimeoutMs) as number,
     migrationRole,
     url,
     caFile: resolvedCaFile,
@@ -1455,6 +1469,7 @@ export function daemonConfigForPersistence(config: DaemonConfig): Record<string,
         connectionTimeoutMs: config.storage.postgresql.connectionTimeoutMs,
         idleTimeoutMs: config.storage.postgresql.idleTimeoutMs,
         statementTimeoutMs: config.storage.postgresql.statementTimeoutMs,
+        snapshotIdleTimeoutMs: config.storage.postgresql.snapshotIdleTimeoutMs,
         migrationRole: config.storage.postgresql.migrationRole,
       },
     };

@@ -1,0 +1,6 @@
+references: ["#1480"]
+rationale: >-
+  #1480 deduplicates the import unbound-project remedy by project identity
+  instead of working directory; the file keeps its established owner.
+pins:
+  - ["src/import.ts", "unit-transcripts-import"]

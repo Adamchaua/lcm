@@ -45,6 +45,17 @@ it('fences real transactions and proves a server-committed response loss before 
       const verification=await destination.verify();
       await destination.complete(verification);
       expect(await destination.readCompleted(verification)).toBe(true);
+      // The completion fence lives only as long as the completion transaction.
+      // Once it commits, a legitimate project-scoped writer may move a
+      // canonical row at any time, including before the settlement readback
+      // runs. The readback proves the run reached 'completed'; failing it here
+      // would report a failed settlement for a migration that did complete.
+      // Passing projectId routes this through a project-scoped transaction that
+      // takes the shared project publication guard, so it is a legitimate
+      // canonical writer rather than an unguarded autocommit statement.
+      const drifted=await targetDb.migrator.query({text:"UPDATE lcm.conversations SET title='post-completion-canary'"},{domain:'factory',operation:'checkCopy',projectId:seeded.expectedIdentity.id});
+      expect(drifted.rowCount).toBeGreaterThan(0);
+      expect(await destination.readCompleted(verification)).toBe(true);
       const rows=await targetDb.migrator.query({text:'SELECT state FROM lcm.transfer_runs'},{domain:'factory',operation:'checkCopy'});
       expect(rows.rows).toEqual([{state:'completed'}]);
     }finally{await destination?.close();await source.close();}

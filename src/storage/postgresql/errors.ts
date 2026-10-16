@@ -13,6 +13,22 @@ const CONNECTION_TERMINATION_SQLSTATES = new Set([
   "57P03",
 ]);
 
+/**
+ * Sessions killed by idle_in_transaction_session_timeout (25P03) are FATAL
+ * and dead, exactly like a transport-level connection loss, but 25P03 is
+ * class 25 ("Invalid Transaction State"), not 08 ("Connection Exception"),
+ * so it is deliberately kept out of {@link CONNECTION_TERMINATION_SQLSTATES}.
+ * Folding it in there would widen {@link isRetryablePostgreSqlError} and the
+ * runtime's destroy decisions across the whole PostgreSQL layer, retrying a
+ * FATAL idle-kill as if it were transient like ECONNRESET. That is the
+ * wrong blast radius. It is used only by the narrower snapshot-local
+ * predicate below.
+ */
+const SNAPSHOT_TERMINATION_SQLSTATES = new Set([
+  "25P03",
+  ...CONNECTION_TERMINATION_SQLSTATES,
+]);
+
 const RETRYABLE_TRANSPORT_CODES = new Set([
   "EAI_AGAIN",
   "ECONNABORTED",
@@ -90,7 +106,7 @@ export class PostgreSqlCommitOutcomeUnknownError extends StorageOperationError {
   }
 }
 
-function sanitizeSqlState(error: unknown): string | null {
+export function sanitizeSqlState(error: unknown): string | null {
   const code = (error as PostgreSqlDriverError | undefined)?.code;
   return typeof code === "string" && /^[0-9A-Z]{5}$/u.test(code) ? code : null;
 }
@@ -101,6 +117,71 @@ export function isPostgreSqlConnectionError(error: unknown): boolean {
   if (typeof code === "string" && (
     (code.length === 5 && code.startsWith("08"))
     || CONNECTION_TERMINATION_SQLSTATES.has(code)
+    || RETRYABLE_TRANSPORT_CODES.has(code)
+  )) {
+    return true;
+  }
+  return error instanceof Error && RETRYABLE_DRIVER_MESSAGES.has(error.message);
+}
+
+/**
+ * Whether a five-character SQLSTATE, already known to be present, has the
+ * shape of a genuine PostgreSQL connection termination or idle-in-
+ * transaction kill (25P03, 08xxx, 57P01/57P02/57P03). Shared by the
+ * snapshot-local predicate below and by
+ * {@link PostgreSqlSnapshotSession}'s captured-diagnostic reattach, so an
+ * out-of-band client 'error' event can only ever be reattached and
+ * classified as a termination when its own code actually looks like one;
+ * a hypothetical async event carrying an unrelated code (pg never emits
+ * one on a client 'error' event in practice) is captured but not reattached.
+ */
+export function isPostgreSqlSnapshotTerminationSqlState(sqlState: string): boolean {
+  return sqlState === "25P03"
+    || (sqlState.length === 5 && sqlState.startsWith("08"))
+    || CONNECTION_TERMINATION_SQLSTATES.has(sqlState);
+}
+
+/**
+ * A narrower, snapshot-local predicate for the read-only snapshot session
+ * only. Matches 25P03 (idle-in-transaction session kill), 08xxx (connection
+ * exception), 57P01/57P02/57P03 (admin/crash shutdown) and the existing
+ * transport codes/messages, reading either the raw pre-normalize driver
+ * error or the sqlState already carried by a normalized
+ * {@link PostgreSqlStorageOperationError}. Deliberately NOT the same set as
+ * {@link isPostgreSqlConnectionError}: use this only at the two seams that
+ * need it (snapshot session destroy-on-error, and the session arm of
+ * portable-source close() tolerance), never for the general retry/destroy
+ * decisions the wider helper feeds.
+ */
+export function isPostgreSqlSnapshotTerminationError(error: unknown): boolean {
+  if (error instanceof PostgreSqlStorageOperationError) {
+    const sqlState = error.sqlState;
+    if (sqlState !== null) {
+      return isPostgreSqlSnapshotTerminationSqlState(sqlState);
+    }
+    // idle_in_transaction_session_timeout fires while no statement is
+    // running: the FATAL arrives on the driver's asynchronous 'error'
+    // event, not on the promise the failing operation rejects with. A
+    // message-only torn connection (for example "Connection terminated
+    // unexpectedly") survives normalization with sqlState null and
+    // retryable true (RETRYABLE_DRIVER_MESSAGES / transport codes); that
+    // is the shape this branch tolerates. It does NOT cover "Client has
+    // encountered a connection error and is not queryable" (sqlState
+    // null, retryable false): that generic local rejection is exactly
+    // what an ordinary dead-but-undiagnosed client also produces, so it
+    // stays untolerated here unless the snapshot checkout's async-failure
+    // listener already captured a real diagnostic and reattached it
+    // (see PostgreSqlSnapshotSession), which gives it a real sqlState and
+    // takes the branch above instead. retryable alone is not a sufficient
+    // signal in general: a 40001 serialization failure is retryable too,
+    // but it keeps its own sqlState and never reaches this branch.
+    return error.retryable === true;
+  }
+  const candidate = error as PostgreSqlDriverError | undefined;
+  const code = candidate?.code;
+  if (typeof code === "string" && (
+    (code.length === 5 && code.startsWith("08"))
+    || SNAPSHOT_TERMINATION_SQLSTATES.has(code)
     || RETRYABLE_TRANSPORT_CODES.has(code)
   )) {
     return true;

@@ -219,6 +219,11 @@ describe("SQLite supplied canonical generation", () => {
   });
 
   it("authenticates many successive checkpoint prefixes without rescanning earlier source records",async()=>{
+    // Authenticate the capture as settled: its read starts well after the
+    // fixture's timestamps, so cached verification does not depend on how
+    // quickly this test runs inside the racy-timestamp window.
+    const realNow=Date.now.bind(Date);
+    vi.spyOn(Date,"now").mockImplementation(()=>realNow()+10_000);
     const source=await open(fixture(db=>conversations(db,60)));
     const stream=await createPortableRecordStream(source);
     const description=source.describeSource();
@@ -358,7 +363,9 @@ describe("SQLite supplied canonical generation", () => {
   it("uses keyset scanning after 500 main instruction rows and returns exact point records",async()=>{
     const source=await open(fixture(db=>{
       const insert=db.prepare("INSERT INTO session_instruction_cache VALUES(?,?,'codex','session','/worktree','/cwd','content','eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee','2026-09-06 00:00:00')");
+      db.exec("BEGIN");
       for(let n=0;n<503;n++)insert.run(identity.projectId,n.toString(16).padStart(64,"0"));
+      db.exec("COMMIT");
     }));
     expect((await source.readDomainPage(page("session-instructions"))).records).toHaveLength(500);
     expect((await source.readDomainPage(page("session-instructions",{afterOrdinal:500}))).records).toHaveLength(3);
@@ -657,6 +664,10 @@ describe("SQLite supplied canonical generation", () => {
 
   it.each(["close", "final checkpoint", "transfer"])("rejects changed capture bytes with unchanged metadata at %s", async terminal => {
     const file = fixture();
+    // Authenticate the capture as already settled: its read starts well after
+    // the fixture's timestamps, so only the forced final hash can reject it.
+    const realNow = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + 10_000);
     const source = await open(file);
     const stream = await createPortableRecordStream(source);
     const description = source.describeSource();
@@ -666,9 +677,10 @@ describe("SQLite supplied canonical generation", () => {
     expect(sqlitePortableFileSha256(file.path)).not.toBe(beforeHash);
     expect(filesystem.lstatSync(file.path, { bigint: true }).size).toBe(before.size);
 
-    // Model a same-size write inside filesystem timestamp granularity. Keep
-    // actual file bytes and every other identity field; mask both pathname and
-    // descriptor timestamps so final rejection must come from the real hash.
+    // Model a same-size write inside filesystem timestamp granularity on a
+    // settled capture. Keep actual file bytes and every other identity field;
+    // mask both pathname and descriptor timestamps so final rejection must come
+    // from the real hash.
     const originalLstat = filesystem.lstatSync;
     vi.spyOn(filesystem, "lstatSync").mockImplementation(((path, options) => {
       const stat = originalLstat(path, options as never);
