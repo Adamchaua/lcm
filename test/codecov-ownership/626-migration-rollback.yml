@@ -5,12 +5,20 @@ rationale: >-
   materialization and the orchestration that sequences them). They are
   cutover lifecycle work, so they stay in the directory-level migration
   cutover owner alongside the forward path they reverse; no topology change.
-  src/storage/local-hook-event-sequence.ts is materially changed but keeps
-  its established local event storage owner.
+  src/migration/activation-evidence-store.ts persists the activation epoch,
+  attempt and witness records those modules read back, in the same owner.
+  src/migration/generation-binding-store.ts (binding resolver and shared
+  scoped-store primitives) and src/migration/verify-generation.ts (exported
+  census and delta builders) are materially changed and keep their existing
+  migration cutover owner. src/storage/local-hook-event-sequence.ts is
+  materially changed but keeps its established local event storage owner.
 pins:
+  - ["src/migration/activation-evidence-store.ts", "unit-migration-cutover"]
+  - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-eligibility.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-generation.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-install.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-sidecars.ts", "unit-migration-cutover"]
   - ["src/migration/rollback.ts", "unit-migration-cutover"]
+  - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
   - ["src/storage/local-hook-event-sequence.ts", "unit-local-event-storage"]

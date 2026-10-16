@@ -415,14 +415,14 @@ function assertWitnessChecksum(value: unknown): asserts value is string {
   }
 }
 
-function validateHomeDir(value: unknown): string {
+export function validateHomeDir(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new MigrationBindingValidationError("homeDir is invalid");
   }
   return value;
 }
 
-function validateGenerationId(value: unknown): string {
+export function validateGenerationId(value: unknown): string {
   assertToken(value, "generationId");
   return value;
 }
