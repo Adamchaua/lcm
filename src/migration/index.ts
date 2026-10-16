@@ -245,3 +245,13 @@ export type {
   StoredDataProjectEnumeration,
   StoredDataProjectEnumerationReason,
 } from "./activation-coverage.js";
+
+export {
+  MigrationCopyBindingReadError,
+  readMigrationCopyBindingSha256,
+} from "./copy-binding-reader.js";
+export type {
+  MigrationCopyBindingReadResult,
+  MigrationCopyBindingUnresolvableReason,
+  ReadMigrationCopyBindingInput,
+} from "./copy-binding-reader.js";

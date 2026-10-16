@@ -16,8 +16,10 @@ rationale: >-
   the project-map witness (one definition, pre/post-publication modes, no
   writing read seam), extends the coverage module with the G8 stored-data
   inventory and single-project verdict, attributes pid-file read failures
-  in the restart check, and adjusts the report body and generation link.
+  in the restart check, adds the transfer-ledger copy-binding reader, and
+  adjusts the report body and generation link.
 pins:
+  - ["src/migration/copy-binding-reader.ts", "unit-migration-cutover"]
   - ["src/migration/project-map-witness.ts", "unit-migration-cutover"]
   - ["src/migration/activation-coverage.ts", "unit-migration-cutover"]
   - ["src/migration/activation-restart-check.ts", "unit-migration-cutover"]
