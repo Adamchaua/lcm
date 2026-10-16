@@ -8,7 +8,11 @@ import { prepareSqliteMigrationEnrollment } from "../../src/migration/maintenanc
 import { PostgreSqlIdentityRepository } from "../../src/storage/postgresql/identity-repository.js";
 import { resolveProjectIdentity, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
 import { configPath } from "../../src/runtime-paths.js";
-import { resolveMigrationPreflight } from "../../src/migration/cli-preflight.js";
+import { resolveMigrationExpectedIdentity, resolveMigrationPreflight } from "../../src/migration/cli-preflight.js";
+import { performMigrationApplyThroughCapture } from "../../src/migration/apply.js";
+import { performMigrationApplyGenesisAndCopy } from "../../src/migration/apply-genesis-copy.js";
+import { performMigrationResumeCommand } from "../../src/migration/cli-resume.js";
+import { performMigrationReportCommand } from "../../src/migration/cli-report.js";
 import { performMigrationApply } from "../../src/migration/cli-apply.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import { classifyMigrationRecovery } from "../../src/migration/protocol.js";
@@ -214,6 +218,77 @@ it(
         });
         expect(second).toEqual(result);
         expect(await projectCounts(db)).toEqual({ projects: "1", aliases: "1" });
+      } finally {
+        closeLcmConnection();
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  },
+  180000,
+);
+
+
+it(
+  "resume continues a copy a real crash interrupted, with every callee real: the held identity is read (nothing minted), the copy stops at copied, and report then names verify",
+  async () => {
+    await withPostgreSqlTestDatabase("cli-resume-roundtrip", async (db) => {
+      const { home, cwd, pgSettings } = await preparedApplyTarget(db);
+      try {
+        vi.stubEnv("LCM_POSTGRES_URL", pgSettings.url);
+        vi.stubEnv("LCM_POSTGRES_CA_FILE", pgSettings.caFile);
+        try {
+          const preflight = await resolveMigrationPreflight({
+            cwd, homeDir: home, _operationsForTesting: { classifyPresence: async () => presentPresence() },
+          });
+          expect(preflight.status).toBe("ready");
+          if (preflight.status !== "ready") throw new Error("unreachable");
+          const identity = await resolveMigrationExpectedIdentity({ preflight, cwd, homeDir: home });
+          expect(identity.status).toBe("resolved");
+          if (identity.status !== "resolved") throw new Error("unreachable");
+          const generationId = preflight.candidate.generationId;
+
+          // The first run: capture, then genesis and a copy that a simulated
+          // crash interrupts after its first batch.
+          const captured = await performMigrationApplyThroughCapture({
+            cwd, homeDir: home, base: preflight.base, confirmGenerationId: generationId,
+          });
+          if (captured.status !== "captured") throw new Error("capture did not complete");
+          let interrupted = false;
+          const first = await performMigrationApplyGenesisAndCopy({
+            homeDir: home, generationId: captured.generationId, maintenanceChecksumSha256: captured.maintenanceChecksumSha256,
+            settings: preflight.targetConfig.postgresql, expectedOwner: preflight.targetConfig.postgresql.migrationRole,
+            expectedIdentity: identity.expectedIdentity, ownerProcessId: "resume-first-run", maxRecords: 1, maxBytes: 150994944,
+            testing: { observe: async (boundary) => {
+              if (boundary === "after-batch-readback" && !interrupted) { interrupted = true; throw new Error("simulated crash"); }
+            } },
+          });
+          expect(first).toMatchObject({ status: "refuse", reason: "copy-failed" });
+          const store = new MigrationManifestStore({ homeDir: home });
+          expect(store.read(generationId).pendingEffect?.kind).toBe("copy-batch");
+          const projectsBefore = await projectCounts(db);
+
+          // report is read-only and says resume owns this cell.
+          const before = await performMigrationReportCommand({ homeDir: home });
+          expect(before).toMatchObject({ next: "resume", evidence: { cell: 21, pendingEffect: "copy-batch" } });
+
+          // resume: the real genesis/copy callee, the real held identity, no seams.
+          const resumed = await performMigrationResumeCommand({
+            cwd, homeDir: home, confirmGenerationId: generationId, maxRecords: 1,
+          });
+          expect(resumed).toEqual({
+            status: "ok", generationId, manifestPhase: "copied", applied: true, next: "report", evidence: { cell: 21 },
+          });
+          expect(store.read(generationId).phase).toBe("copied");
+          expect(classifyMigrationRecovery(store.read(generationId))).toEqual({ action: "ready" });
+          // Resuming minted nothing.
+          expect(await projectCounts(db)).toEqual(projectsBefore);
+
+          const after = await performMigrationReportCommand({ homeDir: home });
+          expect(after).toMatchObject({ next: "verify", evidence: { cell: 22, snapshot: "complete" } });
+          expect(after.reason).toBeUndefined();
+        } finally {
+          vi.unstubAllEnvs();
+        }
       } finally {
         closeLcmConnection();
         rmSync(home, { recursive: true, force: true });
