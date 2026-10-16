@@ -466,6 +466,7 @@ const expectedComponents = [
     paths: [
       "^src/storage/postgresql/coordination\\.ts$",
       "^src/storage/postgresql/publication-guard\\.ts$",
+      "^src/storage/postgresql/publication-remote-guard\\.ts$",
     ],
   },
   {
@@ -785,7 +786,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(260);
+    expect(productionFiles).toHaveLength(261);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -815,7 +816,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(260);
+    expect(ownershipCounts.size).toBe(261);
   });
 
   test("keeps every recorded ownership decision in its intended component", () => {
