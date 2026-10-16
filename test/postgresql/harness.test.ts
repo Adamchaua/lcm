@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   closeAttempts: [] as string[],
   databaseAdminCloseFailure: undefined as Error | undefined,
   dropAttempts: 0,
+  dropBusyFailures: 0,
   dropGate: undefined as Deferred | undefined,
   events: [] as string[],
   extensionOverrides: {} as Partial<{
@@ -141,6 +142,10 @@ vi.mock("../../src/storage/postgresql/runtime.js", () => ({
         }
         if (operation === "dropTestDatabase") {
           mocks.dropAttempts += 1;
+          if (mocks.dropBusyFailures > 0) {
+            mocks.dropBusyFailures -= 1;
+            throw Object.assign(new Error("injected object_in_use"), { sqlState: "55006" });
+          }
           await mocks.dropGate?.promise;
         }
         return { command: "SELECT", fields: [], oid: 0, rowCount: 0, rows: [] };
@@ -182,6 +187,7 @@ beforeEach(() => {
   mocks.closeAttempts.length = 0;
   mocks.databaseAdminCloseFailure = undefined;
   mocks.dropAttempts = 0;
+  mocks.dropBusyFailures = 0;
   mocks.dropGate = undefined;
   mocks.events.length = 0;
   mocks.extensionOverrides = {};
@@ -582,6 +588,21 @@ describe("PostgreSQL test database lease", () => {
     retryGate.resolve();
     await expect(retry).resolves.toBeUndefined();
     expect(mocks.operations.filter((operation) => operation === "drainTestDatabase")).toHaveLength(2);
+  });
+
+  it("retries a transient object_in_use DROP DATABASE failure within a bound", async () => {
+    const database = await createPostgreSqlTestDatabase("busy-drop");
+    mocks.dropBusyFailures = 2;
+
+    await expect(database.drop()).resolves.toBeUndefined();
+    expect(mocks.dropAttempts).toBe(3);
+    expect(mocks.operations.filter((operation) => operation === "verifyDropSentinel")).toHaveLength(1);
+
+    const exhausted = await createPostgreSqlTestDatabase("busy-drop-exhausted");
+    mocks.dropAttempts = 0;
+    mocks.dropBusyFailures = 10;
+    await expect(exhausted.drop()).rejects.toMatchObject({ sqlState: "55006" });
+    expect(mocks.dropAttempts).toBe(5);
   });
 
   it("creates a guarded unmigrated database with an intentionally omitted extension", async () => {
