@@ -869,6 +869,46 @@ are emitted by no registered command in this release.
       "remedy": "The journal, manifest and snapshot of this generation contradict each other. Nothing was changed; run `lcm doctor` and inspect the evidence."
     },
     {
+      "reason": "existing-confirmation-missing",
+      "exitClass": "refused-confirmation",
+      "remedy": "Pass --confirm-generation with the generation id this refusal reports; nothing was changed."
+    },
+    {
+      "reason": "existing-confirmation-moved",
+      "exitClass": "refused-confirmation",
+      "remedy": "--confirm-generation does not match the resolved generation. Pass the id this refusal reports; nothing was changed."
+    },
+    {
+      "reason": "requires-625-project-map-witness",
+      "exitClass": "failed-operator-required",
+      "remedy": "A fresh verification needs the project-map witness that #625 provides, which this build does not include. Nothing was changed; the generation stays copied."
+    },
+    {
+      "reason": "verify-report-identity-conflict",
+      "exitClass": "refused-evidence",
+      "remedy": "The pending verification effect does not name an activation-eligible persisted report. Nothing was changed; run `lcm doctor` and inspect the evidence."
+    },
+    {
+      "reason": "verify-destination-drift",
+      "exitClass": "refused-evidence",
+      "remedy": "The persisted verification report does not match the destination the copy sealed in the manifest. Nothing was changed; the evidence is preserved."
+    },
+    {
+      "reason": "verify-invalid-input",
+      "exitClass": "failed-operator-required",
+      "remedy": "The CLI constructed an invalid verification request. This is an internal defect; file an issue rather than retrying."
+    },
+    {
+      "reason": "verify-report-unresolvable",
+      "exitClass": "refused-evidence",
+      "remedy": "The persisted verification report could not be read. Run `lcm doctor` before retrying."
+    },
+    {
+      "reason": "verify-readback-mismatch",
+      "exitClass": "refused-evidence",
+      "remedy": "The verification appeared to complete but the manifest and its report do not read back as verified. Run `lcm migration report` and inspect the evidence."
+    },
+    {
       "reason": "abort-readback-mismatch",
       "exitClass": "failed-operator-required",
       "remedy": "The abort appeared to complete but its terminal state could not be confirmed on readback. Run `lcm doctor` and inspect the maintenance journal and manifest directly."

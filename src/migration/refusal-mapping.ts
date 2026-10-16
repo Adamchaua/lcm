@@ -30,11 +30,11 @@ export type MigrationRefusalMapping = Readonly<{
 /**
  * Section 5.1's row-level rule, restated per entry so it is checkable
  * mechanically rather than only in prose: `incomplete-recoverable` (exit 6)
- * requires that `resume` can genuinely finish the state. This candidate
- * does not implement `resume`, so no reason it can itself emit maps to
- * exit 6 yet — every held-plus-unsettled case here is `refused-precondition`
- * (exit 2) naming `abort`, never exit 6, exactly as section 5 requires for
- * an unresumable state.
+ * requires that `resume` can genuinely finish the state. Only the router's
+ * `route-resume-required` claims it: the cell has a pending effect that
+ * `resume` completes. Every other held-plus-unsettled case is
+ * `refused-precondition` (exit 2) naming `abort`, never exit 6, exactly as
+ * section 5 requires for an unresumable state.
  */
 export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Object.freeze([
   // --- Round-1 B-4: the boundary catch's closed reason for a throw nothing
@@ -371,6 +371,41 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   Object.freeze({
     reason: "route-contradiction", exitClass: "refused-evidence",
     remedy: "The journal, manifest and snapshot of this generation contradict each other. Nothing was changed; run `lcm doctor` and inspect the evidence.",
+  }),
+  // --- Confirmation for the existing-generation commands (verify, resume). ---
+  Object.freeze({
+    reason: "existing-confirmation-missing", exitClass: "refused-confirmation",
+    remedy: "Pass --confirm-generation with the generation id this refusal reports; nothing was changed.",
+  }),
+  Object.freeze({
+    reason: "existing-confirmation-moved", exitClass: "refused-confirmation",
+    remedy: "--confirm-generation does not match the resolved generation. Pass the id this refusal reports; nothing was changed.",
+  }),
+
+  // --- verify (plan-v4 section 5, plan-v5 Part B (2)). ---
+  Object.freeze({
+    reason: "requires-625-project-map-witness", exitClass: "failed-operator-required",
+    remedy: "A fresh verification needs the project-map witness that #625 provides, which this build does not include. Nothing was changed; the generation stays copied.",
+  }),
+  Object.freeze({
+    reason: "verify-report-identity-conflict", exitClass: "refused-evidence",
+    remedy: "The pending verification effect does not name an activation-eligible persisted report. Nothing was changed; run `lcm doctor` and inspect the evidence.",
+  }),
+  Object.freeze({
+    reason: "verify-destination-drift", exitClass: "refused-evidence",
+    remedy: "The persisted verification report does not match the destination the copy sealed in the manifest. Nothing was changed; the evidence is preserved.",
+  }),
+  Object.freeze({
+    reason: "verify-invalid-input", exitClass: "failed-operator-required",
+    remedy: "The CLI constructed an invalid verification request. This is an internal defect; file an issue rather than retrying.",
+  }),
+  Object.freeze({
+    reason: "verify-report-unresolvable", exitClass: "refused-evidence",
+    remedy: "The persisted verification report could not be read. Run `lcm doctor` before retrying.",
+  }),
+  Object.freeze({
+    reason: "verify-readback-mismatch", exitClass: "refused-evidence",
+    remedy: "The verification appeared to complete but the manifest and its report do not read back as verified. Run `lcm migration report` and inspect the evidence.",
   }),
   Object.freeze({
     reason: "abort-readback-mismatch", exitClass: "failed-operator-required",

@@ -4,6 +4,7 @@ import {
   renderMigrationDryRunEnvelope,
   renderMigrationApplyEnvelope,
   renderMigrationAbortEnvelope,
+  renderMigrationVerifyEnvelope,
   renderMigrationUnexpectedFailureEnvelope,
 } from "../../src/migration/cli-render.js";
 import { migrationExitClassForName } from "../../src/migration/exit-classes.js";
@@ -212,6 +213,44 @@ describe("renderMigrationAbortEnvelope", () => {
     const envelope = renderMigrationAbortEnvelope({ status: "refuse", reason: "abort-nothing-to-abort" });
     expect(envelope.applied).toBe(false);
     expect(envelope.refusal?.reason).toBe("abort-nothing-to-abort");
+  });
+});
+
+describe("renderMigrationVerifyEnvelope", () => {
+  it("builds an ok envelope carrying the cell's evidence, the generation, the phase and next", () => {
+    const envelope = renderMigrationVerifyEnvelope({
+      status: "ok", generationId: "gen-1", manifestPhase: "verified", applied: true, next: "report",
+      evidence: { reportSha256: "a".repeat(64), activationEligible: true, cell: 23, coordinationEffects: "none" },
+    });
+    expect(envelope).toMatchObject({
+      command: "verify", outcome: "ok", exitCode: 0, generation: "gen-1", manifestPhase: "verified", applied: true, next: "report",
+      evidence: { activationEligible: true, cell: 23, coordinationEffects: "none", reportSha256: "a".repeat(64) },
+      refusal: null,
+    });
+  });
+
+  it("builds a not-applied ok envelope for a read-only answer", () => {
+    expect(renderMigrationVerifyEnvelope({
+      status: "ok", generationId: "gen-1", manifestPhase: "copied", applied: false, next: null, evidence: { predictive: false },
+    })).toMatchObject({ applied: false, next: null, evidence: { predictive: false } });
+  });
+
+  it.each([
+    ["requires-625-project-map-witness", 7, undefined],
+    ["verify-destination-drift", 5, undefined],
+    ["existing-confirmation-moved", 3, undefined],
+    ["route-not-owner", 2, "resume"],
+    ["route-resume-required", 6, "resume"],
+  ])("maps the refusal %s to exit %i and carries the router's next (%s) and the generation", (reason, exit, next) => {
+    const envelope = renderMigrationVerifyEnvelope({ status: "refuse", reason, generationId: "gen-1", ...(next === undefined ? {} : { next }) });
+    expect(envelope.exitCode).toBe(exit);
+    expect(envelope.generation).toBe("gen-1");
+    expect(envelope.next).toBe(next ?? null);
+    expect(envelope.applied).toBe(false);
+  });
+
+  it("reports applied:true on a refusal that followed a durable write", () => {
+    expect(renderMigrationVerifyEnvelope({ status: "refuse", reason: "verify-readback-mismatch", applied: true }).applied).toBe(true);
   });
 });
 

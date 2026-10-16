@@ -83,10 +83,9 @@ describe("MIGRATION_REFUSAL_REASONS (section 12's single exported constant)", ()
     }
   });
 
-  it("no entry claims exit class incomplete-recoverable (exit 6): this candidate does not implement resume, so no reason it can itself emit may claim resume can finish it (section 5's exit-6 rule)", () => {
-    for (const entry of MIGRATION_REFUSAL_REASONS) {
-      expect(entry.exitClass).not.toBe("incomplete-recoverable");
-    }
+  it("only route-resume-required claims exit class incomplete-recoverable (exit 6): it is the router's refusal for a cell whose pending effect `resume` finishes, and every other reason is a state resume cannot finish (section 5's exit-6 rule)", () => {
+    expect(MIGRATION_REFUSAL_REASONS.filter((entry) => entry.exitClass === "incomplete-recoverable").map((entry) => entry.reason))
+      .toEqual(["route-resume-required"]);
   });
 
   it.each(REASONS_APPLY_TS_AND_CANDIDATE_TS_CAN_EMIT)(

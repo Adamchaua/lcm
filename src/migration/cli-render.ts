@@ -12,6 +12,7 @@ import type { MigrationDryRunOutcome } from "./cli-dry-run.js";
 import { migrationDryRunEvidence } from "./cli-dry-run.js";
 import type { MigrationApplyOutcome } from "./cli-apply.js";
 import type { MigrationAbortCommandOutcome } from "./cli-abort.js";
+import type { MigrationVerifyCommandOutcome } from "./cli-verify.js";
 import { MIGRATION_UNEXPECTED_FAILURE_REASON, unexpectedFailureEvidence } from "./boundary.js";
 
 /**
@@ -65,6 +66,8 @@ function refusalEnvelope(input: Readonly<{
   applied: boolean;
   generation?: string | null;
   manifestPhase?: string | null;
+  /** The command the router names as the way forward, when it names one. */
+  next?: string | null;
 }>): MigrationEnvelope {
   const mapping = migrationRefusalMapping(input.reason);
   const evidence: MigrationEvidence = input.evidenceDetail === undefined
@@ -77,7 +80,7 @@ function refusalEnvelope(input: Readonly<{
     generation: input.generation ?? null,
     manifestPhase: input.manifestPhase ?? null,
     applied: input.applied,
-    next: null,
+    next: input.next ?? null,
     evidence,
     refusal: { reason: input.reason, remedy: mapping.remedy },
     restart: null,
@@ -181,6 +184,27 @@ export function renderMigrationUnexpectedFailureEnvelope(command: MigrationComma
     evidenceDetail: unexpectedFailureEvidence(error),
     // Only plan and dry-run are known never to have written anything.
     applied: command !== "plan" && command !== "dry-run",
+  });
+}
+
+export function renderMigrationVerifyEnvelope(outcome: MigrationVerifyCommandOutcome): MigrationEnvelope {
+  if (outcome.status === "refuse") {
+    return refusalEnvelope({
+      command: "verify",
+      reason: outcome.reason,
+      evidenceDetail: outcome.evidence,
+      applied: outcome.applied ?? false,
+      generation: outcome.generationId,
+      next: outcome.next,
+    });
+  }
+  return okEnvelope({
+    command: "verify",
+    applied: outcome.applied,
+    generation: outcome.generationId,
+    manifestPhase: outcome.manifestPhase,
+    next: outcome.next,
+    evidence: outcome.evidence,
   });
 }
 
