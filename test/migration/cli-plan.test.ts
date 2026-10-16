@@ -28,7 +28,9 @@ describe("performMigrationPlan: entirely non-mutating, reports the shared prefli
         targetConfig: {} as never,
         presence: { status: "present", storageBackend: "postgresql", pid: 1, daemonInstanceId: "gen-1" },
         candidate: { status: "candidate", disposition: "fresh", generationId: "generation-0" },
-        expectedIdentity: {} as never,
+        local: { id: "a".repeat(64), canonical: "/projects/x", persisted: true },
+        machineId: "machine-1",
+        destinationProjectId: null,
         base: "base-identity",
       }),
     });
@@ -37,6 +39,7 @@ describe("performMigrationPlan: entirely non-mutating, reports the shared prefli
       generationId: "generation-0",
       disposition: "fresh",
       daemonPresence: { status: "present", storageBackend: "postgresql", pid: 1, daemonInstanceId: "gen-1" },
+      identityPreview: { destinationProject: "will-be-created-at-apply", localProject: "persisted" },
     });
   });
 
@@ -50,7 +53,9 @@ describe("performMigrationPlan: entirely non-mutating, reports the shared prefli
         targetConfig: {} as never,
         presence: { status: "authoritatively-absent" },
         candidate: { status: "candidate", disposition: "fresh", generationId: "generation-0" },
-        expectedIdentity: {} as never,
+        local: { id: "a".repeat(64), canonical: "/projects/x", persisted: true },
+        machineId: "machine-1",
+        destinationProjectId: null,
         base: "base-identity",
       }),
     });
@@ -59,6 +64,7 @@ describe("performMigrationPlan: entirely non-mutating, reports the shared prefli
       generationId: "generation-0",
       disposition: "fresh",
       daemonPresence: { status: "authoritatively-absent" },
+      identityPreview: { destinationProject: "will-be-created-at-apply", localProject: "persisted" },
     });
   });
 

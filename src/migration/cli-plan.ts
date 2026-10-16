@@ -1,4 +1,9 @@
-import { resolveMigrationPreflight, type MigrationPreflightResult } from "./cli-preflight.js";
+import {
+  migrationIdentityPreview,
+  resolveMigrationPreflight,
+  type MigrationIdentityPreview,
+  type MigrationPreflightResult,
+} from "./cli-preflight.js";
 import { MIGRATION_UNEXPECTED_FAILURE_REASON, withMigrationBoundary } from "./boundary.js";
 import type { MigrationDaemonPresence } from "./daemon-presence.js";
 
@@ -28,6 +33,8 @@ export type MigrationPlanOutcome =
      * upstream in the shared preflight and never reaches here.
      */
     daemonPresence: Extract<MigrationDaemonPresence, { status: "present" } | { status: "authoritatively-absent" }>;
+    /** What apply would mint, reported without minting it (plan-v5 Part B (3)). */
+    identityPreview: MigrationIdentityPreview;
   }>
   | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
 
@@ -59,5 +66,6 @@ async function runMigrationPlan(input: MigrationPlanInput): Promise<MigrationPla
     generationId: preflight.candidate.generationId,
     disposition: preflight.candidate.disposition,
     daemonPresence: preflight.presence,
+    identityPreview: migrationIdentityPreview(preflight),
   };
 }

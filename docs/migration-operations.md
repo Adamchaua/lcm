@@ -529,6 +529,21 @@ are emitted by no registered command in this release.
       "remedy": "This machine has no registered PostgreSQL identity. Run `lcm machine register` before retrying."
     },
     {
+      "reason": "local-identity-unresolvable",
+      "exitClass": "refused-evidence",
+      "remedy": "This project's persisted identity could not be read. Run `lcm doctor` before retrying."
+    },
+    {
+      "reason": "local-identity-not-persisted",
+      "exitClass": "refused-evidence",
+      "remedy": "A maintenance hold exists but this project has no persisted identity, and nothing is minted under a hold. Run `lcm doctor`; `lcm migration abort` releases the hold."
+    },
+    {
+      "reason": "destination-project-absent",
+      "exitClass": "refused-evidence",
+      "remedy": "A maintenance hold exists but the destination PostgreSQL project does not, and nothing is created under a hold. Run `lcm doctor`; `lcm migration abort` releases the hold."
+    },
+    {
       "reason": "migration-target-identity-unresolvable",
       "exitClass": "refused-evidence",
       "remedy": "The destination PostgreSQL project identity could not be resolved or minted. Run `lcm doctor` before retrying."
@@ -792,6 +807,66 @@ are emitted by no registered command in this release.
       "reason": "abort-nothing-to-abort",
       "exitClass": "refused-precondition",
       "remedy": "There is no maintenance hold to abort."
+    },
+    {
+      "reason": "generation-required",
+      "exitClass": "refused-precondition",
+      "remedy": "No live maintenance hold identifies the generation. Pass --generation <id>; `lcm migration report` lists what is known."
+    },
+    {
+      "reason": "generation-unknown",
+      "exitClass": "refused-precondition",
+      "remedy": "No journal or manifest exists for that generation id. Check the id passed to --generation."
+    },
+    {
+      "reason": "generation-invalid",
+      "exitClass": "usage",
+      "remedy": "The value passed to --generation is not a valid generation id. Nothing was read or changed."
+    },
+    {
+      "reason": "route-not-owner",
+      "exitClass": "refused-precondition",
+      "remedy": "This generation's state is owned by a different command. Run the command this refusal names as next; nothing was changed."
+    },
+    {
+      "reason": "route-publication-in-flight",
+      "exitClass": "refused-contention",
+      "remedy": "A v2 publication occupies the journal slot for this generation. Wait for it to settle, then run `lcm migration report`."
+    },
+    {
+      "reason": "route-resume-required",
+      "exitClass": "incomplete-recoverable",
+      "remedy": "This generation has durably begun work that only `lcm migration resume` (or `verify` where this refusal names it) can finish. Nothing was changed."
+    },
+    {
+      "reason": "route-requires-activation",
+      "exitClass": "failed-operator-required",
+      "remedy": "This generation is verified and awaits activation, which this build does not register. Nothing was changed; run `lcm migration report`."
+    },
+    {
+      "reason": "route-requires-rollback",
+      "exitClass": "failed-operator-required",
+      "remedy": "This generation is past activation and only rollback can settle it, which this build does not register. Nothing was changed; run `lcm migration report`."
+    },
+    {
+      "reason": "route-operator-required",
+      "exitClass": "failed-operator-required",
+      "remedy": "No automatic command settles this generation's state. Nothing was changed; run `lcm migration report` and inspect the evidence."
+    },
+    {
+      "reason": "route-unresolvable",
+      "exitClass": "refused-evidence",
+      "remedy": "The maintenance journal could not be read, so no command can be chosen. Run `lcm doctor` before retrying."
+    },
+    {
+      "reason": "route-foreign-publication",
+      "exitClass": "refused-evidence",
+      "remedy": "The journal slot holds a publication that does not belong to this generation. Nothing was changed; run `lcm migration report`."
+    },
+    {
+      "reason": "route-contradiction",
+      "exitClass": "refused-evidence",
+      "remedy": "The journal, manifest and snapshot of this generation contradict each other. Nothing was changed; run `lcm doctor` and inspect the evidence."
     },
     {
       "reason": "abort-readback-mismatch",

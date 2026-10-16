@@ -127,7 +127,11 @@ export function renderMigrationPlanEnvelope(outcome: MigrationPlanOutcome): Migr
     applied: false,
     generation: outcome.generationId,
     next: "apply",
-    evidence: { disposition: outcome.disposition, ...daemonPresenceEvidence(outcome.daemonPresence) },
+    evidence: {
+      disposition: outcome.disposition,
+      ...daemonPresenceEvidence(outcome.daemonPresence),
+      ...outcome.identityPreview,
+    },
   });
 }
 
@@ -159,7 +163,7 @@ export function renderMigrationApplyEnvelope(outcome: MigrationApplyOutcome): Mi
     generation: outcome.generationId,
     manifestPhase: outcome.phase ?? null,
     next: outcome.applied ? null : "apply (drop --dry-run to copy for real)",
-    evidence: daemonPresenceEvidence(outcome.daemonPresence),
+    evidence: { ...daemonPresenceEvidence(outcome.daemonPresence), ...outcome.identityPreview },
   });
 }
 

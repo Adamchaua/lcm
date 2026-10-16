@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { resolveMigrationPreflight, type MigrationPreflightResult } from "./cli-preflight.js";
+import {
+  resolveMigrationExpectedIdentity,
+  resolveMigrationPreflight,
+  type MigrationIdentityPreview,
+  type MigrationPreflightResult,
+  migrationIdentityPreview,
+} from "./cli-preflight.js";
 import {
   performMigrationApplyThroughCapture,
   type MigrationApplyThroughCaptureOutcome,
@@ -67,6 +73,8 @@ export type MigrationApplyOutcome =
     phase?: string;
     /** The preflight's daemon-presence answer, carried into the exit-0 evidence (round-1 A-8). */
     daemonPresence: MigrationApplyDaemonPresence;
+    /** Present only for `--dry-run`: what apply would mint, reported without minting it. */
+    identityPreview?: MigrationIdentityPreview;
   }>
   | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
 
@@ -74,6 +82,7 @@ export type MigrationApplyOperations = Readonly<{
   performCapture: typeof performMigrationApplyThroughCapture;
   performGenesisAndCopy: typeof performMigrationApplyGenesisAndCopy;
   mintOwnerProcessId: () => string;
+  resolveExpectedIdentity: typeof resolveMigrationExpectedIdentity;
 }>;
 
 export type MigrationApplyInput = Readonly<{
@@ -117,6 +126,7 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
   const performCapture = input._operationsForTesting?.performCapture ?? performMigrationApplyThroughCapture;
   const performGenesisAndCopy = input._operationsForTesting?.performGenesisAndCopy ?? performMigrationApplyGenesisAndCopy;
   const mintOwnerProcessId = input._operationsForTesting?.mintOwnerProcessId ?? randomUUID;
+  const resolveExpectedIdentity = input._operationsForTesting?.resolveExpectedIdentity ?? resolveMigrationExpectedIdentity;
 
   const runPreflight = input._preflight ?? (() => resolveMigrationPreflight({ cwd: input.cwd, homeDir: input.homeDir }));
   const preflight = await runPreflight();
@@ -137,8 +147,15 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
   }
 
   if (input.dryRun === true) {
-    return { status: "ok", generationId: preflight.candidate.generationId, applied: false, daemonPresence };
+    return {
+      status: "ok", generationId: preflight.candidate.generationId, applied: false, daemonPresence,
+      identityPreview: migrationIdentityPreview(preflight),
+    };
   }
+
+  // Only now, past the fence, may anything be minted (plan-v5 Part B (3)).
+  const identity = await resolveExpectedIdentity({ preflight, cwd: input.cwd, homeDir: input.homeDir });
+  if (identity.status === "refuse") return identity;
 
   const captureResult: MigrationApplyThroughCaptureOutcome = await performCapture({
     cwd: input.cwd,
@@ -161,7 +178,7 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
     maintenanceChecksumSha256: captureResult.maintenanceChecksumSha256,
     settings: preflight.targetConfig.postgresql,
     expectedOwner: preflight.targetConfig.postgresql.migrationRole,
-    expectedIdentity: preflight.expectedIdentity,
+    expectedIdentity: identity.expectedIdentity,
     ownerProcessId,
     maxRecords: input.maxRecords ?? DEFAULT_MIGRATION_APPLY_MAX_RECORDS,
     maxBytes: input.maxBytes ?? DEFAULT_MIGRATION_APPLY_MAX_BYTES,

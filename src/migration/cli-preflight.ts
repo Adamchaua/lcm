@@ -1,6 +1,7 @@
 import { basename } from "node:path";
 import { configPath } from "../runtime-paths.js";
-import { resolveProjectIdentity } from "../project-map.js";
+import { hashProjectPath, normalizeProjectPath, readProjectMapIdentity, resolveProjectIdentity } from "../project-map.js";
+import { resolveGitProjectAnchor } from "../git-project.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import type { ResolvedPostgreSqlConfig } from "../daemon/config.js";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
@@ -9,7 +10,8 @@ import { requireMachineIdentity, MachineIdentityFileError } from "../machine-ide
 import { resolveMigrationTargetConfig } from "./target-config.js";
 import { classifyMigrationDaemonPresence, type MigrationDaemonPresence } from "./daemon-presence.js";
 import { verifyMigrationTargetReachability } from "./target-reachability.js";
-import { resolveMigrationTargetProjectId } from "./target-identity.js";
+import { lookupMigrationTargetProjectId, resolveMigrationTargetProjectId } from "./target-identity.js";
+import { unexpectedFailureEvidence } from "./boundary.js";
 import {
   computeMigrationGenerationBase,
   nonSecretPostgreSqlTargetCoordinates,
@@ -78,16 +80,59 @@ import {
  * operator to write the exact field that must stay unset.
  */
 
+/** The local project as the preview saw it: a persisted map entry, or the deterministic derivation labelled as not persisted. */
+export type MigrationLocalProject = Readonly<{ id: string; canonical: string; persisted: boolean }>;
+
+/**
+ * The preview context (plan-v5 Part B (3)): every read, no write. It is what
+ * `plan`, `apply --dry-run` and `apply`'s fence consume. Minting the local
+ * map entry and the destination project is a separate step
+ * (`resolveMigrationExpectedIdentity`) that only `apply` takes, after its
+ * fence.
+ */
 export type MigrationPreflightResult =
   | Readonly<{
     status: "ready";
     targetConfig: ResolvedPostgreSqlConfig;
     presence: Extract<MigrationDaemonPresence, { status: "present" } | { status: "authoritatively-absent" }>;
     candidate: Extract<MigrationApplyCandidateResolution, { status: "candidate" }>;
-    expectedIdentity: StorageIdentityContext;
+    local: MigrationLocalProject;
+    machineId: string;
+    /** The destination project at the alias key, or `null`: it will be created at apply. */
+    destinationProjectId: string | null;
     base: string;
   }>
   | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
+
+/** What the preview can say about the two things apply would mint, without minting either. */
+export type MigrationIdentityPreview = Readonly<{
+  destinationProject: "exists" | "will-be-created-at-apply";
+  localProject: "persisted" | "not-persisted";
+}>;
+
+export function migrationIdentityPreview(
+  preflight: Extract<MigrationPreflightResult, { status: "ready" }>,
+): MigrationIdentityPreview {
+  return {
+    destinationProject: preflight.destinationProjectId === null ? "will-be-created-at-apply" : "exists",
+    localProject: preflight.local.persisted ? "persisted" : "not-persisted",
+  };
+}
+
+function deriveLocalProject(cwd: string): Pick<MigrationLocalProject, "id" | "canonical"> {
+  const anchor = resolveGitProjectAnchor(cwd);
+  const canonical = anchor?.canonical ?? normalizeProjectPath(cwd);
+  return { id: hashProjectPath(canonical), canonical };
+}
+
+async function closeQuietly(runtime: PostgreSqlRuntime): Promise<void> {
+  try {
+    await runtime.close();
+  } catch {
+    // Preserve whichever outcome was already determined; a close failure
+    // after a classified resolution is not itself new evidence.
+  }
+}
 
 export type MigrationPreflightOperations = Readonly<{
   resolveTargetConfig: typeof resolveMigrationTargetConfig;
@@ -95,7 +140,8 @@ export type MigrationPreflightOperations = Readonly<{
   verifyReachability: typeof verifyMigrationTargetReachability;
   requireMachine: typeof requireMachineIdentity;
   createIdentityRuntime: (settings: ResolvedPostgreSqlConfig["postgresql"]) => PostgreSqlRuntime;
-  resolveTargetIdentity: typeof resolveMigrationTargetProjectId;
+  readLocalIdentity: typeof readProjectMapIdentity;
+  lookupTargetProject: typeof lookupMigrationTargetProjectId;
   resolveCandidate: typeof resolveMigrationApplyCandidate;
   resolveTargetCoordinates: typeof nonSecretPostgreSqlTargetCoordinates;
   computeBase: typeof computeMigrationGenerationBase;
@@ -120,7 +166,8 @@ export async function resolveMigrationPreflight(input: Readonly<{
   const requireMachine = input._operationsForTesting?.requireMachine ?? requireMachineIdentity;
   const createIdentityRuntime = input._operationsForTesting?.createIdentityRuntime
     ?? ((settings) => new PostgreSqlRuntime(settings));
-  const resolveTargetIdentity = input._operationsForTesting?.resolveTargetIdentity ?? resolveMigrationTargetProjectId;
+  const readLocalIdentity = input._operationsForTesting?.readLocalIdentity ?? readProjectMapIdentity;
+  const lookupTargetProject = input._operationsForTesting?.lookupTargetProject ?? lookupMigrationTargetProjectId;
   const resolveCandidate = input._operationsForTesting?.resolveCandidate ?? resolveMigrationApplyCandidate;
   const resolveTargetCoordinates = input._operationsForTesting?.resolveTargetCoordinates ?? nonSecretPostgreSqlTargetCoordinates;
   const computeBase = input._operationsForTesting?.computeBase ?? computeMigrationGenerationBase;
@@ -151,17 +198,22 @@ export async function resolveMigrationPreflight(input: Readonly<{
     return { status: "refuse", reason: verification.reason, evidence: verification.evidence };
   }
 
-  // 4a. This local project's own stable identity -- read-only, never
-  // reconciled here (see this module's doc comment: reconciliation could
-  // itself write the project map, which would make `plan` mutating on a
-  // fresh or drifted worktree). `local.canonical` is also section 4.1's
-  // base-identity input below and `target-identity.ts`'s required input
-  // for the destination resolution in 4b -- one computation, reused
-  // everywhere it is needed, never re-derived.
-  const local = resolveProjectIdentity(input.cwd);
+  // 4a. This local project's own identity, read without writing anything
+  // (plan-v5 Part B (3)). A persisted map entry is used; with none, the
+  // deterministic derivation is reported as not persisted. `local.id` and
+  // `local.canonical` are also section 4.1's base-identity input below and
+  // the destination lookup's required input.
+  let persistedLocal: ReturnType<typeof readProjectMapIdentity>;
+  try {
+    persistedLocal = readLocalIdentity({ homeDir: input.homeDir, cwd: input.cwd });
+  } catch (error) {
+    return { status: "refuse", reason: "local-identity-unresolvable", evidence: unexpectedFailureEvidence(error) };
+  }
+  const local: MigrationLocalProject = persistedLocal === null
+    ? { ...deriveLocalProject(input.cwd), persisted: false }
+    : { id: persistedLocal.id, canonical: persistedLocal.canonical, persisted: true };
 
-  // 4b. This machine's own registered identity, required before the
-  // destination project id can be resolved or minted.
+  // 4b. This machine's own registered identity.
   let machineId: string;
   try {
     machineId = requireMachine(input.homeDir).machineId;
@@ -172,41 +224,19 @@ export async function resolveMigrationPreflight(input: Readonly<{
     throw error;
   }
 
-  // 4c. The destination PostgreSQL project identity (section 4.10):
-  // resolved directly against PostgreSQL through the identity repository,
-  // never from the local project map, which must stay unbound through
-  // capture, genesis and copy.
+  // 4c. The destination PostgreSQL project, by SELECT only. An absent alias
+  // key is reported, not created: only apply, after its fence, may mint.
+  let destinationProjectId: string | null;
   const identityRuntime = createIdentityRuntime(targetResolution.config.postgresql);
-  let projectId: string;
   try {
-    const identityResolution = await resolveTargetIdentity({
+    destinationProjectId = await lookupTargetProject({
       repository: new PostgreSqlIdentityRepository(identityRuntime),
       machineId,
-      displayName: basename(local.canonical),
       authorityCanonicalPath: local.canonical,
     });
-    if (identityResolution.status === "refuse") {
-      return { status: "refuse", reason: identityResolution.reason, evidence: identityResolution.evidence };
-    }
-    projectId = identityResolution.projectId;
   } finally {
-    try {
-      await identityRuntime.close();
-    } catch {
-      // Preserve whichever outcome was already determined above; a close
-      // failure after a successful or already-classified resolution is
-      // not itself new evidence about the target.
-    }
+    await closeQuietly(identityRuntime);
   }
-
-  const expectedIdentity: StorageIdentityContext = {
-    id: projectId,
-    remoteProjectId: projectId,
-    localProjectId: local.id,
-    machineId,
-    canonical: local.canonical,
-    selectedPath: local.canonical,
-  };
 
   // 5. The stable narrow base identity (section 4.1).
   const targetCoordinates = resolveTargetCoordinates(targetResolution.config.postgresql.url);
@@ -230,5 +260,103 @@ export async function resolveMigrationPreflight(input: Readonly<{
     return candidate;
   }
 
-  return { status: "ready", targetConfig: targetResolution.config, presence, candidate, expectedIdentity, base };
+  return {
+    status: "ready", targetConfig: targetResolution.config, presence, candidate, local, machineId,
+    destinationProjectId, base,
+  };
+}
+
+export type MigrationExpectedIdentityOperations = Readonly<{
+  createIdentityRuntime: (settings: ResolvedPostgreSqlConfig["postgresql"]) => PostgreSqlRuntime;
+  resolveLocalIdentity: typeof resolveProjectIdentity;
+  readLocalIdentity: typeof readProjectMapIdentity;
+  resolveTargetIdentity: typeof resolveMigrationTargetProjectId;
+  lookupTargetProject: typeof lookupMigrationTargetProjectId;
+}>;
+
+export type MigrationExpectedIdentityResult =
+  | Readonly<{ status: "resolved"; expectedIdentity: StorageIdentityContext }>
+  | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
+
+/**
+ * The identity `apply` takes after its fence (plan-v5 Part B (3)), split on
+ * the candidate disposition the preview already classified:
+ *
+ * - **fresh**: no hold exists, so this is the only place anything is minted.
+ *   The local map entry is written with the home passed through
+ *   (`resolveProjectIdentity` with `homeDir`), then the destination project
+ *   is resolved or created.
+ * - **recover-entering** and **continue-held**: a hold is live, so nothing is
+ *   minted under it. The local identity must already be persisted
+ *   (`readProjectMapIdentity`: no consumer lock, no write, no backfill), and
+ *   the destination project must already exist (a SELECT). Either missing is
+ *   exit 5; neither is created.
+ */
+export async function resolveMigrationExpectedIdentity(input: Readonly<{
+  preflight: Extract<MigrationPreflightResult, { status: "ready" }>;
+  cwd: string;
+  homeDir: string;
+  /** @internal Deterministic failure-injection seam for tests only. */
+  _operationsForTesting?: Partial<MigrationExpectedIdentityOperations>;
+}>): Promise<MigrationExpectedIdentityResult> {
+  const createIdentityRuntime = input._operationsForTesting?.createIdentityRuntime
+    ?? ((settings) => new PostgreSqlRuntime(settings));
+  const resolveLocalIdentity = input._operationsForTesting?.resolveLocalIdentity ?? resolveProjectIdentity;
+  const readLocalIdentity = input._operationsForTesting?.readLocalIdentity ?? readProjectMapIdentity;
+  const resolveTargetIdentity = input._operationsForTesting?.resolveTargetIdentity ?? resolveMigrationTargetProjectId;
+  const lookupTargetProject = input._operationsForTesting?.lookupTargetProject ?? lookupMigrationTargetProjectId;
+  const { preflight } = input;
+  const fresh = preflight.candidate.disposition === "fresh";
+
+  let local: Readonly<{ id: string; canonical: string }>;
+  if (fresh) {
+    local = resolveLocalIdentity(input.cwd, { homeDir: input.homeDir });
+  } else {
+    let persisted: ReturnType<typeof readProjectMapIdentity>;
+    try {
+      persisted = readLocalIdentity({ homeDir: input.homeDir, cwd: input.cwd });
+    } catch (error) {
+      return { status: "refuse", reason: "local-identity-unresolvable", evidence: unexpectedFailureEvidence(error) };
+    }
+    if (persisted === null) return { status: "refuse", reason: "local-identity-not-persisted" };
+    local = persisted;
+  }
+
+  let projectId: string;
+  const runtime = createIdentityRuntime(preflight.targetConfig.postgresql);
+  try {
+    const repository = new PostgreSqlIdentityRepository(runtime);
+    if (fresh) {
+      const resolution = await resolveTargetIdentity({
+        repository,
+        machineId: preflight.machineId,
+        displayName: basename(local.canonical),
+        authorityCanonicalPath: local.canonical,
+      });
+      if (resolution.status === "refuse") {
+        return { status: "refuse", reason: resolution.reason, evidence: resolution.evidence };
+      }
+      projectId = resolution.projectId;
+    } else {
+      const found = await lookupTargetProject({
+        repository, machineId: preflight.machineId, authorityCanonicalPath: local.canonical,
+      });
+      if (found === null) return { status: "refuse", reason: "destination-project-absent" };
+      projectId = found;
+    }
+  } finally {
+    await closeQuietly(runtime);
+  }
+
+  return {
+    status: "resolved",
+    expectedIdentity: {
+      id: projectId,
+      remoteProjectId: projectId,
+      localProjectId: local.id,
+      machineId: preflight.machineId,
+      canonical: local.canonical,
+      selectedPath: local.canonical,
+    },
+  };
 }

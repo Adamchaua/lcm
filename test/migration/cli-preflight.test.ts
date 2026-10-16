@@ -2,7 +2,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolveMigrationPreflight } from "../../src/migration/cli-preflight.js";
+import {
+  migrationIdentityPreview,
+  resolveMigrationExpectedIdentity,
+  resolveMigrationPreflight,
+  type MigrationPreflightResult,
+} from "../../src/migration/cli-preflight.js";
+import { hashProjectPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
+import { readFileSync, existsSync } from "node:fs";
+import { BackendPublicationCoordinator, type BackendPublicationDriver } from "../../src/storage/backend-publication.js";
 import {
   prepareSqliteMigrationEnrollment,
   type SqliteMigrationEnrollmentInput,
@@ -112,7 +120,7 @@ function identitySeams(projectId = "remote-project-1") {
   return {
     requireMachine: vi.fn(() => ({ machineId: "018f0b5d-1234-4abc-8def-1234567890ab" }) as never),
     createIdentityRuntime: vi.fn(stubIdentityRuntime),
-    resolveTargetIdentity: vi.fn(async () => ({ status: "resolved" as const, projectId })),
+    lookupTargetProject: vi.fn(async () => projectId as string | null),
   };
 }
 
@@ -134,14 +142,12 @@ describe("resolveMigrationPreflight: composes every step for real, never collaps
     if (result.status !== "ready") throw new Error("unreachable");
     expect(result.candidate.disposition).toBe("fresh");
     expect(result.presence.status).toBe("present");
-    expect(result.expectedIdentity.localProjectId).toBe(fixture.local.id);
-    expect(result.expectedIdentity.remoteProjectId).toBe("remote-project-1");
-    expect(result.expectedIdentity.id).toBe("remote-project-1");
-    expect(result.expectedIdentity.canonical).toBe(fixture.local.canonical);
-    expect(result.expectedIdentity.selectedPath).toBe(fixture.local.canonical);
+    expect(result.local).toEqual({ id: fixture.local.id, canonical: fixture.local.canonical, persisted: false });
+    expect(result.machineId).toBe("018f0b5d-1234-4abc-8def-1234567890ab");
+    expect(result.destinationProjectId).toBe("remote-project-1");
     expect(result.base.length).toBeGreaterThan(0);
     // The identity runtime is always constructed and always closed, even
-    // when resolveTargetIdentity itself is injected -- it is passed a real
+    // when lookupTargetProject itself is injected -- it is passed a real
     // repository wrapping whatever runtime this seam returns.
     expect(seams.createIdentityRuntime).toHaveBeenCalledOnce();
   });
@@ -209,7 +215,7 @@ describe("resolveMigrationPreflight: composes every step for real, never collaps
     });
     expect(result).toEqual({ status: "refuse", reason: "migration-target-verification-failed", evidence: "readiness-runtime-role-policy" });
     expect(seams.requireMachine).not.toHaveBeenCalled();
-    expect(seams.resolveTargetIdentity).not.toHaveBeenCalled();
+    expect(seams.lookupTargetProject).not.toHaveBeenCalled();
   });
 
   it("refuses machine-identity-unregistered for real: a fresh, never-enrolled home genuinely has no registered machine identity (the real, not injected, requireMachineIdentity default)", async () => {
@@ -230,7 +236,7 @@ describe("resolveMigrationPreflight: composes every step for real, never collaps
 
   it("resolves machine identity for real (the real, not injected, requireMachineIdentity default) against a real enrolled project, proceeding to the injected destination-identity step with the real machineId", async () => {
     const fixture = await enrolled();
-    const resolveTargetIdentity = vi.fn(async () => ({ status: "resolved" as const, projectId: "remote-project-2" }));
+    const lookupTargetProject = vi.fn(async () => "remote-project-2" as string | null);
     const result = await resolveMigrationPreflight({
       cwd: fixture.cwd,
       homeDir: fixture.homeDir,
@@ -239,19 +245,19 @@ describe("resolveMigrationPreflight: composes every step for real, never collaps
         classifyPresence: async () => presentPresence(),
         verifyReachability: async () => verifiedReachability(),
         createIdentityRuntime: stubIdentityRuntime,
-        resolveTargetIdentity,
+        lookupTargetProject,
       },
     });
     expect(result.status).toBe("ready");
-    expect(resolveTargetIdentity).toHaveBeenCalledWith(expect.objectContaining({ machineId: REGISTERED_MACHINE }));
+    expect(lookupTargetProject).toHaveBeenCalledWith(expect.objectContaining({ machineId: REGISTERED_MACHINE }));
   });
 
   it("uses the real createIdentityRuntime default (no injection): constructs a real PostgreSqlRuntime for the target settings and closes it for real, with only destination-identity resolution itself injected", async () => {
     const fixture = await enrolled();
-    const resolveTargetIdentity = vi.fn(async () => ({ status: "resolved" as const, projectId: "remote-project-3" }));
+    const lookupTargetProject = vi.fn(async () => "remote-project-3" as string | null);
     // PostgreSqlRuntime's constructor synchronously reads and validates
     // caFile (client-config.ts) before this test's injected
-    // resolveTargetIdentity ever runs, so the shared REAL_TARGET_CONFIG's
+    // lookupTargetProject ever runs, so the shared REAL_TARGET_CONFIG's
     // placeholder "/unused" path is not enough here -- a real, readable
     // (if not genuinely trusted) file is required to get past
     // construction.
@@ -267,13 +273,13 @@ describe("resolveMigrationPreflight: composes every step for real, never collaps
         }),
         classifyPresence: async () => presentPresence(),
         verifyReachability: async () => verifiedReachability(),
-        resolveTargetIdentity,
+        lookupTargetProject,
       },
     });
     expect(result.status).toBe("ready");
-    expect(resolveTargetIdentity).toHaveBeenCalledOnce();
+    expect(lookupTargetProject).toHaveBeenCalledOnce();
     // The real runtime was constructed and handed a real
-    // PostgreSqlIdentityRepository wrapping it -- resolveTargetIdentity's
+    // PostgreSqlIdentityRepository wrapping it -- lookupTargetProject's
     // own first argument is the repository, never asserted structurally
     // here since target-identity.test.ts already covers that shape; this
     // test's job is only proving the real construct-then-close path runs
@@ -295,24 +301,7 @@ describe("resolveMigrationPreflight: composes every step for real, never collaps
     await expect(outcome).rejects.toThrow("an unrelated failure");
   });
 
-  it("propagates the destination-identity resolver's own refusal unchanged", async () => {
-    const fixture = await enrolled();
-    const result = await resolveMigrationPreflight({
-      cwd: fixture.cwd,
-      homeDir: fixture.homeDir,
-      _operationsForTesting: {
-        resolveTargetConfig: succeedingTargetConfig,
-        classifyPresence: async () => presentPresence(),
-        verifyReachability: async () => verifiedReachability(),
-        requireMachine: identitySeams().requireMachine,
-        createIdentityRuntime: stubIdentityRuntime,
-        resolveTargetIdentity: async () => ({ status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" }),
-      },
-    });
-    expect(result).toEqual({ status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" });
-  });
-
-  it("closes the identity runtime even when resolveTargetIdentity itself throws, and still propagates the throw", async () => {
+  it("closes the identity runtime even when lookupTargetProject itself throws, and still propagates the throw", async () => {
     const fixture = await enrolled();
     const close = vi.fn(async () => undefined);
     const outcome = resolveMigrationPreflight({
@@ -324,7 +313,7 @@ describe("resolveMigrationPreflight: composes every step for real, never collaps
         verifyReachability: async () => verifiedReachability(),
         requireMachine: identitySeams().requireMachine,
         createIdentityRuntime: () => ({ close }) as unknown as PostgreSqlRuntime,
-        resolveTargetIdentity: async () => { throw new Error("connection reset"); },
+        lookupTargetProject: async () => { throw new Error("connection reset"); },
       },
     });
     await expect(outcome).rejects.toThrow("connection reset");
@@ -343,7 +332,7 @@ describe("resolveMigrationPreflight: composes every step for real, never collaps
         verifyReachability: async () => verifiedReachability(),
         requireMachine: identitySeams().requireMachine,
         createIdentityRuntime: () => ({ close }) as unknown as PostgreSqlRuntime,
-        resolveTargetIdentity: async () => ({ status: "resolved" as const, projectId: "remote-project-1" }),
+        lookupTargetProject: async () => "remote-project-1" as string | null,
       },
     });
     expect(result.status).toBe("ready");
@@ -432,5 +421,202 @@ describe("resolveMigrationPreflight: composes every step for real, never collaps
     const result = await resolveMigrationPreflight({ cwd: fixture.cwd, homeDir: fixture.homeDir });
     expect(result.status).toBe("refuse");
     expect((result as { reason: string }).reason).toMatch(/^migration-target-/);
+  });
+});
+function previewOps(extra: Record<string, unknown> = {}) {
+  return {
+    resolveTargetConfig: succeedingTargetConfig,
+    classifyPresence: async () => presentPresence(),
+    verifyReachability: async () => verifiedReachability(),
+    ...identitySeams(),
+    ...extra,
+  };
+}
+
+describe("resolveMigrationPreflight is a read-only preview (plan-v5 Part B (3); closes round-1 A-4)", () => {
+  it("reports an unpersisted local project as not persisted and creates no map file (red against the old resolveProjectIdentity call, which minted it)", async () => {
+    const fixture = await enrolled();
+    const result = await resolveMigrationPreflight({ cwd: fixture.cwd, homeDir: fixture.homeDir, _operationsForTesting: previewOps() });
+    if (result.status !== "ready") throw new Error("unreachable");
+    expect(result.local).toEqual({ id: hashProjectPath(normalizeProjectPath(fixture.cwd)), canonical: normalizeProjectPath(fixture.cwd), persisted: false });
+    expect(existsSync(projectMapPath(fixture.homeDir))).toBe(false);
+    expect(migrationIdentityPreview(result)).toEqual({ destinationProject: "exists", localProject: "not-persisted" });
+  });
+
+  it("uses a persisted map entry, reports it as persisted, and leaves the map bytes unchanged", async () => {
+    const fixture = await enrolled();
+    const canonical = normalizeProjectPath(fixture.cwd);
+    const id = hashProjectPath(canonical);
+    writeFileSync(projectMapPath(fixture.homeDir), JSON.stringify({ [id]: { canonical, aliases: [] } }), { mode: 0o600 });
+    const before = readFileSync(projectMapPath(fixture.homeDir), "utf8");
+    const result = await resolveMigrationPreflight({ cwd: fixture.cwd, homeDir: fixture.homeDir, _operationsForTesting: previewOps() });
+    if (result.status !== "ready") throw new Error("unreachable");
+    expect(result.local).toEqual({ id, canonical, persisted: true });
+    expect(readFileSync(projectMapPath(fixture.homeDir), "utf8")).toBe(before);
+  });
+
+  it("works while a maintenance hold fences every consumer read, with the real held-safe reader (red: resolveProjectIdentity cannot run under a hold)", async () => {
+    const fixture = await enrolled();
+    const canonical = normalizeProjectPath(fixture.cwd);
+    const id = hashProjectPath(canonical);
+    writeFileSync(projectMapPath(fixture.homeDir), JSON.stringify({ [id]: { canonical, aliases: [] } }), { mode: 0o600 });
+    const refuse = async (): Promise<never> => { throw new Error("v2 driver must not run"); };
+    const driver: BackendPublicationDriver = { observeLocalState: refuse, publishProjectMap: refuse, publishConfig: refuse, restoreConfig: refuse, restoreProjectMap: refuse };
+    await new BackendPublicationCoordinator({ homeDir: fixture.homeDir, driver }).enterMaintenance({
+      publicationId: "maintenance-publication", generationId: "generation-1",
+      sourceSelectionSha256: "a".repeat(64), queueEvidenceSha256: "b".repeat(64),
+      roster: [{ machineId: REGISTERED_MACHINE, queueCutoff: null, evidenceSha256: "a".repeat(64) }],
+    });
+    const result = await resolveMigrationPreflight({
+      cwd: fixture.cwd, homeDir: fixture.homeDir,
+      _operationsForTesting: previewOps({ resolveCandidate: async () => ({ status: "candidate", disposition: "continue-held", generationId: "generation-1" }) }),
+    });
+    if (result.status !== "ready") throw new Error("unreachable");
+    expect(result.local.persisted).toBe(true);
+  });
+
+  it("refuses local-identity-unresolvable, carrying only the error name, when the map cannot be read", async () => {
+    const fixture = await enrolled();
+    const result = await resolveMigrationPreflight({
+      cwd: fixture.cwd, homeDir: fixture.homeDir,
+      _operationsForTesting: previewOps({ readLocalIdentity: () => { throw new TypeError("a message with /a/path"); } }),
+    });
+    expect(result).toEqual({ status: "refuse", reason: "local-identity-unresolvable", evidence: "TypeError" });
+  });
+
+  it("reports a missing destination project as will-be-created-at-apply and never creates it", async () => {
+    const fixture = await enrolled();
+    const seams = identitySeams();
+    const result = await resolveMigrationPreflight({
+      cwd: fixture.cwd, homeDir: fixture.homeDir,
+      _operationsForTesting: previewOps({ lookupTargetProject: vi.fn(async () => null as string | null) }),
+    });
+    if (result.status !== "ready") throw new Error("unreachable");
+    expect(result.destinationProjectId).toBeNull();
+    expect(migrationIdentityPreview(result)).toEqual({ destinationProject: "will-be-created-at-apply", localProject: "not-persisted" });
+    expect(seams.createIdentityRuntime).not.toHaveBeenCalled();
+  });
+});
+
+describe("migrationIdentityPreview", () => {
+  it("reports both axes independently", () => {
+    expect(migrationIdentityPreview(readyPreview("fresh", { destinationProjectId: "p" }))).toEqual({ destinationProject: "exists", localProject: "persisted" });
+    expect(migrationIdentityPreview(readyPreview("fresh", { destinationProjectId: null }))).toEqual({ destinationProject: "will-be-created-at-apply", localProject: "persisted" });
+    expect(migrationIdentityPreview(readyPreview("fresh", { local: { id: "a".repeat(64), canonical: "/projects/x", persisted: false } }))).toEqual({ destinationProject: "will-be-created-at-apply", localProject: "not-persisted" });
+  });
+});
+
+function readyPreview(disposition: "fresh" | "recover-entering" | "continue-held", overrides: Partial<Extract<MigrationPreflightResult, { status: "ready" }>> = {}) {
+  return {
+    status: "ready" as const,
+    targetConfig: REAL_TARGET_CONFIG,
+    presence: { status: "authoritatively-absent" as const },
+    candidate: { status: "candidate" as const, disposition, generationId: "generation-0" },
+    local: { id: "a".repeat(64), canonical: "/projects/x", persisted: true },
+    machineId: REGISTERED_MACHINE,
+    destinationProjectId: null,
+    base: "base",
+    ...overrides,
+  };
+}
+
+describe("resolveMigrationExpectedIdentity (the minting step, taken only after apply's fence)", () => {
+  function mintOps(extra: Record<string, unknown> = {}) {
+    return {
+      createIdentityRuntime: vi.fn(stubIdentityRuntime),
+      resolveLocalIdentity: vi.fn(() => ({ id: "b".repeat(64), canonical: "/projects/minted" })),
+      readLocalIdentity: vi.fn(() => ({ id: "c".repeat(64), canonical: "/projects/persisted" }) as { id: string; canonical: string } | null),
+      resolveTargetIdentity: vi.fn(async () => ({ status: "resolved" as const, projectId: "minted-project" })),
+      lookupTargetProject: vi.fn(async () => "existing-project" as string | null),
+      ...extra,
+    };
+  }
+
+  it("fresh: mints the local entry with the home passed through, then the destination project", async () => {
+    const ops = mintOps();
+    const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops });
+    expect(result).toEqual({
+      status: "resolved",
+      expectedIdentity: {
+        id: "minted-project", remoteProjectId: "minted-project", localProjectId: "b".repeat(64),
+        machineId: REGISTERED_MACHINE, canonical: "/projects/minted", selectedPath: "/projects/minted",
+      },
+    });
+    expect(ops.resolveLocalIdentity).toHaveBeenCalledWith("/c", { homeDir: "/h" });
+    expect(ops.readLocalIdentity).not.toHaveBeenCalled();
+    expect(ops.lookupTargetProject).not.toHaveBeenCalled();
+  });
+
+  it("fresh: propagates the destination resolver's own refusal", async () => {
+    const ops = mintOps({ resolveTargetIdentity: async () => ({ status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" }) });
+    const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops });
+    expect(result).toEqual({ status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" });
+  });
+
+  it.each(["recover-entering", "continue-held"] as const)(
+    "%s: mints nothing under a hold: reads the persisted local identity and SELECTs the destination only",
+    async (disposition) => {
+      const ops = mintOps();
+      const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview(disposition), cwd: "/c", homeDir: "/h", _operationsForTesting: ops });
+      expect(result).toMatchObject({
+        status: "resolved",
+        expectedIdentity: { id: "existing-project", remoteProjectId: "existing-project", localProjectId: "c".repeat(64), canonical: "/projects/persisted" },
+      });
+      expect(ops.resolveLocalIdentity).not.toHaveBeenCalled();
+      expect(ops.resolveTargetIdentity).not.toHaveBeenCalled();
+      expect(ops.readLocalIdentity).toHaveBeenCalledWith({ homeDir: "/h", cwd: "/c" });
+    },
+  );
+
+  it("held: a missing persisted local identity is exit 5, never minted", async () => {
+    const ops = mintOps({ readLocalIdentity: () => null });
+    const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview("continue-held"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops });
+    expect(result).toEqual({ status: "refuse", reason: "local-identity-not-persisted" });
+    expect(ops.createIdentityRuntime).not.toHaveBeenCalled();
+  });
+
+  it("held: an unreadable map is local-identity-unresolvable with only the error name", async () => {
+    const ops = mintOps({ readLocalIdentity: () => { throw new RangeError("boom /a/path"); } });
+    const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview("continue-held"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops });
+    expect(result).toEqual({ status: "refuse", reason: "local-identity-unresolvable", evidence: "RangeError" });
+  });
+
+  it("held: a missing destination project is exit 5, never created, and the runtime is still closed", async () => {
+    const close = vi.fn(async () => undefined);
+    const ops = mintOps({ lookupTargetProject: async () => null, createIdentityRuntime: () => ({ close }) as unknown as PostgreSqlRuntime });
+    const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview("recover-entering"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops });
+    expect(result).toEqual({ status: "refuse", reason: "destination-project-absent" });
+    expect(ops.resolveTargetIdentity).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("closes the runtime when the destination step throws, without masking the throw, and tolerates a failing close", async () => {
+    const close = vi.fn(async () => { throw new Error("close failed"); });
+    const ops = mintOps({ resolveTargetIdentity: async () => { throw new Error("connection reset"); }, createIdentityRuntime: () => ({ close }) as unknown as PostgreSqlRuntime });
+    await expect(resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops }))
+      .rejects.toThrow("connection reset");
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("uses the real default runtime constructor, reader and resolvers when none are injected (it fails at the unreachable host, after the real reader ran)", async () => {
+    const fixture = await enrolled();
+    await expect(resolveMigrationExpectedIdentity({
+      preflight: readyPreview("continue-held", { targetConfig: { backend: "postgresql", postgresql: { ...REAL_TARGET_CONFIG.postgresql, caFile: "/nonexistent-ca" } } }),
+      cwd: fixture.cwd, homeDir: fixture.homeDir,
+    })).resolves.toEqual({ status: "refuse", reason: "local-identity-not-persisted" });
+  });
+
+  it("constructs the real default PostgreSqlRuntime for a held destination lookup and closes it for real", async () => {
+    const fixture = await enrolled();
+    const caFile = join(fixture.homeDir, "held-ca.pem");
+    writeFileSync(caFile, "-----BEGIN CERTIFICATE-----\ndummy\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const lookupTargetProject = vi.fn(async () => "remote-project-9" as string | null);
+    const result = await resolveMigrationExpectedIdentity({
+      preflight: readyPreview("continue-held", { targetConfig: { backend: "postgresql", postgresql: { ...REAL_TARGET_CONFIG.postgresql, caFile } } }),
+      cwd: fixture.cwd, homeDir: fixture.homeDir,
+      _operationsForTesting: { readLocalIdentity: () => ({ id: "c".repeat(64), canonical: "/projects/persisted" }), lookupTargetProject },
+    });
+    expect(result.status).toBe("resolved");
+    expect(lookupTargetProject).toHaveBeenCalledOnce();
   });
 });

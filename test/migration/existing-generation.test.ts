@@ -9,6 +9,15 @@ import { routeMigrationGeneration, type MigrationRouteInput } from "../../src/mi
 import type { MigrationJournalObservation } from "../../src/migration/journal-observation.js";
 import type { BackendMaintenanceJournal, BackendMaintenancePhase } from "../../src/storage/backend-publication.js";
 
+import { migrationExitClassForName } from "../../src/migration/exit-classes.js";
+import { MIGRATION_REFUSAL_REASONS } from "../../src/migration/refusal-mapping.js";
+
+function exitCodeOfReason(reason: string): number {
+  const entry = MIGRATION_REFUSAL_REASONS.find((candidate) => candidate.reason === reason);
+  if (entry === undefined) throw new Error(`reason missing from the closed table: ${reason}`);
+  return migrationExitClassForName(entry.exitClass).code;
+}
+
 const roots: string[] = [];
 const AT = "2026-08-12T12:00:00.000Z";
 const GEN = "generation-1";
@@ -198,5 +207,13 @@ describe("refuseUnlessRouted", () => {
     ["exit 5 for a contradiction", route({ manifest: { kind: "present", phase: "copied", pending: null } }), "verify", "route-contradiction", null],
   ])("%s", (_name, routed, command, reason, next) => {
     expect(refuseUnlessRouted(command as never, routed)).toEqual({ status: "refuse", reason, next });
+    // The refusal's closed reason maps to exactly the exit the router reported.
+    expect(exitCodeOfReason(reason as string)).toBe(routed.exitIfRefused);
+  });
+
+  it("maps the resolver's own refusals into the closed table: absent and unknown are exit 2, malformed is usage (1)", () => {
+    expect(exitCodeOfReason("generation-required")).toBe(2);
+    expect(exitCodeOfReason("generation-unknown")).toBe(2);
+    expect(exitCodeOfReason("generation-invalid")).toBe(1);
   });
 });
