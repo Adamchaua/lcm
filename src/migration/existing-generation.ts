@@ -31,6 +31,8 @@ export type ExistingGenerationContext = Readonly<{
   journal: MigrationJournalObservation;
   /** The full manifest when one is present, so callers do not read it twice. */
   manifest: MigrationManifest | null;
+  /** The snapshot class the route consumed, so `report` can show it. */
+  snapshot: MigrationRouteSnapshot;
   route: MigrationRoute;
 }>;
 
@@ -123,7 +125,7 @@ export async function resolveExistingMigrationGeneration(
   };
   return {
     status: "resolved",
-    context: { generationId, journal: observation, manifest, route: routeMigrationGeneration(routeInput) },
+    context: { generationId, journal: observation, manifest, snapshot, route: routeMigrationGeneration(routeInput) },
   };
 }
 

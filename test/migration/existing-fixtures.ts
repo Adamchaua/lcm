@@ -127,7 +127,7 @@ export function fixtureVerificationReport(
   });
 }
 
-export type FixtureStage = "planned" | "dry-run-verified" | "copying" | "copied" | "verified";
+export type FixtureStage = "planned" | "dry-run-verified" | "copying" | "copied" | "verified" | "active" | "rolled-back";
 
 export type FixtureManifestOptions = Readonly<{
   generationId?: string;
@@ -173,7 +173,7 @@ export function createFixtureManifest(
     manifest = store.update(generationId, manifest.checksumSha256, (current) =>
       completeMigrationEffect(current, { effectId, completedAt: FIXTURE_AT, ...evidence }));
   };
-  const order: readonly FixtureStage[] = ["planned", "dry-run-verified", "copying", "copied", "verified"];
+  const order: readonly FixtureStage[] = ["planned", "dry-run-verified", "copying", "copied", "verified", "active", "rolled-back"];
   const reached = (target: FixtureStage): boolean => order.indexOf(stage) >= order.indexOf(target);
   if (reached("dry-run-verified")) {
     begin("verify-dry-run", "dry-run-effect");
@@ -194,6 +194,21 @@ export function createFixtureManifest(
     complete(effectId, {
       activationEligible: true,
       report: { kind: "verification", reportId: report.reportId, reportSha256: report.reportSha256, createdAt: FIXTURE_AT },
+    });
+  }
+  if (reached("active")) {
+    begin("prepare-activation", "prepare-activation-effect");
+    complete("prepare-activation-effect");
+    begin("publish-activation", "publish-activation-effect");
+    complete("publish-activation-effect", { report: { kind: "activation", reportId: "activation-report", reportSha256: HASH_B, createdAt: FIXTURE_AT } });
+  }
+  if (reached("rolled-back")) {
+    begin("prepare-rollback", "prepare-rollback-effect");
+    complete("prepare-rollback-effect");
+    begin("publish-rollback", "publish-rollback-effect");
+    complete("publish-rollback-effect", {
+      rollbackMode: "pre-write",
+      report: { kind: "rollback", reportId: "rollback-report", reportSha256: HASH_C, createdAt: FIXTURE_AT },
     });
   }
   if (options.pending !== undefined) {

@@ -4,6 +4,7 @@ import { migrationRefusalMapping } from "./refusal-mapping.js";
 import {
   buildMigrationEnvelope,
   type MigrationEnvelope,
+  type MigrationEnvelopeRestart,
   type MigrationEvidence,
 } from "./envelope.js";
 import type { MigrationPlanOutcome } from "./cli-plan.js";
@@ -14,6 +15,7 @@ import type { MigrationApplyOutcome } from "./cli-apply.js";
 import type { MigrationAbortCommandOutcome } from "./cli-abort.js";
 import type { MigrationVerifyCommandOutcome } from "./cli-verify.js";
 import type { MigrationResumeCommandOutcome } from "./cli-resume.js";
+import type { MigrationReportOutcome } from "./cli-report.js";
 import { MIGRATION_UNEXPECTED_FAILURE_REASON, unexpectedFailureEvidence } from "./boundary.js";
 
 /**
@@ -69,11 +71,15 @@ function refusalEnvelope(input: Readonly<{
   manifestPhase?: string | null;
   /** The command the router names as the way forward, when it names one. */
   next?: string | null;
+  /** Everything a read-only command managed to read before it refused. */
+  sections?: MigrationEvidence;
+  restart?: MigrationEnvelopeRestart | null;
 }>): MigrationEnvelope {
   const mapping = migrationRefusalMapping(input.reason);
-  const evidence: MigrationEvidence = input.evidenceDetail === undefined
-    ? {}
-    : { detail: input.evidenceDetail };
+  const evidence: MigrationEvidence = {
+    ...input.sections,
+    ...(input.evidenceDetail === undefined ? {} : { detail: input.evidenceDetail }),
+  };
   return buildMigrationEnvelope({
     command: input.command,
     outcome: mapping.exitClass,
@@ -84,7 +90,7 @@ function refusalEnvelope(input: Readonly<{
     next: input.next ?? null,
     evidence,
     refusal: { reason: input.reason, remedy: mapping.remedy },
-    restart: null,
+    restart: input.restart ?? null,
   });
 }
 
@@ -95,6 +101,7 @@ function okEnvelope(input: Readonly<{
   manifestPhase?: string | null;
   next?: string | null;
   evidence: MigrationEvidence;
+  restart?: MigrationEnvelopeRestart | null;
 }>): MigrationEnvelope {
   return buildMigrationEnvelope({
     command: input.command,
@@ -106,7 +113,7 @@ function okEnvelope(input: Readonly<{
     next: input.next ?? null,
     evidence: input.evidence,
     refusal: null,
-    restart: null,
+    restart: input.restart ?? null,
   });
 }
 
@@ -227,6 +234,31 @@ export function renderMigrationResumeEnvelope(outcome: MigrationResumeCommandOut
     manifestPhase: outcome.manifestPhase,
     next: outcome.next,
     evidence: outcome.evidence,
+  });
+}
+
+/** A report never writes, so `applied` is always false, and a non-zero exit still carries every section it read. */
+export function renderMigrationReportEnvelope(outcome: MigrationReportOutcome): MigrationEnvelope {
+  if (outcome.reason !== undefined) {
+    return refusalEnvelope({
+      command: "report",
+      reason: outcome.reason,
+      applied: false,
+      generation: outcome.generationId,
+      manifestPhase: outcome.manifestPhase,
+      next: outcome.next,
+      sections: outcome.evidence,
+      restart: outcome.restart,
+    });
+  }
+  return okEnvelope({
+    command: "report",
+    applied: false,
+    generation: outcome.generationId,
+    manifestPhase: outcome.manifestPhase,
+    next: outcome.next,
+    evidence: outcome.evidence,
+    restart: outcome.restart,
   });
 }
 

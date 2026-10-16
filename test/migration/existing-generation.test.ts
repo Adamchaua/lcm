@@ -102,6 +102,7 @@ describe("resolveExistingMigrationGeneration", () => {
     });
     if (result.status !== "resolved") throw new Error("unreachable");
     expect(result.context.manifest?.phase).toBe("planned");
+    expect(result.context.snapshot).toBe("complete");
     expect(result.context.route.row).toBe(19);
   });
 

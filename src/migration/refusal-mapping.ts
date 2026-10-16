@@ -419,6 +419,23 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     reason: "verify-readback-mismatch", exitClass: "refused-evidence",
     remedy: "The verification appeared to complete but the manifest and its report do not read back as verified. Run `lcm migration report` and inspect the evidence.",
   }),
+  // --- report (plan-v4 section 7): the restart observations. ---
+  Object.freeze({
+    reason: "report-restart-required", exitClass: "restart-required",
+    remedy: "The durable selection is correct, but a running daemon still holds the previous startup backend. Restart the daemon (`lcm daemon restart`), then run `lcm migration report` again.",
+  }),
+  Object.freeze({
+    reason: "report-restart-contradiction", exitClass: "refused-evidence",
+    remedy: "The daemon restart check and the daemon presence observation disagree, so neither can be trusted alone. Run `lcm daemon status`, resolve the difference, and report again.",
+  }),
+  Object.freeze({
+    reason: "report-restart-unresolvable", exitClass: "refused-evidence",
+    remedy: "The daemon restart check could not be made. Run `lcm daemon status`, resolve the failure, and report again.",
+  }),
+  Object.freeze({
+    reason: "report-selection-unresolvable", exitClass: "refused-evidence",
+    remedy: "The journal records a completed selection without naming its backend. Nothing was changed; run `lcm doctor` and inspect the evidence.",
+  }),
   Object.freeze({
     reason: "abort-carried-effect-mismatch", exitClass: "refused-evidence",
     remedy: "The pending abort effect on the manifest is not the one an abort of this generation begins. Nothing was changed; run `lcm doctor` and inspect the evidence.",

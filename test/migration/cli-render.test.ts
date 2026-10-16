@@ -6,6 +6,7 @@ import {
   renderMigrationAbortEnvelope,
   renderMigrationVerifyEnvelope,
   renderMigrationResumeEnvelope,
+  renderMigrationReportEnvelope,
   renderMigrationUnexpectedFailureEnvelope,
 } from "../../src/migration/cli-render.js";
 import { migrationExitClassForName } from "../../src/migration/exit-classes.js";
@@ -289,6 +290,48 @@ describe("renderMigrationResumeEnvelope", () => {
 
   it("reports applied on a refusal that followed a write", () => {
     expect(renderMigrationResumeEnvelope({ status: "refuse", reason: "copy-failed", applied: true }).applied).toBe(true);
+  });
+});
+
+describe("renderMigrationReportEnvelope", () => {
+  const base = { generationId: "gen-1", manifestPhase: "copied", next: "verify", evidence: { cell: 22, snapshot: "complete" }, restart: null } as const;
+
+  it("builds an ok envelope that is never applied and carries every section it read", () => {
+    expect(renderMigrationReportEnvelope(base)).toMatchObject({
+      command: "report", outcome: "ok", exitCode: 0, applied: false, generation: "gen-1", manifestPhase: "copied", next: "verify",
+      evidence: { cell: 22, snapshot: "complete" }, refusal: null, restart: null,
+    });
+  });
+
+  it("carries the restart observations on an ok envelope", () => {
+    expect(renderMigrationReportEnvelope({ ...base, restart: { answer: "satisfied", presence: "absent" } }).restart)
+      .toEqual({ answer: "satisfied", presence: "absent" });
+  });
+
+  it("exits 8 when only a restart is outstanding, still printing the sections and both observations", () => {
+    const envelope = renderMigrationReportEnvelope({ ...base, reason: "report-restart-required", restart: { answer: "unsatisfied", presence: "running" } });
+    expect(envelope).toMatchObject({
+      outcome: "restart-required", exitCode: 8, applied: false, evidence: { cell: 22 },
+      refusal: { reason: "report-restart-required" }, restart: { answer: "unsatisfied", presence: "running" },
+    });
+  });
+
+  it.each([
+    ["generation-required", 2],
+    ["route-publication-in-flight", 4],
+    ["route-contradiction", 5],
+    ["report-restart-contradiction", 5],
+    ["report-restart-unresolvable", 5],
+    ["report-selection-unresolvable", 5],
+  ])("maps the refusal %s to exit %i", (reason, exit) => {
+    expect(renderMigrationReportEnvelope({ ...base, reason }).exitCode).toBe(exit);
+  });
+
+  it("carries a resolver refusal's detail beside the sections", () => {
+    const envelope = renderMigrationReportEnvelope({
+      reason: "journal-unresolvable", generationId: null, manifestPhase: null, next: null, restart: null, evidence: { detail: "journal-checksum-mismatch" },
+    });
+    expect(envelope).toMatchObject({ exitCode: 5, generation: null, evidence: { detail: "journal-checksum-mismatch" } });
   });
 });
 
