@@ -220,3 +220,17 @@ export type {
   MigrationActivationReportStoreDependencies,
   MigrationActivationReportUnresolvableReason,
 } from "./activation-report.js";
+
+export {
+  MIGRATION_PROJECT_MAP_WITNESS_DOMAIN,
+  MigrationProjectMapWitnessError,
+  computeMigrationProjectMapWitnessSha256,
+  migrationProjectMapWitnessDigest,
+} from "./project-map-witness.js";
+export type {
+  ComputeMigrationProjectMapWitnessDependencies,
+  ComputeMigrationProjectMapWitnessInput,
+  MigrationProjectMapDriftCause,
+  MigrationProjectMapWitnessMode,
+  MigrationProjectMapWitnessReason,
+} from "./project-map-witness.js";
