@@ -2630,18 +2630,18 @@ describe("sanitizeError", () => {
   it.each([
     [
       "file://remote.invalid/Users/canary/private.db?next=/etc/private.db",
-      "file://remote.invalid<path>?next=/etc/private.db",
       "file://remote.invalid<path>?next=<path>",
     ],
     [
       "file://remote.invalid/Users/canary/private.db#next=/etc/private.db",
-      "file://remote.invalid<path>#next=/etc/private.db",
       "file://remote.invalid<path>#next=<path>",
     ],
-  ] as const)("redacts file URL delimiter residuals monotonically %#", (input, firstPass, secondPass) => {
-    expect(sanitizeError(input)).toBe(firstPass);
-    expect(sanitizeError(firstPass)).toBe(secondPass);
-    expect(sanitizeError(secondPass)).toBe(secondPass);
+  ] as const)("redacts file URL delimiter residuals on the first pass %#", (input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
   it("redacts Bug #1294 Windows tails after nested public URL brackets in one pass", () => {
@@ -4112,6 +4112,177 @@ describe("sanitizeError", () => {
 
     expect(result).toBe("file://h<path>");
     // Linear takes milliseconds; the quadratic rescan took several seconds.
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  it.each([
+    ["question mark", "file://h/a?/Users/x", "file://h<path>?<path>"],
+    ["query parameter", "file://h/a?q=/Users/x", "file://h<path>?q=<path>"],
+    ["surrounding text", "see file://h/a?q=/Users/x end", "see file://h<path>?q=<path> end"],
+    ["empty authority", "file:///a?q=/Users/x", "file://<path>?q=<path>"],
+    ["repeated question marks", "file://h/a??/Users/x", "file://h<path>??<path>"],
+    ["repeated equals signs", "file://h/a?q==/Users/x", "file://h<path>?q==<path>"],
+    ["fragment parameter", "file://h/a#q=/Users/x", "file://h<path>#q=<path>"],
+    ["Unicode symbol component", "file://h/a?q=/📁/secret.db", "file://h<path>?q=<path>"],
+    [
+      "before an unbracketed public URL parameter",
+      "file://h/a?q=/Users/secret&u=https://e.test/t?key=/public",
+      "file://h<path>?q=<path>&u=https://e.test/t?key=/public",
+    ],
+    [
+      "before a question mark and an unbracketed public URL",
+      "file://h/a?q=/Users/x?u=https://e.test/t?key=/public",
+      "file://h<path>?q=<path>?u=https://e.test/t?key=/public",
+    ],
+    [
+      "after a bracketed backslash query segment",
+      "file://h/a?q=[\\Users\\b]?q=/Users/x",
+      "file://h<path>?q=[<path>]?q=<path>",
+    ],
+    [
+      "after a closed bracketed public URL",
+      "file://h/a?q=[https://e.test/t]?/Users/y",
+      "file://h<path>?q=[https://e.test/t]?<path>",
+    ],
+    [
+      "after a closed bracketed public URL named parameter",
+      "file://h/a?q=[https://e.test/t]=/Users/y",
+      "file://h<path>?q=[https://e.test/t]=<path>",
+    ],
+    [
+      "after a public URL and an ampersand root",
+      "file://h/a?u=https://e.test/t&/Users/a?q=/Users/x",
+      "file://h<path>?u=https://e.test/t&<path>?q=<path>",
+    ],
+    [
+      "after a scheme-like path span",
+      "file://h/a?q=/https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>?q=<path>",
+    ],
+    [
+      "after a scheme-like path component",
+      "file://h/a?q=/Users/x://y?w=/Users/z",
+      "file://h<path>?q=<path>?w=<path>",
+    ],
+    [
+      "after a backslash scheme-like path span",
+      "file://h/a?q=\\https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>?q=<path>",
+    ],
+    [
+      "after a backslash-joined scheme-like path span",
+      "file://h/a\\https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>",
+    ],
+    [
+      "after a digit-leading pseudo scheme",
+      "file://h/a?1ab://x?q=/Users/x",
+      "file://h<path>?1ab://x?q=<path>",
+    ],
+  ] as const)("redacts a root after an unbracketed file URL path query delimiter on the first pass: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "bracketed public child query",
+      "file://h/a?q=[https://e.test/t?key=/public]",
+      "file://h<path>?q=[https://e.test/t?key=/public]",
+    ],
+    [
+      "bracketed public child query question mark",
+      "file://h/a?q=[https://e.test/t?/public]",
+      "file://h<path>?q=[https://e.test/t?/public]",
+    ],
+    ["top-level public URL question mark", "https://h/a?/word", "https://h/a?/word"],
+    ["top-level public URL equals sign", "https://h/a?q=/word", "https://h/a?q=/word"],
+    ["plain text equals sign", "a=/b", "a=<path>"],
+    ["trailing bare slash after question mark", "file://h/a?/", "file://h<path>?/"],
+    ["trailing bare slash after equals sign", "file://h/a?q=/", "file://h<path>?q=/"],
+    ["bracketed query value", "file://h/a?[q=/Users/x]", "file://h<path>?[q=<path>]"],
+    [
+      "unbracketed public URL query",
+      "file://h/a?u=https://cdn.test/logo?next=/public/path",
+      "file://h<path>?u=https://cdn.test/logo?next=/public/path",
+    ],
+    [
+      "unbracketed public URL question mark",
+      "file://h/a?u=https://e.test/t?/public",
+      "file://h<path>?u=https://e.test/t?/public",
+    ],
+    [
+      "unbracketed public URL named parameter",
+      "file://h/a?u=https://e.test/t?a=1&k=/public",
+      "file://h<path>?u=https://e.test/t?a=1&k=/public",
+    ],
+    [
+      "unbracketed public URL query then ampersand root",
+      "file://h/a?u=https://e.test/t?key=/public&/Users/secret",
+      "file://h<path>?u=https://e.test/t?key=/public&<path>",
+    ],
+    [
+      "unbracketed public URL fragment",
+      "file://h/a#u=https://e.test/t#k=/public",
+      "file://h<path>#u=https://e.test/t#k=/public",
+    ],
+    [
+      "unbracketed public URL then slash value",
+      "file://h/a?u=http://x/y?k=/Users/x",
+      "file://h<path>?u=http://x/y?k=/Users/x",
+    ],
+    [
+      "public URL after an ampersand",
+      "file://h/a&u=https://e.test/t?k=/public",
+      "file://h<path>&u=https://e.test/t?k=/public",
+    ],
+    [
+      "public URL after an equals sign",
+      "file://h/a=https://e.test/t?k=/public",
+      "file://h<path>=https://e.test/t?k=/public",
+    ],
+    [
+      "public URL after an ampersand with a dotted host",
+      "file://h/a&u=https://example.com/t?k=/public",
+      "file://h<path>&u=https://example.com/t?k=/public",
+    ],
+    [
+      "public URL directly after an ampersand",
+      "file://h/a&https://e.test/t?k=/public",
+      "file://h<path>&https://e.test/t?k=/public",
+    ],
+    [
+      "plain public URL after an ampersand",
+      "file://h/a&u=http://x/y?k=/public",
+      "file://h<path>&u=http://x/y?k=/public",
+    ],
+  ] as const)("keeps the first-pass output of a non-private query delimiter successor: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("keeps the bracketed-authority start after a later query backslash restart", () => {
+    const first = sanitizeError("file://h[/Users/a]?q=\\Users\\b?/Users/x");
+
+    expect(first).toBe("file://h[<path>]?q=<path>?/Users/x");
+    expect(sanitizeError(first)).toBe("file://h[<path>]?q=<path>?<path>");
+    expect(sanitizeError(sanitizeError(first))).toBe("file://h[<path>]?q=<path>?<path>");
+  });
+
+  it("does not rescan a long file URL path suffix at every query delimiter slash", () => {
+    const input = `file://h${"/a?".repeat(16384)}${"=/a".repeat(16384)}`;
+    const started = performance.now();
+    const result = sanitizeError(input);
+    const elapsed = performance.now() - started;
+
+    expect(result).not.toContain("/a");
+    // Linear takes milliseconds; a rescan at every delimiter would take seconds.
     expect(elapsed).toBeLessThan(1000);
   });
 
