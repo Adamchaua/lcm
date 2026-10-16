@@ -26,6 +26,10 @@ export async function isolateAsyncBoundary(operations) {
     assert.ok(drained.body.errors === 0 && drained.body.incomplete !== true, 'surface-isolation:drain-incomplete');
   }
   settledSidecars(await operations.readSidecars());
+  // A PostgreSQL daemon replicates the outbox of remote-bound projects at startup
+  // (docs/passive-learning.md, "When the daemon runs it"). Settle that once before
+  // the baseline so the comparison below stays exact, with no exemption.
+  if (operations.settleReplication) await operations.settleReplication();
   const previous = await operations.stop();
   const beforeSidecars = settledSidecars(await operations.readSidecars());
   const before = await operations.captureState();

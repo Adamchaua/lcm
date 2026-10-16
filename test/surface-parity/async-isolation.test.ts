@@ -27,6 +27,22 @@ it("isolates once after settlement and preserves independent pending/quarantined
   expect(f.operations.start).toHaveBeenCalledExactlyOnceWith(3000);
 });
 
+it("settles replication once, after drain and before the baseline stop", async () => {
+  const f = fixture();
+  const settleReplication = vi.fn(async () => { f.calls.push("settle"); });
+  await isolateAsyncBoundary({ ...f.operations, settleReplication });
+  expect(f.calls).toEqual(["sidecars", "drain", "sidecars", "settle", "stop", "sidecars", "state", "start", "sidecars", "state", "compare"]);
+  expect(settleReplication).toHaveBeenCalledOnce();
+});
+
+it("does not restart or compare when replication settlement fails", async () => {
+  const f = fixture();
+  const failure = new Error("surface-isolation:replication-not-settled");
+  await expect(isolateAsyncBoundary({ ...f.operations, settleReplication: vi.fn(async () => { throw failure; }) })).rejects.toBe(failure);
+  expect(f.operations.stop).not.toHaveBeenCalled();
+  expect(f.operations.start).not.toHaveBeenCalled();
+});
+
 it.each([
   { status: 503, body: { errors: 0, incomplete: false } },
   { status: 200, body: { errors: 1, incomplete: false } },

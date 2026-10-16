@@ -483,6 +483,32 @@ function ownedLifecycle() {
       assert.ok(JSON.stringify(after.authority) === JSON.stringify(before.authority), 'surface-isolation:authority-changed');
       assertRestartSnapshotUnchanged(after.logical, before.logical, process.getuid());
     },
+    // PostgreSQL only: replicate the pending outbox of remote-bound projects through the
+    // daemon's own startup pass (one extra restart), waiting on public sidecar state.
+    ...(backend === 'postgresql' ? { settleReplication: async function settleReplication() {
+      const bound = row => Boolean(readProjectMapSnapshot()[row.projectId]?.remoteProjectId);
+      const open = row => row.deliveryPending + row.deliveryClaimed + row.deliveryRetry + row.deliveryReplicated + row.deliveryAwaitingRemotePrune;
+      const fixed = row => ({ projectId: row.projectId, captured: row.captured, deliveryQuarantined: row.deliveryQuarantined });
+      const before = await readPassiveSidecars();
+      if (!before.some(row => bound(row) && open(row) > 0)) return;
+      const previous = await this.stop();
+      await this.start(previous.port);
+      const deadline = Date.now() + 30000;
+      let after = await readPassiveSidecars();
+      while (after.some(row => bound(row) && open(row) > 0)) {
+        assert.ok(Date.now() < deadline, 'surface-isolation:replication-not-settled');
+        await new Promise(resolve => setTimeout(resolve, 250));
+        after = await readPassiveSidecars();
+      }
+      const byProject = rows => new Map(rows.map(row => [row.projectId, row]));
+      const prior = byProject(before);
+      for (const row of after) {
+        const earlier = prior.get(row.projectId);
+        assert.ok(earlier && JSON.stringify(fixed(row)) === JSON.stringify(fixed(earlier)), 'surface-isolation:replication-changed-identity');
+        if (!bound(row)) assert.ok(JSON.stringify(row) === JSON.stringify(earlier), 'surface-isolation:replication-touched-unbound');
+      }
+      await admin('replication.advanced');
+    } } : {}),
   };
 }
 async function isolateAsyncWork() {

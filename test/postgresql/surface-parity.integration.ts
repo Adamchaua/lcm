@@ -223,6 +223,11 @@ class OwnedAdministrator {
       await this.runtime.query({ text: "REVOKE SELECT ON lcm.messages FROM lcm_test_runtime" }, scope);
       return { revoked: true };
     }
+    if (action === "replication.advanced") {
+      requireThat(exact(payload, []), "replication-advanced-payload");
+      this.replicationAdvanceObserved = true;
+      return { recorded: true };
+    }
     if (action === "denial.restore") {
       requireThat(exact(payload, []), "denial-restore-payload");
       await this.restore();
@@ -232,6 +237,7 @@ class OwnedAdministrator {
   }
 
   private passiveLeaseObserved = false;
+  private replicationAdvanceObserved = false;
 
   private async preparedCatalog(): Promise<{ projects: Json[]; aliases: Json[]; snapshot: Json }> {
     const projects = await this.runtime.query<{ row: Json }>({ text: 'SELECT to_jsonb(record) AS row FROM lcm.projects record ORDER BY project_id' }, scope);
@@ -257,6 +263,11 @@ class OwnedAdministrator {
         && typeof row.fencing_token === "number" && row.fencing_token >= 1, "passive-replication-lease-shape");
     }
     if (leases.rows.length > 0) this.passiveLeaseObserved = true;
+  }
+
+  /** The settle step is only meaningful if a pending delivery was actually replicated at least once. */
+  requireReplicationAdvanceObserved(): void {
+    requireThat(this.replicationAdvanceObserved, "replication-advance-observed");
   }
 
   /** The exemption is only sound if the exempted row was actually seen at least once. */
@@ -849,6 +860,7 @@ describe.sequential("complete configured backend surface parity", () => {
         if (!hadFailure) {
           if (backend === "postgresql") requireThat(runtime?.corpus, "missing-runtime-corpus");
           if (backend === "postgresql") administrator?.requirePassiveLeaseObserved();
+          if (backend === "postgresql") administrator?.requireReplicationAdvanceObserved();
           assertSemanticEqual(rows.map(row => row.id).sort(), matrix.filter(row => row.scenario !== "control" && row.scenario !== "transfer").map(row => row.id).sort(), "data-row-denominator");
           assertSemanticEqual([...faults.get(backend)!.keys()].sort(), [...FAULT_SCENARIOS].sort(), "fault-denominator");
           for (const scenario of SCENARIOS) assertCompleteReport(matrix, { backend, scenario, rows: rows.filter(row => matrix.find(entry => entry.id === row.id)?.scenario === scenario) });

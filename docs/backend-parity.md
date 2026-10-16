@@ -89,6 +89,18 @@ project `db.sqlite`, WAL, or SHM file created as a database fallback is not.
 Canonical transfer archives and temporary indexes are also separately named
 transfer artifacts, outside project database paths.
 
+A PostgreSQL-backed daemon replicates the local hook outbox of remote-bound
+projects at startup and every five minutes; a SQLite-backed daemon never does
+(see [passive learning](passive-learning.md), "When the daemon runs it"). A
+restart therefore advances pending PostgreSQL deliveries to acknowledged and
+pruned, writes their remote inbox rows, and refreshes the machine-keyed
+passive-events lease row. The parity tests take the restart baseline after
+settling that replication: they restart once, wait up to 30 seconds on public
+sidecar state until no remote-bound project has an open delivery, and then
+require delivery state and database state to be unchanged across the next
+restart. Projects without a remote binding must stay exactly unchanged, and the
+PostgreSQL run fails unless at least one delivery was actually replicated.
+
 Diagnostic reads report the selected backend's actual capabilities. Pool
 statistics may have different shapes, but failures remain sanitized and bounded.
 PostgreSQL statistics metrics contain aggregate counters and omit
