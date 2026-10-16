@@ -5,230 +5,266 @@
  * check here names the two independent observations it compares, and each
  * side is deliberately corrupted at least once elsewhere in this file so
  * the corresponding assertion is proven breakable, not merely passing.
+ * Records are minted by activation-witness.ts's own create* functions.
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
+  classifyRollbackEligibilityMode,
   evaluateRollbackEligibility,
   resolveActivationAuthority,
+  type ActivationAuthority,
+  type MigrationActivationEvidenceResolution,
   type MigrationSelectionBinding,
-  type RollbackAuthoritativeContext,
+  type MigrationWitnessResolution,
+  type OperabilityFactResolution,
   type RollbackEligibilityObservation,
 } from "../../src/migration/rollback-eligibility.js";
 import { PORTABLE_RECORD_SCHEMA_SHA256 } from "../../src/storage/portable-record.js";
 import {
   driftCanonicalDelta,
   driftCensusVector,
-  fixtureAuthoritativelyAbsent,
+  fixtureActivationScenario,
+  fixtureAttempt,
+  fixtureBindingsAbsent,
+  fixtureBindingsUnresolvable,
   fixtureCanonicalDelta,
   fixtureCensusVector,
   fixtureDestinationIdentity,
+  fixtureEpoch,
+  fixtureEvidenceAbsent,
+  fixtureEvidenceUnresolvable,
   fixtureOperabilityAbsent,
   fixtureOperabilityPresent,
   fixtureOperabilityUnresolvable,
-  fixtureResolvedWithActivationSelection,
-  fixtureSchemaWitness,
-  fixtureUnresolvable,
-  fixtureWitnessedButUnpublished,
-  referenceClassifyRollbackMode,
-} from "../fixtures/rollback-eligibility-witness-schema.js";
+  fixtureRollbackWitness,
+} from "../fixtures/migration-activation-records.js";
 
-describe("resolveActivationAuthority", () => {
-  it("resolves to authoritative when an activation selection binding exists", () => {
-    const resolution = fixtureResolvedWithActivationSelection({
-      epochId: "epoch-1",
-      attemptId: "attempt-1",
-      manifestRevision: 3,
-      witnessChecksumSha256: "a".repeat(64),
-      publicationId: "publication-1",
-    });
-    const authority = resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityAbsent });
-    expect(authority).toEqual({
-      status: "authoritative",
-      selection: {
-        kind: "activation",
-        epochId: "epoch-1",
-        attemptId: "attempt-1",
-        manifestRevision: 3,
-        witnessChecksumSha256: "a".repeat(64),
-        publicationId: "publication-1",
-      },
-    });
+type Inputs = Readonly<{
+  resolution: MigrationWitnessResolution;
+  evidence: MigrationActivationEvidenceResolution;
+  operabilityFact: OperabilityFactResolution;
+}>;
+
+/** The baseline every truth-table row below corrupts in exactly one input. */
+function published(): Inputs & { scenario: ReturnType<typeof fixtureActivationScenario> } {
+  const scenario = fixtureActivationScenario();
+  return {
+    scenario,
+    resolution: scenario.bindings,
+    evidence: scenario.evidence,
+    operabilityFact: fixtureOperabilityAbsent,
+  };
+}
+
+const authority = (inputs: Inputs): ActivationAuthority => resolveActivationAuthority(inputs);
+const refusal = (inputs: Inputs): string => {
+  const result = authority(inputs);
+  if (result.status !== "refused") throw new Error("expected refused, got " + result.status);
+  return result.reason;
+};
+
+describe("resolveActivationAuthority: the unactivated truth table (plan-v3.1 A1)", () => {
+  it("baseline: an activation selection with its witness, attempt and epoch stored is authoritative", () => {
+    const { scenario, ...inputs } = published();
+    expect(authority(inputs)).toEqual({ status: "authoritative", selection: scenario.selection });
   });
 
-  it("resolves to authoritative when a binding exists even though the destination is currently operable -- the operability fact is irrelevant once a binding is published", () => {
-    // Same premise as the previous test with the operability fact flipped
-    // to "present". Row 3 of section 15's table: any activation binding
-    // present wins regardless of the operability fact's state. If the
-    // implementation ever started consulting the operability fact before
-    // checking for a binding, this would wrongly refuse.
-    const resolution = fixtureResolvedWithActivationSelection({
-      epochId: "epoch-1",
-      attemptId: "attempt-1",
-      manifestRevision: 3,
-      witnessChecksumSha256: "a".repeat(64),
-      publicationId: "publication-1",
-    });
-    const authority = resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityPresent() });
-    expect(authority.status).toBe("authoritative");
+  it("is authoritative whatever the operability fact says once a selection is bound", () => {
+    // Breakable by consulting the operability fact before looking for a selection.
+    const { scenario, ...inputs } = published();
+    expect(authority({ ...inputs, operabilityFact: fixtureOperabilityPresent() }))
+      .toEqual({ status: "authoritative", selection: scenario.selection });
   });
 
-  it("resolves to unactivated when the only selection binding is kind rollback, not activation", () => {
-    // Breaks the previous test's premise on its own axis: same shape, kind
-    // flipped. If the filter in resolveActivationAuthority ever stopped
-    // checking kind, this would wrongly resolve to authoritative.
-    const resolution = {
-      state: "resolved" as const,
-      witnesses: [],
-      selections: [{
-        kind: "rollback" as const,
-        epochId: "epoch-1",
-        attemptId: "attempt-1",
-        manifestRevision: 3,
-        witnessChecksumSha256: "a".repeat(64),
-        publicationId: "publication-1",
-      }],
+  // Rows 1-3: any reader unresolvable refuses, regardless of the other two,
+  // each corrupting exactly one input of the baseline.
+  it("refuses when the operability fact alone is unresolvable, naming the reader", () => {
+    const { scenario: _scenario, ...inputs } = published();
+    expect(refusal({ ...inputs, operabilityFact: fixtureOperabilityUnresolvable("lock contention") }))
+      .toBe("operability-fact:unresolvable: lock contention");
+  });
+
+  it("refuses when the binding store alone is unresolvable, naming the reader", () => {
+    const { scenario: _scenario, ...inputs } = published();
+    expect(refusal({ ...inputs, resolution: fixtureBindingsUnresolvable("corrupt witness binding") }))
+      .toBe("witness-resolution:unresolvable: corrupt witness binding");
+  });
+
+  it("refuses when the evidence store alone is unresolvable, naming the reader", () => {
+    const { scenario: _scenario, ...inputs } = published();
+    expect(refusal({ ...inputs, evidence: fixtureEvidenceUnresolvable("corrupt epoch record") }))
+      .toBe("activation-evidence:unresolvable: corrupt epoch record");
+  });
+
+  it("refuses an unresolvable evidence store even when nothing was ever bound", () => {
+    expect(refusal({
+      resolution: fixtureBindingsAbsent,
+      evidence: fixtureEvidenceUnresolvable("unreadable directory"),
+      operabilityFact: fixtureOperabilityAbsent,
+    })).toContain("activation-evidence:unresolvable");
+  });
+
+  it("does not collapse absence and unresolvability for the evidence store", () => {
+    const base = { resolution: fixtureBindingsAbsent, operabilityFact: fixtureOperabilityAbsent };
+    expect(authority({ ...base, evidence: fixtureEvidenceAbsent })).toEqual({ status: "unactivated" });
+    expect(authority({ ...base, evidence: fixtureEvidenceUnresolvable("x") }).status).toBe("refused");
+  });
+
+  // Row 4: a binding without its evidence.
+  it("refuses an activation selection whose evidence store is authoritatively absent", () => {
+    const { scenario: _scenario, ...inputs } = published();
+    expect(refusal({ ...inputs, evidence: fixtureEvidenceAbsent }))
+      .toContain("a binding exists without its evidence record");
+  });
+
+  it("refuses a witness binding alone when the evidence store is authoritatively absent", () => {
+    const { scenario } = published();
+    expect(refusal({
+      resolution: scenario.unpublishedBindings,
+      evidence: fixtureEvidenceAbsent,
+      operabilityFact: fixtureOperabilityAbsent,
+    })).toContain("a binding exists without its evidence record");
+  });
+
+  // Row 5: a selection whose records disagree or are missing.
+  it("refuses when the selected witness is missing from the evidence store", () => {
+    const { scenario, ...inputs } = published();
+    expect(refusal({ ...inputs, evidence: { ...scenario.evidence, witnesses: [] } }))
+      .toContain("activation-evidence:witness-missing");
+  });
+
+  it("refuses when the attempt the selected witness names is missing", () => {
+    const { scenario, ...inputs } = published();
+    expect(refusal({ ...inputs, evidence: { ...scenario.evidence, attempts: [] } }))
+      .toContain("activation-evidence:attempt-missing");
+  });
+
+  it("refuses when the epoch the selected witness names is missing", () => {
+    const { scenario, ...inputs } = published();
+    expect(refusal({ ...inputs, evidence: { ...scenario.evidence, epochs: [] } }))
+      .toContain("activation-evidence:epoch-missing");
+  });
+
+  it("refuses when the selection names a different epoch than its witness", () => {
+    const { scenario, ...inputs } = published();
+    const resolution: MigrationWitnessResolution = {
+      state: "resolved", witnesses: [scenario.witnessBinding],
+      selections: [{ ...scenario.selection, epochId: "1".repeat(64) }],
     };
-    expect(resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityAbsent }))
-      .toEqual({ status: "unactivated" });
+    expect(refusal({ ...inputs, resolution })).toContain("activation-evidence:mismatch");
   });
 
-  it("resolves to unactivated for the witnessed-but-unpublished state when the destination is not yet operable", () => {
-    const resolution = fixtureWitnessedButUnpublished({
-      epochId: "epoch-2",
-      attemptId: "attempt-2",
-      manifestRevision: 1,
-      witnessChecksumSha256: "b".repeat(64),
+  it("refuses when the selection names a different attempt than its witness", () => {
+    const { scenario, ...inputs } = published();
+    const resolution: MigrationWitnessResolution = {
+      state: "resolved", witnesses: [scenario.witnessBinding],
+      selections: [{ ...scenario.selection, attemptId: "2".repeat(64) }],
+    };
+    expect(refusal({ ...inputs, resolution })).toContain("activation-evidence:mismatch");
+  });
+
+  it("refuses when the selected witness is a rollback witness, not an activation witness", () => {
+    const { scenario, ...inputs } = published();
+    const rollback = fixtureRollbackWitness({
+      epoch: scenario.epoch, attempt: scenario.attempt,
+      postEpochDelta: driftCanonicalDelta(scenario.attempt.canonicalDeltaBaseline, 0),
+      postEpochCensus: null, rollbackMode: "post-write",
     });
-    expect(resolution.state).toBe("resolved");
-    expect((resolution as { witnesses: unknown[] }).witnesses).toHaveLength(1);
-    expect(resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityAbsent }))
-      .toEqual({ status: "unactivated" });
+    const resolution: MigrationWitnessResolution = {
+      state: "resolved", witnesses: [scenario.witnessBinding],
+      selections: [{ ...scenario.selection, witnessChecksumSha256: rollback.checksumSha256 }],
+    };
+    const evidence = { ...scenario.evidence, witnesses: [scenario.witness, rollback] };
+    expect(refusal({ ...inputs, resolution, evidence })).toContain("activation-evidence:mismatch");
   });
 
-  it("resolves to unactivated for authoritative absence, and to refused for unresolvability -- proving the two are not collapsed", () => {
-    expect(resolveActivationAuthority({ resolution: fixtureAuthoritativelyAbsent, operabilityFact: fixtureOperabilityAbsent }))
-      .toEqual({ status: "unactivated" });
-    const unresolvable = resolveActivationAuthority({
-      resolution: fixtureUnresolvable("artifact directory read failed"),
+  it("refuses when the stored attempt belongs to a different epoch than the stored witness's epoch", () => {
+    const { scenario, ...inputs } = published();
+    const otherEpoch = fixtureEpoch({ generationId: "generation-1", seed: "other" });
+    const crossed = { ...scenario.attempt, epochId: otherEpoch.epochId };
+    expect(refusal({ ...inputs, evidence: { ...scenario.evidence, attempts: [crossed] } }))
+      .toContain("activation-evidence:mismatch");
+  });
+
+  // Row 6: published but unbound.
+  it("refuses as published-but-unbound, never unactivated, when the destination is operable and no selection exists", () => {
+    const { scenario } = published();
+    const inputs = {
+      resolution: scenario.unpublishedBindings,
+      evidence: scenario.evidence,
+      operabilityFact: fixtureOperabilityPresent(),
+    };
+    expect(refusal(inputs)).toContain("published-but-unbound");
+    // Paired control: flipping only the operability fact reaches unactivated.
+    expect(authority({ ...inputs, operabilityFact: fixtureOperabilityAbsent })).toEqual({ status: "unactivated" });
+  });
+
+  it("refuses as published-but-unbound when nothing at all was bound but the destination is operable", () => {
+    expect(refusal({
+      resolution: fixtureBindingsAbsent, evidence: fixtureEvidenceAbsent, operabilityFact: fixtureOperabilityPresent(),
+    })).toContain("published-but-unbound");
+  });
+
+  // Unactivated rows.
+  it("is unactivated when all three observations agree that nothing was activated", () => {
+    expect(authority({
+      resolution: fixtureBindingsAbsent, evidence: fixtureEvidenceAbsent, operabilityFact: fixtureOperabilityAbsent,
+    })).toEqual({ status: "unactivated" });
+  });
+
+  it("is unactivated for an authenticated binding store holding nothing", () => {
+    expect(authority({
+      resolution: { state: "resolved", witnesses: [], selections: [] },
+      evidence: fixtureEvidenceAbsent,
       operabilityFact: fixtureOperabilityAbsent,
-    });
-    expect(unresolvable.status).toBe("refused");
-    // Substituting one state for the other must change the answer. If a
-    // caller ever collapsed "authoritatively-absent" into "unresolvable"
-    // (or vice versa) this equality would start failing in one direction.
-    expect(resolveActivationAuthority({ resolution: fixtureAuthoritativelyAbsent, operabilityFact: fixtureOperabilityAbsent }))
-      .not.toEqual(resolveActivationAuthority({
-        resolution: fixtureUnresolvable("artifact directory read failed"),
-        operabilityFact: fixtureOperabilityAbsent,
-      }));
+    })).toEqual({ status: "unactivated" });
   });
 
-  it("refuses when the witness resolution is unresolvable, carrying which resolver and reason", () => {
-    expect(resolveActivationAuthority({
-      resolution: fixtureUnresolvable("home directory could not be opened"),
+  it("is unactivated for the witnessed-but-unpublished state when the destination is not yet operable", () => {
+    const { scenario } = published();
+    expect(authority({
+      resolution: scenario.unpublishedBindings,
+      evidence: scenario.evidence,
       operabilityFact: fixtureOperabilityAbsent,
-    })).toEqual({
-      status: "refused",
-      reason: "witness-resolution:unresolvable: home directory could not be opened",
-    });
+    })).toEqual({ status: "unactivated" });
   });
 
-  it("refuses when the operability fact is unresolvable, carrying which resolver and reason -- even though the witness resolution is cleanly resolved", () => {
-    // Breakable independently of the previous test: witness resolution is
-    // healthy here (authoritatively-absent, not itself unresolvable); only
-    // the operability fact is unresolvable. This proves the operability
-    // resolver's own unresolvable branch is checked, not merely that some
-    // unresolvable field anywhere produces a refusal.
-    expect(resolveActivationAuthority({
-      resolution: fixtureAuthoritativelyAbsent,
-      operabilityFact: fixtureOperabilityUnresolvable("lock contention"),
-    })).toEqual({
-      status: "refused",
-      reason: "operability-fact:unresolvable: lock contention",
-    });
+  it("is unactivated when an epoch alone is stored", () => {
+    const { scenario } = published();
+    expect(authority({
+      resolution: fixtureBindingsAbsent,
+      evidence: { ...scenario.evidence, attempts: [], witnesses: [] },
+      operabilityFact: fixtureOperabilityAbsent,
+    })).toEqual({ status: "unactivated" });
   });
 
-  it("refuses when the operability fact is unresolvable even though an activation binding exists -- row 4 overrides row 3", () => {
-    // The table's row 4 ("unresolvable | any") takes precedence over row 3
-    // ("binding present -> normal classification") regardless of the
-    // binding's presence. Breakable by reordering the checks: if the
-    // binding-present branch ran first, this would wrongly resolve to
-    // authoritative instead of refusing.
-    const resolution = fixtureResolvedWithActivationSelection({
-      epochId: "epoch-1",
-      attemptId: "attempt-1",
-      manifestRevision: 3,
-      witnessChecksumSha256: "a".repeat(64),
-      publicationId: "publication-1",
-    });
-    expect(resolveActivationAuthority({
-      resolution,
-      operabilityFact: fixtureOperabilityUnresolvable("unsafe storage"),
-    })).toEqual({
-      status: "refused",
-      reason: "operability-fact:unresolvable: unsafe storage",
-    });
-  });
-
-  it("refuses as published-but-unbound, never unactivated, when the destination is operable but no binding exists -- section 15's core repair", () => {
-    // This is the exact destructive-direction defect section 15 exists to
-    // close: version 4 would have answered "unactivated" here (empty
-    // selections), licensing a pre-write reversal that discards committed
-    // writes the destination already has. Paired with the next test, which
-    // flips only the operability fact and gets "unactivated" instead --
-    // proving this branch is the operability fact, not the resolution shape
-    // (which is identical, "witnessed but unpublished", in both tests).
-    const resolution = fixtureWitnessedButUnpublished({
-      epochId: "epoch-3",
-      attemptId: "attempt-3",
-      manifestRevision: 2,
-      witnessChecksumSha256: "f".repeat(64),
-    });
-    const decision = resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityPresent() });
-    expect(decision.status).toBe("refused");
-    expect(decision).not.toEqual({ status: "unactivated" });
-    expect((decision as { reason: string }).reason).toContain("published-but-unbound");
-  });
-
-  it("resolves to unactivated on the identical resolution shape when the operability fact is authoritatively absent instead of present", () => {
-    const resolution = fixtureWitnessedButUnpublished({
-      epochId: "epoch-3",
-      attemptId: "attempt-3",
-      manifestRevision: 2,
-      witnessChecksumSha256: "f".repeat(64),
-    });
-    expect(resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityAbsent }))
+  it("does not treat a rollback-kind selection as activation authority", () => {
+    const { scenario } = published();
+    const resolution: MigrationWitnessResolution = {
+      state: "resolved", witnesses: [],
+      selections: [{ ...scenario.selection, kind: "rollback" }],
+    };
+    expect(authority({ resolution, evidence: scenario.evidence, operabilityFact: fixtureOperabilityAbsent }))
       .toEqual({ status: "unactivated" });
   });
 
-  it("takes the last activation-kind selection when more than one is present", () => {
+  it("takes the last activation selection when more than one is present", () => {
+    const { scenario, ...inputs } = published();
     const older: MigrationSelectionBinding = {
-      kind: "activation",
-      epochId: "epoch-older",
-      attemptId: "attempt-older",
-      manifestRevision: 1,
-      witnessChecksumSha256: "c".repeat(64),
-      publicationId: "publication-older",
+      ...scenario.selection, epochId: "3".repeat(64), attemptId: "4".repeat(64), witnessChecksumSha256: "5".repeat(64),
     };
-    const newer: MigrationSelectionBinding = {
-      kind: "activation",
-      epochId: "epoch-newer",
-      attemptId: "attempt-newer",
-      manifestRevision: 5,
-      witnessChecksumSha256: "d".repeat(64),
-      publicationId: "publication-newer",
+    const resolution: MigrationWitnessResolution = {
+      state: "resolved", witnesses: [scenario.witnessBinding], selections: [older, scenario.selection],
     };
-    const resolution = { state: "resolved" as const, witnesses: [], selections: [older, newer] };
-    expect(resolveActivationAuthority({ resolution, operabilityFact: fixtureOperabilityAbsent }))
-      .toEqual({ status: "authoritative", selection: newer });
+    expect(authority({ ...inputs, resolution })).toEqual({ status: "authoritative", selection: scenario.selection });
   });
 });
 
 function observation(overrides: Partial<RollbackEligibilityObservation> = {}): RollbackEligibilityObservation {
   const identity = fixtureDestinationIdentity("dest");
   return {
-    observedPortableRecordSchemaSha256: "will be overridden by callers that need a real match",
+    observedPortableRecordSchemaSha256: PORTABLE_RECORD_SCHEMA_SHA256,
     destinationIdentity: identity,
     postEpochDelta: fixtureCanonicalDelta("delta"),
     postEpochCensus: null,
@@ -238,205 +274,136 @@ function observation(overrides: Partial<RollbackEligibilityObservation> = {}): R
 }
 
 describe("evaluateRollbackEligibility: unactivated branch", () => {
-  it("passes through a refused authority verbatim, without invoking the classifier", () => {
-    const classifier = vi.fn(referenceClassifyRollbackMode);
+  it("passes a refused authority through verbatim", () => {
     const decision = evaluateRollbackEligibility({
-      authority: { status: "refused", reason: "activation authority is unresolvable: home directory could not be opened" },
+      authority: { status: "refused", reason: "activation authority is unresolvable" },
       authoritativeContext: null,
       observation: observation(),
-      classifyRollbackMode: classifier,
     });
-    expect(decision).toEqual({
-      eligibility: "refused",
-      reason: "activation authority is unresolvable: home directory could not be opened",
-    });
-    expect(classifier).not.toHaveBeenCalled();
+    expect(decision).toEqual({ eligibility: "refused", reason: "activation authority is unresolvable" });
   });
 
   it("returns unactivated pre-write when the destination identity matches the manifest's sealed witness", () => {
-    const decision = evaluateRollbackEligibility({
-      authority: { status: "unactivated" },
-      authoritativeContext: null,
-      observation: observation(),
-      classifyRollbackMode: referenceClassifyRollbackMode,
-    });
-    expect(decision).toEqual({ eligibility: "unactivated", mode: "pre-write" });
+    expect(evaluateRollbackEligibility({
+      authority: { status: "unactivated" }, authoritativeContext: null, observation: observation(),
+    })).toEqual({ eligibility: "unactivated", mode: "pre-write" });
   });
 
   it("refuses when the destination identity does not match the manifest's sealed witness", () => {
-    // Breakable independently of the previous test: same authority, same
-    // classifier, only the comparand on one side changed.
-    const decision = evaluateRollbackEligibility({
+    expect(evaluateRollbackEligibility({
       authority: { status: "unactivated" },
       authoritativeContext: null,
       observation: observation({ manifestDestinationWitnessSha256: "0".repeat(64) }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
-    });
-    expect(decision).toEqual({
+    })).toEqual({
       eligibility: "refused",
       reason: "destination identity does not match the manifest's sealed witness",
     });
   });
 });
 
-function authoritativeContext(overrides: Partial<{
-  destinationIdentity: RollbackAuthoritativeContext["epoch"]["destinationIdentity"];
-  censusVector: RollbackAuthoritativeContext["epoch"]["censusVector"];
-  schemaWitness: RollbackAuthoritativeContext["epoch"]["schemaWitness"];
-  canonicalDeltaBaseline: RollbackAuthoritativeContext["attempt"]["canonicalDeltaBaseline"];
-}> = {}): RollbackAuthoritativeContext {
-  return {
-    epoch: {
-      destinationIdentity: overrides.destinationIdentity ?? fixtureDestinationIdentity("dest"),
-      censusVector: overrides.censusVector ?? fixtureCensusVector("census"),
-      schemaWitness: overrides.schemaWitness ?? fixtureSchemaWitness("schema"),
-    },
-    attempt: {
-      canonicalDeltaBaseline: overrides.canonicalDeltaBaseline ?? fixtureCanonicalDelta("delta"),
-    },
-  };
-}
-
 describe("evaluateRollbackEligibility: authoritative branch", () => {
-  const AUTHORITY = {
-    status: "authoritative" as const,
-    selection: {
-      kind: "activation" as const,
-      epochId: "epoch-1",
-      attemptId: "attempt-1",
-      manifestRevision: 1,
-      witnessChecksumSha256: "a".repeat(64),
-      publicationId: "publication-1",
-    },
-  };
+  const delta = fixtureCanonicalDelta("shared-delta");
+  const census = fixtureCensusVector("shared-census");
+  const scenario = fixtureActivationScenario({
+    destinationIdentity: fixtureDestinationIdentity("dest"),
+    censusVector: census,
+    canonicalDeltaBaseline: delta,
+  });
+  const authoritative = { status: "authoritative" as const, selection: scenario.selection };
+  const evaluate = (overrides: Partial<RollbackEligibilityObservation>, context = scenario.context) =>
+    evaluateRollbackEligibility({ authority: authoritative, authoritativeContext: context, observation: observation(overrides) });
 
-  it("refuses when the authoritative context is missing, without invoking the classifier", () => {
-    const classifier = vi.fn(referenceClassifyRollbackMode);
-    const decision = evaluateRollbackEligibility({
-      authority: AUTHORITY,
-      authoritativeContext: null,
-      observation: observation(),
-      classifyRollbackMode: classifier,
-    });
-    expect(decision.eligibility).toBe("refused");
-    expect(classifier).not.toHaveBeenCalled();
+  it("refuses when the authoritative context is missing", () => {
+    expect(evaluateRollbackEligibility({ authority: authoritative, authoritativeContext: null, observation: observation() }))
+      .toMatchObject({ eligibility: "refused" });
   });
 
-  it("refuses on identity mismatch before the classifier is ever consulted", () => {
-    // The classifier is spied so this test can prove the identity gate
-    // short-circuits it, not merely that the final answer happens to be
-    // "refused" for some other reason. If the gate were removed, the
-    // classifier would run and could wrongly grant pre-write.
-    const context = authoritativeContext({ destinationIdentity: fixtureDestinationIdentity("other-dest") });
-    const classifier = vi.fn(referenceClassifyRollbackMode);
-    const decision = evaluateRollbackEligibility({
-      authority: AUTHORITY,
-      authoritativeContext: context,
-      observation: observation(),
-      classifyRollbackMode: classifier,
+  it("refuses on identity mismatch before the classifier is consulted", () => {
+    // The census equals the epoch's, so a classifier that ran would grant pre-write.
+    const decision = evaluate({
+      destinationIdentity: fixtureDestinationIdentity("other-dest"), postEpochDelta: delta, postEpochCensus: census,
     });
     expect(decision).toEqual({
       eligibility: "refused",
       reason: "destination identity does not match the authoritative epoch",
     });
-    expect(classifier).not.toHaveBeenCalled();
   });
 
-  it("proceeds to the classifier and grants pre-write when identity matches and the delta is unchanged with a matching census", () => {
-    const delta = fixtureCanonicalDelta("shared-delta");
-    const census = fixtureCensusVector("shared-census");
-    const context = authoritativeContext({ canonicalDeltaBaseline: delta, censusVector: census });
-    const decision = evaluateRollbackEligibility({
-      authority: AUTHORITY,
-      authoritativeContext: context,
-      observation: observation({
-        observedPortableRecordSchemaSha256: PORTABLE_RECORD_SCHEMA_SHA256,
-        postEpochDelta: delta,
-        postEpochCensus: census,
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
-    });
-    expect(decision).toEqual({ eligibility: "pre-write", mode: "pre-write" });
+  it("grants pre-write when identity matches and the delta is unchanged with a matching census", () => {
+    expect(evaluate({ postEpochDelta: delta, postEpochCensus: census }))
+      .toEqual({ eligibility: "pre-write", mode: "pre-write" });
   });
 
-  it("grants post-write when the delta has drifted from the baseline -- breakable by removing the drift", () => {
-    const delta = fixtureCanonicalDelta("shared-delta-2");
-    const context = authoritativeContext({ canonicalDeltaBaseline: delta });
-    const decision = evaluateRollbackEligibility({
-      authority: AUTHORITY,
-      authoritativeContext: context,
-      observation: observation({ postEpochDelta: driftCanonicalDelta(delta, 0), postEpochCensus: null }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
-    });
-    expect(decision).toEqual({ eligibility: "post-write", mode: "post-write" });
+  it("grants post-write when the delta has drifted from the baseline", () => {
+    expect(evaluate({ postEpochDelta: driftCanonicalDelta(delta, 0), postEpochCensus: null }))
+      .toEqual({ eligibility: "post-write", mode: "post-write" });
   });
 
-  it("grants post-write when the delta is unchanged but the census has drifted -- breakable by removing the drift", () => {
-    const delta = fixtureCanonicalDelta("shared-delta-3");
-    const census = fixtureCensusVector("shared-census-3");
-    const context = authoritativeContext({ canonicalDeltaBaseline: delta, censusVector: census });
-    const decision = evaluateRollbackEligibility({
-      authority: AUTHORITY,
-      authoritativeContext: context,
-      observation: observation({
-        observedPortableRecordSchemaSha256: PORTABLE_RECORD_SCHEMA_SHA256,
-        postEpochDelta: delta,
-        postEpochCensus: driftCensusVector(census, 0),
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
-    });
-    expect(decision).toEqual({ eligibility: "post-write", mode: "post-write" });
+  it("grants post-write when the delta is unchanged but the census has drifted", () => {
+    expect(evaluate({ postEpochDelta: delta, postEpochCensus: driftCensusVector(census, 0) }))
+      .toEqual({ eligibility: "post-write", mode: "post-write" });
   });
 
   it("refuses rather than defaulting when the delta is unchanged and no census was supplied", () => {
-    const delta = fixtureCanonicalDelta("shared-delta-4");
-    const context = authoritativeContext({ canonicalDeltaBaseline: delta });
-    const decision = evaluateRollbackEligibility({
-      authority: AUTHORITY,
-      authoritativeContext: context,
-      observation: observation({ postEpochDelta: delta, postEpochCensus: null }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
-    });
-    expect(decision).toEqual({
+    expect(evaluate({ postEpochDelta: delta, postEpochCensus: null })).toEqual({
       eligibility: "refused",
       reason: "canonical delta is unchanged and no census was supplied",
     });
   });
 
-  it("refuses on schema-incomparable census with a distinct reason, never falling through to post-write", () => {
-    const delta = fixtureCanonicalDelta("shared-delta-5");
-    const census = fixtureCensusVector("shared-census-5");
-    const context = authoritativeContext({ canonicalDeltaBaseline: delta, censusVector: census });
-    const decision = evaluateRollbackEligibility({
-      authority: AUTHORITY,
-      authoritativeContext: context,
-      observation: observation({
-        observedPortableRecordSchemaSha256: "0".repeat(64),
-        postEpochDelta: delta,
-        postEpochCensus: census,
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
-    });
-    expect(decision).toEqual({
+  it("refuses on a schema-incomparable census with a distinct reason, never falling through to post-write", () => {
+    expect(evaluate({
+      observedPortableRecordSchemaSha256: "0".repeat(64), postEpochDelta: delta, postEpochCensus: census,
+    })).toEqual({
       eligibility: "refused",
       reason: "observed census schema is not comparable to the frozen portable record schema",
     });
   });
 
-  it("matches the schema check on a real match -- proving the previous refusal is the schema comparison, not something else", () => {
-    const delta = fixtureCanonicalDelta("shared-delta-6");
-    const census = fixtureCensusVector("shared-census-6");
-    const context = authoritativeContext({ canonicalDeltaBaseline: delta, censusVector: census });
-    const decision = evaluateRollbackEligibility({
-      authority: AUTHORITY,
-      authoritativeContext: context,
-      observation: observation({
-        observedPortableRecordSchemaSha256: PORTABLE_RECORD_SCHEMA_SHA256,
-        postEpochDelta: delta,
-        postEpochCensus: census,
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
-    });
-    expect(decision).toEqual({ eligibility: "pre-write", mode: "pre-write" });
+  it("refuses a stored pair whose ids do not cross-match, rather than classifying it", () => {
+    const stranger = fixtureAttempt({ epoch: fixtureEpoch({ generationId: "generation-1", seed: "stranger" }) });
+    expect(evaluate({ postEpochDelta: delta, postEpochCensus: census }, { ...scenario.context, attempt: stranger }))
+      .toEqual({
+        eligibility: "refused",
+        reason: "the activation attempt does not belong to the authoritative epoch",
+      });
   });
 });
+
+describe("classifyRollbackEligibilityMode (plan-v3.1 A3)", () => {
+  const delta = fixtureCanonicalDelta("adapter-delta");
+  const census = fixtureCensusVector("adapter-census");
+  const { epoch, attempt } = fixtureActivationScenario({ censusVector: census, canonicalDeltaBaseline: delta });
+
+  it("returns the classifier's answers unchanged once its preconditions hold", () => {
+    expect(classifyRollbackEligibilityMode({ epoch, attempt, postEpochDelta: delta, postEpochCensus: census }))
+      .toEqual({ mode: "pre-write" });
+    expect(classifyRollbackEligibilityMode({ epoch, attempt, postEpochDelta: delta, postEpochCensus: driftCensusVector(census, 1) }))
+      .toEqual({ mode: "post-write" });
+    expect(classifyRollbackEligibilityMode({ epoch, attempt, postEpochDelta: driftCanonicalDelta(delta, 2), postEpochCensus: null }))
+      .toEqual({ mode: "post-write" });
+  });
+
+  it("refuses an attempt that does not belong to the epoch", () => {
+    const stranger = fixtureAttempt({ epoch: fixtureEpoch({ generationId: "generation-1", seed: "stranger" }) });
+    expect(classifyRollbackEligibilityMode({ epoch, attempt: stranger, postEpochDelta: delta, postEpochCensus: census }))
+      .toEqual({ mode: "refused", reason: "the activation attempt does not belong to the authoritative epoch" });
+  });
+
+  it("refuses an unchanged delta with no census, and does not refuse a changed delta with no census", () => {
+    expect(classifyRollbackEligibilityMode({ epoch, attempt, postEpochDelta: delta, postEpochCensus: null }))
+      .toEqual({ mode: "refused", reason: "canonical delta is unchanged and no census was supplied" });
+    expect(classifyRollbackEligibilityMode({ epoch, attempt, postEpochDelta: driftCanonicalDelta(delta, 0), postEpochCensus: null }))
+      .toEqual({ mode: "post-write" });
+  });
+
+  it("rethrows a classifier throw that is not one of the two preconditions", () => {
+    // A census that cannot be canonicalised makes the classifier throw from inside its census
+    // comparison, after both preconditions held. That is a defect to surface, never a refusal.
+    const malformed = { ...census, domains: census.domains.map((entry, index) => (
+      index === 0 ? { ...entry, recordCount: Number.NaN } : entry)) };
+    expect(() => classifyRollbackEligibilityMode({ epoch, attempt, postEpochDelta: delta, postEpochCensus: malformed }))
+      .toThrow(TypeError);
+  });
+});
+

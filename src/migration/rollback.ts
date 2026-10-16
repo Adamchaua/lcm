@@ -5,61 +5,36 @@
  * this file implements it and does not re-derive it) and
  * coordinator-seam-FROZEN.md v7.
  *
- * BOUNDARIES THIS FILE DOES NOT IMPLEMENT, read before extending.
- * Exactly like rollback-eligibility.ts's own boundary note, every one of
- * these is a required dependency-injected parameter with no default and
- * no production fallback anywhere in this file, so a caller that forgets
- * to wire one gets a type error, never silently-wrong behavior:
+ * WHAT IS INJECTED, AND WHAT IT DEFAULTS TO. Every dependency below that has
+ * a production implementation on this branch defaults to it, so a caller
+ * (and a test) that supplies nothing exercises the real stores; each stays
+ * overridable as a seam for failure injection:
  *
- *  - Boundary A: {@link MigrationWitnessResolver} (resolveMigrationWitnessBindings),
- *    owned by #625 (coordinator-seam-FROZEN.md v6 sections 13-14).
- *  - Boundary B: {@link RollbackModeClassifier} (classifyRollbackMode),
- *    owned by #624 (witness-schema-FROZEN-v2.md section 9).
- *  - Boundary C: {@link OperabilityFactResolver}. UNLIKE A and B, #626 owns
- *    this reader's production implementation -- see
- *    {@link readBackendPublicationOperabilityFact} below, which is real,
- *    not injected as an unimplemented boundary. It is still passed
- *    through the same injection seam rollback-eligibility.ts expects,
- *    because that module's resolveActivationAuthority takes an
- *    already-resolved value (its own no-I/O invariant), never performs
- *    the read itself.
- *  - Boundary D: {@link MigrationSelectionBindingRecorder}
- *    (recordMigrationSelectionBinding), owned by #625
- *    (coordinator-seam-FROZEN.md v7 section 17, added specifically
- *    because this item's implementer found the write side of the
- *    selection-binding store undefined and asked rather than inventing a
- *    durable format -- see section 17's own account of that exchange).
- *  - Boundary E: {@link RollbackAuthoritativeContextResolver}, fetching
- *    the MigrationActivationEpochShape/MigrationActivationAttemptShape
- *    pair named by an authoritative selection's epochId/attemptId.
- *    rollback-eligibility.ts's own doc comment on
- *    RollbackAuthoritativeContext states explicitly that "fetching
- *    these by epochId/attemptId from whatever artifact store #624/#625
- *    end up providing is the caller's job (rollback.ts)" -- this is that
- *    job, modeled as an injected boundary for the same reason A/B/D are:
- *    the artifact store's shape is owned by #624/#625's witness-schema
- *    module, which does not exist on this branch.
- *  - Boundary F: {@link OpenRollbackFencedSession}. Everything that
- *    requires (a) a live PostgreSQL connection under the durable
- *    lcm.fenced_leases fence (coordinator-seam-FROZEN.md section 5) and
- *    (b) #624's witness-schema canonicalization of a live snapshot into
- *    MigrationDestinationIdentityShape / MigrationCanonicalDeltaShape /
- *    MigrationCensusVectorShape / MigrationSchemaWitnessShape. #626
- *    owns opening and fencing the PostgreSQL session for real (the
- *    lease-acquisition and repeatable-read machinery lives in
- *    src/storage/postgresql/publication-guard.ts and
- *    snapshot-session.ts), but the CANONICALIZATION of what it reads
- *    into the witness-schema shapes above is #624's algorithm, which does
- *    not exist in this branch (no activation-witness.ts anywhere on
- *    main or this branch). Building the PostgreSQL plumbing here and
- *    then hand-rolling a second, locally-invented canonicalization would
- *    be exactly the "production wrapper to bridge the gap" plan-v2
- *    section 7 forbids, one level further down than rollback-eligibility.ts's
- *    own three boundaries. This is flagged to the root coordinator per
- *    plan-v2 section 7's own instruction to ask rather than guess; see
- *    this item's status report for the exact question.
+ *  - Boundary A: {@link MigrationWitnessResolver}, defaulting to
+ *    generation-binding-store.ts's resolveMigrationWitnessBindings.
+ *  - Activation evidence: {@link ActivationEvidenceResolver}, defaulting to
+ *    activation-evidence-store.ts's readMigrationActivationEvidence. With A
+ *    and Boundary C it feeds resolveActivationAuthority's three-observation
+ *    truth table (plan-v3.1 amendment A1).
+ *  - Boundary B has no seam: classifyMigrationRollbackMode is pure, and
+ *    rollback-eligibility.ts adapts it directly.
+ *  - Boundary C: {@link readBackendPublicationOperabilityFact}, below.
+ *  - Boundaries D and D2: {@link MigrationSelectionBindingRecorder} and
+ *    {@link MigrationWitnessBindingRecorder}, defaulting to
+ *    recordMigrationSelectionBinding and recordMigrationWitnessBinding.
+ *  - Boundary E: {@link RollbackAuthoritativeContextResolver}, defaulting
+ *    to resolveRollbackAuthoritativeContext, which returns the full parsed
+ *    epoch and attempt (and the selected witness) of the selection.
  *
- * WHAT THIS FILE DOES OWN AND IMPLEMENT FOR REAL: the local fencing
+ * STILL REQUIRED, NO DEFAULT:
+ *
+ *  - Boundary F: {@link OpenRollbackFencedSession}. The fenced PostgreSQL
+ *    session (lease, quiescence, dedicated snapshot readback) is composed
+ *    by a later slice of #626; until then a caller supplies it.
+ *  - The BackendPublicationCoordinator. No production driver exists on this
+ *    branch (see the KNOWN GAP note above runMigrationRollback).
+ *
+ * * WHAT THIS FILE DOES OWN AND IMPLEMENT FOR REAL: the local fencing
  * sequence (enterMaintenance retention across the whole window), the
  * migration-protocol effect lifecycle (begin/complete/abandon via
  * MigrationManifestStore), calling rollback-generation.ts /
@@ -104,15 +79,25 @@ import {
   type MigrationReportReference,
 } from "./protocol.js";
 import { MigrationManifestStore } from "./manifest-store.js";
+import type { MigrationCanonicalDelta, MigrationSelectionAuthority } from "./activation-witness.js";
+import {
+  readMigrationActivationEvidence,
+  resolveRollbackAuthoritativeContext,
+} from "./activation-evidence-store.js";
+import {
+  recordMigrationSelectionBinding,
+  recordMigrationWitnessBinding,
+  resolveMigrationWitnessBindings,
+} from "./generation-binding-store.js";
 import {
   evaluateRollbackEligibility,
   resolveActivationAuthority,
   type ActivationAuthority,
   type MigrationSelectionBinding,
   type MigrationWitnessBinding,
+  type ActivationEvidenceResolver,
   type MigrationWitnessResolver,
   type OperabilityFactResolution,
-  type RollbackModeClassifier,
   type RollbackAuthoritativeContext,
   type RollbackEligibilityDecision,
   type RollbackEligibilityObservation,
@@ -534,9 +519,10 @@ function assertAuthorityAgreesWithArtifact(
 }
 
 // ---------------------------------------------------------------------------
-// Boundary D. coordinator-seam-FROZEN.md v7 section 17. Owned by #625,
-// consumed here injected, no production fallback -- #626 persists nothing
-// itself, per section 17's explicit "two independent writers" prohibition.
+// Boundary D. coordinator-seam-FROZEN.md v7 section 17. The writer is
+// generation-binding-store.ts's recordMigrationSelectionBinding (the default
+// below); #626 persists nothing through any other path, per section 17's
+// explicit "two independent writers" prohibition.
 // Synchronous, per section 17: an async writer inside the retained fenced
 // window invites the suspend-across-await hazard the lock seam itself was
 // just fixed to avoid.
@@ -547,12 +533,19 @@ export type MigrationSelectionBindingRecorder = (
 ) => void;
 
 // ---------------------------------------------------------------------------
-// Boundary E. Fetches the epoch/attempt pair an authoritative selection
-// names. See this file's module doc comment.
+// Boundary E. Fetches the full epoch and attempt records an authoritative
+// selection names (plan-v3.1 amendment A4), plus the witness it names. Null
+// only for a store lacking the pair; an unreadable store throws.
 // ---------------------------------------------------------------------------
 
 export type RollbackAuthoritativeContextResolver = (
-  input: Readonly<{ homeDir: string; epochId: string; attemptId: string }>,
+  input: Readonly<{
+    homeDir: string;
+    generationId: string;
+    epochId: string;
+    attemptId: string;
+    witnessChecksumSha256?: string;
+  }>,
 ) => Promise<RollbackAuthoritativeContext | null>;
 
 // ---------------------------------------------------------------------------
@@ -563,13 +556,7 @@ export type RollbackAuthoritativeContextResolver = (
 /** One fenced PostgreSQL session, retained across steps 3 through 10. */
 export interface RollbackFencedSession {
   /** witness-schema-FROZEN-v2.md section 2 shape, minted at lease acquisition (step 3). */
-  readonly selectionAuthority: Readonly<{
-    version: 1;
-    resourceType: string;
-    resourceKey: string;
-    fencingToken: string;
-    ownerProcessId: string;
-  }>;
+  readonly selectionAuthority: MigrationSelectionAuthority;
   readonly quiescenceFenceEvidenceSha256: string;
   /** Re-asserts the same fencingToken before a durable step, per contract section 5. */
   renew(): Promise<void>;
@@ -584,7 +571,7 @@ export interface RollbackFencedSession {
    */
   captureReadback(input: Readonly<{
     manifestDestinationWitnessSha256: string;
-    canonicalDeltaBaseline: Readonly<{ version: 1; domains: readonly unknown[] }> | null;
+    canonicalDeltaBaseline: MigrationCanonicalDelta | null;
   }>): Promise<RollbackEligibilityObservation>;
   /** Opens the source #626 exports from for post-write generation build. */
   openPortableSource(): Promise<PortableRecordStream>;
@@ -727,29 +714,14 @@ export type MigrationWitnessBindingRecorder = (
 ) => void;
 
 // ---------------------------------------------------------------------------
-// EXTENSION TO BOUNDARY F, made by this continuation of #626's work and
-// flagged explicitly rather than guessed (see this item's status report).
-//
-// The predecessor's committed RollbackFencedSession (above) has no way to
-// produce coordinator-seam-FROZEN.md section 4's terminalEvidenceSha256 --
-// "the checksumSha256 of the MigrationActivationWitness of frozen witness
-// schema v3 section 8" -- because that computation is itself the SAME
-// canonicalization the predecessor's own module doc already assigns to
-// Boundary F ("the CANONICALIZATION of what it reads into the
-// witness-schema shapes above is #624's algorithm"). Hand-deriving that
-// digest here from the mirrored shapes in rollback-eligibility.ts would be
-// exactly the "production wrapper to bridge the gap" plan-v2 section 7
-// forbids, one level further down. So this item extends the SAME
-// already-injected boundary with one more method rather than inventing a
-// new canonicalization or a new boundary: the caller supplies only
-// values it already legitimately has (epoch/attempt identity, the fresh
-// observation, and this item's own eligibility decision), and the
-// injected implementation -- which has real access to the witness-schema
-// module -- returns the sealed digest.
-//
-// This is an ADDITIVE change to an interface with no prior consumer
-// (nothing in the committed tree called RollbackFencedSession's methods
-// before this file's continuation), not a rewrite of committed logic.
+// EXTENSION TO BOUNDARY F. coordinator-seam-FROZEN.md section 4's
+// terminalEvidenceSha256 is "the checksumSha256 of the
+// MigrationActivationWitness of frozen witness schema v3 section 8", which
+// only the code that holds the live capture can mint with
+// createMigrationActivationWitness. So the injected session computes it from
+// values this orchestration legitimately has (epoch/attempt identity, the
+// fresh observation, and this item's own eligibility decision) rather than
+// this file hand-deriving a digest that activation-witness.ts owns.
 // ---------------------------------------------------------------------------
 
 export type ComputeRollbackTerminalEvidenceInput = Readonly<{
@@ -800,18 +772,34 @@ export type RollbackTerminalEvidenceComputer = (
 export interface RunMigrationRollbackDependencies {
   /** Caller-constructed; see the KNOWN GAP note above on why this item does not construct one itself. */
   readonly coordinator: BackendPublicationCoordinator;
-  /** Boundary A. */
-  readonly resolveWitnessBindings: MigrationWitnessResolver;
-  /** Boundary B. */
-  readonly classifyRollbackMode: RollbackModeClassifier;
-  /** Boundary D. */
-  readonly recordSelectionBinding: MigrationSelectionBindingRecorder;
-  /** Boundary D2. */
-  readonly recordWitnessBinding: MigrationWitnessBindingRecorder;
-  /** Boundary E. */
-  readonly resolveAuthoritativeContext: RollbackAuthoritativeContextResolver;
   /** Boundary F. */
   readonly openFencedSession: OpenRollbackFencedSession;
+  /** Boundary A. Defaults to resolveMigrationWitnessBindings. */
+  readonly resolveWitnessBindings?: MigrationWitnessResolver;
+  /** Activation evidence store read. Defaults to readMigrationActivationEvidence. */
+  readonly resolveActivationEvidence?: ActivationEvidenceResolver;
+  /** Boundary D. Defaults to recordMigrationSelectionBinding. */
+  readonly recordSelectionBinding?: MigrationSelectionBindingRecorder;
+  /** Boundary D2. Defaults to recordMigrationWitnessBinding. */
+  readonly recordWitnessBinding?: MigrationWitnessBindingRecorder;
+  /** Boundary E. Defaults to resolveRollbackAuthoritativeContext. */
+  readonly resolveAuthoritativeContext?: RollbackAuthoritativeContextResolver;
+}
+
+type ResolvedRollbackDependencies = Required<RunMigrationRollbackDependencies>;
+
+function withDefaultDependencies(
+  deps: Readonly<RunMigrationRollbackDependencies>,
+): Readonly<ResolvedRollbackDependencies> {
+  return {
+    coordinator: deps.coordinator,
+    openFencedSession: deps.openFencedSession,
+    resolveWitnessBindings: deps.resolveWitnessBindings ?? resolveMigrationWitnessBindings,
+    resolveActivationEvidence: deps.resolveActivationEvidence ?? readMigrationActivationEvidence,
+    recordSelectionBinding: deps.recordSelectionBinding ?? recordMigrationSelectionBinding,
+    recordWitnessBinding: deps.recordWitnessBinding ?? recordMigrationWitnessBinding,
+    resolveAuthoritativeContext: deps.resolveAuthoritativeContext ?? resolveRollbackAuthoritativeContext,
+  };
 }
 
 export interface RunMigrationRollbackInput {
@@ -965,8 +953,9 @@ function sameMaintenanceRoster(
 
 export async function runMigrationRollback(
   input: Readonly<RunMigrationRollbackInput>,
-  deps: Readonly<RunMigrationRollbackDependencies>,
+  suppliedDeps: Readonly<RunMigrationRollbackDependencies>,
 ): Promise<RunMigrationRollbackOutcome> {
+  const deps = withDefaultDependencies(suppliedDeps);
   const now = input._now ?? ((): Date => new Date());
   const store = new MigrationManifestStore({ homeDir: input.homeDir });
   const current = store.read(input.generationId);
@@ -1018,7 +1007,11 @@ export async function runMigrationRollback(
     homeDir: input.homeDir,
     generationId: input.generationId,
   });
-  const authority = resolveActivationAuthority({ resolution: witnessResolution, operabilityFact });
+  const evidence = deps.resolveActivationEvidence({
+    homeDir: input.homeDir,
+    generationId: input.generationId,
+  });
+  const authority = resolveActivationAuthority({ resolution: witnessResolution, evidence, operabilityFact });
   if (authority.status === "refused") {
     throw new RollbackOrchestrationError("not-eligible", authority.reason);
   }
@@ -1038,8 +1031,10 @@ export async function runMigrationRollback(
   if (authority.status === "authoritative") {
     authoritativeContext = await deps.resolveAuthoritativeContext({
       homeDir: input.homeDir,
+      generationId: input.generationId,
       epochId: authority.selection.epochId,
       attemptId: authority.selection.attemptId,
+      witnessChecksumSha256: authority.selection.witnessChecksumSha256,
     });
     if (authoritativeContext === null) {
       throw new RollbackOrchestrationError(
@@ -1125,7 +1120,6 @@ export async function runMigrationRollback(
         authority,
         authoritativeContext,
         observation,
-        classifyRollbackMode: deps.classifyRollbackMode,
       });
       if (decision.eligibility === "refused") {
         await deps.coordinator.abortMaintenance({
@@ -1305,7 +1299,7 @@ function highestRollbackGenerationBuildAttempt(
  */
 async function runPostPrepareSequence(
   input: Readonly<RunMigrationRollbackInput>,
-  deps: Readonly<RunMigrationRollbackDependencies>,
+  deps: Readonly<ResolvedRollbackDependencies>,
   store: MigrationManifestStore,
   working: MigrationManifest,
   session: RollbackFencedSession,
@@ -1393,7 +1387,6 @@ async function runPostPrepareSequence(
     authority,
     authoritativeContext,
     observation: revalidated,
-    classifyRollbackMode: deps.classifyRollbackMode,
   });
   if (revalidatedDecision.eligibility === "refused" || revalidatedDecision.mode !== decision.mode) {
     // A racing post-activation write (or any other change) inside the
@@ -1600,7 +1593,7 @@ async function runPostPrepareSequence(
  */
 async function continueAfterPrepareRollback(
   input: Readonly<RunMigrationRollbackInput>,
-  deps: Readonly<RunMigrationRollbackDependencies>,
+  deps: Readonly<ResolvedRollbackDependencies>,
   store: MigrationManifestStore,
   current: MigrationManifest,
   now: () => Date,
@@ -1613,7 +1606,11 @@ async function continueAfterPrepareRollback(
     homeDir: input.homeDir,
     generationId: input.generationId,
   });
-  const authority = resolveActivationAuthority({ resolution: witnessResolution, operabilityFact });
+  const evidence = deps.resolveActivationEvidence({
+    homeDir: input.homeDir,
+    generationId: input.generationId,
+  });
+  const authority = resolveActivationAuthority({ resolution: witnessResolution, evidence, operabilityFact });
   if (authority.status === "refused") {
     throw new RollbackOrchestrationError(
       "unexpected-state",
@@ -1625,8 +1622,10 @@ async function continueAfterPrepareRollback(
   if (authority.status === "authoritative") {
     authoritativeContext = await deps.resolveAuthoritativeContext({
       homeDir: input.homeDir,
+      generationId: input.generationId,
       epochId: authority.selection.epochId,
       attemptId: authority.selection.attemptId,
+      witnessChecksumSha256: authority.selection.witnessChecksumSha256,
     });
     if (authoritativeContext === null) {
       throw new RollbackOrchestrationError(
@@ -1654,7 +1653,6 @@ async function continueAfterPrepareRollback(
         authority,
         authoritativeContext,
         observation,
-        classifyRollbackMode: deps.classifyRollbackMode,
       });
       if (decision.eligibility === "refused") {
         throw new RollbackOrchestrationError("not-eligible", decision.reason);
@@ -1705,7 +1703,7 @@ async function continueAfterPrepareRollback(
  */
 async function recoverPendingPublishRollback(
   input: Readonly<RunMigrationRollbackInput>,
-  deps: Readonly<RunMigrationRollbackDependencies>,
+  deps: Readonly<ResolvedRollbackDependencies>,
   store: MigrationManifestStore,
   current: MigrationManifest,
   now: () => Date,

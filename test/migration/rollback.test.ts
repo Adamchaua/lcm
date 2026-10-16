@@ -22,7 +22,7 @@
  * the explicit list of what remains.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, chmodSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, chmodSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -44,6 +44,18 @@ import {
   type BackendPublicationRecoveryFile,
 } from "../../src/storage/backend-publication.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
+import {
+  migrationActivationEvidenceDirectory,
+  recordMigrationActivationAttempt,
+  recordMigrationActivationEpoch,
+  recordMigrationActivationWitness,
+} from "../../src/migration/activation-evidence-store.js";
+import {
+  migrationGenerationBindingDirectory,
+  recordMigrationSelectionBinding,
+  recordMigrationWitnessBinding,
+  resolveMigrationWitnessBindings,
+} from "../../src/migration/generation-binding-store.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
 import {
   createMigrationManifest,
@@ -67,16 +79,17 @@ import {
   type MigrationWitnessBindingRecorder,
 } from "../../src/migration/rollback.js";
 import {
+  fixtureActivationScenario,
+  fixtureActivationWitness,
+  fixtureAttempt,
+  fixtureBindingsAbsent,
+  fixtureBindingsUnresolvable,
   fixtureCanonicalDelta,
   fixtureCensusVector,
   fixtureDestinationIdentity,
-  fixtureSchemaWitness,
-  fixtureResolvedWithActivationSelection,
-  fixtureAuthoritativelyAbsent,
-  fixtureUnresolvable,
-  fixtureOperabilityAbsent,
-  referenceClassifyRollbackMode,
-} from "../fixtures/rollback-eligibility-witness-schema.js";
+  fixtureEpoch,
+  fixtureEvidenceAbsent,
+} from "../fixtures/migration-activation-records.js";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -135,6 +148,23 @@ function unexpectedDriver(): BackendPublicationDriver {
 
 function coordinatorFor(homeDir: string): BackendPublicationCoordinator {
   return new BackendPublicationCoordinator({ homeDir, driver: unexpectedDriver() });
+}
+
+/** Binding store and evidence store both authoritatively empty: nothing was ever activated. */
+function absentDeps() {
+  return {
+    resolveWitnessBindings: () => fixtureBindingsAbsent,
+    resolveActivationEvidence: () => fixtureEvidenceAbsent,
+  } as const;
+}
+
+/** The stores as one published activation leaves them, with the full records its selection names. */
+function authoritativeDeps(scenario: ReturnType<typeof fixtureActivationScenario>) {
+  return {
+    resolveWitnessBindings: () => scenario.bindings,
+    resolveActivationEvidence: () => scenario.evidence,
+    resolveAuthoritativeContext: async () => scenario.context,
+  } as const;
 }
 
 // ---------------------------------------------------------------------------
@@ -358,11 +388,9 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...absentDeps(),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => { throw new Error("must not open a session for a settled generation"); },
     })).rejects.toMatchObject({ name: "RollbackOrchestrationError", reason: "unexpected-state" });
   });
@@ -378,19 +406,18 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureUnresolvable("simulated read failure"),
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      resolveWitnessBindings: () => fixtureBindingsUnresolvable("simulated read failure"),
+      resolveActivationEvidence: () => fixtureEvidenceAbsent,
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => { throw new Error("must not open a session when authority is refused"); },
     })).rejects.toMatchObject({
       name: "RollbackOrchestrationError",
       reason: "not-eligible",
     });
 
-    // Breakable independently: the positive control below (fixtureAuthoritativelyAbsent
-    // instead of fixtureUnresolvable, same everything else) reaches maintenance and a
+    // Breakable independently: the positive control below (an absent binding store
+    // instead of an unresolvable one, same everything else) reaches maintenance and a
     // different failure point, proving this assertion is not vacuously true.
     expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
   });
@@ -409,11 +436,9 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...absentDeps(),
       recordSelectionBinding: (input) => { selectionBindings.push(input.binding); },
       recordWitnessBinding: (input) => { witnessBindings.push(input.binding); },
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => {
         const destinationIdentity = fixtureDestinationIdentity("d");
         return fakeSession({
@@ -471,22 +496,16 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
-        epochId: "epoch-1", attemptId: "attempt-1", manifestRevision: 1,
-        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-1",
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...authoritativeDeps(fixtureActivationScenario({
+        destinationIdentity: destinationIdentity, censusVector: fixtureCensusVector("census"), canonicalDeltaBaseline: baseline,
+      })),
       recordSelectionBinding: (input) => { selectionBindings.push(input.binding); },
       recordWitnessBinding: (input) => { witnessBindings.push(input.binding); },
-      resolveAuthoritativeContext: async () => ({
-        epoch: { destinationIdentity, censusVector: fixtureCensusVector("census"), schemaWitness: fixtureSchemaWitness("schema") },
-        attempt: { canonicalDeltaBaseline: baseline },
-      }),
       openFencedSession: async () => fakeSession({
         observations: [{
           manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
           destinationIdentity,
-          // Deliberately different from the baseline -- referenceClassifyRollbackMode
+          // Deliberately different from the baseline -- classifyMigrationRollbackMode
           // returns "post-write" as soon as the deltas differ, on the delta axis
           // alone, independent of the census.
           postEpochDelta: fixtureCanonicalDelta("changed"),
@@ -540,20 +559,15 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
-        epochId: "epoch-1", attemptId: "attempt-1", manifestRevision: 1,
-        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-1",
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      // A destination identity that will NOT match the observation below --
+      // the identity gate refuses before any durable change other than the
+      // maintenance entry itself.
+      ...authoritativeDeps(fixtureActivationScenario({
+        destinationIdentity: fixtureDestinationIdentity("different"),
+        canonicalDeltaBaseline: fixtureCanonicalDelta("baseline"),
+      })),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => ({
-        // A destination identity that will NOT match the observation
-        // below -- the identity gate refuses before any durable change
-        // other than the maintenance entry itself.
-        epoch: { destinationIdentity: fixtureDestinationIdentity("different"), censusVector: fixtureCensusVector("c"), schemaWitness: fixtureSchemaWitness("s") },
-        attempt: { canonicalDeltaBaseline: fixtureCanonicalDelta("baseline") },
-      }),
       openFencedSession: async () => fakeSession({
         observations: [{
           manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
@@ -590,17 +604,11 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
-        epochId: "epoch-race", attemptId: "attempt-race", manifestRevision: 1,
-        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-race",
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...authoritativeDeps(fixtureActivationScenario({
+        destinationIdentity: destinationIdentity, censusVector: census, canonicalDeltaBaseline: baseline,
+      })),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => ({
-        epoch: { destinationIdentity, censusVector: census, schemaWitness: fixtureSchemaWitness("s") },
-        attempt: { canonicalDeltaBaseline: baseline },
-      }),
       openFencedSession: async () => fakeSession({
         observations: [
           {
@@ -643,17 +651,11 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
-        epochId: "epoch-race-control", attemptId: "attempt-race-control", manifestRevision: 1,
-        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-race-control",
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...authoritativeDeps(fixtureActivationScenario({
+        destinationIdentity: destinationIdentity, censusVector: census, canonicalDeltaBaseline: baseline,
+      })),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => ({
-        epoch: { destinationIdentity, censusVector: census, schemaWitness: fixtureSchemaWitness("s") },
-        attempt: { canonicalDeltaBaseline: baseline },
-      }),
       openFencedSession: async () => fakeSession({ observations: [observation, observation], source: sqliteSourceStream }),
     });
     expect(outcome.manifest.phase).toBe("rolled-back");
@@ -672,19 +674,23 @@ describe("runMigrationRollback", () => {
     const witnessBindings: unknown[] = [];
     const resolveAuthoritativeContextCalls: string[] = [];
 
-    // Two attempts share one generation after a takeover: "attempt-old"
-    // was superseded and never selected (a witness only); "attempt-new"
-    // is the one an actual selection was published against. Both are
-    // returned as witnesses -- only "attempt-new" is a selection.
+    // Two attempts share one epoch after a takeover: the old attempt was
+    // superseded and never selected (a witness only); the new attempt is
+    // the one an actual selection was published against. Both witnesses are
+    // recorded in both stores -- only the new attempt has a selection.
+    const epoch = fixtureEpoch({ generationId: "gen-takeover", seed: "takeover", destinationIdentity, censusVector: censusBound });
+    const attemptOld = fixtureAttempt({ epoch, seed: "old", canonicalDeltaBaseline: baselineUnboundWrong });
+    const attemptNew = fixtureAttempt({ epoch, seed: "new", canonicalDeltaBaseline: baselineBound });
+    const witnessOld = fixtureActivationWitness(epoch, attemptOld);
+    const witnessNew = fixtureActivationWitness(epoch, attemptNew);
+    const bindingFor = (attempt: typeof attemptOld, witness: typeof witnessOld, manifestRevision: number) => ({
+      kind: "activation" as const, epochId: epoch.epochId, attemptId: attempt.attemptId,
+      manifestRevision, witnessChecksumSha256: witness.checksumSha256,
+    });
     const resolution = {
       state: "resolved" as const,
-      witnesses: [
-        { kind: "activation" as const, epochId: "epoch-takeover", attemptId: "attempt-old", manifestRevision: 1, witnessChecksumSha256: "a".repeat(64) },
-        { kind: "activation" as const, epochId: "epoch-takeover", attemptId: "attempt-new", manifestRevision: 2, witnessChecksumSha256: "b".repeat(64) },
-      ],
-      selections: [
-        { kind: "activation" as const, epochId: "epoch-takeover", attemptId: "attempt-new", manifestRevision: 2, witnessChecksumSha256: "b".repeat(64), publicationId: "pub-new" },
-      ],
+      witnesses: [bindingFor(attemptOld, witnessOld, 1), bindingFor(attemptNew, witnessNew, 2)],
+      selections: [{ ...bindingFor(attemptNew, witnessNew, 2), publicationId: "pub-new" }],
     };
 
     const outcome = await runMigrationRollback({
@@ -694,25 +700,18 @@ describe("runMigrationRollback", () => {
     }, {
       coordinator: coordinatorFor(homeDir),
       resolveWitnessBindings: () => resolution,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      resolveActivationEvidence: () => ({
+        state: "resolved", epochs: [epoch], attempts: [attemptOld, attemptNew], witnesses: [witnessOld, witnessNew],
+      }),
       recordSelectionBinding: (input) => { selectionBindings.push(input.binding); },
       recordWitnessBinding: (input) => { witnessBindings.push(input.binding); },
       resolveAuthoritativeContext: async (input) => {
         resolveAuthoritativeContextCalls.push(input.attemptId);
-        if (input.attemptId !== "attempt-new") {
-          // If this were ever reached with the unbound attempt, a
-          // mismatching baseline makes the wrong-attempt path diverge
-          // (post-write here vs. pre-write below) rather than silently
-          // agreeing with the correct path's outcome.
-          return {
-            epoch: { destinationIdentity, censusVector: fixtureCensusVector("unbound-wrong-census"), schemaWitness: fixtureSchemaWitness("s") },
-            attempt: { canonicalDeltaBaseline: baselineUnboundWrong },
-          };
-        }
-        return {
-          epoch: { destinationIdentity, censusVector: censusBound, schemaWitness: fixtureSchemaWitness("s") },
-          attempt: { canonicalDeltaBaseline: baselineBound },
-        };
+        // If this were ever reached with the unbound attempt, its
+        // mismatching baseline makes the wrong-attempt path diverge
+        // (post-write here vs. pre-write below) rather than silently
+        // agreeing with the correct path's outcome.
+        return { epoch, attempt: input.attemptId === attemptNew.attemptId ? attemptNew : attemptOld, witness: null };
       },
       openFencedSession: async () => fakeSession({
         observations: [{
@@ -723,13 +722,13 @@ describe("runMigrationRollback", () => {
       }),
     });
 
-    expect(resolveAuthoritativeContextCalls).toEqual(["attempt-new"]);
+    expect(resolveAuthoritativeContextCalls).toEqual([attemptNew.attemptId]);
     expect(outcome.manifest.phase).toBe("rolled-back");
     expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
     expect(selectionBindings).toHaveLength(1);
     expect(witnessBindings).toHaveLength(1);
-    expect((selectionBindings[0] as { attemptId: string }).attemptId).toBe("attempt-new");
-    expect((witnessBindings[0] as { attemptId: string }).attemptId).toBe("attempt-new");
+    expect((selectionBindings[0] as { attemptId: string }).attemptId).toBe(attemptNew.attemptId);
+    expect((witnessBindings[0] as { attemptId: string }).attemptId).toBe(attemptNew.attemptId);
    expect(existsSync(join(homeDir, "live.sqlite"))).toBe(false);
  });
 
@@ -788,11 +787,9 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator,
-      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...absentDeps(),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => fakeSession({
         observations: [{
           manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
@@ -857,11 +854,9 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator,
-      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...absentDeps(),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => fakeSession({
         observations: [{
           manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
@@ -905,11 +900,9 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator,
-      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...absentDeps(),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => crashingSession,
     })).rejects.toThrow("simulated crash after step 8");
 
@@ -931,11 +924,9 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator,
-      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...absentDeps(),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => fakeSession({
         observations: [{
           manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
@@ -991,11 +982,9 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator,
-      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...absentDeps(),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => { throw new Error("must not open a session during abandonment recovery"); },
     });
 
@@ -1042,11 +1031,9 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...absentDeps(),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => fakeSession({
         observations: [{
           manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
@@ -1080,11 +1067,9 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...absentDeps(),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => { throw new Error("must not open a session: refusal happens before maintenance"); },
     })).rejects.toMatchObject({
       name: "RollbackOrchestrationError",
@@ -1116,11 +1101,9 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...absentDeps(),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => { throw new Error("must not open a session: refusal happens before maintenance"); },
     })).rejects.toMatchObject({
       name: "RollbackOrchestrationError",
@@ -1148,11 +1131,9 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureAuthoritativelyAbsent,
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...absentDeps(),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => null,
       openFencedSession: async () => { throw new Error("must not open a session: refusal happens before maintenance"); },
     })).rejects.toMatchObject({
       name: "RollbackOrchestrationError",
@@ -1180,11 +1161,7 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
-        epochId: "epoch-y", attemptId: "attempt-y", manifestRevision: 1,
-        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-y",
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...authoritativeDeps(fixtureActivationScenario()),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
       resolveAuthoritativeContext: async () => { throw new Error("must not resolve authoritative context: refusal happens before this call"); },
@@ -1225,17 +1202,11 @@ describe("runMigrationRollback", () => {
 
     const deps: RunMigrationRollbackDependencies = {
       coordinator,
-      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
-        epochId: "epoch-ic", attemptId: "attempt-ic", manifestRevision: 1,
-        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-ic",
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...authoritativeDeps(fixtureActivationScenario({
+        destinationIdentity: destinationIdentity, censusVector: fixtureCensusVector("census-ic"), canonicalDeltaBaseline: baseline,
+      })),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => ({
-        epoch: { destinationIdentity, censusVector: fixtureCensusVector("census-ic"), schemaWitness: fixtureSchemaWitness("schema-ic") },
-        attempt: { canonicalDeltaBaseline: baseline },
-      }),
       openFencedSession: async () => fakeSession({
         observations: [{
           manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
@@ -1331,17 +1302,11 @@ describe("runMigrationRollback", () => {
         sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
       }, {
         coordinator,
-        resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
-          epochId: "epoch-enum", attemptId: "attempt-enum", manifestRevision: 1,
-          witnessChecksumSha256: "w".repeat(64), publicationId: "pub-enum",
-        }),
-        classifyRollbackMode: referenceClassifyRollbackMode,
+        ...authoritativeDeps(fixtureActivationScenario({
+          destinationIdentity: destinationIdentity, censusVector: fixtureCensusVector("census-enum"), canonicalDeltaBaseline: baseline,
+        })),
         recordSelectionBinding: () => undefined,
         recordWitnessBinding: () => undefined,
-        resolveAuthoritativeContext: async () => ({
-          epoch: { destinationIdentity, censusVector: fixtureCensusVector("census-enum"), schemaWitness: fixtureSchemaWitness("schema-enum") },
-          attempt: { canonicalDeltaBaseline: baseline },
-        }),
         openFencedSession: async () => fakeSession({
           observations: [{
             manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
@@ -1382,17 +1347,11 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: readableCoordinator,
-      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
-        epochId: "epoch-enum-control", attemptId: "attempt-enum-control", manifestRevision: 1,
-        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-enum-control",
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...authoritativeDeps(fixtureActivationScenario({
+        destinationIdentity: destinationIdentity, censusVector: fixtureCensusVector("census-enum-control"), canonicalDeltaBaseline: baseline,
+      })),
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => ({
-        epoch: { destinationIdentity, censusVector: fixtureCensusVector("census-enum-control"), schemaWitness: fixtureSchemaWitness("schema-enum-control") },
-        attempt: { canonicalDeltaBaseline: baseline },
-      }),
       openFencedSession: async () => fakeSession({
         observations: [{
           manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
@@ -1424,6 +1383,9 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
     const destinationIdentity = fixtureDestinationIdentity("d");
     const baseline = fixtureCanonicalDelta("1431-baseline");
     const census = fixtureCensusVector("1431-census");
+    const scenario1431 = fixtureActivationScenario({
+      generationId: "gen-1431", destinationIdentity, censusVector: census, canonicalDeltaBaseline: baseline,
+    });
 
     let attemptedBinding: unknown = null;
     let bindingCalls = 0;
@@ -1434,21 +1396,13 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      resolveWitnessBindings: () => fixtureResolvedWithActivationSelection({
-        epochId: "epoch-1431", attemptId: "attempt-1431", manifestRevision: 1,
-        witnessChecksumSha256: "w".repeat(64), publicationId: "pub-1431",
-      }),
-      classifyRollbackMode: referenceClassifyRollbackMode,
+      ...authoritativeDeps(scenario1431),
       recordSelectionBinding: (input) => {
         bindingCalls += 1;
         attemptedBinding = input.binding;
         throw new Error("simulated crash: selection completed but the binding write never landed");
       },
       recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => ({
-        epoch: { destinationIdentity, censusVector: census, schemaWitness: fixtureSchemaWitness("schema-1431") },
-        attempt: { canonicalDeltaBaseline: baseline },
-      }),
       openFencedSession: async () => fakeSession({
         observations: [{
           manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
@@ -1495,8 +1449,8 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
     expect(rollbackReportRef).toBeDefined();
     const rollbackReport = readRollbackReport(homeDir, "gen-1431", rollbackReportRef!.reportId);
     expect(rollbackReport).not.toBeNull();
-    expect(rollbackReport!.epochId).toBe("epoch-1431");
-    expect(rollbackReport!.attemptId).toBe("attempt-1431");
+    expect(rollbackReport!.epochId).toBe(scenario1431.epoch.epochId);
+    expect(rollbackReport!.attemptId).toBe(scenario1431.attempt.attemptId);
 
     const rederivedBinding = {
       kind: "rollback" as const,
@@ -1528,3 +1482,210 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
     expect(recovered).toHaveLength(2);
   });
 });
+
+// Plan-v3 section 1/3 and amendment A1: with no resolver overrides, the
+// orchestration reads the real binding store and the real activation
+// evidence store. Each refusal below corrupts exactly one of the three
+// observations (evidence store, binding store, operability fact) and is
+// paired with a control that leaves them all consistent.
+describe("runMigrationRollback against the real binding and evidence stores", () => {
+  const RUN = (homeDir: string, generationId: string) => ({
+    homeDir, generationId, canonicalPath: join(homeDir, "live.sqlite"),
+    projectIdentity: identity, localProjectId: "local-1",
+    sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+  });
+  const destinationIdentity = fixtureDestinationIdentity("d");
+  const neverOpens = async (): Promise<RollbackFencedSession> => {
+    throw new Error("must not open a session: refusal happens before maintenance");
+  };
+  const unchangedSession = (): Promise<RollbackFencedSession> => Promise.resolve(fakeSession({
+    observations: [{
+      manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+      destinationIdentity,
+      postEpochDelta: fixtureCanonicalDelta("real-baseline"),
+      postEpochCensus: fixtureCensusVector("real-census"),
+    }],
+    source: sqliteSourceStream,
+  }));
+
+  /** Records one activation exactly as the ordering contract says an activation driver does. */
+  function recordActivation(homeDir: string, generationId: string, published: boolean) {
+    const scenario = fixtureActivationScenario({
+      generationId, destinationIdentity,
+      censusVector: fixtureCensusVector("real-census"),
+      canonicalDeltaBaseline: fixtureCanonicalDelta("real-baseline"),
+    });
+    recordMigrationActivationEpoch({ homeDir, epoch: scenario.epoch });
+    recordMigrationActivationAttempt({ homeDir, generationId, attempt: scenario.attempt });
+    recordMigrationActivationWitness({ homeDir, generationId, witness: scenario.witness });
+    recordMigrationWitnessBinding({ homeDir, generationId, binding: scenario.witnessBinding });
+    if (published) recordMigrationSelectionBinding({ homeDir, generationId, binding: scenario.selection });
+    return scenario;
+  }
+
+  const plantJunk = (directory: string): void => {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writeFileSync(join(directory, "junk.txt"), "stray", { mode: 0o600 });
+  };
+
+  it("rolls back a published activation end to end with every default in place, recording the rollback bindings in the real store", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-real");
+    const scenario = recordActivation(homeDir, "gen-real", true);
+
+    const outcome = await runMigrationRollback(RUN(homeDir, "gen-real"), {
+      coordinator: coordinatorFor(homeDir),
+      openFencedSession: unchangedSession,
+    });
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
+    expect(outcome.report).toMatchObject({
+      eligibility: "pre-write", epochId: scenario.epoch.epochId, attemptId: scenario.attempt.attemptId,
+    });
+    const bindings = resolveMigrationWitnessBindings({ homeDir, generationId: "gen-real" });
+    if (bindings.state !== "resolved") throw new Error("expected the real binding store to resolve");
+    expect(bindings.selections.map((entry) => entry.kind).sort()).toEqual(["activation", "rollback"]);
+    expect(bindings.witnesses.map((entry) => entry.kind).sort()).toEqual(["activation", "rollback"]);
+    const rollbackSelection = bindings.selections.find((entry) => entry.kind === "rollback")!;
+    expect(rollbackSelection).toMatchObject({
+      epochId: scenario.epoch.epochId,
+      attemptId: scenario.attempt.attemptId,
+      publicationId: deriveRollbackPublicationId("gen-real"),
+    });
+  });
+
+  it("rolls back a never-activated generation with every default in place, writing no binding", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-never");
+    const outcome = await runMigrationRollback(RUN(homeDir, "gen-never"), {
+      coordinator: coordinatorFor(homeDir),
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
+          destinationIdentity, postEpochDelta: fixtureCanonicalDelta("delta"), postEpochCensus: null,
+        }],
+        source: sqliteSourceStream,
+      }),
+    });
+    expect(outcome.report!.eligibility).toBe("unactivated");
+    expect(resolveMigrationWitnessBindings({ homeDir, generationId: "gen-never" }))
+      .toEqual({ state: "authoritatively-absent" });
+  });
+
+  it("treats witnessed-but-unpublished as unactivated: an epoch and witness are stored, no selection, destination not operable", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-unpublished");
+    recordActivation(homeDir, "gen-unpublished", false);
+    const outcome = await runMigrationRollback(RUN(homeDir, "gen-unpublished"), {
+      coordinator: coordinatorFor(homeDir),
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
+          destinationIdentity, postEpochDelta: fixtureCanonicalDelta("delta"), postEpochCensus: null,
+        }],
+        source: sqliteSourceStream,
+      }),
+    });
+    expect(outcome.report!.eligibility).toBe("unactivated");
+  });
+
+  it("refuses a witnessed-but-unpublished generation once the destination is operable (published but unbound)", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-operable");
+    recordActivation(homeDir, "gen-operable", false);
+    await establishCompletedPostgresqlPublication(homeDir);
+    await expect(runMigrationRollback(RUN(homeDir, "gen-operable"), {
+      coordinator: coordinatorFor(homeDir), openFencedSession: neverOpens,
+    })).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("published-but-unbound") });
+    expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+  });
+
+  it("refuses when only the evidence store is corrupted, before any maintenance", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-bad-evidence");
+    recordActivation(homeDir, "gen-bad-evidence", true);
+    plantJunk(migrationActivationEvidenceDirectory(homeDir, "gen-bad-evidence"));
+    await expect(runMigrationRollback(RUN(homeDir, "gen-bad-evidence"), {
+      coordinator: coordinatorFor(homeDir), openFencedSession: neverOpens,
+    })).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("activation-evidence:unresolvable") });
+    expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+  });
+
+  it("refuses when only the binding store is corrupted, before any maintenance", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-bad-bindings");
+    recordActivation(homeDir, "gen-bad-bindings", true);
+    plantJunk(migrationGenerationBindingDirectory(homeDir, "gen-bad-bindings"));
+    await expect(runMigrationRollback(RUN(homeDir, "gen-bad-bindings"), {
+      coordinator: coordinatorFor(homeDir), openFencedSession: neverOpens,
+    })).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("witness-resolution:unresolvable") });
+  });
+
+  it("refuses a selection binding whose evidence records are gone (evidence store absent), never unactivated", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-no-evidence");
+    const scenario = fixtureActivationScenario({ generationId: "gen-no-evidence" });
+    recordMigrationWitnessBinding({ homeDir, generationId: "gen-no-evidence", binding: scenario.witnessBinding });
+    recordMigrationSelectionBinding({ homeDir, generationId: "gen-no-evidence", binding: scenario.selection });
+    await expect(runMigrationRollback(RUN(homeDir, "gen-no-evidence"), {
+      coordinator: coordinatorFor(homeDir), openFencedSession: neverOpens,
+    })).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("binding exists without its evidence record") });
+  });
+
+  it("refuses an unactivated generation when only the evidence store is corrupted", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-unactivated-bad");
+    plantJunk(migrationActivationEvidenceDirectory(homeDir, "gen-unactivated-bad"));
+    await expect(runMigrationRollback(RUN(homeDir, "gen-unactivated-bad"), {
+      coordinator: coordinatorFor(homeDir), openFencedSession: neverOpens,
+    })).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("activation-evidence:unresolvable") });
+  });
+
+  it("refuses to continue a prepared rollback when the evidence store was corrupted after the crash", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-continue-bad");
+    recordActivation(homeDir, "gen-continue-bad", true);
+    const coordinator = coordinatorFor(homeDir);
+    const crashing = await unchangedSession();
+    crashing.renew = async () => { throw new Error("simulated crash after step 8"); };
+    await expect(runMigrationRollback(RUN(homeDir, "gen-continue-bad"), {
+      coordinator, openFencedSession: async () => crashing,
+    })).rejects.toThrow("simulated crash after step 8");
+
+    plantJunk(migrationActivationEvidenceDirectory(homeDir, "gen-continue-bad"));
+    await expect(runMigrationRollback(RUN(homeDir, "gen-continue-bad"), {
+      coordinator, openFencedSession: neverOpens,
+    })).rejects.toMatchObject({
+      reason: "unexpected-state",
+      message: expect.stringContaining("authority resolution now refuses: activation-evidence:unresolvable"),
+    });
+  });
+
+  it("refuses when the authoritative context cannot be fetched for a selection the stores agree on", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-no-context");
+    recordActivation(homeDir, "gen-no-context", true);
+    await expect(runMigrationRollback(RUN(homeDir, "gen-no-context"), {
+      coordinator: coordinatorFor(homeDir),
+      resolveAuthoritativeContext: async () => null,
+      openFencedSession: neverOpens,
+    })).rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("could not be fetched") });
+  });
+
+  it("refuses to continue a prepared rollback when the authoritative context can no longer be fetched", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-continue-no-context");
+    recordActivation(homeDir, "gen-continue-no-context", true);
+    const coordinator = coordinatorFor(homeDir);
+    const crashing = await unchangedSession();
+    crashing.renew = async () => { throw new Error("simulated crash after step 8"); };
+    await expect(runMigrationRollback(RUN(homeDir, "gen-continue-no-context"), {
+      coordinator, openFencedSession: async () => crashing,
+    })).rejects.toThrow("simulated crash after step 8");
+    await expect(runMigrationRollback(RUN(homeDir, "gen-continue-no-context"), {
+      coordinator, resolveAuthoritativeContext: async () => null, openFencedSession: neverOpens,
+    })).rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("could not be fetched") });
+  });
+});
+

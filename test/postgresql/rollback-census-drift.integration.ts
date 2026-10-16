@@ -5,28 +5,30 @@
  * fixture built by the same code path as the classifier cannot fail on a
  * shared canonicalization bug."
  *
- * This deliberately does NOT invent #624's production census algorithm
- * (activation-witness.ts does not exist on this branch, and #626 must
- * not create it -- see rollback-eligibility.ts's own boundary note). The
- * classifier under test is referenceClassifyRollbackMode, the same
- * independently-written reference implementation of witness-schema-
- * FROZEN-v2.md section 9 the rest of this item's tests already use. What
- * is real here is the SOURCE of the census/delta values: a straightforward
- * SQL scan (row count plus a content digest) over a REAL PostgreSQL 18
- * database provisioned by this repository's own harness, with a genuine
- * row mutation in between two scans -- not a fixture seeded by a string
- * and hashed the same way on both sides of the comparison.
+ * The classifier under test is the production one: rollback-eligibility.ts's
+ * classifyRollbackEligibilityMode over activation-witness.ts's
+ * classifyMigrationRollbackMode, fed epoch and attempt records minted by
+ * createMigrationActivationEpoch/Attempt. What is real here is the SOURCE of
+ * the census/delta values for the "project" domain: a straightforward SQL
+ * scan (row count plus a content digest) over a REAL PostgreSQL 18 database
+ * provisioned by this repository's own harness, with a genuine row
+ * mutation in between two scans -- not a fixture seeded by a string and
+ * hashed the same way on both sides of the comparison. The remaining
+ * domains carry deterministic fixture values, identical on every scan.
  */
 
 import { createHash } from "node:crypto";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import { assertHarnessReady, withPostgreSqlTestDatabase } from "./harness.js";
-import { referenceClassifyRollbackMode } from "../fixtures/rollback-eligibility-witness-schema.js";
-import type {
-  MigrationCanonicalDeltaShape,
-  MigrationCensusVectorShape,
-} from "../../src/migration/rollback-eligibility.js";
+import { classifyRollbackEligibilityMode } from "../../src/migration/rollback-eligibility.js";
+import type { MigrationCanonicalDelta, MigrationCensusVector } from "../../src/migration/activation-witness.js";
+import {
+  fixtureAttempt,
+  fixtureCanonicalDelta,
+  fixtureCensusVector,
+  fixtureEpoch,
+} from "../fixtures/migration-activation-records.js";
 
 beforeAll(assertHarnessReady);
 
@@ -41,21 +43,27 @@ const options = { domain: "factory", operation: "testRollbackCensusDrift" } as c
  */
 async function scanProjectDomain(
   migrator: PostgreSqlRuntime,
-): Promise<Readonly<{ delta: MigrationCanonicalDeltaShape; census: MigrationCensusVectorShape }>> {
+): Promise<Readonly<{ delta: MigrationCanonicalDelta; census: MigrationCensusVector }>> {
   const result = await migrator.query<{ identity_key: string; display_name: string }>({
     text: "SELECT identity_key, display_name FROM lcm.projects ORDER BY identity_key",
   }, options);
   const recordCount = result.rows.length;
   const contentDigestInput = result.rows.map((row) => `${row.identity_key}:${row.display_name}`).join("\n");
   const contentSha256 = createHash("sha256").update(contentDigestInput, "utf8").digest("hex");
+  const otherDelta = fixtureCanonicalDelta("pg-other-domains");
+  const otherCensus = fixtureCensusVector("pg-other-domains");
   return {
     delta: {
-      version: 1,
-      domains: [{ domain: "project", recordCount, terminalIdentitySha256: contentSha256 }],
+      ...otherDelta,
+      domains: otherDelta.domains.map((entry) => (
+        entry.domain === "project" ? { domain: "project", recordCount, terminalIdentitySha256: contentSha256 } : entry
+      )),
     },
     census: {
-      version: 1,
-      domains: [{ domain: "project", recordCount, prefixSha256: contentSha256 }],
+      ...otherCensus,
+      domains: otherCensus.domains.map((entry) => (
+        entry.domain === "project" ? { domain: "project", recordCount, prefixSha256: contentSha256 } : entry
+      )),
       contentSha256,
     },
   };
@@ -79,11 +87,13 @@ describe("PostgreSQL rollback census drift (donadiosolutions/lcm#626 plan-v2 sec
       const rescanUnchanged = await scanProjectDomain(migrator);
       expect(rescanUnchanged.delta).toEqual(baseline.delta);
       expect(rescanUnchanged.census).toEqual(baseline.census);
-      const unchangedClassification = referenceClassifyRollbackMode({
+      const epoch = fixtureEpoch({ generationId: "pg-drift-generation", censusVector: baseline.census });
+      const attempt = fixtureAttempt({ epoch, canonicalDeltaBaseline: baseline.delta });
+      const unchangedClassification = classifyRollbackEligibilityMode({
+        epoch,
+        attempt,
         postEpochDelta: rescanUnchanged.delta,
-        canonicalDeltaBaseline: baseline.delta,
         postEpochCensus: rescanUnchanged.census,
-        censusVector: baseline.census,
       });
       expect(unchangedClassification).toEqual({ mode: "pre-write" });
 
@@ -98,16 +108,17 @@ describe("PostgreSQL rollback census drift (donadiosolutions/lcm#626 plan-v2 sec
       // actually differ from the baseline's -- proving the UPDATE above
       // landed in the real database, not merely that the classifier was
       // told to say so.
-      expect(drifted.delta.domains[0]!.terminalIdentitySha256).not.toBe(
-        baseline.delta.domains[0]!.terminalIdentitySha256,
+      const projectEntry = (delta: MigrationCanonicalDelta) => delta.domains.find((entry) => entry.domain === "project")!;
+      expect(projectEntry(drifted.delta).terminalIdentitySha256).not.toBe(
+        projectEntry(baseline.delta).terminalIdentitySha256,
       );
       expect(drifted.census.contentSha256).not.toBe(baseline.census.contentSha256);
 
-      const driftedClassification = referenceClassifyRollbackMode({
+      const driftedClassification = classifyRollbackEligibilityMode({
+        epoch,
+        attempt,
         postEpochDelta: drifted.delta,
-        canonicalDeltaBaseline: baseline.delta,
         postEpochCensus: drifted.census,
-        censusVector: baseline.census,
       });
       expect(driftedClassification).toEqual({ mode: "post-write" });
     });
