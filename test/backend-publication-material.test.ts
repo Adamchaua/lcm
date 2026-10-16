@@ -343,9 +343,9 @@ describe("composeBackendPublicationMaterial", () => {
       composeBackendPublicationMaterial({
         homeDir: home,
         targetBackend: "postgresql",
-        bindings: [binding(), binding()],
+        bindings: [binding(), binding({ remoteProjectId: REMOTE_ID_B })],
       }),
-    ).toThrow(/must not repeat/);
+    ).toThrow(/must not repeat localProjectId/);
   });
 
   it("refuses an invalid localProjectId shape", () => {
@@ -371,6 +371,17 @@ describe("composeBackendPublicationMaterial", () => {
         bindings: [],
       }),
     ).toThrow(/targetBackend/);
+  });
+
+  it("refuses a source config whose storage value is present but not an object", () => {
+    for (const storage of ["sqlite", null, 5, ["postgresql"]]) {
+      const home = makeHome();
+      writeConfig(home, { storage });
+      writeMap(home, sampleMap());
+      expect(() =>
+        composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [binding()] }),
+      ).toThrow(/storage is not a JSON object/);
+    }
   });
 
   it("refuses a non-object source config", () => {

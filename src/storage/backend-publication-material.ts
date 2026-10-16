@@ -211,7 +211,12 @@ function composeTargetConfigFile(
   if (!isRecord(parsed)) {
     throw new TypeError("backend publication source config is not a JSON object");
   }
-  const storage = isRecord(parsed.storage) ? parsed.storage : {};
+  if (parsed.storage !== undefined && !isRecord(parsed.storage)) {
+    // Replacing a present non-object value would silently drop it from the
+    // published target config.
+    throw new TypeError("backend publication source config storage is not a JSON object");
+  }
+  const storage = parsed.storage ?? {};
   // The same rule as config-manager.ts's configBackend: the source backend
   // is postgresql only when the live config selects it explicitly.
   const sourceBackend: StorageBackendName = storage.backend === "postgresql"
