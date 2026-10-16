@@ -18,6 +18,14 @@ import {
   inspectMigrationVerification,
   migrationVerificationEffectId,
   MigrationVerificationDriverError,
+  deriveActivationPublicationId,
+  recordActivationGenerationLink,
+  readActivationGenerationLink,
+  checkMigrationTargetHealth,
+  createMigrationActivationReport,
+  migrationActivationReportReference,
+  persistMigrationActivationReport,
+  readMigrationActivationReport,
 } from "../../src/migration/index.js";
 
 describe("migration package surface", () => {
@@ -43,5 +51,16 @@ describe("migration package surface", () => {
     expect(inspectMigrationVerification).toBeTypeOf("function");
     expect(migrationVerificationEffectId).toBeTypeOf("function");
     expect(MigrationVerificationDriverError).toBeTypeOf("function");
+  });
+
+  it("exports #625's phase-1 activation building blocks: publicationId, generation link, target health and report", () => {
+    expect(deriveActivationPublicationId).toBeTypeOf("function");
+    expect(recordActivationGenerationLink).toBeTypeOf("function");
+    expect(readActivationGenerationLink).toBeTypeOf("function");
+    expect(checkMigrationTargetHealth).toBeTypeOf("function");
+    expect(createMigrationActivationReport).toBeTypeOf("function");
+    expect(migrationActivationReportReference).toBeTypeOf("function");
+    expect(persistMigrationActivationReport).toBeTypeOf("function");
+    expect(readMigrationActivationReport).toBeTypeOf("function");
   });
 });

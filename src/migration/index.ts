@@ -199,3 +199,25 @@ export type {
   ActivationGenerationLinkUnresolvableReason,
 } from "./activation-artifact-store.js";
 
+export {
+  MigrationActivationReportError,
+  createMigrationActivationReport,
+  migrationActivationReportDirectory,
+  migrationActivationReportPath,
+  migrationActivationReportReference,
+  migrationActivationReportStoreDirectory,
+  parseMigrationActivationReport,
+  persistMigrationActivationReport,
+  readMigrationActivationReport,
+} from "./activation-report.js";
+export type {
+  CreateMigrationActivationReportInput,
+  MigrationActivationReport,
+  MigrationActivationReportBody,
+  MigrationActivationReportPersistResult,
+  MigrationActivationReportReadResult,
+  MigrationActivationReportReason,
+  MigrationActivationReportStoreDependencies,
+  MigrationActivationReportUnresolvableReason,
+  MigrationActivationRestartVerdict,
+} from "./activation-report.js";
