@@ -140,26 +140,46 @@ async function genesis(
     return { status: "refuse", reason: "genesis-create-failed", evidence: protocolEvidence(error) };
   }
 
-  const effectId = backendPublicationCanonicalSha256({
+  return dryRunEffect(input, store, journal, witness.bindingSha256, undefined);
+}
+
+/**
+ * The begin-then-complete of the `verify-dry-run` effect, shared by genesis
+ * and by performMigrationGenesisDryRun's two resume cells. With
+ * `carriedEffectId` the effect is already pending (begun by an earlier
+ * invocation), so it is only completed, with that exact id; a begin is
+ * never repeated.
+ */
+function dryRunEffect(
+  input: MigrationApplyGenesisAndCopyInput,
+  store: MigrationManifestStore,
+  manifest: MigrationManifest,
+  bindingSha256: string,
+  carriedEffectId: string | undefined,
+): Readonly<{ status: "ready" }> | Readonly<{ status: "refuse"; reason: string; evidence?: string }> {
+  let journal = manifest;
+  const effectId = carriedEffectId ?? backendPublicationCanonicalSha256({
     kind: "migration-apply-dry-run-effect",
     generationId: input.generationId,
     maintenanceChecksumSha256: input.maintenanceChecksumSha256,
   });
-  const inputSha256 = backendPublicationCanonicalSha256({
-    kind: "migration-apply-dry-run-input",
-    maintenanceChecksumSha256: input.maintenanceChecksumSha256,
-    bindingSha256: witness.bindingSha256,
-  });
-  try {
-    const begun = beginMigrationEffect(journal, {
-      kind: "verify-dry-run",
-      effectId,
-      inputSha256,
-      startedAt: journal.updatedAt,
+  if (carriedEffectId === undefined) {
+    const inputSha256 = backendPublicationCanonicalSha256({
+      kind: "migration-apply-dry-run-input",
+      maintenanceChecksumSha256: input.maintenanceChecksumSha256,
+      bindingSha256,
     });
-    journal = store.update(input.generationId, journal.checksumSha256, () => begun);
-  } catch (error) {
-    return { status: "refuse", reason: "genesis-dry-run-begin-failed", evidence: protocolEvidence(error) };
+    try {
+      const begun = beginMigrationEffect(journal, {
+        kind: "verify-dry-run",
+        effectId,
+        inputSha256,
+        startedAt: journal.updatedAt,
+      });
+      journal = store.update(input.generationId, journal.checksumSha256, () => begun);
+    } catch (error) {
+      return { status: "refuse", reason: "genesis-dry-run-begin-failed", evidence: protocolEvidence(error) };
+    }
   }
   try {
     const completed = completeMigrationEffect(journal, {
@@ -168,7 +188,7 @@ async function genesis(
       report: {
         kind: "dry-run",
         reportId: effectId,
-        reportSha256: witness.bindingSha256,
+        reportSha256: bindingSha256,
         createdAt: journal.updatedAt,
       },
     });
@@ -179,12 +199,80 @@ async function genesis(
   return { status: "ready" };
 }
 
-export async function performMigrationApplyGenesisAndCopy(
+export type MigrationGenesisDryRunInput = MigrationApplyGenesisAndCopyInput & Readonly<{
+  /**
+   * The effect id a router observed pending (plan-v5 row 20). Required when
+   * a `verify-dry-run` effect is pending, and compared against the manifest
+   * as it is now: a different id writes nothing.
+   */
+  carriedEffectId?: string;
+}>;
+
+export type MigrationGenesisDryRunOutcome =
+  | Readonly<{ status: "ready" }>
+  | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
+
+/**
+ * The genesis-and-dry-run half of apply, without the copy (plan-v5 Part A
+ * item 6, rows 19-20). It is today's private `genesis()`, reachable on its
+ * own, and returns before `runSqliteMigrationCopy`:
+ *
+ * - no manifest: inspect, create, begin and complete, exactly as apply does;
+ * - manifest `planned`, nothing pending (a crash after create): begin and
+ *   complete the dry-run effect;
+ * - manifest `planned` with a pending `verify-dry-run` (a crash after
+ *   begin): complete only the carried effect id.
+ *
+ * The destination is contacted in every case, because the pending effect
+ * stores an input digest, not the dry-run report. A manifest that exists
+ * binds the destination's capture time (`manifest.destination.capturedAt`),
+ * never a fresh clock, so a re-inspection reproduces the sealed binding.
+ * Capture-before-genesis (section 4.7) is enforced on every call.
+ */
+export async function performMigrationGenesisDryRun(
+  input: MigrationGenesisDryRunInput,
+): Promise<MigrationGenesisDryRunOutcome> {
+  const snapshotRefusal = await refuseUnlessSnapshotComplete(input);
+  if (snapshotRefusal !== null) return snapshotRefusal;
+
+  const store = input.manifestStore ?? new MigrationManifestStore({ homeDir: input.homeDir });
+  const copyInput = copyInputFrom(input);
+  const presence = store.probeManifestPresence(input.generationId);
+  if (presence.status === "unresolvable") {
+    return { status: "refuse", reason: "manifest-unresolvable", evidence: `manifest-${presence.reason}` };
+  }
+  if (presence.status === "absent") {
+    return genesis(input, store, copyInput, (input.now ?? new Date()).toISOString());
+  }
+
+  let manifest: MigrationManifest;
+  try {
+    manifest = store.read(input.generationId);
+  } catch (error) {
+    return { status: "refuse", reason: "manifest-unresolvable", evidence: protocolEvidence(error) };
+  }
+  const pending = manifest.pendingEffect;
+  const resumable = manifest.phase === "planned"
+    && (pending === null || pending.kind === "verify-dry-run");
+  if (!resumable) {
+    return { status: "refuse", reason: "genesis-dry-run-unexpected-state", evidence: `manifest-${manifest.phase}` };
+  }
+  if (pending !== null && pending.effectId !== input.carriedEffectId) {
+    return { status: "refuse", reason: "genesis-dry-run-effect-mismatch" };
+  }
+  let witness: Awaited<ReturnType<typeof inspectSqliteMigrationCopy>>;
+  try {
+    witness = await inspectSqliteMigrationCopy({ ...copyInput, destinationCapturedAt: manifest.destination.capturedAt });
+  } catch (error) {
+    return { status: "refuse", reason: "genesis-inspection-failed", evidence: error instanceof Error ? error.name : "unknown-inspection-failure" };
+  }
+  return dryRunEffect(input, store, manifest, witness.bindingSha256, pending === null ? undefined : pending.effectId);
+}
+
+/** Section 4.7, enforced rather than documented: classified fresh, every call, before the manifest tree is consulted. */
+async function refuseUnlessSnapshotComplete(
   input: MigrationApplyGenesisAndCopyInput,
-): Promise<MigrationApplyGenesisAndCopyOutcome> {
-  // Section 4.7: capture-before-genesis, enforced here rather than only
-  // documented -- the carried generationId is classified fresh, every call,
-  // before anything below consults the manifest tree at all.
+): Promise<Readonly<{ status: "refuse"; reason: string; evidence?: string }> | null> {
   let snapshot: Awaited<ReturnType<typeof classifySqliteSnapshotArtifact>>;
   try {
     snapshot = await classifySqliteSnapshotArtifact(input.generationId, { homeDir: input.homeDir });
@@ -194,6 +282,17 @@ export async function performMigrationApplyGenesisAndCopy(
   if (snapshot.state !== "complete") {
     return { status: "refuse", reason: "capture-incomplete", evidence: `snapshot-${snapshot.state}` };
   }
+  return null;
+}
+
+export async function performMigrationApplyGenesisAndCopy(
+  input: MigrationApplyGenesisAndCopyInput,
+): Promise<MigrationApplyGenesisAndCopyOutcome> {
+  // Section 4.7: capture-before-genesis, enforced here rather than only
+  // documented -- the carried generationId is classified fresh, every call,
+  // before anything below consults the manifest tree at all.
+  const snapshotRefusal = await refuseUnlessSnapshotComplete(input);
+  if (snapshotRefusal !== null) return snapshotRefusal;
 
   const store = input.manifestStore ?? new MigrationManifestStore({ homeDir: input.homeDir });
   const copyInput = copyInputFrom(input);

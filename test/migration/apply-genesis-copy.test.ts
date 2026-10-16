@@ -2,9 +2,15 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { performMigrationApplyGenesisAndCopy } from "../../src/migration/apply-genesis-copy.js";
+import { performMigrationApplyGenesisAndCopy, performMigrationGenesisDryRun } from "../../src/migration/apply-genesis-copy.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
-import { classifyMigrationRecovery, type MigrationManifest } from "../../src/migration/protocol.js";
+import {
+  beginMigrationEffect,
+  classifyMigrationRecovery,
+  completeMigrationEffect,
+  createMigrationManifest,
+  type MigrationManifest,
+} from "../../src/migration/protocol.js";
 import type { AuthenticatedSqliteSnapshotAuthority } from "../../src/migration/sqlite-snapshot.js";
 import type { PostgreSqlConnectionSettings } from "../../src/storage/postgresql/contracts.js";
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
@@ -281,5 +287,142 @@ describe("performMigrationApplyGenesisAndCopy (section 8's genesis-and-copy row)
     const input = baseInput();
     const outcome = await performMigrationApplyGenesisAndCopy(input);
     expect(outcome).toEqual({ status: "refuse", reason: "copy-failed", evidence: "unknown-copy-failure" });
+  });
+});
+describe("performMigrationGenesisDryRun (plan-v5 rows 19-20: genesis without the copy)", () => {
+  const CAPTURED_AT = "2026-01-02T03:04:05.000Z";
+
+  function plannedManifest(generationId: string): MigrationManifest {
+    return createMigrationManifest({
+      generationId,
+      source: witness("1".repeat(64)),
+      destination: { ...witness("2".repeat(64), "postgresql"), capturedAt: CAPTURED_AT },
+      parentGenerationId: null,
+      preservedSourceGenerationId: generationId,
+      createdAt: CAPTURED_AT,
+    });
+  }
+
+  function completeSnapshot(): void {
+    classify.mockResolvedValue({ state: "complete", generationId: "generation-1", witness: {} as never });
+  }
+
+  it("with no manifest, does exactly what apply's genesis does, then stops before any copy", async () => {
+    completeSnapshot();
+    inspect.mockResolvedValueOnce({ source: witness("1".repeat(64)), destination: witness("2".repeat(64), "postgresql"), bindingSha256: "b".repeat(64) });
+    const input = baseInput();
+    const outcome = await performMigrationGenesisDryRun(input);
+    expect(outcome).toEqual({ status: "ready" });
+    const manifest = new MigrationManifestStore({ homeDir: input.homeDir }).read(input.generationId);
+    expect(manifest.phase).toBe("dry-run-verified");
+    expect(manifest.pendingEffect).toBeNull();
+    expect(runCopy).not.toHaveBeenCalled();
+  });
+
+  it("with a planned manifest and nothing pending (a crash after create), begins and completes the dry-run effect, binding the sealed capture time rather than a fresh clock", async () => {
+    completeSnapshot();
+    inspect.mockResolvedValueOnce({ source: witness("1".repeat(64)), destination: witness("2".repeat(64), "postgresql"), bindingSha256: "b".repeat(64) });
+    const input = baseInput();
+    new MigrationManifestStore({ homeDir: input.homeDir }).create(plannedManifest(input.generationId));
+    const outcome = await performMigrationGenesisDryRun({ ...input, now: new Date("2030-01-01T00:00:00.000Z") });
+    expect(outcome).toEqual({ status: "ready" });
+    expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ destinationCapturedAt: CAPTURED_AT }));
+    const manifest = new MigrationManifestStore({ homeDir: input.homeDir }).read(input.generationId);
+    expect(manifest.phase).toBe("dry-run-verified");
+    expect(manifest.reports.some((report) => report.kind === "dry-run" && report.reportSha256 === "b".repeat(64))).toBe(true);
+  });
+
+  async function pendingDryRun(input: ReturnType<typeof baseInput>): Promise<string> {
+    const store = new MigrationManifestStore({ homeDir: input.homeDir });
+    const created = store.create(plannedManifest(input.generationId));
+    const begun = beginMigrationEffect(created, {
+      kind: "verify-dry-run", effectId: "carried-effect", inputSha256: "c".repeat(64), startedAt: created.updatedAt,
+    });
+    store.update(input.generationId, created.checksumSha256, () => begun);
+    return "carried-effect";
+  }
+
+  it("with a pending verify-dry-run (a crash after begin), completes only the carried effect id and never begins again", async () => {
+    completeSnapshot();
+    inspect.mockResolvedValueOnce({ source: witness("1".repeat(64)), destination: witness("2".repeat(64), "postgresql"), bindingSha256: "b".repeat(64) });
+    const input = baseInput();
+    const carriedEffectId = await pendingDryRun(input);
+    const outcome = await performMigrationGenesisDryRun({ ...input, carriedEffectId });
+    expect(outcome).toEqual({ status: "ready" });
+    const manifest = new MigrationManifestStore({ homeDir: input.homeDir }).read(input.generationId);
+    expect(manifest.phase).toBe("dry-run-verified");
+    expect(manifest.reports.find((report) => report.kind === "dry-run")?.reportId).toBe(carriedEffectId);
+  });
+
+  it.each([
+    ["a different effect id", "some-other-effect"],
+    ["no carried effect id", undefined],
+  ])("writes nothing and refuses genesis-dry-run-effect-mismatch for %s", async (_name, carried) => {
+    completeSnapshot();
+    const input = baseInput();
+    await pendingDryRun(input);
+    const store = new MigrationManifestStore({ homeDir: input.homeDir });
+    const before = store.read(input.generationId).checksumSha256;
+    const outcome = await performMigrationGenesisDryRun({ ...input, carriedEffectId: carried });
+    expect(outcome).toEqual({ status: "refuse", reason: "genesis-dry-run-effect-mismatch" });
+    expect(store.read(input.generationId).checksumSha256).toBe(before);
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  it("refuses genesis-dry-run-unexpected-state for a manifest past planned, writing nothing", async () => {
+    completeSnapshot();
+    const input = baseInput();
+    const store = new MigrationManifestStore({ homeDir: input.homeDir });
+    const created = store.create(plannedManifest(input.generationId));
+    const begun = beginMigrationEffect(created, { kind: "verify-dry-run", effectId: "e", inputSha256: "c".repeat(64), startedAt: created.updatedAt });
+    const stored = store.update(input.generationId, created.checksumSha256, () => begun);
+    const done = completeMigrationEffect(stored, { effectId: "e", completedAt: stored.updatedAt, report: { kind: "dry-run", reportId: "e", reportSha256: "d".repeat(64), createdAt: stored.updatedAt } });
+    store.update(input.generationId, stored.checksumSha256, () => done);
+    const outcome = await performMigrationGenesisDryRun({ ...input, carriedEffectId: "e" });
+    expect(outcome).toEqual({ status: "refuse", reason: "genesis-dry-run-unexpected-state", evidence: "manifest-dry-run-verified" });
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  it("enforces capture-before-genesis on every call", async () => {
+    classify.mockResolvedValueOnce({ state: "partial", generationId: "generation-1" });
+    const outcome = await performMigrationGenesisDryRun(baseInput());
+    expect(outcome).toEqual({ status: "refuse", reason: "capture-incomplete", evidence: "snapshot-partial" });
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  it("refuses manifest-unresolvable when the presence probe cannot be established, and when a present manifest cannot be read", async () => {
+    completeSnapshot();
+    const probe = baseInput();
+    const migrations = join(probe.homeDir, ".lcm", "migrations");
+    mkdirSync(migrations, { mode: 0o700 });
+    chmodSync(migrations, 0o755);
+    let outcome;
+    try {
+      outcome = await performMigrationGenesisDryRun(probe);
+    } finally {
+      chmodSync(migrations, 0o700);
+    }
+    expect(outcome).toEqual({ status: "refuse", reason: "manifest-unresolvable", evidence: "manifest-internal-error" });
+
+    const unreadable = {
+      probeManifestPresence: () => ({ status: "present" as const }),
+      read: () => { throw new Error("boom"); },
+    } as unknown as MigrationManifestStore;
+    expect(await performMigrationGenesisDryRun({ ...baseInput(), manifestStore: unreadable }))
+      .toEqual({ status: "refuse", reason: "manifest-unresolvable", evidence: "manifest-internal-error" });
+  });
+
+  it.each([
+    ["an Error", new Error("probe failed"), "Error"],
+    ["a non-Error", "not-an-error", "unknown-inspection-failure"],
+  ])("refuses genesis-inspection-failed when re-inspecting a planned manifest throws %s, writing nothing", async (_name, failure, evidence) => {
+    completeSnapshot();
+    inspect.mockRejectedValueOnce(failure);
+    const input = baseInput();
+    const store = new MigrationManifestStore({ homeDir: input.homeDir });
+    const created = store.create(plannedManifest(input.generationId));
+    const outcome = await performMigrationGenesisDryRun(input);
+    expect(outcome).toEqual({ status: "refuse", reason: "genesis-inspection-failed", evidence });
+    expect(store.read(input.generationId).checksumSha256).toBe(created.checksumSha256);
   });
 });
