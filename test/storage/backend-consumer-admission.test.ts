@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   PrivateMutationLockContentionError,
+  processStartTime as readProcessStartTime,
 } from "../../src/private-mutation-lock.js";
 import {
   assertBackendPublicationConfigAccess,
@@ -684,8 +685,8 @@ describe("backend publication consumer admission", () => {
   it("reports the live publication owner under the lock path convergence resolves", () => {
     const home = makeHome(true);
     const lockPath = join(home, ".lcm.backend-publication.lock");
-    const stat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
-    const processStartTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+    const processStartTime = readProcessStartTime(process.pid);
+    expect(processStartTime).not.toBeNull();
     writeFileSync(lockPath, `${JSON.stringify({
       version: 1, pid: process.pid, processStartTime, nonce: "a".repeat(32), createdAtMs: 1,
     })}\n`, { mode: 0o600 });
