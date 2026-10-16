@@ -66,6 +66,9 @@ async function writeV2PublicationFixture(home: string): Promise<void> {
   const driver: BackendPublicationDriver = {
     observeLocalState: async () => targetWitness,
     publishProjectMap: async () => { throw new Error("must not run in this fixture"); },
+    acquireRemoteGuard: async () => { throw new Error("must not run in this fixture"); },
+    readRemoteGuard: async () => { throw new Error("must not run in this fixture"); },
+    releaseRemoteGuard: async () => { throw new Error("must not run in this fixture"); },
     publishConfig: async () => { throw new Error("must not run in this fixture"); },
     restoreConfig: async () => { throw new Error("must not run in this fixture"); },
     restoreProjectMap: async () => { throw new Error("must not run in this fixture"); },
