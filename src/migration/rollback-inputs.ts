@@ -6,15 +6,29 @@ import type { BackendMaintenanceRosterEntry, BackendPublicationCoordinator } fro
 import { connectionSettings } from "../storage/postgresql/factory.js";
 import { resolveStorageIdentityContext } from "../storage/identity-context.js";
 import type { PortableProjectIdentity } from "../storage/portable-record-stream.js";
+import { BackendPublicationJournalError } from "../storage/backend-publication.js";
+import { createBackendPublicationCoordinator } from "../storage/backend-publication-driver.js";
+import { createPostgreSqlBackendPublicationRemoteGuard } from "../storage/postgresql/publication-remote-guard.js";
+import { MigrationBindingUnresolvableError } from "./generation-binding-store.js";
 import { MigrationManifestStore } from "./manifest-store.js";
 import type { MigrationManifest } from "./protocol.js";
 import { inspectAuthenticatedSqliteMigrationSnapshot } from "./queue-evidence.js";
 import {
+  DEFAULT_ROLLBACK_SESSION_DEPENDENCIES,
+  ROLLBACK_LEASE_TTL_MS,
+  RollbackSessionError,
   openRollbackFencedSession,
   type RollbackSessionDependencies,
+  type RollbackSessionRuntime,
   type RollbackSessionTarget,
 } from "./rollback-session.js";
-import type { RunMigrationRollbackDependencies, RunMigrationRollbackInput } from "./rollback.js";
+import {
+  RollbackOrchestrationError,
+  runMigrationRollback,
+  type RunMigrationRollbackDependencies,
+  type RunMigrationRollbackInput,
+  type RunMigrationRollbackOutcome,
+} from "./rollback.js";
 
 /**
  * Derives a rollback's inputs from durable state (plan-v3.1 amendment A12),
@@ -157,8 +171,8 @@ export async function resolveMigrationRollbackContext(
 /**
  * The production dependencies of runMigrationRollback. Binding writers, the
  * binding and evidence readers and the context fetch are the orchestration's
- * own defaults; this supplies the fenced session. The coordinator stays
- * caller-supplied until a production driver exists.
+ * own defaults; this supplies the fenced session. The coordinator is built
+ * by runMigrationRollbackFromHome from the session's own runtime.
  */
 export function createMigrationRollbackDependencies(input: Readonly<{
   coordinator: BackendPublicationCoordinator;
@@ -169,5 +183,133 @@ export function createMigrationRollbackDependencies(input: Readonly<{
     coordinator: input.coordinator,
     openFencedSession: (request) => openRollbackFencedSession(request, input.target, input.sessionDependencies),
   };
+}
+
+
+// ---------------------------------------------------------------------------
+// The production entry. #627's CLI calls only this.
+// ---------------------------------------------------------------------------
+
+/** Why a production rollback ended without completing; the closed list #627 maps to its messages and exit codes. */
+export const MIGRATION_ROLLBACK_ERROR_REASONS = [
+  "not-eligible",
+  "unresolvable",
+  "lease-lost",
+  "quiescence-unsatisfied",
+  "drift",
+  "input-unresolvable",
+  "unexpected-state",
+] as const;
+
+export type MigrationRollbackErrorReason = (typeof MIGRATION_ROLLBACK_ERROR_REASONS)[number];
+
+/**
+ * The one error the production entry throws. Every typed error of the
+ * modules it composes is mapped to a reason; the original message is kept
+ * and the original error is the cause, so nothing is lost.
+ */
+export class MigrationRollbackError extends Error {
+  constructor(readonly reason: MigrationRollbackErrorReason, message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "MigrationRollbackError";
+  }
+}
+
+function rollbackErrorReason(error: unknown): MigrationRollbackErrorReason {
+  if (error instanceof RollbackOrchestrationError) {
+    return error.reason === "not-eligible" || error.reason === "drift" ? error.reason : "unexpected-state";
+  }
+  if (error instanceof RollbackSessionError) {
+    if (error.reason === "lease-lost" || error.reason === "quiescence-unsatisfied") return error.reason;
+    // A fence held by another generation is a refusal; a failed release is not a statement about eligibility.
+    return error.reason === "lease-unavailable" ? "not-eligible" : "unexpected-state";
+  }
+  if (error instanceof RollbackInputResolutionError) return "input-unresolvable";
+  if (
+    error instanceof MigrationBindingUnresolvableError
+    || (error instanceof BackendPublicationJournalError
+      && (error.reason === "unresolved-publication" || error.reason === "publication-evidence-missing"))
+  ) {
+    return "unresolvable";
+  }
+  return "unexpected-state";
+}
+
+/** Maps any failure of a production rollback onto the closed error. */
+export function toMigrationRollbackError(error: unknown): MigrationRollbackError {
+  if (error instanceof MigrationRollbackError) return error;
+  return new MigrationRollbackError(
+    rollbackErrorReason(error),
+    error instanceof Error ? error.message : String(error),
+    { cause: error },
+  );
+}
+
+export interface RollbackEntryDependencies {
+  context: ResolveRollbackContextDependencies;
+  session: RollbackSessionDependencies;
+  createCoordinator: typeof createBackendPublicationCoordinator;
+  run: typeof runMigrationRollback;
+}
+
+export const DEFAULT_ROLLBACK_ENTRY_DEPENDENCIES: RollbackEntryDependencies = {
+  context: DEFAULT_RESOLVE_ROLLBACK_CONTEXT_DEPENDENCIES,
+  session: DEFAULT_ROLLBACK_SESSION_DEPENDENCIES,
+  createCoordinator: createBackendPublicationCoordinator,
+  run: runMigrationRollback,
+};
+
+/**
+ * Rolls a migrated generation back to SQLite, from durable state alone.
+ *
+ * Resolves every input (manifest, preserved-source snapshot evidence, project
+ * map, configuration, machine identity), opens one PostgreSQL runtime and
+ * builds the real coordinator over its publication guard, so the lease the
+ * fenced session takes and the one the coordinator adopts are the same row;
+ * the fenced session shares that runtime, which this entry alone closes.
+ * Re-running the same call is the recovery for every interrupted state. It is
+ * deliberately not reachable from bin/ or src/cli/ in this change.
+ */
+export async function runMigrationRollbackFromHome(
+  request: Readonly<{ homeDir: string; generationId: string; scratchParent?: string; signal?: AbortSignal }>,
+  dependencies: RollbackEntryDependencies = DEFAULT_ROLLBACK_ENTRY_DEPENDENCIES,
+): Promise<RunMigrationRollbackOutcome> {
+  try {
+    const context = await resolveMigrationRollbackContext(
+      { homeDir: request.homeDir, generationId: request.generationId },
+      dependencies.context,
+    );
+    const runtime = dependencies.session.createRuntime(context.target.settings);
+    try {
+      const coordinator = dependencies.createCoordinator({
+        homeDir: request.homeDir,
+        remoteGuard: {
+          mode: "delegated",
+          provider: createPostgreSqlBackendPublicationRemoteGuard({
+            guard: runtime.backendPublicationGuard(),
+            machineId: context.target.machineId,
+            ttlMs: ROLLBACK_LEASE_TTL_MS,
+          }),
+        },
+      });
+      // The session closes its runtime when it is released, which can precede the coordinator's last use
+      // (and a resume opens no session at all): the entry owns the runtime and closes it once.
+      const shared: RollbackSessionRuntime = Object.assign(Object.create(runtime) as RollbackSessionRuntime, {
+        close: async (): Promise<void> => undefined,
+      });
+      return await dependencies.run(
+        { ...context.input, scratchParent: request.scratchParent, signal: request.signal },
+        createMigrationRollbackDependencies({
+          coordinator,
+          target: context.target,
+          sessionDependencies: { ...dependencies.session, createRuntime: () => shared },
+        }),
+      );
+    } finally {
+      await runtime.close();
+    }
+  } catch (error) {
+    throw toMigrationRollbackError(error);
+  }
 }
 

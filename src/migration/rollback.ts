@@ -28,11 +28,23 @@
  *
  * STILL REQUIRED, NO DEFAULT:
  *
- *  - Boundary F: {@link OpenRollbackFencedSession}. The fenced PostgreSQL
- *    session (lease, quiescence, dedicated snapshot readback) is composed
- *    by a later slice of #626; until then a caller supplies it.
- *  - The BackendPublicationCoordinator. No production driver exists on this
- *    branch (see the KNOWN GAP note above runMigrationRollback).
+ *  - Boundary F: {@link OpenRollbackFencedSession}, the fenced PostgreSQL
+ *    session (lease, quiescence, dedicated snapshot readback). The
+ *    production one is rollback-session.ts's.
+ *  - The BackendPublicationCoordinator, over the production driver and the
+ *    PostgreSQL remote guard. rollback-inputs.ts's runMigrationRollbackFromHome
+ *    builds it from the same runtime the session uses, so the lease the
+ *    session holds is the one the coordinator adopts.
+ *
+ * ORDER (plan-v3.2 A16a, which supersedes plan-v3.1 A9's): the rollback
+ * witness and its binding, begin publish-rollback, install (post-write),
+ * the maintenance selection, the rollback selection binding, the
+ * coordinator's publication of the sqlite config and project map (an
+ * unactivated rollback publishes nothing), the report, and the effect's
+ * completion. The binding precedes the coordinator because its prepare()
+ * archives the maintenance journal, after which replay admission routes
+ * from bindings. Every crash row resumes by re-running the same call
+ * (recoverPendingPublishRollback).
  *
  * * WHAT THIS FILE DOES OWN AND IMPLEMENT FOR REAL: the local fencing
  * sequence (enterMaintenance retention across the whole window), the
@@ -884,30 +896,10 @@ export type RollbackTerminalEvidenceComputer = (
 // activeAppendBarrierTokens lifecycle), so "retained across the window"
 // means "the window's code runs inside the one callback", not that the
 // token is threaded out and reused across separate acquisitions.
-//
-// KNOWN GAP, flagged rather than guessed (see this item's status report):
-// coordinator-seam-FROZEN.md section 1 states the seven token-gated
-// coordinator methods have "zero production callers under src/ today".
-// This orchestration is the first one. Constructing a real
-// BackendPublicationCoordinator requires a real BackendPublicationDriver
-// (observeLocalState / publishProjectMap / publishConfig / ... --
-// backend-publication.ts's own interface), and no implementation of that
-// interface exists anywhere in src/ on this branch -- only test doubles
-// under test/. This item does not invent one: plan-v2 section 7 forbids a
-// production wrapper bridging an undefined coupling, and a driver
-// implementation is exactly the PostgreSQL-specific plumbing #625's own
-// activation orchestration needs identically, so it is a joint gap, not
-// this item's alone to close silently. runMigrationRollback therefore
-// takes an already-constructed BackendPublicationCoordinator as a
-// caller-supplied dependency, exactly like MigrationManifestStore and
-// every other already-open resource this codebase's orchestrators accept
-// (see rollback-generation.ts's already-open PortableRecordStream for the
-// same discipline). Wiring a real driver in is out of this item's scope
-// until the coupling is resolved.
 // ---------------------------------------------------------------------------
 
 export interface RunMigrationRollbackDependencies {
-  /** Caller-constructed; see the KNOWN GAP note above on why this item does not construct one itself. */
+  /** Over the production driver: rollback-inputs.ts's entry builds it. Tests inject a coordinator over an in-memory driver. */
   readonly coordinator: BackendPublicationCoordinator;
   /** Boundary F. */
   readonly openFencedSession: OpenRollbackFencedSession;

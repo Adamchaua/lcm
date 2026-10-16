@@ -6,21 +6,31 @@ import type { StorageIdentityContext } from "../../src/storage/contracts.js";
 import type { BackendPublicationCoordinator } from "../../src/storage/backend-publication.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import { createMigrationManifest, type MigrationManifest } from "../../src/migration/protocol.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import { MigrationBindingUnresolvableError } from "../../src/migration/generation-binding-store.js";
 import {
   DEFAULT_RESOLVE_ROLLBACK_CONTEXT_DEPENDENCIES,
+  MIGRATION_ROLLBACK_ERROR_REASONS,
+  MigrationRollbackError,
   RollbackInputResolutionError,
   createMigrationRollbackDependencies,
   resolveMigrationRollbackContext,
+  runMigrationRollbackFromHome,
+  toMigrationRollbackError,
+  type MigrationRollbackErrorReason,
   type ResolveRollbackContextDependencies,
+  type RollbackEntryDependencies,
 } from "../../src/migration/rollback-inputs.js";
+import { RollbackSessionError } from "../../src/migration/rollback-session.js";
 import type { RollbackSessionDependencies, RollbackSessionTarget } from "../../src/migration/rollback-session.js";
+import { RollbackOrchestrationError } from "../../src/migration/rollback.js";
 
 const HOME = "/home/user";
 const GENERATION = "gen-1";
 const PRESERVED = "preserved-gen";
 const LOCAL = "local-project-1";
 const REMOTE = "0197a000-0000-7000-8000-000000000001";
-const MACHINE = "018f0b5d-1234-4abc-8def-1234567890ab";
+const MACHINE = "018f0b5d-1234-7abc-8def-1234567890ab";
 
 const storage = {
   backend: "postgresql" as const,
@@ -172,6 +182,107 @@ describe("RollbackInputResolutionError", () => {
     expect(new RollbackInputResolutionError("project-unbound", "m")).toMatchObject({
       name: "RollbackInputResolutionError", reason: "project-unbound", message: "m",
     });
+  });
+});
+
+
+describe("runMigrationRollbackFromHome", () => {
+  const outcome = { manifest: { phase: "rolled-back" }, report: null } as never;
+
+  function harness(run: RollbackEntryDependencies["run"], contextOverrides: Partial<ResolveRollbackContextDependencies> = {}) {
+    const guard = { acquire: vi.fn(), read: vi.fn(async () => null), release: vi.fn(), renew: vi.fn() };
+    const runtime = { backendPublicationGuard: () => guard, close: vi.fn(async () => undefined) };
+    const createCoordinator = vi.fn((options: unknown) => ({ options }) as unknown as BackendPublicationCoordinator);
+    const session = {
+      createRuntime: vi.fn(() => runtime),
+      verifyRuntimeSchema: vi.fn(async () => { throw new Error("the schema check was reached"); }),
+    } as unknown as RollbackSessionDependencies;
+    const entryDependencies: RollbackEntryDependencies = {
+      context: dependencies(contextOverrides),
+      session,
+      createCoordinator: createCoordinator as never,
+      run,
+    };
+    return { guard, runtime, createCoordinator, session, entryDependencies };
+  }
+
+  it("resolves the inputs, builds the real coordinator over the runtime's guard, runs, and closes the runtime once", async () => {
+    const signal = new AbortController().signal;
+    const run = vi.fn(async () => outcome);
+    const h = harness(run as never);
+
+    await expect(runMigrationRollbackFromHome(
+      { homeDir: HOME, generationId: GENERATION, scratchParent: "/scratch", signal }, h.entryDependencies,
+    )).resolves.toBe(outcome);
+
+    expect(h.session.createRuntime).toHaveBeenCalledTimes(1);
+    const options = h.createCoordinator.mock.calls[0]![0] as { homeDir: string; remoteGuard: { mode: string; provider: Record<string, unknown> } };
+    expect(options.homeDir).toBe(HOME);
+    expect(options.remoteGuard.mode).toBe("delegated");
+    expect(Object.keys(options.remoteGuard.provider).sort()).toEqual(["acquireRemoteGuard", "readRemoteGuard", "releaseRemoteGuard"]);
+    const [input, deps] = run.mock.calls[0] as unknown as [Record<string, unknown>, { coordinator: unknown }];
+    expect(input).toMatchObject({ homeDir: HOME, generationId: GENERATION, localProjectId: LOCAL, scratchParent: "/scratch", signal });
+    expect(deps.coordinator).toEqual({ options });
+    expect(h.runtime.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives the session the entry's runtime but leaves closing it to the entry", async () => {
+    const h = harness((async (_input: unknown, deps: { openFencedSession: (request: never) => Promise<unknown> }) => {
+      await deps.openFencedSession({ homeDir: HOME, manifest: { generationId: GENERATION }, lockToken: {} } as never);
+      return outcome;
+    }) as never);
+
+    await expect(runMigrationRollbackFromHome({ homeDir: HOME, generationId: GENERATION }, h.entryDependencies))
+      .rejects.toMatchObject({ name: "MigrationRollbackError", reason: "unexpected-state", message: "the schema check was reached" });
+
+    // The session failed to open and closed the runtime it was handed: that is the shared wrapper's no-op.
+    expect(h.session.createRuntime).toHaveBeenCalledTimes(1);
+    expect(h.runtime.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps a failed input resolution without opening a runtime", async () => {
+    const h = harness(vi.fn() as never, { readStorageConfig: () => ({ backend: "sqlite" }) as never });
+    await expect(runMigrationRollbackFromHome({ homeDir: HOME, generationId: GENERATION }, h.entryDependencies))
+      .rejects.toMatchObject({ reason: "input-unresolvable", message: expect.stringContaining("configuration selects another") });
+    expect(h.session.createRuntime).not.toHaveBeenCalled();
+  });
+
+  const cases: ReadonlyArray<readonly [string, () => unknown, MigrationRollbackErrorReason]> = [
+    ["a not-eligible refusal", () => new RollbackOrchestrationError("not-eligible", "refused"), "not-eligible"],
+    ["export drift", () => new RollbackOrchestrationError("drift", "drifted"), "drift"],
+    ["an unexpected state", () => new RollbackOrchestrationError("unexpected-state", "odd"), "unexpected-state"],
+    ["an unimplemented reconciliation", () => new RollbackOrchestrationError("not-implemented", "later"), "unexpected-state"],
+    ["a lost lease", () => new RollbackSessionError("lease-lost", "lost"), "lease-lost"],
+    ["unsatisfied quiescence", () => new RollbackSessionError("quiescence-unsatisfied", "busy"), "quiescence-unsatisfied"],
+    ["a lease held by another generation", () => new RollbackSessionError("lease-unavailable", "held"), "not-eligible"],
+    ["a failed release", () => new RollbackSessionError("release-failed", "stuck"), "unexpected-state"],
+    ["an unresolvable binding store", () => new MigrationBindingUnresolvableError("unreadable"), "unresolvable"],
+    ["an unresolved publication", () => new BackendPublicationJournalError("unresolved-publication", "pending"), "unresolvable"],
+    ["missing publication evidence", () => new BackendPublicationJournalError("publication-evidence-missing", "none"), "unresolvable"],
+    ["another journal failure", () => new BackendPublicationJournalError("unsafe-storage", "unsafe"), "unexpected-state"],
+    ["an unrelated Error", () => new Error("boom"), "unexpected-state"],
+  ];
+  it.each(cases)("maps %s onto the closed error, keeping the message and the cause", async (_name, make, reason) => {
+    const failure = make() as Error;
+    const h = harness((async () => { throw failure; }) as never);
+    const error = await runMigrationRollbackFromHome({ homeDir: HOME, generationId: GENERATION }, h.entryDependencies)
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(MigrationRollbackError);
+    expect(error).toMatchObject({ reason, message: failure.message, cause: failure });
+    expect(MIGRATION_ROLLBACK_ERROR_REASONS).toContain(reason);
+    expect(h.runtime.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes an already closed error through and stringifies a thrown non-error", async () => {
+    const closed = new MigrationRollbackError("drift", "already mapped");
+    expect(toMigrationRollbackError(closed)).toBe(closed);
+    expect(toMigrationRollbackError("plain text")).toMatchObject({ reason: "unexpected-state", message: "plain text" });
+  });
+
+  it("exports the closed reason list #627 consumes", () => {
+    expect(MIGRATION_ROLLBACK_ERROR_REASONS).toEqual([
+      "not-eligible", "unresolvable", "lease-lost", "quiescence-unsatisfied", "drift", "input-unresolvable", "unexpected-state",
+    ]);
   });
 });
 
