@@ -62,6 +62,14 @@ describe("performMigrationPlan: entirely non-mutating, reports the shared prefli
     });
   });
 
+  it("maps an unknown throw from the preflight to unexpected-failure with only the error name (round-1 B-4)", async () => {
+    const result = await performMigrationPlan({
+      cwd: "/tmp/project", homeDir: "/tmp/home",
+      _preflight: async () => { throw new TypeError("a message with /a/path"); },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "unexpected-failure", evidence: "TypeError" });
+  });
+
   it("propagates a preflight refusal unchanged, including its evidence", async () => {
     const homeDir = home();
     const result = await performMigrationPlan({

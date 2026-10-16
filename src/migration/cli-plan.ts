@@ -1,4 +1,5 @@
 import { resolveMigrationPreflight, type MigrationPreflightResult } from "./cli-preflight.js";
+import { MIGRATION_UNEXPECTED_FAILURE_REASON, withMigrationBoundary } from "./boundary.js";
 import type { MigrationDaemonPresence } from "./daemon-presence.js";
 
 /**
@@ -30,7 +31,7 @@ export type MigrationPlanOutcome =
   }>
   | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
 
-export async function performMigrationPlan(input: Readonly<{
+export type MigrationPlanInput = Readonly<{
   cwd: string;
   homeDir: string;
   /**
@@ -38,7 +39,16 @@ export async function performMigrationPlan(input: Readonly<{
    * own injection seam without duplicating its composition here.
    */
   _preflight?: () => Promise<MigrationPreflightResult>;
-}>): Promise<MigrationPlanOutcome> {
+}>;
+
+export function performMigrationPlan(input: MigrationPlanInput): Promise<MigrationPlanOutcome> {
+  return withMigrationBoundary(
+    () => runMigrationPlan(input),
+    (evidence) => ({ status: "refuse", reason: MIGRATION_UNEXPECTED_FAILURE_REASON, evidence }),
+  );
+}
+
+async function runMigrationPlan(input: MigrationPlanInput): Promise<MigrationPlanOutcome> {
   const runPreflight = input._preflight ?? (() => resolveMigrationPreflight({ cwd: input.cwd, homeDir: input.homeDir }));
   const preflight = await runPreflight();
   if (preflight.status === "refuse") {

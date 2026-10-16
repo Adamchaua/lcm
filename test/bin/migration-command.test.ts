@@ -103,9 +103,34 @@ describe("lcm migration command group", () => {
     expect(process.exitCode).toBe(2);
   });
 
-  it("plan: an unrecognised refusal reason from the orchestration layer propagates as an uncaught error rather than a guessed exit code", async () => {
+  it("plan: an unrecognised refusal reason is never given a guessed exit code: exactly one unexpected-failure envelope is printed (round-1 B-4)", async () => {
     state.plan.mockResolvedValueOnce({ status: "refuse", reason: "not-a-real-reason" });
-    await expect(invoke("migration", "plan")).rejects.toThrow(/no exit-class mapping/u);
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "plan", "--json");
+    expect(out).toHaveBeenCalledTimes(1);
+    const envelope = JSON.parse(stdoutText(out));
+    expect(envelope).toMatchObject({ command: "plan", outcome: "refused-evidence", exitCode: 5, applied: false });
+    expect(envelope.refusal.reason).toBe("unexpected-failure");
+    expect(envelope.evidence).toEqual({ detail: "Error" });
+    expect(process.exitCode).toBe(5);
+  });
+
+  it.each([
+    ["plan", () => state.plan, false],
+    ["dry-run", () => state.dryRun, false],
+    ["apply", () => state.apply, true],
+    ["abort", () => state.abort, true],
+  ])("%s: evidence the sanitizer refuses to emit still yields exactly one envelope, without the offending value", async (command, mock, applied) => {
+    mock().mockResolvedValueOnce({ status: "refuse", reason: "dry-run-failed", evidence: "/home/someone/secret/path" });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await invoke("migration", command, "--json");
+    expect(out).toHaveBeenCalledTimes(1);
+    const text = stdoutText(out);
+    expect(text).not.toContain("/home/someone");
+    expect(stderrText(err)).not.toContain("/home/someone");
+    expect(JSON.parse(text)).toMatchObject({ command, exitCode: 5, applied });
+    expect(JSON.parse(text).refusal.reason).toBe("unexpected-failure");
   });
 
   it("dry-run: ok envelope carries the flat dry-run evidence", async () => {

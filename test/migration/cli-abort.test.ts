@@ -109,6 +109,20 @@ describe("performMigrationAbortCommand: real end-to-end paths", () => {
   });
 });
 
+describe("performMigrationAbortCommand: the boundary catch (round-1 B-4)", () => {
+  it("maps an unknown throw from the journal readback to unexpected-failure, reporting applied:true since a write may already have happened", async () => {
+    const home = makeHome();
+    await heldJournal(home);
+    const result = await performMigrationAbortCommand({
+      confirmGenerationId: "generation-1", homeDir: home, coordinator: coordinatorFor(home),
+      _operationsForTesting: { readJournal: () => { throw new TypeError("boom with /a/path"); } },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "unexpected-failure", evidence: "TypeError", applied: true });
+    // The abort itself did complete; the boundary reported what it could not rule out.
+    expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-aborted");
+  });
+});
+
 describe("performMigrationAbortCommand: refusal paths", () => {
   it("refuses publication-occupies-slot when injected observation reports a v2 publication journal", async () => {
     const home = makeHome();

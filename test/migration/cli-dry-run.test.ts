@@ -113,6 +113,14 @@ describe("performMigrationDryRunCheck (section 3: owns dryRunAuthenticatedSqlite
     expect(result).toEqual({ status: "refuse", reason: "dry-run-failed", evidence: "RangeError" });
   });
 
+  it("converts an unknown Error into dry-run-failed carrying only its name: dry-run's own catch is its boundary (round-1 B-4)", async () => {
+    const result = await performMigrationDryRunCheck({
+      cwd: "/tmp/project", homeDir: "/tmp/home",
+      _operationsForTesting: { dryRun: async () => { throw new TypeError("a message with /a/path"); } },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "dry-run-failed", evidence: "TypeError" });
+  });
+
   it("converts a non-Error throw into a dry-run-failed refusal with unknown-dry-run-failure evidence", async () => {
     const fixture = await enrolled();
     const result = await performMigrationDryRunCheck({

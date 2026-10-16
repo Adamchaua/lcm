@@ -239,6 +239,21 @@ describe("performMigrationApply: the mutating path", () => {
   });
 });
 
+describe("performMigrationApply: the boundary catch (round-1 B-4)", () => {
+  it.each([
+    ["the preflight", { _preflight: async () => { throw new TypeError("boom"); } }],
+    ["capture", {
+      _preflight: async () => readyPreflight(),
+      _operationsForTesting: { performCapture: async () => { throw new TypeError("boom"); } },
+    }],
+  ])("maps an unknown throw from %s to unexpected-failure with only the error name", async (_name, overrides) => {
+    const result = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", ...overrides,
+    });
+    expect(result).toEqual({ status: "refuse", reason: "unexpected-failure", evidence: "TypeError" });
+  });
+});
+
 describe("performMigrationApply: round-1 fixes", () => {
   const captured = async () => ({ status: "captured" as const, generationId: "generation-0", maintenanceChecksumSha256: "a".repeat(64), snapshot: {} as never });
   const copied = async () => ({ status: "copied" as const, result: { phase: "copied" } as never });

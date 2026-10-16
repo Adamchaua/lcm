@@ -10,6 +10,7 @@ import {
 } from "./apply-genesis-copy.js";
 import { MigrationManifestStore } from "./manifest-store.js";
 import { MigrationProtocolError } from "./protocol.js";
+import { MIGRATION_UNEXPECTED_FAILURE_REASON, withMigrationBoundary } from "./boundary.js";
 import type { MigrationDaemonPresence } from "./daemon-presence.js";
 import type { BackendPublicationCoordinator } from "../storage/backend-publication.js";
 
@@ -75,7 +76,7 @@ export type MigrationApplyOperations = Readonly<{
   mintOwnerProcessId: () => string;
 }>;
 
-export async function performMigrationApply(input: Readonly<{
+export type MigrationApplyInput = Readonly<{
   cwd: string;
   homeDir: string;
   confirmGenerationId?: string;
@@ -103,7 +104,16 @@ export async function performMigrationApply(input: Readonly<{
    * `src/migration/`.
    */
   _operationsForTesting?: Partial<MigrationApplyOperations>;
-}>): Promise<MigrationApplyOutcome> {
+}>;
+
+export function performMigrationApply(input: MigrationApplyInput): Promise<MigrationApplyOutcome> {
+  return withMigrationBoundary(
+    () => runMigrationApply(input),
+    (evidence) => ({ status: "refuse", reason: MIGRATION_UNEXPECTED_FAILURE_REASON, evidence }),
+  );
+}
+
+async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationApplyOutcome> {
   const performCapture = input._operationsForTesting?.performCapture ?? performMigrationApplyThroughCapture;
   const performGenesisAndCopy = input._operationsForTesting?.performGenesisAndCopy ?? performMigrationApplyGenesisAndCopy;
   const mintOwnerProcessId = input._operationsForTesting?.mintOwnerProcessId ?? randomUUID;

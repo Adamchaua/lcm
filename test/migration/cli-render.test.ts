@@ -4,6 +4,7 @@ import {
   renderMigrationDryRunEnvelope,
   renderMigrationApplyEnvelope,
   renderMigrationAbortEnvelope,
+  renderMigrationUnexpectedFailureEnvelope,
 } from "../../src/migration/cli-render.js";
 import { migrationExitClassForName } from "../../src/migration/exit-classes.js";
 import type { SqliteSnapshotDryRun } from "../../src/migration/sqlite-snapshot.js";
@@ -159,6 +160,18 @@ describe("renderMigrationApplyEnvelope, applied and presence evidence (round-1 A
     });
     expect(envelope.evidence).toEqual({ daemonPresent: false });
   });
+});
+
+describe("renderMigrationUnexpectedFailureEnvelope (round-1 B-4)", () => {
+  it.each([["plan", false], ["dry-run", false], ["apply", true], ["abort", true]] as const)(
+    "builds the closed exit-5 envelope for %s, with applied:%s and only the error name as evidence",
+    (command, applied) => {
+      const envelope = renderMigrationUnexpectedFailureEnvelope(command, new RangeError("a message with /a/path"));
+      expect(envelope).toMatchObject({ command, outcome: "refused-evidence", exitCode: 5, applied });
+      expect(envelope.refusal?.reason).toBe("unexpected-failure");
+      expect(envelope.evidence).toEqual({ detail: "RangeError" });
+    },
+  );
 });
 
 describe("renderMigrationAbortEnvelope", () => {

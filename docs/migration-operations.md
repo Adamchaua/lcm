@@ -164,6 +164,10 @@ knowing by name:
 - `multi-machine-installation` (exit 2): this project is already linked to a PostgreSQL project
   (see "Configuration" above). Migration requires an unlinked, single-machine project.
 - `abort-nothing-to-abort` (exit 2): there is no hold to leave. Nothing to do.
+- `unexpected-failure` (exit 5): something threw that no command classified. The command still prints
+  exactly one envelope; its evidence is only the error's name. Check `applied` (reported `true` for
+  `apply` and `abort`, which cannot rule out an earlier write), run `lcm doctor`, and re-run
+  `lcm migration plan` to see the current state.
 - Anything ending `-unresolvable` or classed `refused-evidence` (exit 5): the command could not
   establish the state it needed to decide anything — this is different from the state actively
   forbidding the operation (exit 2), and the remedy is almost always `lcm doctor` followed by a
@@ -506,6 +510,11 @@ above.
     }
   ],
   "refusals": [
+    {
+      "reason": "unexpected-failure",
+      "exitClass": "refused-evidence",
+      "remedy": "The command hit an unexpected internal failure. Run `lcm doctor`, then `lcm migration plan` to see the current state, and file an issue quoting the evidence."
+    },
     {
       "reason": "invalid-expected-owner",
       "exitClass": "refused-precondition",

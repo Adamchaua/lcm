@@ -23,7 +23,9 @@ import {
   renderMigrationDryRunEnvelope,
   renderMigrationApplyEnvelope,
   renderMigrationAbortEnvelope,
+  renderMigrationUnexpectedFailureEnvelope,
 } from "../src/migration/cli-render.js";
+import type { MigrationCommandName } from "../src/migration/exit-classes.js";
 import { serializeMigrationEnvelope, type MigrationEnvelope } from "../src/migration/envelope.js";
 import {
   ConfigValidationError,
@@ -2097,7 +2099,19 @@ function migrationHumanSummary(envelope: MigrationEnvelope): string {
   return parts.join(" ");
 }
 
-function emitMigrationEnvelope(envelope: MigrationEnvelope, jsonFlag: boolean | undefined): void {
+function emitMigrationEnvelope(
+  command: MigrationCommandName,
+  build: () => MigrationEnvelope,
+  jsonFlag: boolean | undefined,
+): void {
+  // Rendering can itself fail (an unmapped reason, evidence the sanitizer
+  // refuses to emit). Exactly one document is still printed.
+  let envelope: MigrationEnvelope;
+  try {
+    envelope = build();
+  } catch (error) {
+    envelope = renderMigrationUnexpectedFailureEnvelope(command, error);
+  }
   if (jsonFlag) {
     writeCliOutput(serializeMigrationEnvelope(envelope));
   } else {
@@ -2132,7 +2146,7 @@ export function registerMigrationCommand(program: Command): void {
       writeCliError("Resolving migration preflight...\n");
       const outcome = await performMigrationPlan({ cwd: process.cwd(), homeDir: homedir() });
       writeCliError("Migration plan finished.\n");
-      emitMigrationEnvelope(renderMigrationPlanEnvelope(outcome), opts.json);
+      emitMigrationEnvelope("plan", () => renderMigrationPlanEnvelope(outcome), opts.json);
     });
 
   migrationCmd
@@ -2144,7 +2158,7 @@ export function registerMigrationCommand(program: Command): void {
       writeCliError("Checking the SQLite migration source...\n");
       const outcome = await performMigrationDryRunCheck({ cwd: process.cwd(), homeDir: homedir() });
       writeCliError("Migration dry-run finished.\n");
-      emitMigrationEnvelope(renderMigrationDryRunEnvelope(outcome), opts.json);
+      emitMigrationEnvelope("dry-run", () => renderMigrationDryRunEnvelope(outcome), opts.json);
     });
 
   migrationCmd
@@ -2174,7 +2188,7 @@ export function registerMigrationCommand(program: Command): void {
         },
       });
       writeCliError("Migration apply finished.\n");
-      emitMigrationEnvelope(renderMigrationApplyEnvelope(outcome), opts.json);
+      emitMigrationEnvelope("apply", () => renderMigrationApplyEnvelope(outcome), opts.json);
     });
 
   migrationCmd
@@ -2192,7 +2206,7 @@ export function registerMigrationCommand(program: Command): void {
         dryRun: opts.dryRun,
       });
       writeCliError("Migration abort finished.\n");
-      emitMigrationEnvelope(renderMigrationAbortEnvelope(outcome), opts.json);
+      emitMigrationEnvelope("abort", () => renderMigrationAbortEnvelope(outcome), opts.json);
     });
 
   program.addCommand(migrationCmd);

@@ -12,6 +12,7 @@ import type { MigrationDryRunOutcome } from "./cli-dry-run.js";
 import { migrationDryRunEvidence } from "./cli-dry-run.js";
 import type { MigrationApplyOutcome } from "./cli-apply.js";
 import type { MigrationAbortCommandOutcome } from "./cli-abort.js";
+import { MIGRATION_UNEXPECTED_FAILURE_REASON, unexpectedFailureEvidence } from "./boundary.js";
 
 /**
  * The single place every migration command's own outcome type is turned
@@ -41,6 +42,8 @@ import type { MigrationAbortCommandOutcome } from "./cli-abort.js";
  * an operator reading a failed `apply` knows whether state moved.
  */
 const APPLY_REASONS_WITH_DURABLE_MUTATION: ReadonlySet<string> = new Set([
+  // An unclassified throw cannot rule out an earlier write in this invocation.
+  "unexpected-failure",
   "hold-entry-readback-mismatch",
   "capture-failed",
   "capture-contention",
@@ -157,6 +160,23 @@ export function renderMigrationApplyEnvelope(outcome: MigrationApplyOutcome): Mi
     manifestPhase: outcome.phase ?? null,
     next: outcome.applied ? null : "apply (drop --dry-run to copy for real)",
     evidence: daemonPresenceEvidence(outcome.daemonPresence),
+  });
+}
+
+/**
+ * The envelope for a failure that happened while rendering an outcome (an
+ * unmapped reason, or evidence the sanitizer refused to emit). Rendering is
+ * the one step the orchestration-level boundary cannot cover, and it must
+ * still print exactly one document under `--json`. Only the error's name
+ * reaches the evidence.
+ */
+export function renderMigrationUnexpectedFailureEnvelope(command: MigrationCommandName, error: unknown): MigrationEnvelope {
+  return refusalEnvelope({
+    command,
+    reason: MIGRATION_UNEXPECTED_FAILURE_REASON,
+    evidenceDetail: unexpectedFailureEvidence(error),
+    // Only plan and dry-run are known never to have written anything.
+    applied: command !== "plan" && command !== "dry-run",
   });
 }
 

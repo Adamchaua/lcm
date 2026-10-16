@@ -13,6 +13,7 @@ import {
 import { MigrationManifestStore } from "./manifest-store.js";
 import { classifyMigrationRecovery, MigrationProtocolError } from "./protocol.js";
 import { maintenanceOnlyDriver } from "./apply.js";
+import { MIGRATION_UNEXPECTED_FAILURE_REASON, withMigrationBoundary } from "./boundary.js";
 
 /**
  * The `abort` command's CLI orchestration (section 3): observes the live
@@ -61,7 +62,7 @@ function manifestProtocolEvidence(error: unknown): string {
   return error instanceof MigrationProtocolError ? `manifest-${error.reason}` : "manifest-internal-error";
 }
 
-export async function performMigrationAbortCommand(input: Readonly<{
+export type MigrationAbortCommandInput = Readonly<{
   homeDir: string;
   /**
    * The generation id of the live journal this invocation intends to abort
@@ -80,7 +81,18 @@ export async function performMigrationAbortCommand(input: Readonly<{
    * `src/migration/`.
    */
   _operationsForTesting?: Partial<MigrationAbortCommandOperations>;
-}>): Promise<MigrationAbortCommandOutcome> {
+}>;
+
+export function performMigrationAbortCommand(input: MigrationAbortCommandInput): Promise<MigrationAbortCommandOutcome> {
+  return withMigrationBoundary(
+    () => runMigrationAbortCommand(input),
+    // An unclassified throw cannot rule out that the journal or manifest write
+    // had already happened, so applied is reported true.
+    (evidence) => ({ status: "refuse", reason: MIGRATION_UNEXPECTED_FAILURE_REASON, evidence, applied: true }),
+  );
+}
+
+async function runMigrationAbortCommand(input: MigrationAbortCommandInput): Promise<MigrationAbortCommandOutcome> {
   const observeJournal = input._operationsForTesting?.observeJournal ?? observeMigrationMaintenanceJournal;
   const performAbort = input._operationsForTesting?.performAbort ?? performMigrationAbort;
   const readJournal = input._operationsForTesting?.readJournal ?? readBackendMaintenanceJournal;

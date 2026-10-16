@@ -37,6 +37,13 @@ export type MigrationRefusalMapping = Readonly<{
  * an unresumable state.
  */
 export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Object.freeze([
+  // --- Round-1 B-4: the boundary catch's closed reason for a throw nothing
+  // classified. Evidence is only the error's name. ---
+  Object.freeze({
+    reason: "unexpected-failure", exitClass: "refused-evidence",
+    remedy: "The command hit an unexpected internal failure. Run `lcm doctor`, then `lcm migration plan` to see the current state, and file an issue quoting the evidence.",
+  }),
+
   // --- Section 4.4/4.9's genesis-and-copy ownership plumbing, and the
   // target resolution the root ruled on (docs/migration-operations.md
   // documents storage.backend vs storage.postgresql's split explicitly). ---

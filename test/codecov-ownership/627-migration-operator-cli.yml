@@ -4,7 +4,8 @@ rationale: >-
   command renderers, the target configuration, identity and reachability
   resolvers, the daemon-presence, hold-entry and hold-continuation fences,
   the apply and genesis-copy drivers and the typed refusal and exit-class
-  mapping. They all live under src/migration/ and stay in the directory-level
+  mapping and the boundary catch that turns an unclassified throw into one
+  closed refusal. They all live under src/migration/ and stay in the directory-level
   migration cutover owner; no topology change. bin/lcm.ts and
   src/cli-help.ts only dispatch to and describe the new command and remain
   in the CLI owner. The manifest store gains a three-valued manifest presence
@@ -18,6 +19,7 @@ pins:
   - ["src/migration/abort.ts", "unit-migration-cutover"]
   - ["src/migration/apply-genesis-copy.ts", "unit-migration-cutover"]
   - ["src/migration/apply.ts", "unit-migration-cutover"]
+  - ["src/migration/boundary.ts", "unit-migration-cutover"]
   - ["src/migration/candidate.ts", "unit-migration-cutover"]
   - ["src/migration/cli-abort.ts", "unit-migration-cutover"]
   - ["src/migration/cli-apply.ts", "unit-migration-cutover"]
