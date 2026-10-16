@@ -137,7 +137,8 @@ the project's deduplication lock for the duration of its write, so it takes
 turns with a concurrent `lcm promote` or knowledge import into that same
 project. On SQLite the decision is scoped to memories with the same recorded
 origin, which for `lcm store` is `manual` unless the request supplies
-`metadata.projectId`.
+a non-empty string `metadata.projectId`; an empty or non-string value is
+treated as `manual`.
 
 When SQLite is selected, the stored text must not contain an embedded NUL
 character (`U+0000`). The store operation rejects that input before writing;

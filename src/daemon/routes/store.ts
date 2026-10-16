@@ -127,7 +127,9 @@ export function createStoreHandler(
           transaction: project.transaction.bind(project),
           content: scrubbedText,
           tags: scrubbedTags,
-          sourceProjectId: metadata.projectId ?? "manual",
+          sourceProjectId: typeof metadata.projectId === "string" && metadata.projectId !== ""
+            ? metadata.projectId
+            : "manual",
           candidateScope: "owner",
           backend: project.backend,
           sessionId: metadata.sessionId ?? "manual",

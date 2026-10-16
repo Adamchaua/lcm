@@ -117,6 +117,52 @@ describe("POST /store", () => {
     }
   });
 
+  // #1471: an empty or non-string metadata.projectId must not widen the SQLite
+  // deduplication scope beyond the manual origin and merge into another origin.
+  it.each([["an empty string", ""], ["a number", 7], ["a boolean", false]])(
+    "does not merge into another origin's memory when metadata.projectId is %s",
+    async (_label, projectId) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "lcm-store-origin-"));
+      tempDirs.push(tempDir);
+      const config = loadDaemonConfig("/nonexistent");
+      config.daemon.port = 0;
+      const daemon = await createDaemon(config);
+      const port = daemon.address().port;
+
+      const store = async (tags: string[], metadata: Record<string, unknown>) => {
+        const res = await fetch(`http://127.0.0.1:${port}/store`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: "We agreed to keep the ledger append-only", tags, metadata, cwd: tempDir }),
+        });
+        expect(res.status).toBe(200);
+        return await res.json() as { stored: boolean; id: string };
+      };
+
+      try {
+        const original = await store(["decision"], { projectId: "origin-a" });
+        const other = await store(["ledger"], { projectId });
+        expect(other.id).not.toBe(original.id);
+
+        const db = new DatabaseSync(projectDbPath(tempDir));
+        db.exec("PRAGMA busy_timeout = 5000");
+        try {
+          const rows = db.prepare(
+            "SELECT id, tags, confidence, project_id, archived_at FROM promoted ORDER BY rowid",
+          ).all() as Array<{ id: string; tags: string; confidence: number; project_id: string; archived_at: string | null }>;
+          expect(rows).toHaveLength(2);
+          expect(rows[0]).toMatchObject({ id: original.id, project_id: "origin-a", confidence: 1, archived_at: null });
+          expect(JSON.parse(rows[0].tags)).toEqual(["decision"]);
+          expect(rows[1]).toMatchObject({ id: other.id, project_id: "manual", archived_at: null });
+        } finally {
+          db.close();
+        }
+      } finally {
+        await daemon.stop();
+      }
+    },
+  );
+
   it("returns 400 when cwd is missing", async () => {
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;
