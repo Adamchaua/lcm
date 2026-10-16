@@ -146,6 +146,7 @@ function localRepository(
     pruneErrorLog: vi.fn().mockResolvedValue(0),
     claimDeliveries: vi.fn().mockResolvedValue([]),
     markReplicated: vi.fn().mockResolvedValue(true),
+    requeueReplicated: vi.fn().mockResolvedValue(true),
     markDeliveryRetry: vi.fn().mockResolvedValue(true),
     markDeliveryQuarantined: vi.fn().mockResolvedValue(true),
     listAwaitingRemote: vi.fn().mockResolvedValue([]),
@@ -178,6 +179,7 @@ function remoteRepository(
     scheduleRetry: vi.fn(),
     quarantine: vi.fn(),
     pruneApplied: vi.fn().mockResolvedValue(0n),
+    releaseFromOtherProjects: vi.fn().mockResolvedValue([]),
     ...overrides,
   } as unknown as PostgreSqlPassiveEventRepository & Record<string, ReturnType<typeof vi.fn>>;
 }
@@ -880,6 +882,240 @@ describe("PassiveEventReplicationWorker", () => {
     });
     expect(local.markQuarantined).toHaveBeenCalledWith(EVENT_ID, 41n, "poison");
   });
+
+  describe("rows replicated to a previous remote project (#1509)", () => {
+    const SECOND = "87654321-4321-5abc-8def-123456789abc";
+    const THIRD = "aaaaaaaa-4321-5abc-8def-123456789abc";
+    const FOURTH = "bbbbbbbb-4321-5abc-8def-123456789abc";
+    const FIFTH = "cccccccc-4321-5abc-8def-123456789abc";
+
+    function replicatedRow(
+      eventUuid: string,
+      sequence: number,
+      inboxId: number,
+      overrides: Partial<LocalHookEventRow> = {},
+    ): LocalHookEventRow {
+      return localRow({
+        event_id: sequence,
+        event_uuid: eventUuid,
+        machine_sequence: String(sequence).padStart(19, "0"),
+        delivery_state: "replicated",
+        remote_inbox_id: String(inboxId),
+        ...overrides,
+      });
+    }
+
+    it("asks the remote about exactly this machine's rows the bound project lacks", async () => {
+      const absent = replicatedRow(SECOND, 8, 42);
+      const present = replicatedRow(EVENT_ID, 7, 41);
+      const foreign = replicatedRow(THIRD, 9, 43, {
+        machine_id: "0195d250-0000-7000-8000-0000000000aa",
+      });
+      const mismatched = replicatedRow(FOURTH, 10, 44);
+      const local = localRepository({
+        listAwaitingRemote: vi.fn().mockResolvedValue([present, absent, foreign, mismatched]),
+      });
+      const remote = remoteRepository({
+        readEvents: vi.fn().mockResolvedValue([
+          remoteRecord(),
+          // The bound project holds a different envelope for this row.
+          remoteRecord({
+            inboxId: 44n,
+            eventId: FOURTH,
+            machineSequence: 10n,
+            payload: { sessionId: "other" },
+          }),
+        ]),
+      });
+      const signal = new AbortController().signal;
+
+      await worker(local, remote).runOnce(signal);
+
+      expect(remote.releaseFromOtherProjects).toHaveBeenCalledTimes(1);
+      expect(remote.releaseFromOtherProjects).toHaveBeenCalledWith([
+        {
+          inboxId: 42n,
+          machineId: MACHINE_ID,
+          eventId: SECOND,
+          eventVersion: 1,
+          machineSequence: 8n,
+          eventType: "choice",
+          payload: {
+            sessionId: "session",
+            sessionSequence: 1,
+            category: "decision",
+            data: "SQLite",
+            priority: 1,
+            sourceHook: "PostToolUse",
+            previousEventId: null,
+            createdAt: "2026-07-29 12:00:00",
+          },
+        },
+      ], { staleClaimMs: 60_000, signal });
+      expect(local.requeueReplicated).not.toHaveBeenCalled();
+    });
+
+    it("does not ask the remote when the bound project holds every awaiting row", async () => {
+      const local = localRepository({
+        listAwaitingRemote: vi.fn().mockResolvedValue([replicatedRow(EVENT_ID, 7, 41)]),
+      });
+      const remote = remoteRepository({
+        readEvents: vi.fn().mockResolvedValue([remoteRecord()]),
+      });
+      await worker(local, remote).runOnce();
+      expect(remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+    });
+
+    it("maps every outcome to exactly one local transition", async () => {
+      const rows = [
+        replicatedRow(EVENT_ID, 7, 41),
+        replicatedRow(SECOND, 8, 42),
+        replicatedRow(THIRD, 9, 43),
+        replicatedRow(FOURTH, 10, 44),
+        replicatedRow(FIFTH, 11, 45),
+      ];
+      const local = localRepository({
+        listAwaitingRemote: vi.fn().mockResolvedValue(rows),
+      });
+      const remote = remoteRepository({
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: EVENT_ID, outcome: "absent" },
+          { eventId: SECOND, outcome: "released" },
+          { eventId: THIRD, outcome: "applied", inboxId: 43n },
+          {
+            eventId: FOURTH,
+            outcome: "quarantined",
+            inboxId: 44n,
+            quarantineReason: "poison",
+          },
+          { eventId: FIFTH, outcome: "busy" },
+        ]),
+      });
+
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        acknowledged: 1,
+        quarantined: 1,
+        uploaded: 0,
+      });
+      expect(local.requeueReplicated.mock.calls).toEqual([
+        [EVENT_ID, 41n],
+        [SECOND, 42n],
+      ]);
+      expect(local.markAcknowledged.mock.calls).toEqual([[THIRD, 43n]]);
+      expect(local.markQuarantined.mock.calls).toEqual([[FOURTH, 44n, "poison"]]);
+    });
+
+    it("leaves rows alone for a live claim, a bound copy, or no answer", async () => {
+      const rows = [
+        replicatedRow(EVENT_ID, 7, 41),
+        replicatedRow(SECOND, 8, 42),
+        replicatedRow(THIRD, 9, 43),
+      ];
+      const local = localRepository({
+        listAwaitingRemote: vi.fn().mockResolvedValue(rows),
+      });
+      const onError = vi.fn();
+      const answers: unknown[][] = [
+        [
+          { eventId: EVENT_ID, outcome: "busy" },
+          { eventId: SECOND, outcome: "bound" },
+        ],
+        [],
+        // An outcome for a key nobody asked about is never acted on.
+        [{ eventId: FIFTH, outcome: "released" }, {
+          eventId: FIFTH,
+          outcome: "applied",
+          inboxId: 45n,
+        }],
+      ];
+      for (const answer of answers) {
+        const remote = remoteRepository({
+          releaseFromOtherProjects: vi.fn().mockResolvedValue(answer),
+        });
+        await worker(local, remote, { onError }).runOnce();
+      }
+      expect(local.requeueReplicated).not.toHaveBeenCalled();
+      expect(local.markAcknowledged).not.toHaveBeenCalled();
+      expect(local.markQuarantined).not.toHaveBeenCalled();
+      expect(onError).not.toHaveBeenCalled();
+    });
+
+    it("does not count local transitions that raced", async () => {
+      const local = localRepository({
+        listAwaitingRemote: vi.fn().mockResolvedValue([
+          replicatedRow(EVENT_ID, 7, 41),
+          replicatedRow(SECOND, 8, 42),
+          replicatedRow(THIRD, 9, 43),
+        ]),
+        requeueReplicated: vi.fn().mockResolvedValue(false),
+        markAcknowledged: vi.fn().mockResolvedValue(false),
+        markQuarantined: vi.fn().mockResolvedValue(false),
+      });
+      const remote = remoteRepository({
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: EVENT_ID, outcome: "released" },
+          { eventId: SECOND, outcome: "applied", inboxId: 42n },
+          { eventId: THIRD, outcome: "quarantined", inboxId: 43n, quarantineReason: "poison" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        acknowledged: 0,
+        quarantined: 0,
+      });
+      expect(local.requeueReplicated).toHaveBeenCalledTimes(1);
+      expect(local.markAcknowledged).toHaveBeenCalledTimes(1);
+      expect(local.markQuarantined).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports rows that differ from their copy elsewhere once and never moves them", async () => {
+      const local = localRepository({
+        listAwaitingRemote: vi.fn().mockResolvedValue([
+          replicatedRow(EVENT_ID, 7, 41),
+          replicatedRow(SECOND, 8, 42),
+          replicatedRow(THIRD, 9, 43),
+        ]),
+      });
+      const onError = vi.fn();
+      const remote = remoteRepository({
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: EVENT_ID, outcome: "mismatch" },
+          { eventId: SECOND, outcome: "mismatch" },
+          { eventId: THIRD, outcome: "busy" },
+        ]),
+      });
+      await worker(local, remote, { onError }).runOnce();
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+        message: expect.stringContaining(`${EVENT_ID}, ${SECOND}`),
+      }));
+      expect(local.requeueReplicated).not.toHaveBeenCalled();
+      expect(local.markAcknowledged).not.toHaveBeenCalled();
+      expect(local.markQuarantined).not.toHaveBeenCalled();
+    });
+
+    it("reports a failed recovery and still prunes", async () => {
+      const failure = new Error("recovery unavailable");
+      const acknowledged = replicatedRow(SECOND, 8, 42, {
+        delivery_state: "acknowledged",
+        acknowledged_at: "2026-07-29 12:00:02",
+      });
+      const local = localRepository({
+        listAwaitingRemote: vi.fn().mockResolvedValue([replicatedRow(EVENT_ID, 7, 41)]),
+        listAcknowledgedForRemotePrune: vi.fn().mockResolvedValue([acknowledged]),
+      });
+      const onError = vi.fn();
+      const remote = remoteRepository({
+        releaseFromOtherProjects: vi.fn().mockRejectedValue(failure),
+        pruneApplied: vi.fn().mockResolvedValue(1n),
+      });
+      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({
+        pruned: 1,
+      });
+      expect(onError).toHaveBeenCalledWith(failure);
+      expect(local.requeueReplicated).not.toHaveBeenCalled();
+    });
+  });
+
 
   it.each([
     ["missing", null],

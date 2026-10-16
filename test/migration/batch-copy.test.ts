@@ -361,6 +361,20 @@ it('records the destination system identifier at copy time and refuses a differe
     expect((await runSqliteMigrationCopy(input)).phase).toBe('copied');
 });
 
+it('binds the copy writer to the system identifier recorded in the manifest (#1508)', async () => {
+    const { input, store } = await prepared();
+    const recorded = store.read(input.generationId).destination.systemIdentifier;
+    expect(recorded).toBe('7123456789');
+    const open = destinationApi.openMigrationCopyDestination;
+    const received: unknown[] = [];
+    vi.spyOn(destinationApi, 'openMigrationCopyDestination').mockImplementationOnce(async args => {
+        received.push(args.expectedSystemIdentifier);
+        return open(args);
+    });
+    expect((await runSqliteMigrationCopy(input)).phase).toBe('copied');
+    expect(received).toEqual([recorded]);
+});
+
 it('refuses a legacy manifest whose destination witness has no recorded system identifier', async () => {
     const { input } = await prepared();
     const read = MigrationManifestStore.prototype.read;

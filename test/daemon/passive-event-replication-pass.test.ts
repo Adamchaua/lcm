@@ -2,6 +2,7 @@ import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { readMachineIdentity } from "../../src/machine-identity.js";
 import {
@@ -12,6 +13,7 @@ import {
   PassiveEventReplicationWorker,
   type PassiveEventReplicationDependencies,
 } from "../../src/daemon/passive-event-replication.js";
+import { PostgreSqlPassiveEventDataError } from "../../src/storage/postgresql/passive-event-repository.js";
 import {
   applyReplicatedPassiveEvent,
   createPassiveEventReplicationPass,
@@ -317,6 +319,8 @@ describe("passive-event replication pass", () => {
     const harness = modules({
       resolveProjectIdentity: vi.fn().mockReturnValue({ remoteProjectId: null }),
     });
+    const local = { close: vi.fn().mockResolvedValue(undefined) };
+    harness.factory.openExisting.mockResolvedValue(local);
     const onError = vi.fn();
     const pass = createPassiveEventReplicationPass(postgresConfig(), {
       processId: "lcm-daemon:test",
@@ -328,6 +332,11 @@ describe("passive-event replication pass", () => {
     expect(harness.modules.ensureWorktreeProjectReconciled).toHaveBeenCalledWith("/proj");
     expect(harness.modules.createRuntime).not.toHaveBeenCalled();
     expect(onError).not.toHaveBeenCalled();
+    // The scanned sidecar was opened before the identity was resolved, and
+    // the outbox it opened is released again (#1510).
+    expect(harness.factory.openExisting.mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(harness.modules.ensureWorktreeProjectReconciled).mock.invocationCallOrder[0]);
+    expect(local.close).toHaveBeenCalledTimes(1);
   });
 
   it("treats an absent remote project id as unbound", async () => {
@@ -352,7 +361,9 @@ describe("passive-event replication pass", () => {
     });
     await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
     expect(onError).toHaveBeenCalledWith(failure);
-    expect(harness.factory.openExisting).not.toHaveBeenCalled();
+    // The outbox was opened before the health gate and is released again.
+    expect(harness.factory.openExisting).toHaveBeenCalledTimes(1);
+    expect(harness.modules.createRepository).not.toHaveBeenCalled();
   });
 
   it("reports unhealthy storage that offers no error", async () => {
@@ -677,6 +688,119 @@ describe("passive-event replication pass", () => {
     await pass.close();
   });
 
+  it("resolves no project identity while the scanned sidecar is gone (#1510)", async () => {
+    // Resolving an identity can create and publish a project-map entry, so a
+    // sidecar that no longer exists must be discovered before any of it runs.
+    const harness = modules();
+    harness.factory.openExisting.mockResolvedValue(null);
+    const pass = createPassiveEventReplicationPass(postgresConfig(), {
+      processId: "lcm-daemon:missing",
+      loadModules: async () => harness.modules,
+    });
+    await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+    expect(harness.modules.ensureWorktreeProjectReconciled).not.toHaveBeenCalled();
+    expect(harness.modules.resolveProjectIdentity).not.toHaveBeenCalled();
+    expect(harness.modules.createRuntime).not.toHaveBeenCalled();
+    await pass.close();
+  });
+
+  describe("an opened sidecar is released on every way out (#1510)", () => {
+    const failure = new Error("gate failed");
+    const cases: ReadonlyArray<readonly [
+      string,
+      (harness: ReturnType<typeof modules>) => void,
+      boolean,
+    ]> = [
+      [
+        "an unbound project",
+        harness => {
+          vi.mocked(harness.modules.resolveProjectIdentity)
+            .mockReturnValue({ remoteProjectId: null });
+        },
+        false,
+      ],
+      [
+        "a failing reconciliation",
+        harness => {
+          vi.mocked(harness.modules.ensureWorktreeProjectReconciled)
+            .mockImplementation(() => { throw failure; });
+        },
+        true,
+      ],
+      [
+        "a failing identity resolution",
+        harness => {
+          vi.mocked(harness.modules.resolveProjectIdentity)
+            .mockImplementation(() => { throw failure; });
+        },
+        true,
+      ],
+      [
+        "unhealthy storage",
+        harness => {
+          harness.runtime.health.mockResolvedValue({ status: "unavailable", error: failure });
+        },
+        true,
+      ],
+      [
+        "a failing health check",
+        harness => {
+          harness.runtime.health.mockRejectedValue(failure);
+        },
+        true,
+      ],
+    ];
+
+    it.each(cases)("closes the outbox after %s", async (_label, arrange, reportsGate) => {
+      const harness = modules();
+      arrange(harness);
+      const local = { close: vi.fn().mockResolvedValue(undefined) };
+      harness.factory.openExisting.mockResolvedValue(local);
+      const onError = vi.fn();
+      const pass = createPassiveEventReplicationPass(postgresConfig(), {
+        processId: "lcm-daemon:gates",
+        loadModules: async () => harness.modules,
+        onError,
+      });
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      expect(local.close).toHaveBeenCalledTimes(1);
+      expect(harness.modules.createRepository).not.toHaveBeenCalled();
+      expect(onError).toHaveBeenCalledTimes(reportsGate ? 1 : 0);
+      await pass.close();
+    });
+
+    it.each(cases)("retains and reports an outbox that will not close after %s", async (
+      _label,
+      arrange,
+      reportsGate,
+    ) => {
+      const harness = modules();
+      arrange(harness);
+      const closeFailure = new Error("close contended");
+      const local = {
+        close: vi.fn().mockRejectedValueOnce(closeFailure).mockResolvedValue(undefined),
+      };
+      harness.factory.openExisting.mockResolvedValue(local);
+      const onError = vi.fn();
+      const pass = createPassiveEventReplicationPass(postgresConfig(), {
+        processId: "lcm-daemon:gates",
+        loadModules: async () => harness.modules,
+        onError,
+      });
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      expect(onError).toHaveBeenCalledWith(closeFailure);
+      expect(onError).toHaveBeenCalledTimes(reportsGate ? 2 : 1);
+      expect(local.close).toHaveBeenCalledTimes(1);
+
+      // The held repository is closed again before the sidecar is reopened.
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      expect(local.close.mock.invocationCallOrder[1])
+        .toBeLessThan(harness.factory.openExisting.mock.invocationCallOrder[1]);
+      expect(harness.factory.openExisting).toHaveBeenCalledTimes(2);
+      await pass.close();
+    });
+  });
+
   it("never creates a sidecar for a missing events database", async () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-replication-missing-"));
     const missing = join(directory, "absent", "events.db");
@@ -732,7 +856,8 @@ describe("passive-event replication pass", () => {
       expect(onError).toHaveBeenCalledWith(expect.objectContaining({
         message: "PostgreSQL passive-event storage is unavailable",
       }));
-      expect(harness.factory.openExisting).not.toHaveBeenCalled();
+      // Opened before the identity and health gates; released unused.
+      expect(harness.factory.openExisting).toHaveBeenCalledTimes(1);
       expect(createWorker).not.toHaveBeenCalled();
     } finally {
       release();
@@ -1267,5 +1392,284 @@ describe("passive-event replication pass", () => {
       expect(onError).not.toHaveBeenCalled();
       await pass.close();
     });
+
+  describe("project binding moves while rows still await the previous project (#1509)", () => {
+    const MACHINE = "0195d250-0000-7000-8000-000000000091";
+    const PROJECT_A = "project-a";
+    const PROJECT_B = "project-b";
+
+    interface InboxRow {
+      readonly inboxId: bigint;
+      readonly projectId: string;
+      readonly machineId: string;
+      readonly eventId: string;
+      readonly eventVersion: number;
+      readonly machineSequence: bigint;
+      readonly eventType: string;
+      readonly payload: Record<string, unknown>;
+      status: "pending" | "claimed" | "applied";
+    }
+
+    /**
+     * A remote inbox shared by every project, with the global
+     * (machine, event) uniqueness of the real schema: inserting an event that
+     * still sits in another project fails the whole batch, as in PostgreSQL.
+     * Only the projects in `applying` ever claim and apply their rows.
+     */
+    function sharedInbox(applying: ReadonlySet<string>) {
+      const rows: InboxRow[] = [];
+      const insertions: string[] = [];
+      let nextInboxId = 100n;
+      const record = (row: InboxRow) => ({
+        ...row,
+        attemptCount: 0,
+        claimedAt: null,
+        claimedBy: null,
+        quarantineReason: null,
+      });
+      const find = (machineId: string, eventId: string) =>
+        rows.find(row => row.machineId === machineId && row.eventId === eventId);
+      const repositoryFor = (projectId: string, machineId: string) => ({
+        projectId,
+        machineId,
+        acquireDrainLease: async () => ({ fencingToken: 1n }),
+        renewDrainLease: async () => ({ fencingToken: 1n }),
+        releaseDrainLease: async () => undefined,
+        insertEvents: async (inputs: ReadonlyArray<Omit<InboxRow, "inboxId" | "projectId" | "status">>) => {
+          const inserted = inputs.map(input => {
+            const existing = find(input.machineId, input.eventId);
+            if (existing !== undefined && existing.projectId !== projectId) {
+              throw new PostgreSqlPassiveEventDataError(projectId, "idempotency_readback", input.eventId);
+            }
+            if (existing !== undefined) return existing;
+            const row: InboxRow = { ...input, inboxId: nextInboxId, projectId, status: "pending" };
+            nextInboxId += 1n;
+            rows.push(row);
+            insertions.push(`${projectId}:${input.machineSequence.toString()}`);
+            return row;
+          });
+          return inserted.map(record);
+        },
+        readEvents: async (keys: ReadonlyArray<{ machineId: string; eventId: string }>) =>
+          rows
+            .filter(row => row.projectId === projectId
+              && keys.some(key => key.machineId === row.machineId && key.eventId === row.eventId))
+            .map(record),
+        readEvent: async (key: { machineId: string; eventId: string }) => {
+          const row = find(key.machineId, key.eventId);
+          return row === undefined || row.projectId !== projectId ? null : record(row);
+        },
+        claimEvents: async () => {
+          if (!applying.has(projectId)) return [];
+          return rows.filter(row => row.projectId === projectId && row.status === "pending").map(row => {
+            row.status = "claimed";
+            return { ...record(row), claimedAt: "2026-07-29T12:00:00.000Z", claimedBy: "fake" };
+          });
+        },
+        completeApplied: async (
+          input: { claim: { machineId: string; eventId: string } },
+          apply: (executor: unknown, claim: unknown) => Promise<void>,
+        ) => {
+          const row = find(input.claim.machineId, input.claim.eventId)!;
+          await apply({}, input.claim);
+          row.status = "applied";
+          return { event: record(row), result: undefined };
+        },
+        pruneApplied: async (keys: ReadonlyArray<{ inboxId: bigint }>) => {
+          let deleted = 0n;
+          for (const key of keys) {
+            const index = rows.findIndex(row => row.inboxId === key.inboxId
+              && row.projectId === projectId && row.status === "applied");
+            if (index >= 0) {
+              rows.splice(index, 1);
+              deleted += 1n;
+            }
+          }
+          return deleted;
+        },
+        releaseFromOtherProjects: async (keys: ReadonlyArray<{ machineId: string; eventId: string }>) =>
+          keys.map(key => {
+            const row = find(key.machineId, key.eventId);
+            if (row === undefined) return { eventId: key.eventId, outcome: "absent" as const };
+            if (row.projectId === projectId) return { eventId: key.eventId, outcome: "bound" as const };
+            if (row.status === "claimed") return { eventId: key.eventId, outcome: "busy" as const };
+            rows.splice(rows.indexOf(row), 1);
+            return row.status === "applied"
+              ? { eventId: key.eventId, outcome: "applied" as const, inboxId: row.inboxId }
+              : { eventId: key.eventId, outcome: "released" as const };
+          }),
+      });
+      return { rows, insertions, repositoryFor };
+    }
+
+    async function relinkScenario(applying: ReadonlySet<string>) {
+      const directory = mkdtempSync(join(tmpdir(), "lcm-replication-relink-"));
+      const sidecar = join(directory, "events.db");
+      const factory = new SQLiteLocalHookOutboxFactory();
+      const inbox = sharedInbox(applying);
+      const state = { project: PROJECT_A };
+      const binding = () => ({ remoteProjectId: state.project });
+      const harness = modules({
+        readMachineIdentity: vi.fn().mockReturnValue({ ...REGISTERED_IDENTITY, machineId: MACHINE }),
+        resolveProjectIdentity: vi.fn(binding),
+        resolveExistingProjectIdentity: vi.fn(binding),
+        createOutboxFactory: () => factory,
+        createRepository: vi.fn((_runtime: unknown, projectId: string, machineId: string) =>
+          inbox.repositoryFor(projectId, machineId)),
+      });
+      const onError = vi.fn();
+      const pass = createPassiveEventReplicationPass(postgresConfig(), {
+        processId: "lcm-daemon:relink",
+        loadModules: async () => harness.modules,
+        onError,
+      });
+      onTestFinished(async () => {
+        await pass.close();
+        await factory.close();
+        rmSync(directory, { recursive: true, force: true });
+      });
+      const insert = async (data: string): Promise<void> => {
+        const seed = await new SQLiteLocalHookOutboxFactory().open(sidecar);
+        await seed.insertEvent(
+          "relink-session",
+          { type: "choice", category: "decision", data, priority: 1 },
+          "PostToolUse",
+        );
+        await seed.close();
+      };
+      const states = (): Array<{ state: string; inbox: string | null; pruned: boolean }> => {
+        const raw = new DatabaseSync(sidecar, { readOnly: true });
+        try {
+          return (raw.prepare(
+            "SELECT delivery_state, remote_inbox_id, remote_pruned_at FROM events ORDER BY machine_sequence",
+          ).all() as Array<Record<string, string | null>>).map(row => ({
+            state: row.delivery_state as string,
+            inbox: row.remote_inbox_id,
+            pruned: row.remote_pruned_at !== null,
+          }));
+        } finally {
+          raw.close();
+        }
+      };
+      return {
+        inbox,
+        insert,
+        states,
+        onError,
+        run: () => pass.run("/proj", undefined, sidecar),
+        relink: (project: string) => { state.project = project; },
+      };
+    }
+
+    it("withdraws the rows from the old project and delivers them to the new one", async () => {
+      // Only the new project's drain applies rows; the old one is abandoned.
+      const scenario = await relinkScenario(new Set([PROJECT_B]));
+      await scenario.insert("first");
+      await scenario.insert("second");
+
+      await expect(scenario.run()).resolves.toMatchObject({ uploaded: 2, applied: 0 });
+      expect(scenario.states().map(row => row.state)).toEqual(["replicated", "replicated"]);
+      expect(scenario.inbox.rows.map(row => row.projectId)).toEqual([PROJECT_A, PROJECT_A]);
+
+      scenario.relink(PROJECT_B);
+      // Recovery: both copies leave the old project and the rows go back to
+      // the queue instead of staying replicated forever.
+      await scenario.run();
+      expect(scenario.inbox.rows).toEqual([]);
+      expect(scenario.states()).toEqual([
+        { state: "pending", inbox: null, pruned: false },
+        { state: "pending", inbox: null, pruned: false },
+      ]);
+
+      // The next pass delivers to the new project all the way to the prune.
+      await expect(scenario.run()).resolves.toMatchObject({
+        uploaded: 2,
+        applied: 2,
+        acknowledged: 2,
+        pruned: 2,
+      });
+      expect(scenario.states().every(row => row.state === "acknowledged" && row.pruned)).toBe(true);
+      expect(scenario.inbox.rows).toEqual([]);
+      expect(scenario.onError).not.toHaveBeenCalled();
+    });
+
+    it("acknowledges a row the old project already applied instead of re-sending it", async () => {
+      const scenario = await relinkScenario(new Set([PROJECT_B]));
+      await scenario.insert("applied before the relink");
+      // The old project applies the row after the pass that uploaded it, and
+      // the project is relinked before any pass can acknowledge it.
+      await expect(scenario.run()).resolves.toMatchObject({ uploaded: 1, applied: 0 });
+      scenario.inbox.rows[0].status = "applied";
+      scenario.relink(PROJECT_B);
+
+      await expect(scenario.run()).resolves.toMatchObject({ acknowledged: 1 });
+      // Its remote copy was deleted by the recovery; the prune phase proves
+      // the absence from the new project and settles the row.
+      await scenario.run();
+      expect(scenario.inbox.rows).toEqual([]);
+      expect(scenario.states()).toEqual([
+        expect.objectContaining({ state: "acknowledged", pruned: true }),
+      ]);
+    });
+
+    it("can deliver a newer row before the recovered older one after a relink", async () => {
+      const scenario = await relinkScenario(new Set([PROJECT_B]));
+      await scenario.insert("older");
+      await scenario.run();
+      await scenario.insert("newer");
+      scenario.relink(PROJECT_B);
+
+      await scenario.run();
+      await scenario.run();
+      // Per-machine ordering holds within a project binding, not across a
+      // relink: the newer row reached the new project first.
+      const sequences = scenario.inbox.insertions.map(entry => entry.split(":")[1]);
+      expect(scenario.inbox.insertions.map(entry => entry.split(":")[0]))
+        .toEqual([PROJECT_A, PROJECT_B, PROJECT_B]);
+      expect(BigInt(sequences[1])).toBeGreaterThan(BigInt(sequences[0]));
+      expect(sequences[2]).toBe(sequences[0]);
+    });
+
+    function guardedRecovery(goodChecks: number) {
+      const fixture = relinkHarness(goodChecks, REBOUND, { row: true });
+      const replicated = { ...LOCAL_EVENT, remote_inbox_id: "41" };
+      Object.assign(fixture.local, {
+        listAwaitingRemote: vi.fn(async () =>
+          fixture.local.markReplicated.mock.calls.length > 0 ? [replicated] : []),
+        requeueReplicated: vi.fn().mockResolvedValue(true),
+      });
+      Object.assign(fixture.remote, {
+        readEvents: vi.fn().mockResolvedValue([]),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: "event-1", outcome: "released" },
+        ]),
+      });
+      return fixture;
+    }
+
+    it("recovers while the binding holds", async () => {
+      const home = publicationHome();
+      const fixture = guardedRecovery(Number.MAX_SAFE_INTEGER);
+      const pass = admittedPass(fixture.harness, home);
+      await pass.run("/proj", undefined, SIDECAR);
+      expect(fixture.remote.releaseFromOtherProjects).toHaveBeenCalledTimes(1);
+      expect(fixture.local.requeueReplicated).toHaveBeenCalledWith("event-1", 41n);
+      await pass.close();
+    });
+
+    it("withholds the recovery once the binding moved before the reconcile phase", async () => {
+      const home = publicationHome();
+      // Checks: lease, upload, renew, claim fetch; the relink lands at the
+      // reconcile admission, so the repository is still bound to project A.
+      const fixture = guardedRecovery(4);
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await pass.run("/proj", undefined, SIDECAR);
+      expect(fixture.remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+      expect(fixture.local.requeueReplicated).not.toHaveBeenCalled();
+      expect(onError).toHaveBeenCalledWith(expect.any(ReplicationBindingChangedError));
+      await pass.close();
+    });
+  });
   });
 });

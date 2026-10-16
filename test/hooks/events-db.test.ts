@@ -801,6 +801,78 @@ describe("EventsDb", () => {
     db.close();
   });
 
+  it("returns a replicated row to the pending queue only for its recorded inbox id", () => {
+    const db = new EventsDb(dbPath);
+    db.insertEvent(
+      "s1",
+      { type: "choice", category: "decision", data: "requeue", priority: 1 },
+      "PostToolUse",
+    );
+    const machineId = machineIdFor(db);
+    const [claimed] = db.claimDeliveries({
+      machineId,
+      claimOwner: "owner-a",
+      limit: 1,
+      staleClaimMs: 60_000,
+    });
+    // Only a replicated row can be re-queued (#1509).
+    expect(db.requeueReplicated(claimed.event_uuid, 41n)).toBe(false);
+    expect(db.markDeliveryRetry(
+      claimed.event_uuid,
+      "owner-a",
+      "transient",
+      "2020-01-01T00:00:00.000Z",
+    )).toBe(true);
+    const [retryClaim] = db.claimDeliveries({
+      machineId,
+      claimOwner: "owner-b",
+      limit: 1,
+      staleClaimMs: 60_000,
+    });
+    expect(db.markReplicated(retryClaim.event_uuid, "owner-b", 41n)).toBe(true);
+    const [replicated] = db.listAwaitingRemote();
+
+    // A decision about another inbox id never moves the row.
+    expect(db.requeueReplicated(replicated.event_uuid, 42n)).toBe(false);
+    expect(db.listAwaitingRemote()).toHaveLength(1);
+    expect(() => db.requeueReplicated(replicated.event_uuid, 0n))
+      .toThrow("outside the PostgreSQL bigint range");
+    expect(() => db.requeueReplicated("not-an-event-uuid", 41n)).toThrow();
+
+    expect(db.requeueReplicated(replicated.event_uuid, 41n)).toBe(true);
+    // It is no longer replicated, so the same decision cannot repeat.
+    expect(db.requeueReplicated(replicated.event_uuid, 41n)).toBe(false);
+    expect(db.listAwaitingRemote()).toEqual([]);
+    const [requeued] = withSqlite(dbPath, (raw) => raw.prepare(
+      "SELECT * FROM events WHERE event_uuid = ?",
+    ).all(replicated.event_uuid)) as Array<Record<string, unknown>>;
+    expect(requeued).toMatchObject({
+      delivery_state: "pending",
+      delivery_generation: Number(replicated.delivery_generation) + 1,
+      delivery_attempts: replicated.delivery_attempts,
+      delivery_owner: null,
+      delivery_claimed_at: null,
+      delivery_last_error: null,
+      remote_inbox_id: null,
+      quarantine_reason: null,
+      machine_id: machineId,
+      machine_sequence: replicated.machine_sequence,
+    });
+
+    // Eligible at once, with identity and attempt count preserved.
+    const [again] = db.claimDeliveries({
+      machineId,
+      claimOwner: "owner-c",
+      limit: 1,
+      staleClaimMs: 60_000,
+    });
+    expect(again).toMatchObject({
+      event_uuid: replicated.event_uuid,
+      delivery_attempts: replicated.delivery_attempts + 1,
+    });
+    db.close();
+  });
+
   it("rejects remote inbox IDs outside the exact PostgreSQL bigint range", () => {
     const db = new EventsDb(dbPath);
     db.insertEvent(

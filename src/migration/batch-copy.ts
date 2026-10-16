@@ -158,6 +158,7 @@ export async function runSqliteMigrationCopy(rawInput: SqliteMigrationCopyInput,
             refuse();
         const authenticated = source;
         destination = await openMigrationCopyDestination({ ...input, ...limits, generationId: bound.targetGenerationId, runId: bound.runId,
+            expectedSystemIdentifier: current.destination.systemIdentifier,
             source: source.stream, scratchParent: scratch, withSourceAuthority: operation => underSource(authenticated, operation) });
         await destination.admit(current.phase !== 'dry-run-verified');
         const manifest = source.stream.describe();
