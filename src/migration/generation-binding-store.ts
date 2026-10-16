@@ -1026,27 +1026,76 @@ export function recordGenerationScopedFile(
   const attempt = (): "absent" | "reused" =>
     reconcileGenerationScopedFile(path, directory, store, expectedUid, readWithStat, reconcile);
 
-  if (attempt() === "reused") return;
-
-  try {
-    writeDurable(path, serialized, {
-      requireAbsent: true,
-      maxExistingBytes: store.maxFileBytes,
-      expectedUid,
-    });
-  } catch (error) {
-    if (!isBenignCollisionRace(error)) throw error;
-    // A concurrent writer published (or leftover debris blocked, then
-    // cleared) between our presence check and this write attempt. Re-read
-    // and reconcile exactly as above rather than treating a race as a
-    // failure: this is the "retry converges" property applied to true
-    // concurrency, not just sequential crash-then-retry.
-    if (attempt() === "absent") {
-      // The collision this call observed is already gone. Surface the
-      // original error rather than loop indefinitely against a filesystem
-      // that keeps changing out from under this call.
-      throw error;
+  if (attempt() === "absent") {
+    try {
+      writeDurable(path, serialized, {
+        requireAbsent: true,
+        maxExistingBytes: store.maxFileBytes,
+        expectedUid,
+      });
+    } catch (error) {
+      if (!isBenignCollisionRace(error)) throw error;
+      // A concurrent writer published (or leftover debris blocked, then
+      // cleared) between our presence check and this write attempt. Re-read
+      // and reconcile exactly as above rather than treating a race as a
+      // failure: this is the "retry converges" property applied to true
+      // concurrency, not just sequential crash-then-retry.
+      if (attempt() === "absent") {
+        // The collision this call observed is already gone. Surface the
+        // original error rather than loop indefinitely against a filesystem
+        // that keeps changing out from under this call.
+        throw error;
+      }
     }
+  }
+  removeIdenticalLoneScratch(path, directory, store, expectedUid, readWithStat);
+}
+
+/**
+ * After a successful write or reuse, removes the writer scratch files of
+ * this final name that a crash before the link step left behind and whose
+ * content is byte-identical to the file just published or reused: they hold
+ * nothing the published file does not, and the reader refuses any other lone
+ * scratch. Each candidate must be a single-link regular file owned by the
+ * expected uid with the writer's mode (a twin, a foreign file or a scratch
+ * with different content is left alone). The removal is made durable.
+ */
+function removeIdenticalLoneScratch(
+  path: string,
+  directory: string,
+  store: GenerationScopedStore,
+  expectedUid: number | undefined,
+  readWithStat: typeof readBoundedRegularFileWithStat,
+): void {
+  const published = readWithStat(path, {
+    allowedRoot: directory,
+    maxBytes: store.maxFileBytes,
+    expectedUid,
+    allowedModes: [PRIVATE_FILE_MODE],
+    requireSingleLink: true,
+  }).content;
+  const namePattern = writerScratchNamePattern(basename(path));
+  let removed = false;
+  for (const entry of readdirSync(directory)) {
+    if (!namePattern.test(entry)) continue;
+    const candidate = join(directory, entry);
+    if (
+      !isLoneScratchShape(candidate, expectedUid)
+      || readLoneScratchContent(candidate, directory, store, expectedUid, readWithStat) !== published
+    ) continue;
+    try {
+      unlinkSync(candidate);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    removed = true;
+  }
+  if (!removed) return;
+  const directoryHandle = openPrivateDirectory(directory, { expectedUid });
+  try {
+    fsyncSync(directoryHandle.fd);
+  } finally {
+    directoryHandle.close();
   }
 }
 
@@ -1138,20 +1187,40 @@ function generationScopedUnresolvable(reason: string): GenerationScopedRead {
 }
 
 /**
- * A scratch entry the reader may ignore: the exact twin of a final file
- * (authenticated by findAuthenticatedScratchTwin while reading that file),
- * or a lone unlinked scratch file -- the debris a crash before the
- * writer's link step leaves, which holds a binding that was never
- * published and therefore is not evidence of anything. A lone scratch file
- * must still be a single-link regular file owned by the expected uid with
- * the writer's mode; anything else is not debris.
+ * Whether a directory entry is a single-link regular file owned by the
+ * expected uid with the writer's mode: the only shape a lone writer scratch
+ * file can legitimately have. Anything else is not debris of this store.
  */
-function isIgnorableLoneScratch(path: string, expectedUid: number | undefined): boolean {
+function isLoneScratchShape(path: string, expectedUid: number | undefined): boolean {
   const stat = lstatSync(path, { bigint: true });
   return stat.isFile()
     && stat.nlink === 1n
     && (expectedUid === undefined || Number(stat.uid) === expectedUid)
     && (Number(stat.mode) & 0o777) === PRIVATE_FILE_MODE;
+}
+
+/**
+ * A lone scratch file's content, or undefined when it cannot be read as a
+ * bounded private regular file.
+ */
+function readLoneScratchContent(
+  path: string,
+  directory: string,
+  store: GenerationScopedStore,
+  expectedUid: number | undefined,
+  readWithStat: typeof readBoundedRegularFileWithStat,
+): string | undefined {
+  try {
+    return readWithStat(path, {
+      allowedRoot: directory,
+      maxBytes: store.maxFileBytes,
+      expectedUid,
+      allowedModes: [PRIVATE_FILE_MODE],
+      requireSingleLink: true,
+    }).content;
+  } catch {
+    return undefined;
+  }
 }
 
 function scanGenerationScopedDirectory(
@@ -1162,7 +1231,7 @@ function scanGenerationScopedDirectory(
 ): GenerationScopedRead {
   const files: { name: string; content: string }[] = [];
   const twinPaths = new Set<string>();
-  const scratchEntries: string[] = [];
+  const scratchEntries: { entry: string; finalName: string }[] = [];
   for (const entry of readdirSync(directory).sort()) {
     const path = join(directory, entry);
     if (store.isFinalFileName(entry)) {
@@ -1186,11 +1255,22 @@ function scanGenerationScopedDirectory(
     if (scratchOf === undefined || !store.isFinalFileName(scratchOf)) {
       return generationScopedUnresolvable("unknown entry " + entry);
     }
-    scratchEntries.push(entry);
+    scratchEntries.push({ entry, finalName: scratchOf });
   }
-  for (const entry of scratchEntries) {
+  // A scratch entry is ignorable only when it is the authenticated twin of a
+  // final file, or a lone single-link file whose content is byte-identical
+  // to the published file of the same name -- stale debris after a completed
+  // write. Any other lone scratch may be the only copy of a binding whose
+  // final name was lost, or an interrupted write of unknown outcome.
+  for (const { entry, finalName } of scratchEntries) {
     const path = join(directory, entry);
-    if (!twinPaths.has(path) && !isIgnorableLoneScratch(path, expectedUid)) {
+    if (twinPaths.has(path)) continue;
+    const published = files.find((file) => file.name === finalName);
+    if (
+      published === undefined
+      || !isLoneScratchShape(path, expectedUid)
+      || readLoneScratchContent(path, directory, store, expectedUid, readWithStat) !== published.content
+    ) {
       return generationScopedUnresolvable("scratch entry " + entry + " is not an authenticated writer scratch file");
     }
   }
@@ -1352,6 +1432,18 @@ export function resolveMigrationWitnessBindings(
     }
     if (parsed.selection !== undefined) selections.push(parsed.selection);
     else witnesses.push(parsed.witness);
+  }
+  // Protocol order: a rollback unwinds an activation, so its selection is
+  // recorded at a strictly later manifest revision. An equal or inverted
+  // pair cannot be ordered by revision and is not trusted.
+  const activation = selections.find((selection) => selection.kind === "activation");
+  const rollback = selections.find((selection) => selection.kind === "rollback");
+  if (activation !== undefined && rollback !== undefined && rollback.manifestRevision <= activation.manifestRevision) {
+    return {
+      state: "unresolvable",
+      reason: "the rollback selection (revision " + rollback.manifestRevision
+        + ") is not recorded after the activation selection (revision " + activation.manifestRevision + ")",
+    };
   }
   return {
     state: "resolved",

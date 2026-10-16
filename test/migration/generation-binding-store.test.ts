@@ -5,6 +5,7 @@ import {
   chmodSync,
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -2097,15 +2098,14 @@ describe("resolveMigrationWitnessBindings", () => {
 
   it("resolves every recorded binding in manifestRevision order, not directory order", () => {
     const homeDir = home();
-    // Directory order is selection-activation < selection-rollback and, for
-    // the witnesses, HASH_A < HASH_B: each pair is recorded so that revision
-    // order is the opposite of file-name order.
+    // Directory order for the witnesses is HASH_A < HASH_B; they are
+    // recorded so that revision order is the opposite of file-name order.
     recordMigrationSelectionBinding({
-      homeDir, generationId: GENERATION_ID, binding: selectionBinding({ kind: "activation", manifestRevision: 9 }),
+      homeDir, generationId: GENERATION_ID, binding: selectionBinding({ kind: "activation", manifestRevision: 3 }),
     });
     recordMigrationSelectionBinding({
       homeDir, generationId: GENERATION_ID,
-      binding: selectionBinding({ kind: "rollback", manifestRevision: 3, witnessChecksumSha256: HASH_B }),
+      binding: selectionBinding({ kind: "rollback", manifestRevision: 9, witnessChecksumSha256: HASH_B }),
     });
     recordMigrationWitnessBinding({
       homeDir, generationId: GENERATION_ID, binding: witnessBinding({ witnessChecksumSha256: HASH_A, manifestRevision: 7 }),
@@ -2115,18 +2115,25 @@ describe("resolveMigrationWitnessBindings", () => {
     });
     const result = resolve(homeDir);
     if (result.state !== "resolved") throw new Error("expected resolved");
-    expect(result.selections.map((entry) => entry.kind)).toEqual(["rollback", "activation"]);
+    expect(result.selections.map((entry) => entry.kind)).toEqual(["activation", "rollback"]);
     expect(result.witnesses.map((entry) => entry.witnessChecksumSha256)).toEqual([HASH_B, HASH_A]);
   });
 
-  it("breaks manifestRevision ties by kind for selections and by checksum for witnesses", () => {
+  it("is unresolvable when the rollback selection is not recorded after the activation selection (A18)", () => {
+    for (const [activationRevision, rollbackRevision] of [[4, 4], [9, 3]] as const) {
+      const homeDir = home();
+      recordMigrationSelectionBinding({
+        homeDir, generationId: GENERATION_ID, binding: selectionBinding({ kind: "activation", manifestRevision: activationRevision }),
+      });
+      recordMigrationSelectionBinding({
+        homeDir, generationId: GENERATION_ID, binding: selectionBinding({ kind: "rollback", manifestRevision: rollbackRevision }),
+      });
+      expect(unresolvable(homeDir)).toContain("is not recorded after the activation selection");
+    }
+  });
+
+  it("breaks manifestRevision ties by checksum for witnesses", () => {
     const homeDir = home();
-    recordMigrationSelectionBinding({
-      homeDir, generationId: GENERATION_ID, binding: selectionBinding({ kind: "rollback", manifestRevision: 4 }),
-    });
-    recordMigrationSelectionBinding({
-      homeDir, generationId: GENERATION_ID, binding: selectionBinding({ kind: "activation", manifestRevision: 4 }),
-    });
     for (const checksum of ["c".repeat(64), HASH_B, HASH_A]) {
       recordMigrationWitnessBinding({
         homeDir, generationId: GENERATION_ID, binding: witnessBinding({ witnessChecksumSha256: checksum, manifestRevision: 4 }),
@@ -2134,7 +2141,6 @@ describe("resolveMigrationWitnessBindings", () => {
     }
     const result = resolve(homeDir);
     if (result.state !== "resolved") throw new Error("expected resolved");
-    expect(result.selections.map((entry) => entry.kind)).toEqual(["activation", "rollback"]);
     expect(result.witnesses.map((entry) => entry.witnessChecksumSha256)).toEqual([HASH_A, HASH_B, "c".repeat(64)]);
   });
 
@@ -2220,20 +2226,36 @@ describe("resolveMigrationWitnessBindings", () => {
     expect(unresolvable(homeDir)).toContain("unknown entry");
   });
 
-  it("ignores, and never deletes, lone scratch debris from a crash before the link step", () => {
+  it("ignores, and never deletes, a lone scratch file byte-identical to its published file (A19)", () => {
     const homeDir = home();
-    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witnessBinding() });
+    const binding = selectionBinding();
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding });
+    const published = migrationSelectionBindingPath(homeDir, GENERATION_ID, "activation");
     const debris = join(generationDirectory(homeDir), ".selection-activation.binding.0123abcd.tmp");
-    writeFileSync(debris, "half written", { mode: 0o600 });
-    expect(resolve(homeDir)).toMatchObject({ state: "resolved" });
+    writeFileSync(debris, readFileSync(published, "utf8"), { mode: 0o600 });
+    expect(resolve(homeDir)).toEqual({ state: "resolved", witnesses: [], selections: [binding] });
     expect(existsSync(debris)).toBe(true);
   });
 
-  it("is absent, not resolved, when the directory holds only lone scratch debris", () => {
+  it("is unresolvable for a lone scratch file whose final name was never published (A19)", () => {
     const homeDir = home();
     mkdirSync(generationDirectory(homeDir), { recursive: true, mode: 0o700 });
     writeFileSync(join(generationDirectory(homeDir), ".selection-activation.binding.0123abcd.tmp"), "x", { mode: 0o600 });
-    expect(resolve(homeDir)).toEqual({ state: "authoritatively-absent" });
+    expect(unresolvable(homeDir)).toContain("not an authenticated writer scratch file");
+  });
+
+  it("is unresolvable for a lone scratch file that differs from the published file of its name (A19)", () => {
+    const homeDir = home();
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding: selectionBinding() });
+    writeFileSync(join(generationDirectory(homeDir), ".selection-activation.binding.0123abcd.tmp"), "half written", { mode: 0o600 });
+    expect(unresolvable(homeDir)).toContain("not an authenticated writer scratch file");
+  });
+
+  it("is unresolvable for a lone scratch file that is too large to read (A19)", () => {
+    const homeDir = home();
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding: selectionBinding() });
+    writeFileSync(join(generationDirectory(homeDir), ".selection-activation.binding.0123abcd.tmp"), "x".repeat(5000), { mode: 0o600 });
+    expect(unresolvable(homeDir)).toContain("not an authenticated writer scratch file");
   });
 
   it("is unresolvable for scratch debris with an untrusted mode", () => {
@@ -2297,6 +2319,112 @@ describe("resolveMigrationWitnessBindings", () => {
       .toThrow(MigrationBindingValidationError);
     expect(() => resolveMigrationWitnessBindings({ homeDir, generationId: "../escape" }))
       .toThrow(MigrationBindingValidationError);
+  });
+});
+
+
+describe("writer cleanup of identical lone scratch (A19)", () => {
+  const FINAL = "selection-activation.binding";
+  const scratchName = (suffix: string): string => "." + FINAL + "." + suffix + ".tmp";
+  const directoryOf = (homeDir: string): string => migrationGenerationBindingDirectory(homeDir, GENERATION_ID);
+  const plantScratch = (homeDir: string, suffix: string, content: string, mode = 0o600): string => {
+    mkdirSync(directoryOf(homeDir), { recursive: true, mode: 0o700 });
+    const path = join(directoryOf(homeDir), scratchName(suffix));
+    writeFileSync(path, content, { mode });
+    chmodSync(path, mode);
+    return path;
+  };
+
+  it("converges after a crash before the link step: the retry publishes and removes the identical debris", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const bytes = captureCleanSelectionBytes(binding);
+    const debris = plantScratch(homeDir, "0123abcd", bytes);
+    expect(resolveMigrationWitnessBindings({ homeDir, generationId: GENERATION_ID }))
+      .toMatchObject({ state: "unresolvable" });
+
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding });
+
+    expect(existsSync(debris)).toBe(false);
+    expect(resolveMigrationWitnessBindings({ homeDir, generationId: GENERATION_ID }))
+      .toEqual({ state: "resolved", witnesses: [], selections: [binding] });
+  });
+
+  it("also removes identical debris when the retry only reuses the published file", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding });
+    const debris = plantScratch(homeDir, "0123abcd", readFileSync(migrationSelectionBindingPath(homeDir, GENERATION_ID, "activation"), "utf8"));
+
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding });
+
+    expect(existsSync(debris)).toBe(false);
+  });
+
+  it("leaves scratch files that are not identical single-link private files of this name alone", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const bytes = captureCleanSelectionBytes(binding);
+    const different = plantScratch(homeDir, "aaaa0001", "half written");
+    const untrustedMode = plantScratch(homeDir, "aaaa0002", bytes, 0o644);
+    const oversized = plantScratch(homeDir, "aaaa0003", "x".repeat(5000));
+    const symlink = join(directoryOf(homeDir), scratchName("aaaa0004"));
+    symlinkSync("/nonexistent", symlink);
+    const linked = plantScratch(homeDir, "aaaa0005", bytes);
+    linkSync(linked, join(home(), "alias"));
+    const otherName = join(directoryOf(homeDir), ".selection-rollback.binding.aaaa0006.tmp");
+    writeFileSync(otherName, bytes, { mode: 0o600 });
+
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding });
+
+    for (const path of [different, untrustedMode, oversized, symlink, linked, otherName]) {
+      expect(lstatSync(path, { throwIfNoEntry: false })).toBeDefined();
+    }
+  });
+
+  it("tolerates the debris vanishing between the scan and the unlink", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const debris = plantScratch(homeDir, "0123abcd", captureCleanSelectionBytes(binding));
+    const realUnlinkSync = (createRequire(import.meta.url)("node:fs") as { unlinkSync: (p: string) => void }).unlinkSync;
+    withPatchedFs("unlinkSync", ((path: string) => {
+      if (path === debris) {
+        realUnlinkSync(path);
+        const error = new Error("gone") as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
+      }
+      return realUnlinkSync(path);
+    }), () => recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }));
+    expect(existsSync(debris)).toBe(false);
+  });
+
+  it("propagates an unexpected unlink failure", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const debris = plantScratch(homeDir, "0123abcd", captureCleanSelectionBytes(binding));
+    const realUnlinkSync = (createRequire(import.meta.url)("node:fs") as { unlinkSync: (p: string) => void }).unlinkSync;
+    expect(() => withPatchedFs("unlinkSync", ((path: string) => {
+      if (path === debris) {
+        const error = new Error("denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return realUnlinkSync(path);
+    }), () => recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }))).toThrow("denied");
+  });
+
+  it("applies to the witness binding store entry point as well", () => {
+    const homeDir = home();
+    const binding = witnessBinding();
+    const bytes = captureCleanWitnessBytes(binding);
+    mkdirSync(directoryOf(homeDir), { recursive: true, mode: 0o700 });
+    const debris = join(directoryOf(homeDir), "." + "witness-" + HASH_A + ".binding.0123abcd.tmp");
+    writeFileSync(debris, bytes, { mode: 0o600 });
+
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding });
+
+    expect(existsSync(debris)).toBe(false);
   });
 });
 

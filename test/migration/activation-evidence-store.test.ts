@@ -226,6 +226,34 @@ describe("activation evidence store: writers", () => {
     expect(statSync(join(dir(homeDir), name)).nlink).toBe(1);
     expect(existsSync(scratch)).toBe(false);
   });
+
+  it("A19: a lone scratch with no published file is unresolvable, and the writer's retry publishes and clears it", () => {
+    const homeDir = home();
+    const epoch = fixtureEpoch({ generationId: GENERATION_ID });
+    const name = "epoch-" + epoch.epochId + ".json";
+    const scratch = plant(homeDir, "." + name + ".0123abcd.tmp", wire(epoch));
+    expect(readMigrationActivationEvidence({ homeDir, generationId: GENERATION_ID }))
+      .toMatchObject({ state: "unresolvable" });
+
+    recordMigrationActivationEpoch({ homeDir, epoch });
+
+    expect(existsSync(scratch)).toBe(false);
+    expect(readMigrationActivationEvidence({ homeDir, generationId: GENERATION_ID }))
+      .toMatchObject({ state: "resolved" });
+  });
+
+  it("A19: a lone scratch identical to the published file is ignored; a differing one is not", () => {
+    const homeDir = home();
+    const epoch = fixtureEpoch({ generationId: GENERATION_ID });
+    recordMigrationActivationEpoch({ homeDir, epoch });
+    const name = "epoch-" + epoch.epochId + ".json";
+    const identical = plant(homeDir, "." + name + ".0123abcd.tmp", wire(epoch));
+    expect(readMigrationActivationEvidence({ homeDir, generationId: GENERATION_ID })).toMatchObject({ state: "resolved" });
+    expect(existsSync(identical)).toBe(true);
+    plant(homeDir, "." + name + ".0123abce.tmp", "half written");
+    expect(readMigrationActivationEvidence({ homeDir, generationId: GENERATION_ID }))
+      .toMatchObject({ state: "unresolvable" });
+  });
 });
 
 describe("activation evidence store: reader", () => {
