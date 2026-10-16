@@ -383,6 +383,11 @@ async function identity(context) {
     const successorDirectory = join(projectsRoot, expectedSuccessor);
     assert.deepEqual(readdirSync(successorDirectory), ["meta.json"], "surface-identity:retired-successor-directory");
     rmSync(successorDirectory, { recursive: true });
+    // Without its metadata, the successor's event sidecar from the refused ingest would trip the next settle's metadata assertion.
+    for (const suffix of [".db", ".db-wal", ".db-shm"]) {
+      const sidecar = join(context.homeDir, ".lcm", "events", expectedSuccessor + suffix);
+      if (existsSync(sidecar)) rmSync(sidecar);
+    }
   } else {
     await ingest(context, retiredRoot, "surface-identity-retired", "Identity corpus violet retired renewal");
     assert.equal((await matches(context, retiredRoot, "violet retired renewal")).length, 1);
