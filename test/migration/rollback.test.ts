@@ -39,11 +39,7 @@ import {
   readBackendMaintenanceJournal,
   withBackendPublicationConsumerLockAsync,
   backendPublicationJournalPath,
-  backendPublicationMaterialWitness,
   type BackendPublicationDriver,
-  type BackendPublicationFenceRecord,
-  type BackendPublicationRecoveryMaterial,
-  type BackendPublicationRecoveryFile,
 } from "../../src/storage/backend-publication.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import {
@@ -59,6 +55,7 @@ import {
   resolveMigrationWitnessBindings,
 } from "../../src/migration/generation-binding-store.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
+import { publicationMaterial, workingPublicationDriver } from "../fixtures/backend-publication-driver.js";
 import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
 import {
   createMigrationManifest,
@@ -201,82 +198,6 @@ function authoritativeDeps(scenario: ReturnType<typeof fixtureActivationScenario
 // imported from that file (test files do not share fixtures across
 // modules in this repo) but faithful to the same construction.
 // ---------------------------------------------------------------------------
-
-function publicationRecoveryFile(content: string): BackendPublicationRecoveryFile {
-  return {
-    presence: "present",
-    content: Buffer.from(content),
-    mode: 0o600,
-    uid: typeof process.getuid === "function" ? process.getuid() : 0,
-    gid: typeof process.getgid === "function" ? process.getgid() : 0,
-    nlink: "1",
-    dev: "1",
-    ino: "2",
-    parentDev: "3",
-    parentIno: "4",
-  };
-}
-
-function publicationMaterial(): BackendPublicationRecoveryMaterial {
-  return {
-    source: {
-      config: publicationRecoveryFile('{"backend":"sqlite"}'),
-      projectMap: publicationRecoveryFile('{"projects":[]}'),
-    },
-    target: {
-      config: publicationRecoveryFile('{"backend":"postgresql"}'),
-      projectMap: publicationRecoveryFile('{"projects":["remote"]}'),
-    },
-  };
-}
-
-function workingPublicationDriver(materialInput: BackendPublicationRecoveryMaterial): BackendPublicationDriver {
-  let state = backendPublicationMaterialWitness(materialInput);
-  const targetState = backendPublicationMaterialWitness({ source: materialInput.target, target: materialInput.target });
-  const fences = new Map<string, BackendPublicationFenceRecord>();
-  return {
-    acquireRemoteGuard: async ({ journal, project }) => {
-      const fence: BackendPublicationFenceRecord = {
-        projectId: project.remoteProjectId,
-        machineId: "machine-1",
-        publicationId: journal.publicationId,
-        targetBackend: journal.targetBackend,
-        evidenceSha256: project.evidenceSha256,
-        fencingToken: "1",
-        acquiredAt: capturedAt,
-        renewedAt: capturedAt,
-        expiresAt: "2999-08-06T12:00:00.000Z",
-        releasedAt: null,
-        databaseExpired: false,
-      };
-      fences.set(project.remoteProjectId, fence);
-      return fence;
-    },
-    readRemoteGuard: async ({ project }) => fences.get(project.remoteProjectId) ?? null,
-    releaseRemoteGuard: async ({ project, fence }) => {
-      fences.set(project.remoteProjectId, { ...fence, releasedAt: capturedAt });
-    },
-    observeLocalState: async () => state,
-    publishProjectMap: async ({ permit }) => {
-      permit.assertActive();
-      state = { ...state, projectMap: targetState.projectMap };
-      return targetState.projectMap;
-    },
-    publishConfig: async ({ permit }) => {
-      permit.assertActive();
-      state = { ...state, config: targetState.config };
-      return targetState.config;
-    },
-    restoreConfig: async ({ permit }) => {
-      permit.assertActive();
-      return targetState.config;
-    },
-    restoreProjectMap: async ({ permit }) => {
-      permit.assertActive();
-      return targetState.projectMap;
-    },
-  };
-}
 
 /**
  * Drives a REAL BackendPublicationCoordinator through prepare()+resume()

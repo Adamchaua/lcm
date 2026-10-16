@@ -15,9 +15,12 @@ rationale: >-
   census and delta builders) are materially changed and keep their existing
   migration cutover owner. src/storage/local-hook-event-sequence.ts is
   materially changed but keeps its established local event storage owner.
+  src/migration/maintenance.ts (replay admission routed from durable
+  authority) is materially changed and keeps its migration cutover owner.
 pins:
   - ["src/migration/activation-evidence-store.ts", "unit-migration-cutover"]
   - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]
+  - ["src/migration/maintenance.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-eligibility.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-generation.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-inputs.ts", "unit-migration-cutover"]

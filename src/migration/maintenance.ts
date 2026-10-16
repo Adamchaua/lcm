@@ -14,12 +14,16 @@ import {
   type MachineIdentity,
 } from "../machine-identity.js";
 import { projectMapPath, readProjectMapSnapshot } from "../project-map.js";
+import { resolveMigrationWitnessBindings } from "./generation-binding-store.js";
+import { MigrationManifestStore } from "./manifest-store.js";
+import { MigrationProtocolError } from "./protocol.js";
 import { lcmHomeDir } from "../runtime-paths.js";
 import { readBoundedRegularFileWithStat } from "../security-files.js";
 import { assertStorageBackendPublication } from "../storage/backend.js";
 import {
   backendPublicationCanonicalSha256,
   BackendPublicationJournalError,
+  isTerminalBackendMaintenancePhase,
   readBackendMaintenanceJournal,
   rebindBackendMaintenanceCutoff,
   withBackendPublicationAppendBarrierAsync,
@@ -255,6 +259,34 @@ export function inspectImmutableSqliteSnapshot(
   return inspectSqliteSnapshotArtifact(generationId, { homeDir });
 }
 
+/**
+ * True only for a valid manifest at phase rolled-back with no pending effect. A generation with no manifest
+ * at all is not manifest-backed (false); a manifest that is present but cannot be read or validated refuses.
+ */
+function rolledBackWithoutPendingEffect(homeDir: string, generationId: string): boolean {
+  try {
+    const manifest = new MigrationManifestStore({ homeDir }).read(generationId);
+    return manifest.phase === "rolled-back" && manifest.pendingEffect === null;
+  } catch (error) {
+    if (error instanceof MigrationProtocolError && error.message === "migration manifest head is absent") return false;
+    throw new BackendPublicationJournalError(
+      "unresolved-publication",
+      "migration manifest cannot be read: " + (error as Error).message,
+    );
+  }
+}
+
+/**
+ * Whether a replayed terminal `evidenceSha256` of a generation is an authoritative terminal state, and
+ * which backend it selects. Decided from durable authority in this order (plan-v3.2 A15): a live
+ * non-terminal maintenance of the generation refuses; the generation's selection bindings decide (the
+ * last by manifest revision: activation selects postgresql, rollback selects sqlite); with no selection
+ * recorded, a migration manifest at rolled-back with no pending effect selects sqlite (the unactivated
+ * rollback, whose only durable record is the manifest); the generation's own terminal maintenance
+ * journal, if the coordinator has not yet archived it, decides as before; everything else refuses.
+ * Unresolvable bindings and an unreadable manifest refuse. Between the coordinator's archival of the
+ * maintenance journal and the manifest's completion, admission refuses until the resume completes.
+ */
 export function assertMigrationReplayAdmission(input: Readonly<{
   homeDir: string;
   generationId: string;
@@ -264,25 +296,60 @@ export function assertMigrationReplayAdmission(input: Readonly<{
   disposition: "selected" | "source-abort";
 }> {
   const journal = readBackendMaintenanceJournal(input.homeDir);
-  if (
-    journal === null
-    || journal.generationId !== input.generationId
-  ) {
+  const live = journal !== null && journal.generationId === input.generationId ? journal : null;
+  // 1. A live, non-terminal maintenance of this generation: its selection is still pending.
+  if (live !== null && !isTerminalBackendMaintenancePhase(live.phase)) {
+    throw new BackendPublicationJournalError(
+      "unresolved-publication",
+      "migration maintenance has no authoritative terminal replay state",
+    );
+  }
+  // 2. The recorded selection bindings, the last by manifest revision deciding. The live maintenance slot
+  // is archived by the coordinator's next publication, so the bindings are the durable authority.
+  const bindings = resolveMigrationWitnessBindings({ homeDir: input.homeDir, generationId: input.generationId });
+  if (bindings.state === "unresolvable") {
+    throw new BackendPublicationJournalError(
+      "unresolved-publication",
+      "migration selection bindings cannot be resolved: " + bindings.reason,
+    );
+  }
+  if (bindings.state === "resolved" && bindings.selections.length > 0) {
+    const last = bindings.selections[bindings.selections.length - 1]!;
+    if (last.witnessChecksumSha256 !== input.evidenceSha256) {
+      throw new BackendPublicationJournalError(
+        "unresolved-publication",
+        "migration maintenance has no authoritative terminal replay state",
+      );
+    }
+    return { backend: last.kind === "activation" ? "postgresql" : "sqlite", disposition: "selected" };
+  }
+  // 3. No selection was ever recorded: a rollback of an unactivated generation is authoritative only
+  // through its migration manifest, which the coordinator never archives.
+  if (rolledBackWithoutPendingEffect(input.homeDir, input.generationId)) {
+    return { backend: "sqlite", disposition: "selected" };
+  }
+  // 4. The terminal maintenance journal of this generation, not yet archived.
+  const journalForGeneration = live;
+  if (journalForGeneration === null) {
     throw new BackendPublicationJournalError(
       "unexpected-state",
       "migration replay evidence does not match a terminal maintenance generation",
     );
   }
   if (
-    journal.phase === "selection-completed"
-    && journal.targetBackend !== null
-    && journal.terminalEvidenceSha256 === input.evidenceSha256
+    journalForGeneration.phase === "selection-completed"
+    && journalForGeneration.targetBackend !== null
+    && journalForGeneration.terminalEvidenceSha256 === input.evidenceSha256
   ) {
-    return { backend: journal.targetBackend, disposition: "selected" };
+    return { backend: journalForGeneration.targetBackend, disposition: "selected" };
   }
-  if (journal.phase === "maintenance-aborted" && journal.abortEvidenceSha256 === input.evidenceSha256) {
+  if (
+    journalForGeneration.phase === "maintenance-aborted"
+    && journalForGeneration.abortEvidenceSha256 === input.evidenceSha256
+  ) {
     return { backend: "sqlite", disposition: "source-abort" };
   }
+  // 5. Anything else refuses.
   throw new BackendPublicationJournalError(
     "unresolved-publication",
     "migration maintenance has no authoritative terminal replay state",
