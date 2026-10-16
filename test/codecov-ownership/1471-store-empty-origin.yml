@@ -1,0 +1,6 @@
+references: ["#1471"]
+rationale: >-
+  #1471 normalizes an empty or non-string metadata.projectId to the manual
+  origin inside the store route; the file stays route-owned.
+pins:
+  - ["src/daemon/routes/store.ts", "unit-daemon-routes"]

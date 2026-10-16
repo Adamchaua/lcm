@@ -22,6 +22,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
+import { inferredHealthStorageBackend } from "./client.js";
 import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "./version.js";
 import type { StorageBackend } from "./config.js";
 import {
@@ -606,8 +607,7 @@ function healthStorageBackendMatches(
   health: HealthResponse | null,
   expectedStorageBackend: StorageBackend,
 ): boolean {
-  // Daemons predating backend identity were necessarily SQLite-only.
-  return (health?.storageBackend ?? "sqlite") === expectedStorageBackend;
+  return health !== null && inferredHealthStorageBackend(health) === expectedStorageBackend;
 }
 
 function healthRuntimeDigestMatches(
@@ -622,8 +622,7 @@ function healthRuntimeDigestMatches(
 }
 
 function recognizedHealthStorageBackend(health: HealthResponse): StorageBackend | null {
-  const backend = health.storageBackend ?? "sqlite";
-  return backend === "sqlite" || backend === "postgresql" ? backend : null;
+  return inferredHealthStorageBackend(health) ?? null;
 }
 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
@@ -1575,7 +1574,7 @@ async function checkDaemonAccess(
 function sameHealthIdentity(publicHealth: HealthResponse, authenticatedHealth: HealthResponse): boolean {
   return publicHealth.pid === authenticatedHealth.pid
     && publicHealth.version === authenticatedHealth.version
-    && (publicHealth.storageBackend ?? "sqlite") === (authenticatedHealth.storageBackend ?? "sqlite")
+    && publicHealth.storageBackend === authenticatedHealth.storageBackend
     && publicHealth.ownerId === authenticatedHealth.ownerId;
 }
 
@@ -4242,8 +4241,8 @@ async function restartDaemonUnlocked(
     // The current daemon may legitimately use a different backend during a
     // configured transition. Authenticate it independently; ensureOptions
     // applies expectedStorageBackend to the replacement below.
-    const currentStorageBackend = health.storageBackend ?? "sqlite";
-    if (currentStorageBackend !== "sqlite" && currentStorageBackend !== "postgresql") return false;
+    const currentStorageBackend = inferredHealthStorageBackend(health);
+    if (currentStorageBackend === undefined) return false;
     const authenticatedHealth = await checkDaemonDiagnostics(
       port,
       tokenPath,

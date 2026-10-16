@@ -30,6 +30,7 @@ const fetchHealthy = (
       json: async () => ({
         status: "ok",
         version: "1",
+        storageBackend: "sqlite",
         pid,
         ...(identity.entrypoint === undefined
           ? {}
@@ -317,8 +318,11 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(__lifecycleTestUtils.healthVersionMatches(null, undefined)).toBe(false);
     expect(__lifecycleTestUtils.healthVersionMatches({ status: "ok", version: "" }, "")).toBe(false);
     expect(__lifecycleTestUtils.healthVersionMatches({ status: "ok", version: "1" }, "1")).toBe(true);
-    expect(__lifecycleTestUtils.healthStorageBackendMatches(null, "sqlite")).toBe(true);
-    expect(__lifecycleTestUtils.healthStorageBackendMatches({ status: "ok" }, "postgresql")).toBe(false);
+    expect(__lifecycleTestUtils.healthStorageBackendMatches(null, "sqlite")).toBe(false);
+    expect(__lifecycleTestUtils.healthStorageBackendMatches({ status: "ok", version: "1.4.3" }, "sqlite")).toBe(true);
+    expect(__lifecycleTestUtils.healthStorageBackendMatches({ status: "ok", version: "1.4.3" }, "postgresql")).toBe(false);
+    expect(__lifecycleTestUtils.healthStorageBackendMatches({ status: "ok", version: "1.4.4" }, "sqlite")).toBe(false);
+    expect(__lifecycleTestUtils.healthStorageBackendMatches({ status: "ok" }, "sqlite")).toBe(false);
     expect(__lifecycleTestUtils.healthStorageBackendMatches({ status: "ok", storageBackend: "postgresql" }, "postgresql")).toBe(true);
     expect(__lifecycleTestUtils.resolveWindowsNetstatPath(undefined, undefined)).toBeNull();
     expect(__lifecycleTestUtils.resolveWindowsNetstatPath("C:\\project", "relative", () => true)).toBeNull();

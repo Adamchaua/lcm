@@ -1,0 +1,9 @@
+references: ["#1417", "PR #1420"]
+rationale: >-
+  #1417 makes the verification listing probe compare identity and title
+  pairs, deriving each destination conversation's portable identity with the
+  derivation exported from the portable record module; the driver keeps its
+  migration owner and the portable record module keeps its storage owner.
+pins:
+  - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
+  - ["src/storage/portable-record.ts", "unit-storage-abstractions"]

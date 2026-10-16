@@ -1,0 +1,16 @@
+references: ["#626"]
+rationale: >-
+  Adds reversible rollback into a new SQLite generation as five modules
+  under src/migration/ (eligibility, generation build, install, sidecar
+  materialization and the orchestration that sequences them). They are
+  cutover lifecycle work, so they stay in the directory-level migration
+  cutover owner alongside the forward path they reverse; no topology change.
+  src/storage/local-hook-event-sequence.ts is materially changed but keeps
+  its established local event storage owner.
+pins:
+  - ["src/migration/rollback-eligibility.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-install.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-sidecars.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback.ts", "unit-migration-cutover"]
+  - ["src/storage/local-hook-event-sequence.ts", "unit-local-event-storage"]

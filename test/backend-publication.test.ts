@@ -114,6 +114,7 @@ function makeDriver(input: BackendPublicationRecoveryMaterial): {
   let state = sourceState(input);
   const expectedTarget = targetState(input);
   const calls: string[] = [];
+  const fences = new Map<string, BackendPublicationFenceRecord>();
   const driver: BackendPublicationDriver = {
     observeLocalState: vi.fn(async () => state),
     publishProjectMap: vi.fn(async ({ permit }) => {
@@ -139,6 +140,20 @@ function makeDriver(input: BackendPublicationRecoveryMaterial): {
       calls.push("restore-map");
       state = { ...state, projectMap: sourceState(input).projectMap };
       return sourceState(input).projectMap;
+    }),
+    acquireRemoteGuard: vi.fn(async ({ journal, project }) => {
+      const fence = fenceRecord({
+        projectId: project.remoteProjectId,
+        publicationId: journal.publicationId,
+        targetBackend: journal.targetBackend,
+        evidenceSha256: project.evidenceSha256,
+      });
+      fences.set(project.remoteProjectId, fence);
+      return fence;
+    }),
+    readRemoteGuard: vi.fn(async ({ project }) => fences.get(project.remoteProjectId) ?? null),
+    releaseRemoteGuard: vi.fn(async ({ project, fence }) => {
+      fences.set(project.remoteProjectId, { ...fence, releasedAt: "2026-08-06T12:01:00.000Z" });
     }),
   };
   return { driver, getState: () => state, setState: (next) => { state = next; }, calls };
@@ -618,6 +633,9 @@ function countingDriver(input: BackendPublicationRecoveryMaterial): Readonly<{
         calls.push("restore-project-map");
         return base.restoreProjectMap(context);
       },
+      acquireRemoteGuard: base.acquireRemoteGuard,
+      readRemoteGuard: base.readRemoteGuard,
+      releaseRemoteGuard: base.releaseRemoteGuard,
     },
   };
 }
@@ -2179,8 +2197,11 @@ describe("BackendPublicationCoordinator", () => {
   });
 
   it("finalizes a journal already at the released checkpoint", async () => {
-    const { home, fake } = await preparedFixture();
-    rewriteJournal(home, (journal) => ({ ...journal, phase: "released" }));
+    const { home, fake } = await coordinatorDriftFixture("released-replay");
+    const parked = readBackendPublicationJournal(home);
+    expect(parked?.projects).toHaveLength(1);
+    expect(parked?.projects[0]?.fence?.releasedAt).not.toBeNull();
+    expect(parked?.projects[0]?.fence).not.toBeNull();
     expect((await coordinator(home, fake.driver).resume()).phase).toBe("completed");
   });
 
@@ -2193,6 +2214,7 @@ describe("BackendPublicationCoordinator", () => {
     const home = makeHome();
     let state = exactSource;
     const expected = targetState(input);
+    const guard = makeDriver(input).driver;
     const driver: BackendPublicationDriver = {
       observeLocalState: vi.fn(async () => state),
       publishProjectMap: vi.fn(async ({ permit }) => {
@@ -2215,6 +2237,9 @@ describe("BackendPublicationCoordinator", () => {
         state = { ...state, projectMap: exactSource.projectMap };
         return state.projectMap;
       }),
+      acquireRemoteGuard: guard.acquireRemoteGuard,
+      readRemoteGuard: guard.readRemoteGuard,
+      releaseRemoteGuard: guard.releaseRemoteGuard,
     };
     await coordinator(home, driver).prepare(inputFor(input));
     expect((await coordinator(home, driver).resume()).phase).toBe("completed");
@@ -2497,14 +2522,16 @@ describe("BackendPublicationCoordinator", () => {
     expect(fence?.releasedAt).not.toBeNull();
   });
 
-  it("handles optional remote admission seams and already-active fences", async () => {
+  it("refuses incomplete remote admission seams and handles already-active fences", async () => {
     const absentReadHome = makeHome();
     const absentRead = makeDriver(material());
     absentRead.driver.acquireRemoteGuard = vi.fn(async () => fenceRecord());
+    delete absentRead.driver.readRemoteGuard;
+    delete absentRead.driver.releaseRemoteGuard;
     await expect(coordinator(absentReadHome, absentRead.driver).prepare(inputFor(material())))
-      .resolves.toMatchObject({ phase: "prepared" });
-    await expect(coordinator(absentReadHome, absentRead.driver).resume()).resolves.toMatchObject({ phase: "completed" });
+      .rejects.toMatchObject({ reason: "invalid-input" });
     expect(absentRead.driver.acquireRemoteGuard).not.toHaveBeenCalled();
+    expect(readBackendPublicationJournal(absentReadHome)).toBeNull();
 
     const activeHome = makeHome();
     const active = makeDriver(material());
@@ -2519,6 +2546,151 @@ describe("BackendPublicationCoordinator", () => {
     expect(completed.phase).toBe("completed");
     expect(active.driver.acquireRemoteGuard).not.toHaveBeenCalled();
     expect(active.driver.releaseRemoteGuard).toHaveBeenCalledOnce();
+  });
+
+  describe("complete remote guard provider requirement", () => {
+    type GuardHook = "acquireRemoteGuard" | "readRemoteGuard" | "releaseRemoteGuard";
+
+    function withoutHook(driver: BackendPublicationDriver, hook: GuardHook): BackendPublicationDriver {
+      const copy = { ...driver };
+      delete copy[hook];
+      return copy;
+    }
+
+    function withoutGuard(driver: BackendPublicationDriver): BackendPublicationDriver {
+      return withoutHook(withoutHook(withoutHook(driver, "acquireRemoteGuard"), "readRemoteGuard"), "releaseRemoteGuard");
+    }
+
+    function materialFile(home: string): string {
+      return join(backendPublicationDirectory(home), "publication-1.material");
+    }
+
+    it.each(["acquireRemoteGuard", "readRemoteGuard", "releaseRemoteGuard"] as const)(
+      "refuses prepare with projects when %s is missing",
+      async (hook) => {
+        const home = makeHome();
+        const input = material();
+        const fake = makeDriver(input);
+        const incomplete = withoutHook(fake.driver, hook);
+
+        await expect(coordinator(home, incomplete).prepare(inputFor(input)))
+          .rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("remote guard provider") });
+
+        expect(readBackendPublicationJournal(home)).toBeNull();
+        expect(existsSync(materialFile(home))).toBe(false);
+        expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
+      },
+    );
+
+    it("refuses an incomplete provider before archiving an existing terminal journal", async () => {
+      const home = makeHome();
+      const input = material();
+      const fake = makeDriver(input);
+      await coordinator(home, fake.driver).prepare(inputFor(input));
+      await expect(coordinator(home, fake.driver).resume()).resolves.toMatchObject({ phase: "completed" });
+      const journalPath = backendPublicationJournalPath(home);
+      const before = readFileSync(journalPath);
+
+      await expect(coordinator(home, withoutGuard(fake.driver)).prepare({
+        ...inputFor(input),
+        publicationId: "publication-2",
+      })).rejects.toMatchObject({ reason: "invalid-input" });
+
+      expect(readFileSync(journalPath)).toEqual(before);
+      expect(existsSync(backendPublicationHistoryDirectory(home))).toBe(false);
+      expect(existsSync(join(backendPublicationDirectory(home), "publication-2.material"))).toBe(false);
+    });
+
+    it("prepares and resumes a publication without projects when no guard hooks exist", async () => {
+      const home = makeHome();
+      const input = material();
+      const fake = makeDriver(input);
+      const guardless = withoutGuard(fake.driver);
+
+      await expect(coordinator(home, guardless).prepare({ ...inputFor(input), projects: [] }))
+        .resolves.toMatchObject({ phase: "prepared" });
+      await expect(coordinator(home, guardless).resume()).resolves.toMatchObject({ phase: "completed", projects: [] });
+    });
+
+    it("finalizes a released journal without projects when no guard hooks exist", async () => {
+      const home = makeHome();
+      const input = material();
+      const guardless = withoutGuard(makeDriver(input).driver);
+      const retained = vi.fn(async () => undefined);
+      guardless.retainCompletedMaterial = retained;
+
+      await coordinator(home, guardless).prepare({ ...inputFor(input), projects: [] });
+      rewriteJournal(home, (journal) => ({ ...journal, phase: "released" }));
+
+      await expect(coordinator(home, guardless).resume()).resolves.toMatchObject({ phase: "completed", projects: [] });
+      expect(retained).toHaveBeenCalledOnce();
+    });
+
+    it.each(["acquireRemoteGuard", "readRemoteGuard"] as const)(
+      "refuses to record guarded when %s is missing and leaves abort available",
+      async (hook) => {
+        const { home, fake } = await preparedFixture();
+        const incomplete = withoutHook(fake.driver, hook);
+
+        await expect(coordinator(home, incomplete).resume()).rejects.toMatchObject({ reason: "unexpected-state" });
+        expect(readBackendPublicationJournal(home)?.phase).toBe("acquiring");
+        await expect(coordinator(home, incomplete).resume()).rejects.toMatchObject({ reason: "unexpected-state" });
+        expect(readBackendPublicationJournal(home)?.phase).toBe("acquiring");
+        expect(fake.calls).toEqual([]);
+
+        await expect(coordinator(home, incomplete).abort()).resolves.toMatchObject({ phase: "aborted" });
+        expect(existsSync(materialFile(home))).toBe(false);
+      },
+    );
+
+    it.each(
+      (["releaseRemoteGuard", "readRemoteGuard"] as const).flatMap((hook) => (
+        [[hook, "resume"], [hook, "abort"]] as const
+      )),
+    )("refuses to release a persisted fence without %s during %s and finishes with a complete provider", async (hook, mode) => {
+      const { home, fake } = await releasingFixture();
+      const cleanup = vi.fn(async ({ homeDir, recoveryReference }: Readonly<{
+        homeDir: string | undefined;
+        recoveryReference: { relativePath: string };
+      }>) => {
+        rmSync(join(backendPublicationDirectory(homeDir), recoveryReference.relativePath));
+      });
+      fake.driver.cleanupAbortedMaterial = cleanup;
+      const incomplete = withoutHook(fake.driver, hook);
+      const run = (active: BackendPublicationDriver) => (
+        mode === "resume" ? coordinator(home, active).resume() : coordinator(home, active).abort()
+      );
+
+      await expect(run(incomplete)).rejects.toMatchObject({ reason: "unexpected-state" });
+      expect(readBackendPublicationJournal(home)?.phase).toBe(mode === "resume" ? "releasing" : "abort-releasing");
+      expect(readBackendPublicationJournal(home)?.projects[0]?.fence).not.toBeNull();
+      expect(existsSync(materialFile(home))).toBe(true);
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+
+      await expect(run(fake.driver)).resolves.toMatchObject({ phase: mode === "resume" ? "completed" : "aborted" });
+      expect(fake.driver.releaseRemoteGuard).toHaveBeenCalledOnce();
+      expect(existsSync(materialFile(home))).toBe(mode === "resume");
+      expect(cleanup).toHaveBeenCalledTimes(mode === "resume" ? 0 : 1);
+    });
+
+    it.each(["guarded", "map-publishing", "map-published", "config-publishing", "config-published", "releasing", "released"] as const)(
+      "refuses to resume a %s journal that has no recorded fence",
+      async (phase) => {
+        const { home, fake } = await preparedFixture();
+        const retained = vi.fn(async () => undefined);
+        fake.driver.retainCompletedMaterial = retained;
+        rewriteJournal(home, (journal) => ({ ...journal, phase }));
+
+        await expect(coordinator(home, fake.driver).resume()).rejects.toMatchObject({ reason: "unexpected-state" });
+
+        expect(readBackendPublicationJournal(home)?.phase).toBe(phase);
+        expect(fake.calls).toEqual([]);
+        expect(fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+        expect(retained).not.toHaveBeenCalled();
+        await expect(coordinator(home, fake.driver).abort()).resolves.toMatchObject({ phase: "aborted" });
+      },
+    );
   });
 
   it("acquires and releases projects in canonical order", async () => {
@@ -2711,8 +2883,14 @@ describe("BackendPublicationCoordinator", () => {
         },
       ],
     }));
-    const skippedRecovered = await coordinator(skipped.home, skipped.fake.driver).recoverPending();
-    expect(skippedRecovered?.phase).toBe("completed");
+    await expect(coordinator(skipped.home, skipped.fake.driver).recoverPending())
+      .rejects.toMatchObject({ reason: "unexpected-state" });
+    expect(readBackendPublicationJournal(skipped.home)?.phase).toBe("releasing");
+    expect(skipped.fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+    const skippedRecovered = await coordinator(skipped.home, skipped.fake.driver)
+      .recoverPending({ disposition: "abort" });
+    expect(skippedRecovered?.phase).toBe("aborted");
+    expect(skipped.fake.driver.releaseRemoteGuard).toHaveBeenCalledOnce();
 
     const successor = await releasingFixture();
     rewriteJournal(successor.home, (journal) => ({
@@ -5298,41 +5476,13 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
   // fails with PrivateMutationLockContentionError. If either branch were
   // wired wrong -- token ignored, or untokened path silently skipping the
   // lock -- the corresponding assertion goes red on its own.
-
-  it("enterMaintenance: accepts a retained barrier token", async () => {
-    const home = makeHome();
-    const fake = makeDriver(material());
-    const active = coordinator(home, fake.driver);
-    const held = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.enterMaintenance({
-      publicationId: "maintenance-publication",
-      generationId: "maintenance-generation",
-      sourceSelectionSha256: "a".repeat(64),
-      queueEvidenceSha256: "b".repeat(64),
-      roster: [{
-        machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
-        queueCutoff: null,
-        evidenceSha256: "a".repeat(64),
-      }],
-    }, token));
-    expect(held.phase).toBe("maintenance-held");
-  });
-
-  it("enterMaintenance: still acquires the lock when no token is supplied", async () => {
-    const home = makeHome();
-    const fake = makeDriver(material());
-    const active = coordinator(home, fake.driver);
-    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.enterMaintenance({
-      publicationId: "maintenance-publication",
-      generationId: "maintenance-generation",
-      sourceSelectionSha256: "a".repeat(64),
-      queueEvidenceSha256: "b".repeat(64),
-      roster: [{
-        machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
-        queueCutoff: null,
-        evidenceSha256: "a".repeat(64),
-      }],
-    }))).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
-  });
+  //
+  // The refusal tests that follow prove the same token contract for every
+  // coordinator method rather than one exemplar, so a future divergence in a
+  // single method's forwarding is caught. Synchronous-origin tokens are
+  // refused at that same boundary: the synchronous wrapper releases the lock
+  // when its callback returns while async coordinator work can still resume
+  // afterwards.
 
   it("prepareMaintenanceSelection: accepts a retained barrier token", async () => {
     const home = makeHome();
@@ -5471,16 +5621,6 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
       .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
   });
 
-  it("recoverPending: accepts the (undefined, token) form -- the defaulted first parameter makes a bare (token) call a positional trap TypeScript rejects but nothing else pins", async () => {
-    const { home, fake } = await preparedFixture();
-    const active = coordinator(home, fake.driver);
-    const recovered = await withBackendPublicationAppendBarrierAsync(
-      home,
-      async (token) => active.recoverPending(undefined, token),
-    );
-    expect(recovered?.phase).toBe("completed");
-  });
-
   it("refuses a lock token whose home differs from the coordinator's home", async () => {
     const { home, fake } = await preparedFixture();
     const otherHome = makeHome();
@@ -5517,6 +5657,194 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
     expect(resumed.phase).toBe("completed");
   });
 
+  it("enterMaintenance: accepts a retained barrier token", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const active = coordinator(home, fake.driver);
+    const held = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.enterMaintenance({
+      publicationId: "maintenance-publication",
+      generationId: "maintenance-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{
+        machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+        queueCutoff: null,
+        evidenceSha256: "a".repeat(64),
+      }],
+    }, token));
+    expect(held.phase).toBe("maintenance-held");
+  });
+
+  it("enterMaintenance: still acquires the lock when no token is supplied", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.enterMaintenance({
+      publicationId: "maintenance-publication",
+      generationId: "maintenance-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{
+        machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+        queueCutoff: null,
+        evidenceSha256: "a".repeat(64),
+      }],
+    }))).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  // The refusal loops below prove the token contract for every coordinator
+  // method rather than one exemplar: each method forwards its token to the
+  // same private #locked, so per-method coverage catches a future divergence
+  // in one method's forwarding instead of assuming it stays identical.
+  async function seamMethodCases(): Promise<Array<{
+    readonly name: string;
+    readonly home: string;
+    readonly invoke: (token: BackendPublicationLockToken) => Promise<unknown>;
+  }>> {
+    const prepareHome = makeHome();
+    const prepareMaterial = material();
+    const prepareFake = makeDriver(prepareMaterial);
+    const prepareInput = inputFor(prepareMaterial);
+    const maintenanceHome = makeHome();
+    const maintenanceFake = makeDriver(material());
+    const held = await createMaintenanceState(maintenanceHome, maintenanceFake.driver, "maintenance-held");
+    const selectionHome = makeHome();
+    const selectionFake = makeDriver(material());
+    const preparedSelection = await createMaintenanceState(selectionHome, selectionFake.driver, "selection-prepared");
+    const publication = await preparedFixture();
+    const enterMaintenanceInput = {
+      publicationId: "maintenance-publication",
+      generationId: "maintenance-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{
+        machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
+        queueCutoff: null,
+        evidenceSha256: "a".repeat(64),
+      }],
+    };
+    return [
+      {
+        name: "enterMaintenance",
+        home: prepareHome,
+        invoke: (token) => coordinator(prepareHome, prepareFake.driver).enterMaintenance(enterMaintenanceInput, token),
+      },
+      {
+        name: "prepare",
+        home: prepareHome,
+        invoke: (token) => coordinator(prepareHome, prepareFake.driver).prepare(prepareInput, token),
+      },
+      {
+        name: "prepareMaintenanceSelection",
+        home: maintenanceHome,
+        invoke: (token) => coordinator(maintenanceHome, maintenanceFake.driver).prepareMaintenanceSelection({
+          expectedChecksumSha256: held.checksumSha256,
+          generationId: held.generationId,
+          targetBackend: "postgresql",
+          terminalEvidenceSha256: "c".repeat(64),
+        }, token),
+      },
+      {
+        name: "completeMaintenanceSelection",
+        home: selectionHome,
+        invoke: (token) => coordinator(selectionHome, selectionFake.driver).completeMaintenanceSelection({
+          expectedChecksumSha256: preparedSelection.checksumSha256,
+          generationId: preparedSelection.generationId,
+          terminalEvidenceSha256: preparedSelection.terminalEvidenceSha256!,
+        }, token),
+      },
+      {
+        name: "abortMaintenance",
+        home: maintenanceHome,
+        invoke: (token) => coordinator(maintenanceHome, maintenanceFake.driver).abortMaintenance({
+          expectedChecksumSha256: held.checksumSha256,
+          sourceSelectionSha256: held.sourceSelectionSha256,
+          abortEvidenceSha256: "c".repeat(64),
+        }, token),
+      },
+      {
+        name: "resume",
+        home: publication.home,
+        invoke: (token) => coordinator(publication.home, publication.fake.driver).resume(token),
+      },
+      {
+        name: "abort",
+        home: publication.home,
+        invoke: (token) => coordinator(publication.home, publication.fake.driver).abort(token),
+      },
+      {
+        name: "recoverPending",
+        home: publication.home,
+        invoke: (token) => coordinator(publication.home, publication.fake.driver).recoverPending({}, token),
+      },
+    ];
+  }
+
+  it("refuses a foreign-home token on every coordinator method", async () => {
+    const cases = await seamMethodCases();
+    const otherHome = makeHome();
+    await withBackendPublicationAppendBarrierAsync(otherHome, async (foreignToken) => {
+      for (const { name, invoke } of cases) {
+        await expect(
+          invoke(foreignToken),
+          name + " refuses a foreign-home token",
+        ).rejects.toMatchObject({
+          name: "BackendPublicationJournalError",
+          reason: "permit-mismatch",
+        });
+      }
+    });
+  });
+
+  it("refuses a revoked token on every coordinator method", async () => {
+    const cases = await seamMethodCases();
+    const revoked = new Map<string, BackendPublicationLockToken>();
+    for (const { home } of cases) {
+      if (revoked.has(home)) continue;
+      await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+        revoked.set(home, token);
+      });
+    }
+    for (const { name, home, invoke } of cases) {
+      await expect(
+        invoke(revoked.get(home)!),
+        name + " refuses a revoked token",
+      ).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "permit-mismatch",
+      });
+    }
+  });
+
+  it("refuses a synchronous-origin token on every coordinator method", async () => {
+    const cases = await seamMethodCases();
+    const pending: Array<Promise<unknown>> = [];
+    for (const { name, home, invoke } of cases) {
+      let escaped: Promise<unknown> | undefined;
+      expect(
+        () => withBackendPublicationConsumerLock(home, (token) => {
+          escaped = invoke(token);
+          void escaped.catch(() => undefined);
+          return escaped;
+        }, { allowUnresolved: true }),
+        name + " surfaces the synchronous wrapper refusal",
+      ).toThrowError(expect.objectContaining({
+        name: "BackendPublicationJournalError",
+        reason: "unsafe-storage",
+      }));
+      pending.push(escaped!);
+    }
+    for (const [index, promise] of pending.entries()) {
+      await expect(
+        promise,
+        cases[index]!.name + " refuses a synchronous-origin token",
+      ).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "permit-mismatch",
+      });
+    }
+  });
+
   it("refuses a synchronous-origin token before an async prepare can mutate after lock release", async () => {
     const home = makeHome();
     const input = material();
@@ -5548,6 +5876,37 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
       name: "BackendPublicationJournalError",
       reason: "permit-mismatch",
     });
+  });
+
+  it("recoverPending: accepts the (undefined, token) form", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    const recovered = await withBackendPublicationAppendBarrierAsync(
+      home,
+      async (token) => active.recoverPending(undefined, token),
+    );
+    expect(recovered?.phase).toBe("completed");
+  });
+
+  it.each([
+    "maintenance-held",
+    "selection-prepared",
+  ] as const)("refuses a tokened prepare against an active %s predecessor before effects", async (phase) => {
+    // maintenance-entering stays covered by the untokened test only: the
+    // append barrier itself refuses to open on an entering journal, so a
+    // retained-barrier token cannot exist in that state.
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const active = await createMaintenanceState(home, fake.driver, phase);
+    const journalBytes = readFileSync(backendPublicationJournalPath(home));
+    await expect(withBackendPublicationAppendBarrierAsync(home, async (token) => coordinator(home, fake.driver).prepare({
+      ...inputFor(input),
+      publicationId: "ordinary-refused",
+    }, token))).rejects.toMatchObject({ reason: "unresolved-publication" });
+    expect(readFileSync(backendPublicationJournalPath(home))).toEqual(journalBytes);
+    expect(readBackendMaintenanceJournal(home)).toEqual(active);
+    expect(fake.driver.observeLocalState).not.toHaveBeenCalled();
   });
 });
 

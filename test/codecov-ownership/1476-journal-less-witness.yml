@@ -1,0 +1,8 @@
+references: ["#1476"]
+rationale: >-
+  #1476 makes the PostgreSQL publication-witness classifier read the journal
+  with the consumer evidence rules, so an existing journal-less publication
+  directory is unresolvable rather than absent; both files keep their owners.
+pins:
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
+  - ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"]

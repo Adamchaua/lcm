@@ -28,7 +28,6 @@ jobs:
             exit 1
           fi
 
-          # Every PR head already passed exact-head CI and DCO. Sensitive heads
-          # also supplied authenticated exact-head Copilot dynamic execution.
-          # Those sources do not report on synthetic merge commits.
+          # Every PR head already passed exact-head CI and DCO. Those sources
+          # do not report on synthetic merge commits.
           echo "Trusted pull-request admission passed before merge-queue admission."

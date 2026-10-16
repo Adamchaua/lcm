@@ -273,6 +273,79 @@ describe("migration manifest protocol", () => {
     expect(parsed.checkpoints.map((item) => [item.domain, item.ordinal])).toEqual([["alpha", 0], ["zulu", 0]]);
   });
 
+  describe("destination system identifier", () => {
+    it("parses the legacy six-field witness without the identifier and the seven-field witness with it", () => {
+      const legacy = createValidManifest();
+      expect("systemIdentifier" in legacy.destination).toBe(false);
+      expect(parseMigrationManifest(JSON.stringify(legacy))).toEqual(legacy);
+
+      const recorded = createMigrationManifest({
+        generationId: "generation-1",
+        source: witness("sqlite", CREATED_AT),
+        destination: { ...witness("postgresql", UPDATED_AT), systemIdentifier: "7123456789012345678" },
+        parentGenerationId: null,
+        preservedSourceGenerationId: "source-generation-1",
+        createdAt: CREATED_AT,
+      });
+      expect(recorded.destination.systemIdentifier).toBe("7123456789012345678");
+      expect(parseMigrationManifest(JSON.stringify(recorded))).toEqual(recorded);
+      expect(recorded.checksumSha256).not.toBe(legacy.checksumSha256);
+    });
+
+    it.each(["0", "18446744073709551615"])("accepts the canonical decimal %s", (systemIdentifier) => {
+      const manifest = createMigrationManifest({
+        generationId: "generation-1",
+        source: witness("sqlite", CREATED_AT),
+        destination: { ...witness("postgresql", UPDATED_AT), systemIdentifier },
+        parentGenerationId: null,
+        preservedSourceGenerationId: "source-generation-1",
+        createdAt: CREATED_AT,
+      });
+      expect(manifest.destination.systemIdentifier).toBe(systemIdentifier);
+    });
+
+    it.each([
+      ["a hexadecimal string", "0x1f"],
+      ["a leading zero", "01"],
+      ["a sign", "+7"],
+      ["an empty string", ""],
+      ["more than twenty digits", "1".repeat(21)],
+      ["a number", 7123456789],
+      ["undefined", undefined],
+      ["null", null],
+    ])("rejects %s as the identifier", (_name, systemIdentifier) => {
+      const destination = { ...witness("postgresql", UPDATED_AT), systemIdentifier } as unknown as MigrationStorageWitness;
+      expectProtocolError(() => createMigrationManifest({
+        generationId: "generation-1",
+        source: witness("sqlite", CREATED_AT),
+        destination,
+        parentGenerationId: null,
+        preservedSourceGenerationId: "source-generation-1",
+        createdAt: CREATED_AT,
+      }), "invalid-input");
+      const manifest = createValidManifest();
+      // An undefined member is not representable in a persisted (JSON) manifest.
+      if (systemIdentifier !== undefined) {
+        expectProtocolError(
+          () => parseMigrationManifest(sealManifest({ ...manifest, destination })),
+          "malformed-manifest",
+        );
+      }
+    });
+
+    it("rejects the identifier on a sqlite witness and any other extra key", () => {
+      const manifest = createValidManifest();
+      expectProtocolError(() => parseMigrationManifest(sealManifest({
+        ...manifest,
+        source: { ...witness("sqlite", CREATED_AT), systemIdentifier: "7123456789" },
+      })), "malformed-manifest");
+      expectProtocolError(() => parseMigrationManifest(sealManifest({
+        ...manifest,
+        destination: { ...witness("postgresql", UPDATED_AT), systemIdentifier: "7", extra: true },
+      })), "malformed-manifest");
+    });
+  });
+
   it.each([
     ["unsafe effect identifier", { effectId: "effect/unsafe" }],
     ["unsafe report identifier", { reportId: "report unsafe" }],

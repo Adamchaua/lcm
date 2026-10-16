@@ -2,4 +2,4 @@
 "@donadiosolutions/lcm": patch
 ---
 
-Require authenticated exact-head Copilot dynamic-run evidence before external admission accepts pull requests that change CI, build, package, production, or trusted test-harness inputs. Managed Copilot reruns now wake admission and revoke stale success before reevaluation.
+Bind external admission to authenticated exact-head CI and DCO evidence, including the canonical pull-request CI run, before accepting a pull request.

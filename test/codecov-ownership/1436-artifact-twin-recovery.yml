@@ -1,0 +1,7 @@
+references: ["#1436", "PR #1452"]
+rationale: >-
+  The activation artifact store recovers the post-link hard-link twin and
+  classifies unauthenticatable multi-link reads; the store stays in the
+  migration cutover owner.
+pins:
+  - ["src/migration/activation-artifact-store.ts", "unit-migration-cutover"]

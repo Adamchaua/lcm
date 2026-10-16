@@ -1,0 +1,7 @@
+references: ["#1416"]
+rationale: >-
+  #1416 re-runs the selected schema verifier inside the PostgreSQL export
+  snapshot so readiness and every export read share one MVCC snapshot;
+  portable-source.ts keeps its established owner.
+pins:
+  - ["src/storage/postgresql/portable-source.ts", "integration-postgresql-portable"]

@@ -566,10 +566,19 @@ Size `poolMax` against the cluster connection limit after reserving capacity for
 administration, migrations, monitoring, and other services. Multiply the value
 by the maximum number of simultaneously running LCM daemon processes; do not
 treat it as a host-wide total. `connectionTimeoutMs` bounds pool acquisition and
-new connections, `idleTimeoutMs` retires unused pooled clients, and
-`statementTimeoutMs` also supplies the idle-in-transaction session bound. Keep
-all three finite and below upstream load-balancer or maintenance timeouts so LCM
-fails with a sanitized storage error first.
+new connections, and `idleTimeoutMs` retires unused pooled clients.
+`statementTimeoutMs` bounds one query's execution time on every pooled
+connection. It is deliberately separate from `snapshotIdleTimeoutMs`, which
+bounds only the longest idle gap inside a portable transfer's long-lived
+read-only snapshot transaction (`SET LOCAL`-scoped, reverted on
+commit/rollback): PostgreSQL resets that timer on every statement the
+snapshot issues, so it caps an abandoned or stalled snapshot, not total
+transfer duration, and previously derived it from `statementTimeoutMs`,
+which killed healthy snapshots for sitting idle exactly as designed. Keep all
+four finite and below upstream load-balancer or maintenance timeouts so LCM
+fails with a sanitized storage error first. See
+[Configuration](../../../../docs/configuration.md) for the full
+`snapshotIdleTimeoutMs` autovacuum/xmin and pool-capacity guidance.
 
 To rotate the managed CA, download the replacement from DigitalOcean's
 Connection Details page, write it atomically to a new private regular file,

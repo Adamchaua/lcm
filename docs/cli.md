@@ -36,20 +36,25 @@ Aliases of the same selected project are processed once. This does not
 enumerate every project hosted by the PostgreSQL server. With
 `storage.backend` set to `postgresql`, an unbound local project is still
 enumerated rather than aborting the run, and every other selected project
-is still processed. `lcm compact --all` and `lcm export --all` report it
-as that project's own failure and name the `lcm project create` or
-`lcm project link <project-id>` remedy; `lcm promote --all` reports a
-generic per-project failure naming the project path, but not the remedy.
-All three exit with status 1. `lcm import --all` is session-driven rather
+is still processed. `lcm compact --all`, `lcm export --all`, and
+`lcm promote --all` report it as that project's own failure, naming the
+project path and the `lcm project create` or `lcm project link <project-id>`
+remedy, and exit with status 1. `lcm import --all` is session-driven rather
 than project-driven: it fails that project's sessions at ingest, counts
-them in its failed total, and exits 1, but it prints per-session detail
-only under `--verbose` and never names the project; a project with no
-sessions to import is never opened, so nothing is reported for it and the
-command can exit 0. This condition is specific to the PostgreSQL backend;
-SQLite has no binding to check. `lcm import --all --dry-run` contacts no
+them in its failed total, prints one remedy line naming the project (once
+per project across providers), and exits 1; per-session detail prints only
+under `--verbose`. A project with
+no sessions to import is never opened, so nothing is reported for it and
+the command can exit 0. This condition is specific to the PostgreSQL
+backend; SQLite has no binding to check. `lcm import --all --dry-run` contacts no
 project storage, so a clean dry-run never guarantees the following import
 will succeed; this is true of any project it cannot open, not only an
 unbound one.
+
+A failed export, direct or `--all`, prints a failure line of the form
+`  <project path>: <diagnostic>` on stderr. `lcm export --all` ends with a
+summary that reports the entries exported and, when any project failed, how
+many projects could not be exported.
 
 `lcm promote --all` processes the canonical paths from those bindings even when
 no local `meta.json` exists. `--verbose` reports each project's counts and
@@ -66,13 +71,19 @@ Unbound-project errors explain how to run `lcm project create` or
 remedies for these known failures are fixed messages; database diagnostics,
 connection strings, and mutable exception text are not printed. Unknown
 failures retain a generic diagnostic and exit with status 1.
+When enumeration succeeds but every selected project fails to open,
+`lcm compact --all` reports "No sessions were compacted because N selected
+projects failed"; "project discovery failed" is reserved for a failed
+enumeration itself.
 
 `lcm export` without `--output` writes only the version-1 promoted-knowledge
 JSON document to stdout. Progress and status messages go to stderr. With
 `--all`, one file is written per project using a path-derived unique suffix;
 `--all --output <file>` is rejected because one file cannot represent multiple
 project exports. Any project failure makes the command exit with status 1,
-including partial exports; files already completed remain available. Successful
+including partial exports; files already completed remain available. A direct
+export failure prints the same project path and diagnostic failure line as
+`--all`. Successful
 commands exit with status 0. Native session import also exits with status 1
 when any session fails.
 
@@ -115,6 +126,23 @@ In `lcm store`, `--tag` and `--tags` are repeatable single-tag aliases. This is
 different from `lcm export --tags`, which remains a comma-separated filter,
 for example `lcm export --tags decision,architecture`.
 
+`lcm store` makes the same deduplication decision as `lcm promote` and
+knowledge import. When the content already exists as an active memory in
+scope, the command merges into that memory instead of adding a second one:
+the printed `id` is the existing memory's id, its tags are unioned with the
+new ones, and its confidence stays at the maximum of the two. Repeating the
+same `lcm store` therefore yields one memory, even when the content carries
+no searchable lexical terms (for example, punctuation only) that ranked
+search alone could not recall: an exact-content lookup runs as a fallback on
+every backend. Content that does not match returns a fresh id. On PostgreSQL
+the scope is every active memory of the bound project, and the store takes
+the project's deduplication lock for the duration of its write, so it takes
+turns with a concurrent `lcm promote` or knowledge import into that same
+project. On SQLite the decision is scoped to memories with the same recorded
+origin, which for `lcm store` is `manual` unless the request supplies
+a non-empty string `metadata.projectId`; an empty or non-string value is
+treated as `manual`.
+
 When SQLite is selected, the stored text must not contain an embedded NUL
 character (`U+0000`). The store operation rejects that input before writing;
 JSON-escaped NUL characters in tags remain supported. A selected legacy
@@ -145,6 +173,15 @@ client for each read:
 | `lcm grep <query>` | Search messages and summaries by exact text or regular expression; optional inclusive `--since` accepts `YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm)` with normalized UTC years 0001-9999, and malformed or out-of-range values return HTTP 400 |
 | `lcm describe <nodeId>` | Read summary or stored-memory metadata |
 | `lcm expand <nodeId>` | Traverse a summary's DAG links and list its child summaries as short snippets |
+
+For `lcm grep --mode regex`, snippet handling depends on the selected storage
+backend. For each matching row, the default SQLite backend applies built-in
+credential redaction to the complete row before deriving the returned snippet.
+If redaction removes the requested match, the snippet is exactly `[REDACTED]`.
+SQLite then limits the snippet to 512 Unicode code points, including its
+truncation marker. PostgreSQL separately limits regex matches to 512 characters
+without read-time credential redaction or a marker. Exact-text/full-text snippets
+are unchanged.
 
 When `--since` is supplied, its value is forwarded to the daemon exactly as
 provided. An empty or whitespace-only value is therefore invalid and returns

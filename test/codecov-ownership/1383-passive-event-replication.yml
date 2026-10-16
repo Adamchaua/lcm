@@ -1,0 +1,14 @@
+references: ["#1383", "PR #1408"]
+rationale: >-
+  Adds the daemon-owned passive-event replication pass beside the processor
+  that drives it, so both stay in the passive-events owner; the sweep-driven
+  pass, its gates and operator counters are daemon-events-owned. Replication
+  construction and shutdown in the server stay daemon-core-owned, the
+  background replication status block stays route-owned, and the per-phase
+  admission of the worker keeps its PostgreSQL passive-events owner.
+pins:
+  - ["src/daemon/passive-event-replication-pass.ts", "unit-daemon-events"]
+  - ["src/daemon/passive-event-processor.ts", "unit-daemon-events"]
+  - ["src/daemon/passive-event-replication.ts", "integration-postgresql-passive-events"]
+  - ["src/daemon/server.ts", "unit-daemon-core"]
+  - ["src/daemon/routes/status.ts", "unit-daemon-routes"]
