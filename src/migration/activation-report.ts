@@ -106,6 +106,10 @@ export type MigrationActivationReportBody = Readonly<{
   publicationId: string;
   /** Store key of the recovery-material record (activation-artifact-store.ts). */
   identityDigest: string;
+  /** The pending (activating) manifest's revision as read immediately
+   * before completeMigrationEffect, never the successor's: the successor
+   * revision only exists after the report is already written, so carrying
+   * it would make the body non-reproducible (plan-v7.1 amendment 2). */
   manifestRevisionAtComplete: number;
   /** computeMigrationProjectMapWitnessSha256 in mode "post-publication" at
    * S16's authoritative readback (plan-v6 section 2). */
@@ -434,7 +438,11 @@ function reconcileExisting(
 
 /**
  * Durably persist a report under its own identity, or reuse an existing
- * byte-identical one. The report is strictly re-parsed first and its body
+ * byte-identical one. An S16 retry that finds a stored report for this
+ * publication already authenticating reuses those bytes (plan-v7.1
+ * amendment 2): the body is reproducible, so the recomputed report is the
+ * same identity and persist reports "reused" without rewriting. The report
+ * is strictly re-parsed first and its body
  * must name generationId (the path is derived from the caller's generation
  * id, and a report filed under another generation's directory would be
  * read back as evidence about the wrong generation).
