@@ -7,6 +7,9 @@ rationale: >-
   cutover owner alongside the forward path they reverse; no topology change.
   src/migration/activation-evidence-store.ts persists the activation epoch,
   attempt and witness records those modules read back, in the same owner.
+  src/migration/rollback-session.ts (the production fenced PostgreSQL session)
+  and src/migration/rollback-inputs.ts (input derivation from durable state)
+  complete the same lifecycle and stay in that owner.
   src/migration/generation-binding-store.ts (binding resolver and shared
   scoped-store primitives) and src/migration/verify-generation.ts (exported
   census and delta builders) are materially changed and keep their existing
@@ -17,7 +20,9 @@ pins:
   - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-eligibility.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-inputs.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-install.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-session.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-sidecars.ts", "unit-migration-cutover"]
   - ["src/migration/rollback.ts", "unit-migration-cutover"]
   - ["src/migration/verify-generation.ts", "unit-migration-cutover"]

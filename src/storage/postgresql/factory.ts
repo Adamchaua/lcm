@@ -242,7 +242,7 @@ function safeFactoryError(
     : initializationError(projectId, operation);
 }
 
-function connectionSettings(
+export function connectionSettings(
   config: ResolvedPostgreSqlConfig,
 ): PostgreSqlConnectionSettings {
   return {
