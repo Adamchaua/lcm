@@ -66,6 +66,7 @@ import {
   openPrivateDirectoryIfExists,
   readBoundedRegularFileWithStat,
 } from "../security-files.js";
+import { parseDaemonConfig, resolveDaemonConfigEnv, type ResolvedStorageConfig } from "../daemon/config.js";
 import { canonicalJson, canonicalSha256, sha256 } from "../storage/portable-record.js";
 import type { PortableRecordStream } from "../storage/portable-record-stream.js";
 import type { PortableProjectIdentity } from "../storage/portable-record-stream.js";
@@ -73,14 +74,17 @@ import {
   BackendPublicationJournalError,
   backendPublicationCanonicalSha256,
   captureBackendPublicationState,
+  readAuthenticatedBackendPublicationMaterial,
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
+  withBackendPublicationConsumerLock,
   withBackendPublicationConsumerLockAsync,
   withBackendPublicationAppendBarrierAsync,
   BackendPublicationCoordinator,
   type BackendPublicationJournal,
   type BackendPublicationLockToken,
   type BackendPublicationRecoveryFile,
+  type BackendPublicationRecoveryMaterial,
   type BackendMaintenanceRosterEntry,
   type BackendMaintenanceJournal,
 } from "../storage/backend-publication.js";
@@ -936,7 +940,7 @@ function withDefaultDependencies(
     recordSelectionBinding: deps.recordSelectionBinding ?? recordMigrationSelectionBinding,
     recordWitnessBinding: deps.recordWitnessBinding ?? recordMigrationWitnessBinding,
     resolveAuthoritativeContext: deps.resolveAuthoritativeContext ?? resolveRollbackAuthoritativeContext,
-    readProjectMap: deps.readProjectMap ?? readProjectMapSnapshot,
+    readProjectMap: deps.readProjectMap ?? readProjectMapForRollback,
     readRetainedMaterial: deps.readRetainedMaterial ?? readRetainedBackendPublicationMaterial,
     composePublication: deps.composePublication ?? composeBackendPublicationMaterial,
     recordActivationWitness: deps.recordActivationWitness ?? recordMigrationActivationWitness,
@@ -953,6 +957,58 @@ function withDefaultDependencies(
  * its remote id) -- and either one alone being wrong refuses. An unreadable
  * map refuses too. A local-only entry (no remoteProjectId) never blocks.
  */
+export type OwnPublicationSource = Readonly<{ storage: ResolvedStorageConfig; projectMap: ProjectMap }>;
+
+function decodeRecoveryFile(file: BackendPublicationRecoveryFile): string {
+  if (file.presence !== "present") {
+    throw new RollbackOrchestrationError("unexpected-state", "the rollback's publication sealed no source file where one is required");
+  }
+  return new TextDecoder("utf-8", { fatal: true }).decode(file.content);
+}
+
+/**
+ * The configuration and project map as they were before this rollback's own publication, read from the
+ * authenticated recovery material that publication sealed; null when no publication of this rollback is in the
+ * live slot (or it was aborted, which restored the files). Once the publication has begun the live files and the
+ * consumer reads are the rollback's in-flight state -- the config selects sqlite, the project is unbound, and the
+ * consumer read refuses an unresolved publication -- so every re-run reads its inputs from this sealed source.
+ */
+function readOwnPublicationMaterial(homeDir: string, publicationId: string): BackendPublicationRecoveryMaterial | null {
+  // While maintenance holds the live slot no publication journal is readable, and none of this rollback's exists.
+  if (readBackendMaintenanceJournal(homeDir) !== null) return null;
+  const journal = readBackendPublicationJournal(homeDir);
+  if (journal === null || journal.publicationId !== publicationId || journal.phase === "aborted") return null;
+  return readAuthenticatedBackendPublicationMaterial(journal, homeDir);
+}
+
+/** The sealed pre-rollback project map of the rollback's own publication, or null when it is not in the live slot. */
+function readOwnPublicationProjectMap(homeDir: string, publicationId: string): ProjectMap | null {
+  const material = readOwnPublicationMaterial(homeDir, publicationId);
+  return material === null ? null : parseProjectMap(decodeRecoveryFile(material.source.projectMap));
+}
+
+/** The sealed pre-rollback configuration and project map of the rollback's own publication, or null. */
+export function readOwnPublicationSourceFromMaterial(homeDir: string, publicationId: string): OwnPublicationSource | null {
+  const material = readOwnPublicationMaterial(homeDir, publicationId);
+  if (material === null) return null;
+  return {
+    storage: parseDaemonConfig(decodeRecoveryFile(material.source.config), undefined, resolveDaemonConfigEnv()).storage,
+    projectMap: parseProjectMap(decodeRecoveryFile(material.source.projectMap)),
+  };
+}
+
+/**
+ * The project map as a rollback reads it: while a rollback is underway the publication slot is held or in flight
+ * (the very states a re-run recovers), and the consumer read refuses any unresolved publication, so this reader
+ * admits them. It reads the live map, never writes it.
+ */
+export const readProjectMapForRollback: typeof readProjectMapSnapshot = (homeDir, publicationLockToken) =>
+  withBackendPublicationConsumerLock(
+    homeDir,
+    (token) => readProjectMapSnapshot(homeDir, token),
+    { allowUnresolved: true, lockToken: publicationLockToken },
+  );
+
 function assertCoveredProjectIsSoleRemoteBinding(
   deps: Readonly<ResolvedRollbackDependencies>,
   input: Readonly<RunMigrationRollbackInput>,
@@ -960,7 +1016,8 @@ function assertCoveredProjectIsSoleRemoteBinding(
 ): string {
   let map: ReturnType<typeof readProjectMapSnapshot>;
   try {
-    map = deps.readProjectMap(input.homeDir, token);
+    map = readOwnPublicationProjectMap(input.homeDir, deriveRollbackPublicationId(input.generationId))
+      ?? deps.readProjectMap(input.homeDir, token);
   } catch (error) {
     throw new RollbackOrchestrationError(
       "not-eligible",
@@ -972,7 +1029,8 @@ function assertCoveredProjectIsSoleRemoteBinding(
   if (covered?.remoteProjectId === undefined) {
     throw new RollbackOrchestrationError(
       "not-eligible",
-      "covered-project-unbound: the project map does not bind the covered project to PostgreSQL",
+      "covered-project-unbound: the project map does not bind the covered project to PostgreSQL; a generation that never "
+        + "activated is left with lcm migration abort",
     );
   }
   if (input.projectIdentity.scope === "shared" && covered.remoteProjectId !== input.projectIdentity.projectId) {

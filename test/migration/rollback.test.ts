@@ -28,7 +28,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import {
   openSqlitePortableSource,
@@ -89,6 +89,7 @@ import {
   deriveRollbackAuthorityArtifactId,
   readRollbackAuthorityArtifact,
   readBackendPublicationOperabilityFact,
+  readOwnPublicationSourceFromMaterial,
   type RunMigrationRollbackDependencies,
   type RollbackFencedSession,
   type MigrationSelectionBindingRecorder,
@@ -2726,7 +2727,7 @@ describe("runMigrationRollback: only the covered project may be remotely bound (
     manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-unbound");
     for (const map of [{ "local-1": localOnly }, {}, { "other-hash": bound("02") }]) {
       await expect(runMigrationRollback(RUN(homeDir, "gen-unbound"), deps(homeDir, () => map)))
-        .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("covered-project-unbound") });
+        .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringMatching(/covered-project-unbound.*lcm migration abort/u) });
     }
     expectNothingDurable(homeDir, "gen-unbound");
   });
@@ -3131,6 +3132,57 @@ describe("runMigrationRollback: the publication source and the coordinator's pub
         return session;
       },
     }))).rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("not the rollback witness") });
+  });
+});
+
+
+describe("readOwnPublicationSourceFromMaterial: the rollback's sealed pre-publication source", () => {
+  const ID = deriveRollbackPublicationId("gen-own-source");
+  const projects = [{ localProjectId: FIXTURE_LOCAL_PROJECT_ID, remoteProjectId: FIXTURE_REMOTE_PROJECT_ID, evidenceSha256: "d".repeat(64) }];
+  const coordinatorOver = (homeDir: string, material = rollbackPublicationMaterial()) =>
+    new BackendPublicationCoordinator({ homeDir, driver: workingPublicationDriver(material) });
+  const prepared = async (homeDir: string, publicationId: string, material = rollbackPublicationMaterial()) => {
+    const coordinator = coordinatorOver(homeDir, material);
+    await coordinator.prepare({ publicationId, sourceBackend: "postgresql", targetBackend: "sqlite", material, projects });
+    return coordinator;
+  };
+  beforeEach(() => {
+    vi.stubEnv("LCM_POSTGRES_URL", "postgresql://user:secret@example/db");
+    const caFile = join(tempHome(), "ca.pem");
+    writeFileSync(caFile, "-----BEGIN CERTIFICATE-----\n", { mode: 0o600 });
+    vi.stubEnv("LCM_POSTGRES_CA_FILE", caFile);
+    vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE", "lcm_owner");
+  });
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it("is null when the slot holds no publication journal", () => {
+    expect(readOwnPublicationSourceFromMaterial(tempHome(), ID)).toBeNull();
+  });
+
+  it("reads the sealed source configuration and project map of its own in-flight publication", async () => {
+    const homeDir = tempHome();
+    await prepared(homeDir, ID);
+    // The live files could say anything now; only the sealed material is read.
+    const source = readOwnPublicationSourceFromMaterial(homeDir, ID)!;
+    expect(source.storage).toMatchObject({ backend: "postgresql", postgresql: { url: "postgresql://user:secret@example/db", caFile: expect.stringContaining("ca.pem") } });
+    expect(source.projectMap[FIXTURE_LOCAL_PROJECT_ID]).toMatchObject({ remoteProjectId: FIXTURE_REMOTE_PROJECT_ID });
+  });
+
+  it("is null for another publication's journal, and once its own publication was aborted", async () => {
+    const homeDir = tempHome();
+    const coordinator = await prepared(homeDir, ID);
+    expect(readOwnPublicationSourceFromMaterial(homeDir, deriveRollbackPublicationId("another-generation"))).toBeNull();
+    await coordinator.recoverPending({ disposition: "abort" });
+    expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "aborted" });
+    expect(readOwnPublicationSourceFromMaterial(homeDir, ID)).toBeNull();
+  });
+
+  it("refuses a sealed publication whose source project map was absent", async () => {
+    const homeDir = tempHome();
+    const material = rollbackPublicationMaterial();
+    await prepared(homeDir, ID, { ...material, source: { ...material.source, projectMap: { presence: "absent" } } });
+    expect(() => readOwnPublicationSourceFromMaterial(homeDir, ID))
+      .toThrow(expect.objectContaining({ reason: "unexpected-state", message: expect.stringContaining("sealed no source file") }));
   });
 });
 

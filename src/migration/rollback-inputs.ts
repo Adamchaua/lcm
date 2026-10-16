@@ -24,7 +24,11 @@ import {
 } from "./rollback-session.js";
 import {
   RollbackOrchestrationError,
+  deriveRollbackPublicationId,
+  readOwnPublicationSourceFromMaterial,
+  readProjectMapForRollback,
   runMigrationRollback,
+  type OwnPublicationSource,
   type RunMigrationRollbackDependencies,
   type RunMigrationRollbackInput,
   type RunMigrationRollbackOutcome,
@@ -88,6 +92,13 @@ export interface ResolveRollbackContextDependencies {
   readStorageConfig(homeDir: string): ResolvedStorageConfig;
   readProjectMap: typeof readProjectMapSnapshot;
   resolveIdentity: typeof resolveStorageIdentityContext;
+  /**
+   * The configuration and project map as they were before this rollback's own publication, read from the
+   * publication's authenticated recovery material, or null when no such publication is in the live slot.
+   * Once the rollback's publication has begun, the live files and the consumer read are the rollback's
+   * in-flight state, so a re-run resolves its inputs from the material that publication sealed.
+   */
+  readOwnPublicationSource(homeDir: string, publicationId: string): OwnPublicationSource | null;
 }
 
 export const DEFAULT_RESOLVE_ROLLBACK_CONTEXT_DEPENDENCIES: ResolveRollbackContextDependencies = {
@@ -95,8 +106,9 @@ export const DEFAULT_RESOLVE_ROLLBACK_CONTEXT_DEPENDENCIES: ResolveRollbackConte
   inspectSnapshot: inspectAuthenticatedSqliteMigrationSnapshot,
   requireMachineIdentity,
   readStorageConfig: (homeDir) => readDaemonConfigSnapshot(join(homeDir, ".lcm", "config.json")).config.storage,
-  readProjectMap: readProjectMapSnapshot,
+  readProjectMap: readProjectMapForRollback,
   resolveIdentity: resolveStorageIdentityContext,
+  readOwnPublicationSource: readOwnPublicationSourceFromMaterial,
 };
 
 export async function resolveMigrationRollbackContext(
@@ -123,18 +135,27 @@ export async function resolveMigrationRollbackContext(
     evidenceSha256: artifact.sourceByteWitnessSha256,
   }];
 
-  const storage = dependencies.readStorageConfig(homeDir);
+  const own = dependencies.readOwnPublicationSource(homeDir, deriveRollbackPublicationId(generationId));
+  const storage = own === null ? dependencies.readStorageConfig(homeDir) : own.storage;
   if (storage.backend !== "postgresql") {
     throw new RollbackInputResolutionError(
       "backend-not-postgresql",
-      "rollback unwinds an activated PostgreSQL backend, but the configuration selects another",
+      "rollback unwinds an activated PostgreSQL backend, but the configuration selects another; a generation that "
+        + "never activated is left with lcm migration abort",
     );
   }
-  const entry = dependencies.readProjectMap(homeDir)[authority.physicalProjectId];
+  const entry = (own === null ? dependencies.readProjectMap(homeDir) : own.projectMap)[authority.physicalProjectId];
   if (entry?.remoteProjectId === undefined) {
+    // Owner decision (against coordinator-seam-FROZEN.md section 12's "answer rather than defer to abort"): a
+    // generation that never activated has no project-map binding, because activation's publication is what
+    // binds the project, and no durable local source holds its PostgreSQL id before that (copy-source.ts
+    // receives the id from the caller and does not persist it, and the PostgreSQL identity repository is
+    // circular for a lease that needs the id first). Rollback therefore cannot start for it; the operator
+    // leaves through "lcm migration abort", which the protocol permits from planned through verified.
     throw new RollbackInputResolutionError(
       "project-unbound",
-      "the project has no PostgreSQL binding in the project map; there is nothing to roll back from",
+      "the project has no PostgreSQL binding in the project map, so this generation never activated and there is "
+        + "nothing to roll back from; run lcm migration abort to leave it",
     );
   }
   const remoteProjectId = entry.remoteProjectId;

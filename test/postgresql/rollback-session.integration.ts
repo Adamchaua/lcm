@@ -1,30 +1,52 @@
 /**
- * The production rollback session (src/migration/rollback-session.ts) against a
- * real PostgreSQL 18 database: a real lease on lcm.fenced_leases, real
- * read-only snapshots, the real census and export. Quiescence (a local
- * append-barrier concern with its own tests) is the one collaborator
- * satisfied by a stand-in; everything on the PostgreSQL side is real.
+ * The production rollback against a real PostgreSQL 18 database: a real
+ * lease on lcm.fenced_leases, real read-only snapshots, the real census and
+ * export, and the REAL coordinator over the production driver and the
+ * PostgreSQL remote guard. Quiescence (a local append-barrier concern with
+ * its own tests) is the one collaborator satisfied by a stand-in; the
+ * resolved context (the preserved-source snapshot evidence and machine
+ * identity) is supplied, since those belong to the forward migration.
  *
- * The orchestration (runMigrationRollback) runs with the real session, a real
- * coordinator and a real manifest store, so the cases below prove the
- * behaviours end to end: pre-write on an unchanged destination, post-write
- * after a racing post-epoch write, a lost fence mid-window, and the
- * build-versus-revalidation equality of plan-v3.1 amendment A6.
+ * The cases drive runMigrationRollbackFromHome, the entry #627 will call, over
+ * an installation whose activation was itself published through the real
+ * coordinator (config.json and the project map are real files, the retained
+ * activation publication is read back, the evidence and binding stores hold
+ * the activation's records). They prove: pre-write, post-write and
+ * unactivated rollbacks complete and publish sqlite; replay admission then
+ * routes to sqlite from the selection binding; the released activation lease
+ * row is replaced while an unreleased one refuses; a crash after the
+ * coordinator's prepare and after its config publish resume through
+ * coordinator.resume; two remotely bound projects refuse; and the
+ * build-versus-revalidation equality of plan-v3.1 amendments A6 and A17.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
-  BackendPublicationCoordinator,
   readBackendMaintenanceJournal,
-  type BackendPublicationDriver,
+  readBackendPublicationJournal,
 } from "../../src/storage/backend-publication.js";
+import { createBackendPublicationCoordinator } from "../../src/storage/backend-publication-driver.js";
+import { composeBackendPublicationMaterial } from "../../src/storage/backend-publication-material.js";
+import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage/postgresql/publication-remote-guard.js";
+import { configPath } from "../../src/runtime-paths.js";
 import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
-import { resolveMigrationWitnessBindings } from "../../src/migration/generation-binding-store.js";
+import {
+  recordMigrationActivationAttempt,
+  recordMigrationActivationEpoch,
+  recordMigrationActivationWitness,
+} from "../../src/migration/activation-evidence-store.js";
+import {
+  recordMigrationSelectionBinding,
+  recordMigrationWitnessBinding,
+  resolveMigrationWitnessBindings,
+} from "../../src/migration/generation-binding-store.js";
+import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
 import {
   beginMigrationEffect,
   completeMigrationEffect,
@@ -32,11 +54,12 @@ import {
   type MigrationManifest,
   type MigrationStorageWitness,
 } from "../../src/migration/protocol.js";
+import { deriveRollbackPublicationId, runMigrationRollback } from "../../src/migration/rollback.js";
 import {
-  deriveRollbackPublicationId,
-  runMigrationRollback,
-  type RunMigrationRollbackInput,
-} from "../../src/migration/rollback.js";
+  DEFAULT_RESOLVE_ROLLBACK_CONTEXT_DEPENDENCIES,
+  runMigrationRollbackFromHome,
+  type RollbackEntryDependencies,
+} from "../../src/migration/rollback-inputs.js";
 import {
   DEFAULT_ROLLBACK_SESSION_DEPENDENCIES,
   RollbackSessionError,
@@ -60,7 +83,8 @@ beforeAll(assertHarnessReady);
 const fixture = PORTABLE_POSTGRESQL_FIXTURE;
 const factoryContext = { domain: "factory", operation: "rollbackSessionIntegration" } as const;
 const capturedAt = "2026-09-06T00:00:00.000Z";
-const ROSTER = [{ machineId: fixture.machineId, queueCutoff: null, evidenceSha256: "7".repeat(64) }];
+const ACTIVATION_PUBLICATION_ID = "activation-publication";
+const ACTIVATION_EVIDENCE_SHA256 = "a".repeat(64);
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -72,14 +96,6 @@ function tempHome(): string {
   return dir;
 }
 
-function unexpectedDriver(): BackendPublicationDriver {
-  const unexpected = async (): Promise<never> => { throw new Error("rollback does not publish project-map or config here"); };
-  return {
-    observeLocalState: unexpected, publishProjectMap: unexpected, publishConfig: unexpected,
-    restoreConfig: unexpected, restoreProjectMap: unexpected,
-  };
-}
-
 function storageWitness(backend: "sqlite" | "postgresql", seed: string): MigrationStorageWitness {
   return {
     version: 1, backend, identitySha256: seed.repeat(64).slice(0, 64), schemaSha256: "2".repeat(64),
@@ -88,9 +104,14 @@ function storageWitness(backend: "sqlite" | "postgresql", seed: string): Migrati
 }
 
 /** A manifest at phase "verified", reached through the ordinary forward effect sequence. */
-function manifestAtVerified(store: MigrationManifestStore, generationId: string): MigrationManifest {
+function manifestAtVerified(
+  store: MigrationManifestStore,
+  generationId: string,
+  destinationIdentitySha256?: string,
+): MigrationManifest {
   let m = store.create(createMigrationManifest({
-    generationId, source: storageWitness("sqlite", "1"), destination: storageWitness("postgresql", "4"),
+    generationId, source: storageWitness("sqlite", "1"),
+    destination: { ...storageWitness("postgresql", "4"), ...(destinationIdentitySha256 === undefined ? {} : { identitySha256: destinationIdentitySha256 }) },
     parentGenerationId: null, preservedSourceGenerationId: generationId, createdAt: capturedAt,
   }));
   const step = (kind: string, extra: Record<string, unknown> = {}) => {
@@ -144,15 +165,6 @@ async function scan(database: PostgreSqlTestDatabase) {
   }
 }
 
-/** The activation the rollback unwinds, built from a REAL baseline scan of this database. */
-async function activationFor(database: PostgreSqlTestDatabase, generationId: string) {
-  const baseline = await scan(database);
-  const destinationIdentity = await captureDestinationIdentity(database.runtime, fixture.projectId);
-  return fixtureActivationScenario({
-    generationId, destinationIdentity, censusVector: baseline.census, canonicalDeltaBaseline: baseline.delta,
-  });
-}
-
 async function insertConversation(database: PostgreSqlTestDatabase, sessionId: string): Promise<void> {
   await database.migrator.query({
     text: "INSERT INTO lcm.conversations (project_id, session_id, title, bootstrapped_at, created_at, updated_at) "
@@ -170,13 +182,123 @@ async function editFirstMessage(database: PostgreSqlTestDatabase, content: strin
   }, factoryContext);
 }
 
-async function leaseRow(database: PostgreSqlTestDatabase) {
-  const result = await database.migrator.query<{ operation: string; owner_machine_id: string; released: boolean; live: boolean }>({
-    text: "SELECT operation, owner_machine_id::text AS owner_machine_id, released_at IS NOT NULL AS released, "
+type LeaseRow = Readonly<{ operation: string; owner_machine_id: string; owner_process_id: string; released: boolean; live: boolean }>;
+
+async function leaseRow(database: PostgreSqlTestDatabase): Promise<LeaseRow | undefined> {
+  const result = await database.migrator.query<LeaseRow>({
+    text: "SELECT operation, owner_machine_id::text AS owner_machine_id, owner_process_id, released_at IS NOT NULL AS released, "
       + "expires_at > statement_timestamp() AS live FROM lcm.fenced_leases WHERE project_id = $1",
     values: [fixture.projectId],
   }, factoryContext);
   return result.rows[0];
+}
+
+type ProjectMapFile = Record<string, { canonical: string; aliases: string[]; remoteProjectId?: string }>;
+
+function writeProjectMap(homeDir: string, map: ProjectMapFile): void {
+  clearProjectMapCache();
+  writeFileSync(projectMapPath(homeDir), JSON.stringify(map), { mode: 0o600 });
+}
+
+function readProjectMapFile(homeDir: string): ProjectMapFile {
+  return JSON.parse(readFileSync(projectMapPath(homeDir), "utf8")) as ProjectMapFile;
+}
+
+function readConfigBackend(homeDir: string): string {
+  return (JSON.parse(readFileSync(configPath(homeDir), "utf8")) as { storage: { backend: string } }).storage.backend;
+}
+
+/** The sqlite-selecting config an installation holds before activation; its postgresql block survives every publication. */
+function writeSourceConfig(homeDir: string, backend: "sqlite" | "postgresql" = "sqlite"): void {
+  writeFileSync(configPath(homeDir), `${JSON.stringify({
+    storage: { backend, postgresql: { migrationRole: "lcm_test_migrator" } },
+  })}\n`, { mode: 0o600 });
+}
+
+const unboundMap: ProjectMapFile = { [fixture.localProjectId]: { canonical: fixture.path, aliases: [] } };
+const boundMap: ProjectMapFile = {
+  [fixture.localProjectId]: { canonical: fixture.path, aliases: [], remoteProjectId: fixture.projectId },
+};
+
+/**
+ * Activates the covered project exactly as the activation does: the real coordinator, over the production
+ * driver and the PostgreSQL remote guard, publishes the postgresql config and the bound project map and
+ * releases the fence. The activation's evidence and bindings are recorded in the real stores afterwards.
+ */
+async function activate(
+  database: PostgreSqlTestDatabase,
+  homeDir: string,
+  generationId: string,
+  options: { record?: boolean } = {},
+): Promise<void> {
+  writeSourceConfig(homeDir);
+  writeProjectMap(homeDir, unboundMap);
+  const composed = composeBackendPublicationMaterial({
+    homeDir, targetBackend: "postgresql",
+    bindings: [{ localProjectId: fixture.localProjectId, remoteProjectId: fixture.projectId, evidenceSha256: ACTIVATION_EVIDENCE_SHA256 }],
+  });
+  const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl));
+  try {
+    const coordinator = createBackendPublicationCoordinator({
+      homeDir,
+      remoteGuard: {
+        mode: "delegated",
+        provider: createPostgreSqlBackendPublicationRemoteGuard({
+          guard: runtime.backendPublicationGuard(), machineId: fixture.machineId, ttlMs: 60_000,
+        }),
+      },
+    });
+    await coordinator.prepare({ publicationId: ACTIVATION_PUBLICATION_ID, ...composed });
+    await coordinator.resume();
+  } finally {
+    await runtime.close();
+  }
+  // Without the records the publication is complete but the activation never recorded its epoch or binding.
+  if (options.record === false) return;
+  const baseline = await scan(database);
+  const scenario = fixtureActivationScenario({
+    generationId, publicationId: ACTIVATION_PUBLICATION_ID,
+    destinationIdentity: await captureDestinationIdentity(database.runtime, fixture.projectId),
+    censusVector: baseline.census, canonicalDeltaBaseline: baseline.delta,
+  });
+  recordMigrationActivationEpoch({ homeDir, epoch: scenario.epoch });
+  recordMigrationActivationAttempt({ homeDir, generationId, attempt: scenario.attempt });
+  recordMigrationActivationWitness({ homeDir, generationId, witness: scenario.witness });
+  recordMigrationWitnessBinding({ homeDir, generationId, binding: scenario.witnessBinding });
+  recordMigrationSelectionBinding({ homeDir, generationId, binding: scenario.selection });
+}
+
+/**
+ * The seeded database, a verified manifest and, by default, a published activation. With activated false the
+ * installation holds no activation evidence: by default its configuration selects PostgreSQL and its map binds
+ * the project without any coordinator publication (the unactivated shape rollback accepts), "unpublished" leaves
+ * the configuration on sqlite, and "recordless" is a complete coordinator publication whose epoch and binding
+ * were never recorded.
+ */
+async function prepared(
+  database: PostgreSqlTestDatabase,
+  generationId: string,
+  options: { activated?: boolean; shape?: "unpublished" | "recordless" } = {},
+) {
+  await applyAllRuntimeGrants(database);
+  await seedPortablePostgreSql(database.migrator);
+  const homeDir = tempHome();
+  if (options.activated === false) {
+    // With no activation epoch the only comparand is the manifest's own sealed destination witness, so the
+    // manifest is sealed against the live destination, as a real copy records it.
+    const destination = await captureDestinationIdentity(database.runtime, fixture.projectId);
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), generationId, destination.sealedWitnessSha256);
+    if (options.shape === "recordless") {
+      await activate(database, homeDir, generationId, { record: false });
+    } else {
+      writeSourceConfig(homeDir, options.shape === "unpublished" ? "sqlite" : "postgresql");
+      writeProjectMap(homeDir, boundMap);
+    }
+  } else {
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), generationId);
+    await activate(database, homeDir, generationId);
+  }
+  return { homeDir, canonicalPath: join(homeDir, "live.sqlite") };
 }
 
 type Run = Readonly<{
@@ -186,45 +308,89 @@ type Run = Readonly<{
   database: PostgreSqlTestDatabase;
   /** Wraps the opened session, for injecting a change at an exact point of the window. */
   wrap?: (session: Awaited<ReturnType<typeof openRollbackFencedSession>>) => void;
+  /** Wraps the coordinator the entry builds (a crash right after one of its methods). */
+  wrapCoordinator?: (coordinator: ReturnType<typeof createBackendPublicationCoordinator>) => void;
+  /** Passed to the coordinator the entry builds. */
+  observer?: Parameters<typeof createBackendPublicationCoordinator>[0]["observer"];
 }>;
 
-async function runRollback(run: Run, scenario: Awaited<ReturnType<typeof activationFor>>) {
-  const input: RunMigrationRollbackInput = {
-    homeDir: run.homeDir, generationId: run.generationId, canonicalPath: run.canonicalPath,
-    projectIdentity: { scope: "shared", projectId: fixture.projectId }, localProjectId: fixture.localProjectId,
-    sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
-  };
-  return runMigrationRollback(input, {
-    coordinator: new BackendPublicationCoordinator({ homeDir: run.homeDir, driver: unexpectedDriver() }),
-    resolveWitnessBindings: () => scenario.bindings,
-    resolveActivationEvidence: () => scenario.evidence,
-    resolveAuthoritativeContext: async () => scenario.context,
-    openFencedSession: async (request) => {
-      const session = await openRollbackFencedSession(request, targetFor(run.database), dependencies);
-      run.wrap?.(session);
-      return session;
+/** The entry's dependencies: the forward snapshot evidence and machine identity are supplied; everything else is real. */
+function entryDependencies(run: Run): RollbackEntryDependencies {
+  return {
+    context: {
+      ...DEFAULT_RESOLVE_ROLLBACK_CONTEXT_DEPENDENCIES,
+      inspectSnapshot: (async () => ({
+        artifact: {
+          sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), sourceByteWitnessSha256: "7".repeat(64),
+          authority: {
+            physicalProjectId: fixture.localProjectId, projectDbPath: run.canonicalPath,
+            machineIdentity: { identityKey: fixture.machineIdentityKey, machineId: fixture.machineId },
+          },
+        },
+        receiptReference: { queueCutoff: null },
+      })) as never,
+      requireMachineIdentity: (() => ({ machineId: fixture.machineId })) as never,
+      resolveIdentity: (() => fixture.expectedIdentity) as never,
     },
+    session: dependencies,
+    createCoordinator: (options) => {
+      const coordinator = createBackendPublicationCoordinator({ ...options, observer: run.observer });
+      run.wrapCoordinator?.(coordinator);
+      return coordinator;
+    },
+    run: (input, deps) => runMigrationRollback(input, {
+      ...deps,
+      openFencedSession: async (request) => {
+        const session = await deps.openFencedSession(request);
+        run.wrap?.(session);
+        return session;
+      },
+    }),
+  };
+}
+
+/** The connection secrets never live in config.json: the entry reads them from the environment, as the daemon does. */
+async function runRollback(run: Run) {
+  const previous = { url: process.env.LCM_POSTGRES_URL, caFile: process.env.LCM_POSTGRES_CA_FILE };
+  const connection = settings(run.database.runtimeUrl);
+  process.env.LCM_POSTGRES_URL = connection.url;
+  process.env.LCM_POSTGRES_CA_FILE = connection.caFile;
+  try {
+    return await runMigrationRollbackFromHome({ homeDir: run.homeDir, generationId: run.generationId }, entryDependencies(run));
+  } finally {
+    if (previous.url === undefined) delete process.env.LCM_POSTGRES_URL; else process.env.LCM_POSTGRES_URL = previous.url;
+    if (previous.caFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE; else process.env.LCM_POSTGRES_CA_FILE = previous.caFile;
+  }
+}
+
+function rollbackBinding(homeDir: string, generationId: string) {
+  const resolved = resolveMigrationWitnessBindings({ homeDir, generationId });
+  return resolved.state === "resolved" ? resolved.selections.find((selection) => selection.kind === "rollback") : undefined;
+}
+
+/** The rollback's publication in the live slot, completed: the sqlite config and the unbound project map are published. */
+function expectRollbackPublished(homeDir: string, generationId: string): void {
+  expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+  expect(readBackendPublicationJournal(homeDir)).toMatchObject({
+    phase: "completed", publicationId: deriveRollbackPublicationId(generationId),
+    sourceBackend: "postgresql", targetBackend: "sqlite",
   });
+  expect(readConfigBackend(homeDir)).toBe("sqlite");
+  expect(readProjectMapFile(homeDir)[fixture.localProjectId]!.remoteProjectId).toBeUndefined();
 }
 
-/** The real project map file the rollback's single-project check (plan-v3.2 A14) reads. */
-function writeProjectMap(homeDir: string, map: Record<string, { canonical: string; aliases: string[]; remoteProjectId?: string }>): void {
-  clearProjectMapCache();
-  writeFileSync(projectMapPath(homeDir), JSON.stringify(map), { mode: 0o600 });
+function crashAfter(method: "prepare" | "resume") {
+  return (coordinator: ReturnType<typeof createBackendPublicationCoordinator>): void => {
+    const target = coordinator as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    const real = target[method]!.bind(coordinator);
+    target[method] = async (...args: unknown[]) => {
+      await real(...args);
+      throw new Error("simulated crash right after " + method);
+    };
+  };
 }
 
-async function prepared(database: PostgreSqlTestDatabase, generationId: string) {
-  await applyAllRuntimeGrants(database);
-  await seedPortablePostgreSql(database.migrator);
-  const homeDir = tempHome();
-  manifestAtVerified(new MigrationManifestStore({ homeDir }), generationId);
-  writeProjectMap(homeDir, {
-    [fixture.localProjectId]: { canonical: fixture.path, aliases: [], remoteProjectId: fixture.projectId },
-  });
-  return { homeDir, canonicalPath: join(homeDir, "live.sqlite"), scenario: await activationFor(database, generationId) };
-}
-
-describe("production rollback session against PostgreSQL 18", { timeout: 180_000 }, () => {
+describe("production rollback against PostgreSQL 18", { timeout: 240_000 }, () => {
   it("holds a real lease for the coordinator's identity, renews and asserts it, refuses once the fence is lost, and releases", async () => {
     await withPostgreSqlTestDatabase("rollback-session-lease", async (database) => {
       await applyAllRuntimeGrants(database);
@@ -283,38 +449,103 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
     });
   });
 
-  it("rolls back pre-write on an unchanged destination: no data moves and the lease is released", async () => {
+  it("rolls back pre-write on an unchanged destination: no data moves, sqlite is published and replay admission routes to it", async () => {
     await withPostgreSqlTestDatabase("rollback-session-pre-write", async (database) => {
-      const { homeDir, canonicalPath, scenario } = await prepared(database, "gen-pre");
-      const outcome = await runRollback({ homeDir, generationId: "gen-pre", canonicalPath, database }, scenario);
+      const { homeDir, canonicalPath } = await prepared(database, "gen-pre");
+      // The activation's lease row is released; the rollback replaces it.
+      expect(await leaseRow(database)).toMatchObject({ released: true, operation: expect.stringMatching(/^backend-publication:postgresql:/u) });
+      expect(readConfigBackend(homeDir)).toBe("postgresql");
+
+      const outcome = await runRollback({ homeDir, generationId: "gen-pre", canonicalPath, database });
+
       expect(outcome.manifest.phase).toBe("rolled-back");
       expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
       expect(existsSync(canonicalPath)).toBe(false);
+      expectRollbackPublished(homeDir, "gen-pre");
+      expect(outcome.report!.sealedPublicationMaterialDigestSha256)
+        .toBe(readBackendPublicationJournal(homeDir)!.recoveryReference!.sealSha256);
+      // The coordinator released the fence it adopted from the session, exactly once.
+      expect(await leaseRow(database)).toMatchObject({
+        released: true, operation: expect.stringMatching(/^backend-publication:sqlite:/u),
+        owner_process_id: deriveRollbackPublicationId("gen-pre"),
+      });
+      // The coordinator's prepare archived the maintenance journal: admission routes from the binding, with fresh state.
+      clearProjectMapCache();
+      expect(assertMigrationReplayAdmission({
+        homeDir, generationId: "gen-pre", evidenceSha256: rollbackBinding(homeDir, "gen-pre")!.witnessChecksumSha256,
+      })).toEqual({ backend: "sqlite", disposition: "selected" });
+    });
+  });
+
+  it("refuses a generation whose configuration was never published, naming abort as the way out", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-config-unpublished", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-unpublished", { activated: false, shape: "unpublished" });
+      await expect(runRollback({ homeDir, generationId: "gen-unpublished", canonicalPath, database }))
+        .rejects.toMatchObject({ reason: "input-unresolvable", message: expect.stringContaining("lcm migration abort") });
+      expect(readConfigBackend(homeDir)).toBe("sqlite");
+      expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+    });
+  });
+
+  it("rolls back an unactivated generation (configuration selects PostgreSQL, no coordinator publication): no coordinator publication, selection reversed", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-unactivated", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-unactivated", { activated: false });
+      const outcome = await runRollback({ homeDir, generationId: "gen-unactivated", canonicalPath, database });
+      expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
+      expect(outcome.report).toMatchObject({ eligibility: "unactivated", epochId: null, sealedPublicationMaterialDigestSha256: null });
+      expect(readBackendMaintenanceJournal(homeDir)).toMatchObject({ phase: "selection-completed", targetBackend: "sqlite" });
+      expect(rollbackBinding(homeDir, "gen-unactivated")).toBeUndefined();
       expect((await leaseRow(database))!.released).toBe(true);
+    });
+  });
+
+  it("refuses a complete publication whose activation never recorded its binding (published-but-unbound)", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-recordless", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-recordless", { activated: false, shape: "recordless" });
+      await expect(runRollback({ homeDir, generationId: "gen-recordless", canonicalPath, database }))
+        .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("published-but-unbound") });
+      expect(readConfigBackend(homeDir)).toBe("postgresql");
+    });
+  });
+
+  it("refuses while the activation's lease row is still held, leaving PostgreSQL selected", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-held-activation", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-held");
+      await database.migrator.query({
+        text: "UPDATE lcm.fenced_leases SET released_at = NULL, expires_at = statement_timestamp() + interval '1 hour' WHERE project_id = $1",
+        values: [fixture.projectId],
+      }, factoryContext);
+      await expect(runRollback({ homeDir, generationId: "gen-held", canonicalPath, database }))
+        .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("actively held by a different publication generation") });
+      expect(readConfigBackend(homeDir)).toBe("postgresql");
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
     });
   });
 
   it("refuses a second remotely bound project before any lease, maintenance or manifest change (A14)", async () => {
     await withPostgreSqlTestDatabase("rollback-session-two-projects", async (database) => {
-      const { homeDir, canonicalPath, scenario } = await prepared(database, "gen-two-projects");
+      const { homeDir, canonicalPath } = await prepared(database, "gen-two-projects");
       writeProjectMap(homeDir, {
-        [fixture.localProjectId]: { canonical: fixture.path, aliases: [], remoteProjectId: fixture.projectId },
+        ...boundMap,
         ["f".repeat(64)]: { canonical: "/another", aliases: [], remoteProjectId: "01990000-0000-7000-8000-0000000000ff" },
       });
-      await expect(runRollback({ homeDir, generationId: "gen-two-projects", canonicalPath, database }, scenario))
+      const leaseBefore = await leaseRow(database);
+      await expect(runRollback({ homeDir, generationId: "gen-two-projects", canonicalPath, database }))
         .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("multiple-remote-projects") });
-      expect(await leaseRow(database)).toBeUndefined();
+      expect(await leaseRow(database)).toEqual(leaseBefore);
       expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+      expect(readConfigBackend(homeDir)).toBe("postgresql");
       expect(new MigrationManifestStore({ homeDir }).read("gen-two-projects").phase).toBe("verified");
     });
   });
 
   it("rolls back post-write after a racing post-epoch write, exporting the written data into the installed database", async () => {
     await withPostgreSqlTestDatabase("rollback-session-post-write", async (database) => {
-      const { homeDir, canonicalPath, scenario } = await prepared(database, "gen-post");
+      const { homeDir, canonicalPath } = await prepared(database, "gen-post");
       await insertConversation(database, "raced-session");
-      const outcome = await runRollback({ homeDir, generationId: "gen-post", canonicalPath, database }, scenario);
+      const outcome = await runRollback({ homeDir, generationId: "gen-post", canonicalPath, database });
       expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+      expectRollbackPublished(homeDir, "gen-post");
       const installed = new DatabaseSync(canonicalPath, { readOnly: true });
       try {
         const row = installed.prepare("SELECT count(*) AS n FROM conversations WHERE session_id = ?").get("raced-session") as { n: number };
@@ -331,16 +562,56 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
 
   it("classifies an in-place post-epoch change as post-write although the delta is unchanged, because the census sees it", async () => {
     await withPostgreSqlTestDatabase("rollback-session-in-place", async (database) => {
-      const { homeDir, canonicalPath, scenario } = await prepared(database, "gen-inplace");
+      const { homeDir, canonicalPath } = await prepared(database, "gen-inplace");
       await editFirstMessage(database, "Edited after activation");
-      const outcome = await runRollback({ homeDir, generationId: "gen-inplace", canonicalPath, database }, scenario);
+      const outcome = await runRollback({ homeDir, generationId: "gen-inplace", canonicalPath, database });
       expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+    });
+  });
+
+  it("resumes through the coordinator after a crash right after its prepare, from a fresh process", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-crash-prepare", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-crash-prepare");
+      await expect(runRollback({
+        homeDir, generationId: "gen-crash-prepare", canonicalPath, database, wrapCoordinator: crashAfter("prepare"),
+      })).rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("simulated crash right after prepare") });
+      expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "prepared" });
+      expect(readConfigBackend(homeDir)).toBe("postgresql");
+      expect(rollbackBinding(homeDir, "gen-crash-prepare")).toBeDefined();
+
+      const outcome = await runRollback({ homeDir, generationId: "gen-crash-prepare", canonicalPath, database });
+
+      expect(outcome.manifest.phase).toBe("rolled-back");
+      expectRollbackPublished(homeDir, "gen-crash-prepare");
+      expect((await leaseRow(database))!.released).toBe(true);
+    });
+  });
+
+  it("resumes through the coordinator after a crash right after the config publish", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-crash-config", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-crash-config");
+      await expect(runRollback({
+        homeDir, generationId: "gen-crash-config", canonicalPath, database,
+        observer: (event) => {
+          if (event === "after-journal-write" && readBackendPublicationJournal(homeDir)?.phase === "config-published") {
+            throw new Error("simulated crash right after the config publish");
+          }
+        },
+      })).rejects.toMatchObject({ message: expect.stringContaining("simulated crash right after the config publish") });
+      expect(readConfigBackend(homeDir)).toBe("sqlite");
+      expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "config-published" });
+
+      const outcome = await runRollback({ homeDir, generationId: "gen-crash-config", canonicalPath, database });
+
+      expect(outcome.manifest.phase).toBe("rolled-back");
+      expectRollbackPublished(homeDir, "gen-crash-config");
+      expect((await leaseRow(database))!.released).toBe(true);
     });
   });
 
   it("refuses when the fence is lost mid-window, installing and selecting nothing", async () => {
     await withPostgreSqlTestDatabase("rollback-session-fence-loss", async (database) => {
-      const { homeDir, canonicalPath, scenario } = await prepared(database, "gen-fence");
+      const { homeDir, canonicalPath } = await prepared(database, "gen-fence");
       await insertConversation(database, "raced-session");
       await expect(runRollback({
         homeDir, generationId: "gen-fence", canonicalPath, database,
@@ -354,7 +625,7 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
             await renew();
           };
         },
-      }, scenario)).rejects.toMatchObject({ name: "RollbackSessionError", reason: "lease-lost" });
+      })).rejects.toMatchObject({ name: "MigrationRollbackError", reason: "lease-lost" });
       expect(existsSync(canonicalPath)).toBe(false);
       expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
     });
@@ -362,7 +633,7 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
 
   it("A17: refuses an in-place update after the export snapshot that preserves every count and identity, leaving PostgreSQL authoritative", async () => {
     await withPostgreSqlTestDatabase("rollback-session-a17", async (database) => {
-      const { homeDir, canonicalPath, scenario } = await prepared(database, "gen-a17");
+      const { homeDir, canonicalPath } = await prepared(database, "gen-a17");
       // Post-write by an in-place edit before the export; the delta carries no content.
       await editFirstMessage(database, "Edited after activation");
       const counts = async () => (await database.migrator.query<{ conversations: string; messages: string; ids: string }>({
@@ -384,14 +655,14 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
             await renew();
           };
         },
-      }, scenario)).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("census differs") });
+      })).rejects.toMatchObject({ reason: "drift", message: expect.stringContaining("census differs") });
 
       expect(existsSync(canonicalPath)).toBe(false);
       const journal = readBackendMaintenanceJournal(homeDir);
       expect(journal?.phase).toBe("maintenance-held");
       expect(journal?.targetBackend ?? null).toBeNull();
-      expect(resolveMigrationWitnessBindings({ homeDir, generationId: "gen-a17" }))
-        .toMatchObject({ state: "authoritatively-absent" });
+      expect(rollbackBinding(homeDir, "gen-a17")).toBeUndefined();
+      expect(readConfigBackend(homeDir)).toBe("postgresql");
       const manifest = new MigrationManifestStore({ homeDir }).read("gen-a17");
       expect(manifest.phase).toBe("rolling-back");
       expect(manifest.pendingEffect).toBeNull();
@@ -401,7 +672,7 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
 
   it("A6: refuses an unfenced change between build and revalidation that leaves the mode at post-write, installing and selecting nothing", async () => {
     await withPostgreSqlTestDatabase("rollback-session-a6", async (database) => {
-      const { homeDir, canonicalPath, scenario } = await prepared(database, "gen-a6");
+      const { homeDir, canonicalPath } = await prepared(database, "gen-a6");
       await insertConversation(database, "raced-session");
       await expect(runRollback({
         homeDir, generationId: "gen-a6", canonicalPath, database,
@@ -413,10 +684,9 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
             await renew();
           };
         },
-      }, scenario)).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("census differs") });
+      })).rejects.toMatchObject({ reason: "drift", message: expect.stringContaining("census differs") });
       expect(existsSync(canonicalPath)).toBe(false);
       expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
     });
   });
 });
-

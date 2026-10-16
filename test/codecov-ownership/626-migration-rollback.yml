@@ -17,6 +17,10 @@ rationale: >-
   materially changed but keeps its established local event storage owner.
   src/migration/maintenance.ts (replay admission routed from durable
   authority) is materially changed and keeps its migration cutover owner.
+  rollback-inputs.ts now also holds the production entry (the closed
+  MigrationRollbackError and the coordinator wiring), and rollback.ts the
+  coordinator step and the resume table; both are materially changed and
+  stay in the same owner. No file is added, removed, moved or re-owned.
 pins:
   - ["src/migration/activation-evidence-store.ts", "unit-migration-cutover"]
   - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]

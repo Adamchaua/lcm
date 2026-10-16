@@ -12,9 +12,10 @@ rollback builds on.
 Rollback has two outcomes, decided from evidence at the moment it runs, never
 chosen by the operator:
 
-- **Pre-write or unactivated rollback copies nothing.** If PostgreSQL was
-  never activated, or was activated but nothing was durably written to it
-  since, the live SQLite database at the canonical path is already correct
+- **Pre-write or unactivated rollback copies nothing.** If PostgreSQL has
+  no activation evidence and no completed publication (for example, the
+  configuration was switched to PostgreSQL by hand), or it was activated but
+  nothing was durably written to it since, the live SQLite database at the canonical path is already correct
   and current. No rollback generation is built, nothing is installed, no
   runtime sidecar is materialized, and the live database is not touched. The
   reversal is the maintenance-selection flip back to SQLite, nothing else.
@@ -42,6 +43,44 @@ create in the same run.
   It is checkpointed and witnessed by content hash both before and after the
   move, so the preserved copy is provably byte-identical to what was live.
 
+## A generation that never activated cannot be rolled back
+
+Rollback unwinds an activation, and it finds the project's PostgreSQL id in
+the project map entry that the activation's publication writes. A generation
+that never activated has no such entry (the project map does not yet bind the
+project), and no durable local record holds the id before then. Rollback
+refuses with `project-unbound`, and the same applies when the configuration
+does not select PostgreSQL. Nothing was changed; leave the generation with:
+
+```bash
+lcm migration abort
+```
+
+The protocol permits an abort from planned through verified. The refusal
+message names this command.
+
+## Only one project may be remotely bound
+
+The maintenance selection flip moves the whole installation's backend
+selection back to SQLite. If another project is also bound to PostgreSQL in
+the project map, it would be silently stranded on a backend it no longer
+routes to. Rollback therefore refuses (`multiple-remote-projects`) unless the covered project is the only one bound to
+PostgreSQL. A local-only entry never blocks. The check runs before maintenance
+is entered and again right before the selection is prepared. Unbind or migrate
+the other projects first.
+
+## What activation evidence rollback relies on
+
+For an activation that recorded its evidence, rollback compares the
+PostgreSQL destination against the activation's epoch (the destination
+identity and the baseline census) to decide pre-write or post-write, and it
+records its own witness before it changes anything. It reads the activation's
+retained backend publication before it prepares its own, and persists the
+publication identity, the source backend, the project map entry and the
+digests of the source configuration and map. A rollback artifact written by an
+older version refuses distinctly. When the retained publication is absent or
+unreadable, rollback refuses for every case except an unactivated one.
+
 ## Recovery procedure after an interrupted rollback
 
 A rollback can be interrupted at any point -- before entering maintenance,
@@ -59,6 +98,16 @@ un-deleted, and, if the earlier attempt got far enough to know it failed
 verification, quarantined read-only. This is deliberate. A failed or
 incomplete generation is evidence of what the earlier attempt actually wrote,
 and quarantining it is safer than any hidden repair.
+
+The same holds after the selection flips. A crash after the maintenance
+selection, after the coordinator prepared the rollback's own publication,
+after the configuration was published, or after the publication completed
+resumes from where it stopped when the same operation is run again: the
+rollback records its selection binding as soon as the selection completes,
+resumes or verifies the coordinator publication from the material it sealed,
+and then writes its report and settles the generation as `rolled-back`. A
+`rolled-back` generation whose binding was lost to a crash gets it written
+on the next run.
 
 Simply re-running the same rollback operation triggers this recovery
 automatically; there is nothing an operator needs to do to make a stalled
@@ -102,6 +151,21 @@ to check.
 | "could not enumerate existing rollback generation build attempts" / "...has more entries than this enumeration will scan" | Rollback could not safely determine the next attempt number for this generation, either because the private generations directory could not be read or because it holds an implausibly large number of entries. Rollback refuses rather than risk reusing an attempt number that is already evidence. | Check filesystem permissions on `.lcm/migration-rollback-generations/`; if the entry count is genuinely large, that is itself worth investigating -- it means many prior attempts were never cleaned up. |
 | Independent verification failure recorded in a generation's `witness.json` `reason` field (`transfer:*`, `independent-verification:manifest-readback-failed`, `independent-verification:manifest-sha-mismatch`, `independent-verification:readback-failed`, `independent-verification:content-mismatch`) | The newly built generation failed one of the two independent verification passes rollback runs before it will ever install a generation. The generation was quarantined, not installed. | Read the `witness.json` file in that generation's directory for the exact reason. The quarantined generation and its manifest are preserved; do not repair a partial generation by editing its files. Rollback will build a fresh attempt on retry. |
 | "publish-rollback must be abandoned but the maintenance journal is already durably selection-completed for a different or ambiguous target" | A crash-recovery path found backend selection already durably completed toward a target rollback cannot reconcile automatically. This is a known, explicitly unimplemented case, flagged loudly rather than silently guessed at. | This needs manual investigation; do not attempt to force a re-selection. |
+| "backend publication is unresolved; recover it before consuming local state" | An activation's publication is still in flight (a crash while it published). Rollback does not start over it. | Finish or abort the activation first. A rollback's own interrupted publication is not this refusal: re-running resumes it. |
+| `published-but-unbound` | PostgreSQL is live (its publication completed) but the activation never recorded its selection binding. | Let the activation record it, then retry. |
+| `project-unbound`, or "the configuration selects another" | The generation never activated. | Run `lcm migration abort`. |
+| `multiple-remote-projects`, `covered-project-mismatch` | The project map binds another project to PostgreSQL. | See "Only one project may be remotely bound". |
+| "actively held by a different publication generation" | The activation's fence on the PostgreSQL project is still held, so a rollback cannot take it over. | Wait for the holder to finish or its lease to expire; rollback does not break a live lease. |
+| Drift: the destination changed between the export and the final check, or the rollback mode changed | PostgreSQL was written to while rollback was building, so the generation it built no longer matches. | Nothing was installed or selected. Run the rollback again. |
+
+A production rollback ends with one of seven reasons: `not-eligible`,
+`unresolvable`, `lease-lost`, `quiescence-unsatisfied`, `drift`,
+`input-unresolvable` or `unexpected-state`. The first five map the refusals
+above; `input-unresolvable` means the inputs it derives from durable state
+(the manifest, the preserved snapshot, the configuration, the project map or
+this machine's identity) cannot be resolved, including the never-activated
+case; `unexpected-state` carries any failure that does not fit, with the
+original message.
 
 Every refusal preserves whatever durable evidence already existed. None of
 them require, or benefit from, deleting files to "retry cleanly."
@@ -117,28 +181,20 @@ outage window from the amount of data PostgreSQL holds, not from a fixed
 estimate: a larger destination means a longer window during which PostgreSQL
 writes from this project are fenced.
 
-## What this page does not claim: backlog drain after rollback
+## Backlog drain after rollback
 
-Appends made locally while maintenance is held are preserved and remain
-admitted through the same local outbox mechanism used during the original
-cutover, whether the direction is forward (cutover) or backward (rollback).
-This page makes **no claim about when a retained backlog is drained** after a
-rollback completes. Preservation and correct routing of those appends is
-established and tested; a guarantee that they are eventually drained, rather
-than preserved indefinitely, is not. Do not assume a rollback flushes a
-backlog that a prior cutover left pending; nothing here guarantees that it
-does.
+Appends made locally while maintenance is held are preserved and admitted
+through the same local outbox mechanism used during the original cutover.
+Rollback does not flush the backlog that accumulated after the forward
+cutoff: once the selection is back on SQLite, the daemon's passive sweep
+drains it (see [Passive learning](passive-learning.md)). Until that sweep
+has run, the backlog stays preserved and correctly routed.
 
-## Current rollout boundary: no operator-reachable entry point yet
+## Current rollout boundary: no operator command yet
 
-Rollback's config and project-map publication step -- the piece that would
-make other LCM consumers durably aware that the backend selection changed --
-is not wired today, because the production publication driver those
-consumers require does not exist yet. The maintenance journal's own selection
-record is still durably completed correctly, so backend selection and replay
-admission already route to SQLite the moment a rollback finishes. But there
-is currently no CLI command, daemon trigger, or other operator-reachable
-entry point that starts a rollback. This is an internal orchestration API
-today, exercised only in tests, not a feature you can invoke yet. This page
-will be updated with the command once one exists; do not look for one in the
-meantime.
+Rollback publishes its configuration and project map through the same
+coordinator as activation, and it releases its PostgreSQL fence when the
+publication completes, so every LCM consumer sees SQLite selected once a
+rollback finishes. The orchestration is complete, but there is no CLI command
+or daemon trigger that starts it yet: the operator command (issue #627) will
+call the single internal entry point. Do not look for one in the meantime.

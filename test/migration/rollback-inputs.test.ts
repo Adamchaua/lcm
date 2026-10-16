@@ -23,7 +23,7 @@ import {
 } from "../../src/migration/rollback-inputs.js";
 import { RollbackSessionError } from "../../src/migration/rollback-session.js";
 import type { RollbackSessionDependencies, RollbackSessionTarget } from "../../src/migration/rollback-session.js";
-import { RollbackOrchestrationError } from "../../src/migration/rollback.js";
+import { RollbackOrchestrationError, deriveRollbackPublicationId } from "../../src/migration/rollback.js";
 
 const HOME = "/home/user";
 const GENERATION = "gen-1";
@@ -65,6 +65,7 @@ function dependencies(overrides: Partial<ResolveRollbackContextDependencies> = {
       id: local.remoteProjectId, canonical: local.canonical, remoteProjectId: local.remoteProjectId, machineId: MACHINE,
       selectedPath, localProjectId: local.id,
     })) as never,
+    readOwnPublicationSource: vi.fn(() => null),
     ...overrides,
   };
 }
@@ -124,15 +125,33 @@ describe("resolveMigrationRollbackContext", () => {
       .rejects.toMatchObject({ reason: "backend-not-postgresql" });
   });
 
+  it("resolves the configuration and the map from the rollback's own sealed publication once it has begun", async () => {
+    // The live files are the rollback's in-flight state (sqlite selected, project unbound); neither is read.
+    const own = {
+      storage,
+      projectMap: { [LOCAL]: { canonical: "/work/project", aliases: [], remoteProjectId: REMOTE } },
+    };
+    const deps = dependencies({
+      readOwnPublicationSource: vi.fn(() => own) as never,
+      readStorageConfig: vi.fn(() => { throw new Error("live config must not be read"); }),
+      readProjectMap: vi.fn(() => { throw new Error("live map must not be read"); }) as never,
+    });
+    const { input, target } = await resolveMigrationRollbackContext({ homeDir: HOME, generationId: GENERATION }, deps);
+    expect(deps.readOwnPublicationSource).toHaveBeenCalledWith(HOME, deriveRollbackPublicationId(GENERATION));
+    expect(input.localProjectId).toBe(LOCAL);
+    expect(target.remoteProjectId).toBe(REMOTE);
+    expect(target.settings.url).toBe("postgresql://example/db");
+  });
+
   it("refuses an unbound project, and a project missing from the map", async () => {
     const unbound = dependencies({
       readProjectMap: vi.fn(() => ({ [LOCAL]: { canonical: "/work/project", aliases: [] } })) as never,
     });
     await expect(resolveMigrationRollbackContext({ homeDir: HOME, generationId: GENERATION }, unbound))
-      .rejects.toMatchObject({ reason: "project-unbound" });
+      .rejects.toMatchObject({ reason: "project-unbound", message: expect.stringContaining("lcm migration abort") });
     const missing = dependencies({ readProjectMap: vi.fn(() => ({})) as never });
     await expect(resolveMigrationRollbackContext({ homeDir: HOME, generationId: GENERATION }, missing))
-      .rejects.toMatchObject({ reason: "project-unbound" });
+      .rejects.toMatchObject({ reason: "project-unbound", message: expect.stringContaining("lcm migration abort") });
   });
 
   it("reads the manifest and the configuration from the home directory by default", async () => {
