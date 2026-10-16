@@ -934,6 +934,45 @@ describe("passive-event replication pass", () => {
     const REBOUND = { remoteProjectId: "project-b" };
     type Binding = { readonly remoteProjectId?: string | null } | null;
 
+    const LOCAL_EVENT = {
+      event_uuid: "event-1",
+      event_version: 1,
+      machine_id: "machine-uuid",
+      machine_sequence: "7",
+      type: "choice",
+      session_id: "session",
+      seq: 1,
+      category: "decision",
+      data: "SQLite",
+      priority: 1,
+      source_hook: "PostToolUse",
+      prev_event_id: null,
+      created_at: "2026-07-29 12:00:00",
+      delivery_attempts: 1,
+    };
+
+    function remoteEvent(status: "pending" | "applied") {
+      return {
+        inboxId: 41n,
+        machineId: "machine-uuid",
+        eventId: "event-1",
+        eventVersion: 1,
+        machineSequence: 7n,
+        eventType: "choice",
+        payload: {
+          sessionId: "session",
+          sessionSequence: 1,
+          category: "decision",
+          data: "SQLite",
+          priority: 1,
+          sourceHook: "PostToolUse",
+          previousEventId: null,
+          createdAt: "2026-07-29 12:00:00",
+        },
+        status,
+      };
+    }
+
     function publicationHome(): string {
       const home = mkdtempSync(join(tmpdir(), "lcm-replication-binding-"));
       mkdirSync(join(home, ".lcm"), { recursive: true });
@@ -946,8 +985,15 @@ describe("passive-event replication pass", () => {
      * The shipped worker runs against fake repositories. The binding the
      * pass re-reads is the bound one for `goodChecks` admissions and then
      * becomes `after`, as if an operator relinked the project mid-pass.
+     * With `row` the local outbox holds one pending event: the first
+     * claim hands it out, and once it is marked replicated it awaits the
+     * remote project's applied state.
      */
-    function relinkHarness(goodChecks: number, after: Binding = REBOUND, claims: unknown[] = []) {
+    function relinkHarness(
+      goodChecks: number,
+      after: Binding = REBOUND,
+      options: { readonly claims?: unknown[]; readonly row?: boolean } = {},
+    ) {
       const fencingToken = 7n;
       const state: { current: Binding } = { current: BOUND };
       let checks = 0;
@@ -957,20 +1003,22 @@ describe("passive-event replication pass", () => {
         return state.current;
       });
       const local = {
-        claimDeliveries: vi.fn().mockResolvedValue([]),
-        listAwaitingRemote: vi.fn().mockResolvedValue([]),
+        claimDeliveries: vi.fn().mockResolvedValueOnce(options.row === true ? [LOCAL_EVENT] : []).mockResolvedValue([]),
+        listAwaitingRemote: vi.fn(async () =>
+          options.row === true && local.markReplicated.mock.calls.length > 0 ? [LOCAL_EVENT] : []),
         listAcknowledgedForRemotePrune: vi.fn().mockResolvedValue([]),
-        markReplicated: vi.fn(),
-        markAcknowledged: vi.fn(),
+        markReplicated: vi.fn().mockResolvedValue(true),
+        markAcknowledged: vi.fn().mockResolvedValue(true),
         close: vi.fn().mockResolvedValue(undefined),
       };
       const remote = {
         machineId: "machine-uuid",
         acquireDrainLease: vi.fn().mockResolvedValue({ fencingToken }),
         renewDrainLease: vi.fn().mockResolvedValue({ fencingToken }),
-        claimEvents: vi.fn().mockResolvedValue(claims),
+        claimEvents: vi.fn().mockResolvedValue(options.claims ?? []),
         completeApplied: vi.fn(),
-        insertEvents: vi.fn(),
+        insertEvents: vi.fn().mockResolvedValue([remoteEvent("pending")]),
+        readEvents: vi.fn().mockResolvedValue([remoteEvent("applied")]),
         releaseDrainLease: vi.fn().mockResolvedValue(undefined),
       };
       const harness = modules({
@@ -1001,150 +1049,220 @@ describe("passive-event replication pass", () => {
       });
     }
 
-    function expectStoppedWithoutRemoteWork(
+    function expectReportedOnce(
       fixture: ReturnType<typeof relinkHarness>,
       onError: ReturnType<typeof vi.fn>,
     ): void {
-      const { local, remote, fencingToken } = fixture;
-      expect(local.markReplicated).not.toHaveBeenCalled();
-      expect(local.markAcknowledged).not.toHaveBeenCalled();
-      expect(remote.insertEvents).not.toHaveBeenCalled();
-      expect(remote.completeApplied).not.toHaveBeenCalled();
+      const { remote, fencingToken } = fixture;
       expect(onError).toHaveBeenCalledTimes(1);
       expect(onError).toHaveBeenCalledWith(expect.any(ReplicationBindingChangedError));
       expect(onError.mock.calls[0][0]).toMatchObject({
         name: "ReplicationBindingChangedError",
         message: expect.stringContaining("/proj"),
       });
-      // The lease taken for this pass is released exactly once.
+      // The pass finishes its phases, so its lease is released exactly once.
       expect(remote.releaseDrainLease).toHaveBeenCalledTimes(1);
       expect(remote.releaseDrainLease).toHaveBeenCalledWith("lcm-daemon:binding", fencingToken, undefined);
     }
 
-    it("stops before the next phase when the project is relinked after the lease", async () => {
+    it("uploads no new row to the old project when the project is relinked at the lease", async () => {
       const home = publicationHome();
-      const fixture = relinkHarness(1);
+      const fixture = relinkHarness(0, REBOUND, { row: true });
       const onError = vi.fn();
       const tokens: unknown[] = [];
       const pass = admittedPass(fixture.harness, home, onError, tokens);
 
-      // The relink lands after the lease admission, so the upload never runs.
-      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
-      expect(fixture.remote.acquireDrainLease).toHaveBeenCalledTimes(1);
+      // The worker's own result comes back; the pass is not abandoned.
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({
+        leaseAcquired: true,
+        uploaded: 0,
+      });
+      // The stale project is never offered the pending row, and the row
+      // stays pending in the local outbox for the new binding.
       expect(fixture.local.claimDeliveries).not.toHaveBeenCalled();
-      expect(fixture.remote.renewDrainLease).not.toHaveBeenCalled();
-      expect(fixture.remote.claimEvents).not.toHaveBeenCalled();
-      expect(fixture.local.listAwaitingRemote).not.toHaveBeenCalled();
-      expect(fixture.local.listAcknowledgedForRemotePrune).not.toHaveBeenCalled();
-      expectStoppedWithoutRemoteWork(fixture, onError);
-
-      // Each check read the binding under the token its admission granted.
-      expect(tokens).toHaveLength(2);
-      expect(fixture.resolveExistingProjectIdentity.mock.calls.map(call => call[0]))
-        .toEqual(["/proj", "/proj"]);
-      expect(fixture.resolveExistingProjectIdentity.mock.calls[0][1]).toBe(tokens[0]);
-      expect(fixture.resolveExistingProjectIdentity.mock.calls[1][1]).toBe(tokens[1]);
-      await pass.close();
-    });
-
-    it("stops a pass that is relinked before its first admission without taking a lease", async () => {
-      const home = publicationHome();
-      const fixture = relinkHarness(0);
-      const onError = vi.fn();
-      const pass = admittedPass(fixture.harness, home, onError);
-      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
-      expect(fixture.remote.acquireDrainLease).not.toHaveBeenCalled();
-      expect(fixture.remote.releaseDrainLease).not.toHaveBeenCalled();
-      expect(onError).toHaveBeenCalledTimes(1);
-      expect(onError).toHaveBeenCalledWith(expect.any(ReplicationBindingChangedError));
-      await pass.close();
-    });
-
-    it("stops before a later claim is applied", async () => {
-      const home = publicationHome();
-      // Checks: lease, upload, renew, claim fetch; the relink lands before
-      // the first claim's own admission.
-      const fixture = relinkHarness(4, REBOUND, [{ eventId: "event-1", eventVersion: 1 }]);
-      const onError = vi.fn();
-      const pass = admittedPass(fixture.harness, home, onError);
-      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
-      expect(fixture.remote.claimEvents).toHaveBeenCalledTimes(1);
+      expect(fixture.remote.insertEvents).not.toHaveBeenCalled();
+      expect(fixture.local.markReplicated).not.toHaveBeenCalled();
+      // Everything that completes work already in the old project still runs.
       expect(fixture.remote.renewDrainLease).toHaveBeenCalledTimes(1);
-      expect(fixture.local.listAwaitingRemote).not.toHaveBeenCalled();
-      expectStoppedWithoutRemoteWork(fixture, onError);
-      await pass.close();
-    });
-
-    it("stops before the local reconcile and prune phases", async () => {
-      const home = publicationHome();
-      const fixture = relinkHarness(4);
-      const onError = vi.fn();
-      const pass = admittedPass(fixture.harness, home, onError);
-      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
       expect(fixture.remote.claimEvents).toHaveBeenCalledTimes(1);
-      expect(fixture.local.listAwaitingRemote).not.toHaveBeenCalled();
-      expect(fixture.local.listAcknowledgedForRemotePrune).not.toHaveBeenCalled();
-      expectStoppedWithoutRemoteWork(fixture, onError);
+      expect(fixture.local.listAwaitingRemote).toHaveBeenCalledTimes(1);
+      expect(fixture.local.listAcknowledgedForRemotePrune).toHaveBeenCalledTimes(1);
+      expectReportedOnce(fixture, onError);
+
+      // The binding was read once, under the token the lease admission
+      // granted, and never again after it changed.
+      expect(tokens).toHaveLength(6);
+      expect(fixture.resolveExistingProjectIdentity.mock.calls).toEqual([["/proj", tokens[0]]]);
       await pass.close();
     });
 
-    it("stops when the project becomes unbound or loses its identity", async () => {
-      for (const after of [null, {}, { remoteProjectId: null }] as Binding[]) {
-        const home = publicationHome();
-        const fixture = relinkHarness(1, after);
-        const onError = vi.fn();
-        const pass = admittedPass(fixture.harness, home, onError);
-        await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
-        expect(fixture.local.claimDeliveries).not.toHaveBeenCalled();
-        expectStoppedWithoutRemoteWork(fixture, onError);
-        await pass.close();
-      }
-    });
-
-    it("builds the next pass's repository for the new binding", async () => {
+    it("completes the rows it already uploaded when the project is relinked after the upload", async () => {
       const home = publicationHome();
-      const fixture = relinkHarness(1);
+      const fixture = relinkHarness(2, REBOUND, { row: true });
       const onError = vi.fn();
-      const pass = admittedPass(fixture.harness, home, onError);
-      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
-      expect(fixture.harness.modules.createRepository).toHaveBeenLastCalledWith(
+      const tokens: unknown[] = [];
+      const pass = admittedPass(fixture.harness, home, onError, tokens);
+
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({
+        leaseAcquired: true,
+        uploaded: 1,
+        acknowledged: 1,
+      });
+      // The pass bound its repository to the old project once and uploaded there.
+      expect(fixture.harness.modules.createRepository).toHaveBeenCalledTimes(1);
+      expect(fixture.harness.modules.createRepository).toHaveBeenCalledWith(
         fixture.harness.runtime,
         "project-a",
         "machine-uuid",
       );
+      expect(fixture.remote.insertEvents).toHaveBeenCalledTimes(1);
+      expect(fixture.local.markReplicated).toHaveBeenCalledWith("event-1", "lcm-daemon:binding:local", 41n);
+      // The relink lands at the next admission, yet the uploaded row is
+      // still reconciled against the project that holds it.
+      expect(fixture.remote.readEvents).toHaveBeenCalledTimes(1);
+      expect(fixture.local.markAcknowledged).toHaveBeenCalledWith("event-1", 41n);
+      expect(fixture.local.listAcknowledgedForRemotePrune).toHaveBeenCalledTimes(1);
+      expectReportedOnce(fixture, onError);
 
-      // The binding now resolves to project B at gate 3 and at every phase.
-      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ leaseAcquired: true });
-      expect(fixture.harness.modules.createRepository).toHaveBeenLastCalledWith(
-        fixture.harness.runtime,
-        "project-b",
-        "machine-uuid",
-      );
-      expect(onError).toHaveBeenCalledTimes(1);
+      expect(fixture.resolveExistingProjectIdentity.mock.calls).toEqual([
+        ["/proj", tokens[0]],
+        ["/proj", tokens[1]],
+        ["/proj", tokens[2]],
+      ]);
+      await pass.close();
+    });
+
+    it("completes uploaded rows when the project becomes unbound or loses its identity", async () => {
+      for (const after of [null, {}, { remoteProjectId: null }] as Binding[]) {
+        const home = publicationHome();
+        const fixture = relinkHarness(2, after, { row: true });
+        const onError = vi.fn();
+        const pass = admittedPass(fixture.harness, home, onError);
+        await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({
+          uploaded: 1,
+          acknowledged: 1,
+        });
+        expect(fixture.local.markAcknowledged).toHaveBeenCalledWith("event-1", 41n);
+        expectReportedOnce(fixture, onError);
+        await pass.close();
+      }
+    });
+
+    it("still applies the claims it fetched when the project is relinked before applying them", async () => {
+      const home = publicationHome();
+      // Checks: lease, upload, renew, claim fetch; the relink lands at the
+      // first claim's own admission.
+      const claim = { eventId: "event-1", eventVersion: 1, machineId: "machine-uuid" };
+      const fixture = relinkHarness(4, REBOUND, { claims: [claim] });
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ applied: 1 });
+      expect(fixture.remote.completeApplied).toHaveBeenCalledTimes(1);
+      expect(fixture.resolveExistingProjectIdentity).toHaveBeenCalledTimes(5);
+      expectReportedOnce(fixture, onError);
       await pass.close();
     });
 
     it("checks the binding best effort when no publication admission is supplied", async () => {
-      const fixture = relinkHarness(1);
+      const fixture = relinkHarness(1, REBOUND, { row: true });
       const onError = vi.fn();
       const pass = createPassiveEventReplicationPass(postgresConfig(), {
         processId: "lcm-daemon:binding",
         loadModules: async () => fixture.harness.modules,
         onError,
       });
-      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBeNull();
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({
+        leaseAcquired: true,
+        uploaded: 0,
+      });
       expect(fixture.local.claimDeliveries).not.toHaveBeenCalled();
+      expect(fixture.remote.insertEvents).not.toHaveBeenCalled();
+      expect(fixture.resolveExistingProjectIdentity).toHaveBeenCalledTimes(2);
       expect(fixture.resolveExistingProjectIdentity).toHaveBeenCalledWith("/proj", undefined);
-      expectStoppedWithoutRemoteWork(fixture, onError);
+      expectReportedOnce(fixture, onError);
+      await pass.close();
+    });
+
+    it("uploads the pending rows to the new binding on the next run", async () => {
+      const home = publicationHome();
+      const fixture = relinkHarness(1, REBOUND, { row: true });
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ uploaded: 0 });
+      expect(fixture.harness.modules.createRepository).toHaveBeenLastCalledWith(
+        fixture.harness.runtime,
+        "project-a",
+        "machine-uuid",
+      );
+      expect(fixture.remote.insertEvents).not.toHaveBeenCalled();
+
+      // The binding now resolves to project B at gate 3 and at every phase.
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ uploaded: 1 });
+      expect(fixture.harness.modules.createRepository).toHaveBeenLastCalledWith(
+        fixture.harness.runtime,
+        "project-b",
+        "machine-uuid",
+      );
+      expect(fixture.local.claimDeliveries).toHaveBeenCalledTimes(1);
+      expect(fixture.remote.insertEvents).toHaveBeenCalledTimes(1);
+      expect(fixture.local.markReplicated).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledTimes(1);
+      await pass.close();
+    });
+
+    it("hands the worker the real outbox with only the new-row claim withheld after a relink", async () => {
+      const home = publicationHome();
+      const fixture = relinkHarness(0);
+      const real = {
+        token: "real-outbox",
+        marker: "kept",
+        claimDeliveries: vi.fn().mockResolvedValue(["claimed"]),
+        listAwaitingRemote(this: { token: string }) { return Promise.resolve([this.token]); },
+        close: vi.fn().mockResolvedValue(undefined),
+      };
+      fixture.harness.factory.openExisting.mockResolvedValue(real);
+      const seen: unknown[] = [];
+      const onError = vi.fn();
+      const pass = createPassiveEventReplicationPass(postgresConfig(), {
+        processId: "lcm-daemon:binding",
+        loadModules: async () => fixture.harness.modules,
+        onError,
+        withPublicationAdmission: async operation =>
+          withBackendPublicationConsumerLockAsync(home, token => operation(token)),
+        publicationHome: home,
+        createWorker: dependencies => ({
+          runOnce: async () => {
+            const local = dependencies.local as unknown as typeof real;
+            // Before the binding is checked, the claim reaches the repository.
+            seen.push(await local.claimDeliveries());
+            await dependencies.admitPhase!(async () => undefined);
+            // After the relink the claim resolves empty without a database call.
+            seen.push(await local.claimDeliveries());
+            seen.push(await local.listAwaitingRemote());
+            seen.push(local.marker);
+            return summary;
+          },
+        }),
+      });
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toBe(summary);
+      expect(seen).toEqual([["claimed"], [], ["real-outbox"], "kept"]);
+      expect(real.claimDeliveries).toHaveBeenCalledTimes(1);
+      // The pass closes the real repository, not the wrapper.
+      expect(real.close).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledTimes(1);
       await pass.close();
     });
 
     it("runs every phase while the binding holds", async () => {
       const home = publicationHome();
-      const fixture = relinkHarness(Number.MAX_SAFE_INTEGER);
+      const fixture = relinkHarness(Number.MAX_SAFE_INTEGER, REBOUND, { row: true });
       const onError = vi.fn();
       const pass = admittedPass(fixture.harness, home, onError);
-      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ leaseAcquired: true });
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({
+        leaseAcquired: true,
+        uploaded: 1,
+      });
+      expect(fixture.local.claimDeliveries).toHaveBeenCalledTimes(1);
       expect(fixture.local.listAcknowledgedForRemotePrune).toHaveBeenCalledTimes(1);
       expect(onError).not.toHaveBeenCalled();
       await pass.close();

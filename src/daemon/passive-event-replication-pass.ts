@@ -46,12 +46,15 @@ interface OutboxFactoryLike {
 /**
  * The project's remote binding changed, or disappeared, after the pass
  * resolved it (#1473). It is a plain error on purpose: it belongs to this
- * project's pass, so the pass reports it once and returns instead of letting
- * it halt the sweep like a publication failure would.
+ * project's pass, so the pass reports it once and keeps running instead of
+ * letting it halt the sweep like a publication failure would.
  */
 export class ReplicationBindingChangedError extends Error {
   constructor(cwd: string) {
-    super(`passive-event replication stopped: the remote project binding of ${cwd} changed during the pass`);
+    super(
+      `the remote project binding of ${cwd} changed during the pass; `
+      + "it uploads no further rows to the previous project",
+    );
     this.name = "ReplicationBindingChangedError";
   }
 }
@@ -272,18 +275,38 @@ export function createPassiveEventReplicationPass(
         if (local === null) return null;
         // The remote repository is bound to one project id for the whole
         // pass. Each admitted phase re-reads the persisted binding before it
-        // touches that repository and stops the pass when it moved (#1473).
-        // The check is read-only. Where the admission supplies a token it
-        // reads under that token; the publication home is assumed to equal
-        // the project-map home, as it is for the daemon (both homedir()).
-        // Without an admission there is no lock to be atomic with, so the
-        // check is best effort.
-        const assertBinding = (publicationLockToken?: BackendPublicationLockToken): void => {
+        // touches that repository until it sees the binding move (#1473).
+        // From then on the pass sends no new local row to the previous
+        // project, but it still completes the work that project already
+        // holds: rows this pass uploaded would otherwise stay replicated
+        // forever, because later passes bind the new project and never look
+        // them up. The check is read-only. Where the admission supplies a
+        // token it reads under that token; the publication home is assumed
+        // to equal the project-map home, as it is for the daemon (both
+        // homedir()). Without an admission there is no lock to be atomic
+        // with, so the check is best effort.
+        let bindingChanged = false;
+        const checkBinding = async (
+          publicationLockToken?: BackendPublicationLockToken,
+        ): Promise<void> => {
+          if (bindingChanged) return;
           const current = loaded.resolveExistingProjectIdentity(cwd, publicationLockToken);
           if (current === null || (current.remoteProjectId ?? null) !== remoteProjectId) {
-            throw new ReplicationBindingChangedError(cwd);
+            bindingChanged = true;
+            await report(new ReplicationBindingChangedError(cwd));
           }
         };
+        // The worker's view of the outbox. Every method reaches the real
+        // repository with the repository as receiver; once the binding moved,
+        // claiming new deliveries resolves empty without touching the
+        // database, so those rows stay pending for the new binding.
+        const guarded = new Proxy(local, {
+          get: (target, property) => {
+            if (property === "claimDeliveries" && bindingChanged) return async () => [];
+            const value: unknown = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
         // Each worker phase runs under its own publication admission so the
         // consumer lock is released between phases and hook appends can
         // proceed. Without an admission the phases run directly, as a
@@ -292,12 +315,12 @@ export function createPassiveEventReplicationPass(
         const admitPhase: PassiveEventReplicationDependencies["admitPhase"] =
           admit === undefined
             ? async operation => {
-              assertBinding();
+              await checkBinding();
               return operation();
             }
             : async operation => admit(
-              publicationLockToken => {
-                assertBinding(publicationLockToken);
+              async publicationLockToken => {
+                await checkBinding(publicationLockToken);
                 return withBackendPublicationAppendBarrierAsync(
                   options.publicationHome,
                   () => operation(),
@@ -308,7 +331,7 @@ export function createPassiveEventReplicationPass(
         try {
           const remote = loaded.createRepository(runtime, remoteProjectId, identity.machineId);
           const dependencies: PassiveEventReplicationDependencies = {
-            local,
+            local: guarded,
             remote,
             applyEvent: applyReplicatedPassiveEvent,
             onError: report,

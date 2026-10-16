@@ -292,11 +292,12 @@ no sidecar or project identity evidence is created.
 Each pass reads the project's remote binding once, before its first phase, and
 binds its remote repository to it. Every admitted phase then re-reads the
 persisted binding before it touches that repository. If the project was
-relinked or unbound in the meantime, the pass stops before that phase, reports
-one error, and releases its lease. Rows already handled stay as they were, and
-the next sweep replicates the project against its new binding. A pass run
-without a publication admission checks the binding too, but without the
-admission's lock, so that check is best effort.
+relinked or unbound in the meantime, the pass reports one error and uploads no
+further rows to the previous project: the rows that were still waiting stay
+pending locally and upload to the new binding on the next sweep. Rows the pass
+had already uploaded to the previous project are still completed against it
+before the pass ends. A pass run without a publication admission checks the
+binding too, but without the admission's lock, so that check is best effort.
 
 The storage health check receives the daemon's shutdown signal, so stopping the
 daemon cancels a health check that is still waiting on a PostgreSQL connection
