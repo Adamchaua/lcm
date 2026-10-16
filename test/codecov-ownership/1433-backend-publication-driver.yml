@@ -1,0 +1,20 @@
+references: ["#1433"]
+rationale: >-
+  #1433 adds the production BackendPublicationDriver and coordinator factory,
+  the composed publication material source with its retained-material
+  reader, and the PostgreSQL remote guard provider. The driver and material
+  files are tightly coupled extensions of the backend publication coordinator
+  and join its existing storage-abstractions owner. The provider adapts
+  publication-guard.ts to the coordinator and joins that file's
+  PostgreSQL-coordination owner.
+  src/project-map.ts only exports its existing parseProjectMap so the
+  composer reuses the map's own parser; it keeps its project-worktrees owner.
+  src/storage/backend-publication.ts gains the
+  readAuthenticatedBackendPublicationMaterial export that the
+  retained-material reader uses; it keeps its storage-abstractions owner.
+pins:
+  - ["src/storage/backend-publication-driver.ts", "unit-storage-abstractions"]
+  - ["src/storage/backend-publication-material.ts", "unit-storage-abstractions"]
+  - ["src/project-map.ts", "unit-project-worktrees"]
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
+  - ["src/storage/postgresql/publication-remote-guard.ts", "integration-postgresql-coordination"]

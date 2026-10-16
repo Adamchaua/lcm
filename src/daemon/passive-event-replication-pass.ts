@@ -240,20 +240,6 @@ export function createPassiveEventReplicationPass(
         const identity = loaded.readMachineIdentity();
         if (identity === null || identity.machineId === null) return null;
 
-        // Gate 3: the project must be bound to a remote project id. Reconcile
-        // first so a linked worktree resolves to its canonical binding.
-        loaded.ensureWorktreeProjectReconciled(cwd);
-        const remoteProjectId = loaded.resolveProjectIdentity(cwd).remoteProjectId ?? null;
-        if (remoteProjectId === null) return null;
-
-        // Gate 4: refuse to claim a lease against unhealthy storage.
-        runtime ??= loaded.createRuntime(storage.postgresql);
-        const health = await runtime.health(signal);
-        if (health.status !== "healthy") {
-          await report(health.error ?? new Error("PostgreSQL passive-event storage is unavailable"));
-          return null;
-        }
-
         outboxFactory ??= loaded.createOutboxFactory();
         // A repository whose close failed on an earlier pass is closed again
         // before this path is opened, so each sidecar keeps at most one open
@@ -270,67 +256,110 @@ export function createPassiveEventReplicationPass(
           }
         }
         // The sweep already scanned and promoted this exact sidecar, so open
-        // it as it is: never derive another path, never create a file.
+        // it as it is: never derive another path, never create a file. A
+        // sidecar that is gone resolves no project identity at all, because
+        // resolving one can create and publish a project-map entry (#1510).
         const local = await outboxFactory.openExisting(sidecarPath);
         if (local === null) return null;
-        // The remote repository is bound to one project id for the whole
-        // pass. Each admitted phase re-reads the persisted binding before it
-        // touches that repository until it sees the binding move (#1473).
-        // From then on the pass sends no new local row to the previous
-        // project, but it keeps completing what that project already holds
-        // instead of abandoning it mid-pass. This does not guarantee every
-        // row uploaded there is completed: rows still awaiting the previous
-        // project when the pass ends stay replicated after the next sweep
-        // binds the new project (#1509). The check is read-only. Where the
-        // admission supplies a token it reads under that token; the
-        // publication home is assumed to equal the project-map home, as it
-        // is for the daemon (both homedir()). Without an admission there is
-        // no lock to be atomic with, so the check is best effort.
-        let bindingChanged = false;
-        const checkBinding = async (
-          publicationLockToken?: BackendPublicationLockToken,
-        ): Promise<void> => {
-          if (bindingChanged) return;
-          const current = loaded.resolveExistingProjectIdentity(cwd, publicationLockToken);
-          if (current === null || (current.remoteProjectId ?? null) !== remoteProjectId) {
-            bindingChanged = true;
-            await report(new ReplicationBindingChangedError(cwd));
-          }
-        };
-        // The worker's view of the outbox. Every method reaches the real
-        // repository with the repository as receiver; once the binding moved,
-        // claiming new deliveries resolves empty without touching the
-        // database, so those rows stay pending for the new binding.
-        const guarded = new Proxy(local, {
-          get: (target, property) => {
-            if (property === "claimDeliveries" && bindingChanged) return async () => [];
-            const value: unknown = Reflect.get(target, property, target);
-            return typeof value === "function" ? value.bind(target) : value;
-          },
-        });
-        // Each worker phase runs under its own publication admission so the
-        // consumer lock is released between phases and hook appends can
-        // proceed. Without an admission the phases run directly, as a
-        // standalone worker would.
-        const admit = options.withPublicationAdmission;
-        const admitPhase: PassiveEventReplicationDependencies["admitPhase"] =
-          admit === undefined
-            ? async operation => {
-              await checkBinding();
-              return operation();
-            }
-            : async operation => admit(
-              async publicationLockToken => {
-                await checkBinding(publicationLockToken);
-                return withBackendPublicationAppendBarrierAsync(
-                  options.publicationHome,
-                  () => operation(),
-                  publicationLockToken,
-                );
-              },
-            );
+        // Everything below runs while the opened outbox is held, so every
+        // way out of it, a skipped gate or a thrown error included, releases
+        // that outbox. The factory registers every repository it opens and
+        // only releases one when that repository closes, so a sweep that kept
+        // its outbox would add a SQLite connection per project every five
+        // minutes for the life of the daemon. Releasing cannot fail the pass:
+        // the durable work is already committed by the time we get here. A
+        // repository that refuses to close is kept for the next pass's retry
+        // instead of being dropped while the factory still holds it.
         try {
-          const remote = loaded.createRepository(runtime, remoteProjectId, identity.machineId);
+          // Gate 3: the project must be bound to a remote project id.
+          // Reconcile first so a linked worktree resolves to its canonical
+          // binding.
+          loaded.ensureWorktreeProjectReconciled(cwd);
+          const remoteProjectId = loaded.resolveProjectIdentity(cwd).remoteProjectId ?? null;
+          if (remoteProjectId === null) return null;
+
+          // Gate 4: refuse to claim a lease against unhealthy storage.
+          runtime ??= loaded.createRuntime(storage.postgresql);
+          const health = await runtime.health(signal);
+          if (health.status !== "healthy") {
+            await report(health.error ?? new Error("PostgreSQL passive-event storage is unavailable"));
+            return null;
+          }
+
+          // The remote repository is bound to one project id for the whole
+          // pass. Each admitted phase re-reads the persisted binding before
+          // it touches that repository until it sees the binding move
+          // (#1473). From then on the pass sends no new local row to the
+          // previous project and withdraws no row from other projects, but
+          // it keeps completing what that project already holds instead of
+          // abandoning it mid-pass. Rows still awaiting the previous project
+          // when the pass ends are recovered by the next pass, which is bound
+          // to the new project (#1509). The check is read-only. Where the
+          // admission supplies a token it reads under that token; the
+          // publication home is assumed to equal the project-map home, as it
+          // is for the daemon (both homedir()). Without an admission there is
+          // no lock to be atomic with, so the check is best effort.
+          let bindingChanged = false;
+          const checkBinding = async (
+            publicationLockToken?: BackendPublicationLockToken,
+          ): Promise<void> => {
+            if (bindingChanged) return;
+            const current = loaded.resolveExistingProjectIdentity(cwd, publicationLockToken);
+            if (current === null || (current.remoteProjectId ?? null) !== remoteProjectId) {
+              bindingChanged = true;
+              await report(new ReplicationBindingChangedError(cwd));
+            }
+          };
+          // The worker's view of the outbox. Every method reaches the real
+          // repository with the repository as receiver; once the binding
+          // moved, claiming new deliveries resolves empty without touching
+          // the database, so those rows stay pending for the new binding.
+          const guarded = new Proxy(local, {
+            get: (target, property) => {
+              if (property === "claimDeliveries" && bindingChanged) return async () => [];
+              const value: unknown = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+          // The worker's view of the remote repository, guarded the same
+          // way: once the binding moved it is still bound to the previous
+          // project, so withdrawing rows from "other" projects would be
+          // decided against a stale binding. That recovery then resolves with
+          // no outcomes and waits for the next pass. A binding move inside
+          // the call itself is accepted: the call only releases this
+          // machine's own, envelope-matched rows, which re-upload to the new
+          // binding.
+          const bound = loaded.createRepository(runtime, remoteProjectId, identity.machineId);
+          const remote = new Proxy(bound, {
+            get: (target, property) => {
+              if (property === "releaseFromOtherProjects" && bindingChanged) {
+                return async () => [];
+              }
+              const value: unknown = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+          // Each worker phase runs under its own publication admission so the
+          // consumer lock is released between phases and hook appends can
+          // proceed. Without an admission the phases run directly, as a
+          // standalone worker would.
+          const admit = options.withPublicationAdmission;
+          const admitPhase: PassiveEventReplicationDependencies["admitPhase"] =
+            admit === undefined
+              ? async operation => {
+                await checkBinding();
+                return operation();
+              }
+              : async operation => admit(
+                async publicationLockToken => {
+                  await checkBinding(publicationLockToken);
+                  return withBackendPublicationAppendBarrierAsync(
+                    options.publicationHome,
+                    () => operation(),
+                    publicationLockToken,
+                  );
+                },
+              );
           const dependencies: PassiveEventReplicationDependencies = {
             local: guarded,
             remote,
@@ -342,13 +371,6 @@ export function createPassiveEventReplicationPass(
           const worker = createWorker(dependencies, options.processId);
           return await worker.runOnce(signal);
         } finally {
-          // The factory registers every repository it opens and only releases
-          // one when that repository closes, so a sweep that kept its outbox
-          // would add a SQLite connection per project every five minutes for
-          // the life of the daemon. Releasing here cannot fail the pass: the
-          // durable work is already committed by the time we get here. A
-          // repository that refuses to close is kept for the next pass's
-          // retry instead of being dropped while the factory still holds it.
           try {
             await local.close();
           } catch (error) {

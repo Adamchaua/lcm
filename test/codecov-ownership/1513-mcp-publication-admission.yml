@@ -1,0 +1,7 @@
+references: ["#1513"]
+rationale: >-
+  #1513 routes `lcm mcp` startup publication admission through the
+  authenticated daemon convergence; both files keep their existing owners.
+pins:
+  - ["bin/lcm.ts", "unit-cli"]
+  - ["src/mcp/server.ts", "unit-mcp"]
