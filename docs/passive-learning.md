@@ -291,13 +291,18 @@ no sidecar or project identity evidence is created.
 
 Each pass reads the project's remote binding once, before its first phase, and
 binds its remote repository to it. Every admitted phase then re-reads the
-persisted binding before it touches that repository. If the project was
-relinked or unbound in the meantime, the pass reports one error and uploads no
-further rows to the previous project: the rows that were still waiting stay
-pending locally and upload to the new binding on the next sweep. Rows the pass
-had already uploaded to the previous project are still completed against it
-before the pass ends. A pass run without a publication admission checks the
-binding too, but without the admission's lock, so that check is best effort.
+persisted binding before it touches that repository, until it sees the binding
+change. If the project was relinked or unbound in the meantime, the pass
+reports one error and uploads no further rows to the previous project. It
+keeps working on what that project already holds (claims, reconcile and prune)
+for the rest of the pass, so rows it uploaded there are not abandoned
+mid-pass. Rows the pass did not upload stay pending locally and upload to the
+new binding on the next sweep. Rows that are still awaiting the previous
+project when the pass ends are not reconciled after the next sweep binds the
+new project; this is a known limitation tracked in
+[#1509](https://github.com/donadiosolutions/lcm/issues/1509). A pass run
+without a publication admission checks the binding too, but without the
+admission's lock, so that check is best effort.
 
 The storage health check receives the daemon's shutdown signal, so stopping the
 daemon cancels a health check that is still waiting on a PostgreSQL connection

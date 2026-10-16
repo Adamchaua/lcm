@@ -277,14 +277,15 @@ export function createPassiveEventReplicationPass(
         // pass. Each admitted phase re-reads the persisted binding before it
         // touches that repository until it sees the binding move (#1473).
         // From then on the pass sends no new local row to the previous
-        // project, but it still completes the work that project already
-        // holds: rows this pass uploaded would otherwise stay replicated
-        // forever, because later passes bind the new project and never look
-        // them up. The check is read-only. Where the admission supplies a
-        // token it reads under that token; the publication home is assumed
-        // to equal the project-map home, as it is for the daemon (both
-        // homedir()). Without an admission there is no lock to be atomic
-        // with, so the check is best effort.
+        // project, but it keeps completing what that project already holds
+        // instead of abandoning it mid-pass. This does not guarantee every
+        // row uploaded there is completed: rows still awaiting the previous
+        // project when the pass ends stay replicated after the next sweep
+        // binds the new project (#1509). The check is read-only. Where the
+        // admission supplies a token it reads under that token; the
+        // publication home is assumed to equal the project-map home, as it
+        // is for the daemon (both homedir()). Without an admission there is
+        // no lock to be atomic with, so the check is best effort.
         let bindingChanged = false;
         const checkBinding = async (
           publicationLockToken?: BackendPublicationLockToken,
