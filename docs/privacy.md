@@ -546,7 +546,7 @@ The `Security` section of the doctor output shows:
   or `=` is redacted on the first pass, so `file://h/a&?/Users/A/secret.db`
   becomes `file://h<path>&?<path>` and `file://h/a?q=/Users/A/secret.db`
   becomes `file://h<path>?q=<path>`; the query of a bracketed public URL child
-  and the own `?` and `=` values of an unbracketed public URL in the query stay
+  and the own `?` and `=` values of an unbracketed public URL after the path stay
   readable. Before the first path separator, semicolons, commas, apostrophes,
   closing parentheses, and closing braces remain part of an exact `file://`
   authority. In a single-quoted exact

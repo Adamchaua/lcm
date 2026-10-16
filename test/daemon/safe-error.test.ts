@@ -4149,6 +4149,36 @@ describe("sanitizeError", () => {
       "file://h/a?q=[https://e.test/t]=/Users/y",
       "file://h<path>?q=[https://e.test/t]=<path>",
     ],
+    [
+      "after a public URL and an ampersand root",
+      "file://h/a?u=https://e.test/t&/Users/a?q=/Users/x",
+      "file://h<path>?u=https://e.test/t&<path>?q=<path>",
+    ],
+    [
+      "after a scheme-like path span",
+      "file://h/a?q=/https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>?q=<path>",
+    ],
+    [
+      "after a scheme-like path component",
+      "file://h/a?q=/Users/x://y?w=/Users/z",
+      "file://h<path>?q=<path>?w=<path>",
+    ],
+    [
+      "after a backslash scheme-like path span",
+      "file://h/a?q=\\https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>?q=<path>",
+    ],
+    [
+      "after a backslash-joined scheme-like path span",
+      "file://h/a\\https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>",
+    ],
+    [
+      "after a digit-leading pseudo scheme",
+      "file://h/a?1ab://x?q=/Users/x",
+      "file://h<path>?1ab://x?q=<path>",
+    ],
   ] as const)("redacts a root after an unbracketed file URL path query delimiter on the first pass: %s", (_name, input, expected) => {
     const first = sanitizeError(input);
 
@@ -4203,6 +4233,31 @@ describe("sanitizeError", () => {
       "unbracketed public URL then slash value",
       "file://h/a?u=http://x/y?k=/Users/x",
       "file://h<path>?u=http://x/y?k=/Users/x",
+    ],
+    [
+      "public URL after an ampersand",
+      "file://h/a&u=https://e.test/t?k=/public",
+      "file://h<path>&u=https://e.test/t?k=/public",
+    ],
+    [
+      "public URL after an equals sign",
+      "file://h/a=https://e.test/t?k=/public",
+      "file://h<path>=https://e.test/t?k=/public",
+    ],
+    [
+      "public URL after an ampersand with a dotted host",
+      "file://h/a&u=https://example.com/t?k=/public",
+      "file://h<path>&u=https://example.com/t?k=/public",
+    ],
+    [
+      "public URL directly after an ampersand",
+      "file://h/a&https://e.test/t?k=/public",
+      "file://h<path>&https://e.test/t?k=/public",
+    ],
+    [
+      "plain public URL after an ampersand",
+      "file://h/a&u=http://x/y?k=/public",
+      "file://h<path>&u=http://x/y?k=/public",
     ],
   ] as const)("keeps the first-pass output of a non-private query delimiter successor: %s", (_name, input, expected) => {
     const first = sanitizeError(input);

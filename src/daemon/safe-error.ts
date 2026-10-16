@@ -662,11 +662,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (
         exactFileScheme &&
         foundFilePath &&
-        queryOrFragmentStart > separator &&
         brackets === 0 &&
-        isUrlSchemeColon(chars, index, queryOrFragmentStart + 1)
+        isPublicUrlTailColon(chars, index, separator + 1)
       ) {
-        // The rest of this query belongs to an unbracketed public URL.
+        // The rest of this tail belongs to an unbracketed public URL.
         filePathQueryHasPublicUrl = true;
       }
       if (
@@ -705,6 +704,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       ) {
         // An ampersand after the path starts a fresh root, not URL authority.
         forcedPath[index] = 1;
+        filePathQueryHasPublicUrl = false;
         continue;
       }
       if (char === "/" && !quotedPathEnded) authority[index] = 1;
@@ -838,10 +838,20 @@ function startsUrlSchemeLiteral(chars: readonly string[], index: number): boolea
 }
 
 function isUrlSchemeColon(chars: readonly string[], index: number, lowerBound: number): boolean {
-  if (chars[index] !== ":" || chars[index + 1] !== "/" || chars[index + 2] !== "/") return false;
+  return urlSchemeStart(chars, index, lowerBound) >= 0;
+}
+
+function isPublicUrlTailColon(chars: readonly string[], index: number, lowerBound: number): boolean {
+  const start = urlSchemeStart(chars, index, lowerBound);
+  // A scheme directly after a path separator belongs to a private path span.
+  return start >= 0 && chars[start - 1] !== "/" && chars[start - 1] !== "\\";
+}
+
+function urlSchemeStart(chars: readonly string[], index: number, lowerBound: number): number {
+  if (chars[index] !== ":" || chars[index + 1] !== "/" || chars[index + 2] !== "/") return -1;
   let start = index;
   while (start > lowerBound && URL_SCHEME_CHARACTER_PATTERN.test(chars[start - 1])) start -= 1;
-  return URL_SCHEME_START_PATTERN.test(chars[start]);
+  return URL_SCHEME_START_PATTERN.test(chars[start]) ? start : -1;
 }
 
 function isSpanLocalSchemeColon(chars: readonly string[], start: number, index: number): boolean {
