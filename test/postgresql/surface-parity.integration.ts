@@ -231,10 +231,37 @@ class OwnedAdministrator {
     throw failure("unknown-admin-action");
   }
 
+  private passiveLeaseObserved = false;
+
   private async preparedCatalog(): Promise<{ projects: Json[]; aliases: Json[]; snapshot: Json }> {
     const projects = await this.runtime.query<{ row: Json }>({ text: 'SELECT to_jsonb(record) AS row FROM lcm.projects record ORDER BY project_id' }, scope);
     const aliases = await this.runtime.query<{ row: Json }>({ text: 'SELECT to_jsonb(record) AS row FROM lcm.project_aliases record ORDER BY machine_id,normalized_path COLLATE "C"' }, scope);
     return { projects: projects.rows.map(row => row.row), aliases: aliases.rows.map(row => row.row), snapshot: await this.snapshot() };
+  }
+
+  /**
+   * Main 9174f381 (passive-event replication in the daemon) makes every daemon
+   * start or pass acquire and release one fenced lease row per machine:
+   * resource_type passive-events, operation replicate, keyed by the machine id.
+   * Only that exact shape is exempt from the exact table digest; any other
+   * passive-events lease row fails here, and every other lease row stays pinned.
+   */
+  private async requirePassiveReplicationLeases(): Promise<void> {
+    const leases = await this.runtime.query<{ row: Json }>({
+      text: "SELECT to_jsonb(record) AS row FROM lcm.fenced_leases record WHERE record.resource_type = 'passive-events'",
+    }, scope);
+    for (const { row } of leases.rows) {
+      requireThat(object(row) && row.operation === "replicate" && typeof row.resource_key === "string"
+        && row.resource_key === row.owner_machine_id && typeof row.owner_process_id === "string"
+        && /^lcm-daemon:[0-9a-f-]{36}$/u.test(row.owner_process_id)
+        && typeof row.fencing_token === "number" && row.fencing_token >= 1, "passive-replication-lease-shape");
+    }
+    if (leases.rows.length > 0) this.passiveLeaseObserved = true;
+  }
+
+  /** The exemption is only sound if the exempted row was actually seen at least once. */
+  requirePassiveLeaseObserved(): void {
+    requireThat(this.passiveLeaseObserved, "passive-replication-lease-observed");
   }
 
   private async snapshot(): Promise<Json> {
@@ -260,10 +287,17 @@ class OwnedAdministrator {
     const tables: Record<string, Json> = {};
     for (const { name } of names.rows) {
       requireThat(/^[a-z][a-z0-9_]{0,62}$/u.test(name), "snapshot-table-name");
+      // The daemon's passive-event replication lane acquires and releases a
+      // fenced lease per pass, so its bookkeeping row can appear or advance
+      // across a restart or an idle interval without any user-visible change.
+      // That one bounded row shape is validated below and excluded from the
+      // exact digest; every other lease row stays exactly pinned.
       const rows = await this.runtime.query<{ row: Json }>({
-        text: `SELECT to_jsonb(record) AS row FROM lcm."${name}" AS record ORDER BY to_jsonb(record)::text COLLATE "C"`,
+        text: `SELECT to_jsonb(record) AS row FROM lcm."${name}" AS record${name === "fenced_leases" ? " WHERE record.resource_type <> 'passive-events'" : ""}
+          ORDER BY to_jsonb(record)::text COLLATE "C"`,
       }, scope);
       tables[name] = { count: rows.rows.length, digest: semanticDigest(rows.rows.map(row => row.row)) };
+      if (name === "fenced_leases") await this.requirePassiveReplicationLeases();
     }
     const counts = await this.runtime.query<{ projects: number; conversations: number; messages: number; summaries: number; promotedCount: number }>({
       text: `SELECT (SELECT count(*)::integer FROM lcm.projects) AS projects,
@@ -814,6 +848,7 @@ describe.sequential("complete configured backend surface parity", () => {
         const rows = [...results.get(backend)!.values()];
         if (!hadFailure) {
           if (backend === "postgresql") requireThat(runtime?.corpus, "missing-runtime-corpus");
+          if (backend === "postgresql") administrator?.requirePassiveLeaseObserved();
           assertSemanticEqual(rows.map(row => row.id).sort(), matrix.filter(row => row.scenario !== "control" && row.scenario !== "transfer").map(row => row.id).sort(), "data-row-denominator");
           assertSemanticEqual([...faults.get(backend)!.keys()].sort(), [...FAULT_SCENARIOS].sort(), "fault-denominator");
           for (const scenario of SCENARIOS) assertCompleteReport(matrix, { backend, scenario, rows: rows.filter(row => matrix.find(entry => entry.id === row.id)?.scenario === scenario) });

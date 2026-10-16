@@ -361,19 +361,19 @@ async function identity(context) {
     assert.equal(unbound.status, 409);
     assert.deepEqual(unbound.body, {
       code: "STORAGE_IDENTITY_REQUIRED",
+      reason: "unbound-postgresql-project",
       error: "local project has no PostgreSQL binding; from the affected project directory, "
         + "run `lcm project create` or `lcm project link <project-id>`",
       storageBackend: "postgresql",
     });
     // This renewed successor stays permanently local-only by design (see
-    // above); it is not a retired-identity fence itself, so a later
-    // listCliProjects() sweep (e.g. `compact --all`, `import --all`) would
-    // hit src/cli-storage.ts's unguarded resolveStorageIdentityContext call
-    // for it and abort its ENTIRE enumeration, not just skip this one
-    // project (github.com/donadiosolutions/lcm/issues/1403). Remove this
-    // test-owned entry now that its refusal is proven, so later, unrelated
-    // scenarios sharing this home are not poisoned by it. The retained
-    // fence at the retired id is untouched.
+    // above). A later listCliProjects() sweep (e.g. `compact --all`,
+    // `import --all`) now enumerates an unbound project and reports it as that
+    // project's own failure with exit status 1 instead of aborting the whole
+    // enumeration (github.com/donadiosolutions/lcm/issues/1403, fixed on
+    // main). Remove this test-owned entry now that its refusal is proven, so
+    // later, unrelated scenarios sharing this home do not inherit a failing
+    // unbound project. The retained fence at the retired id is untouched.
     const cleanupMap = JSON.parse(readFileSync(mapPath, "utf8"));
     assert.equal(Object.hasOwn(cleanupMap, expectedSuccessor), true);
     const { [expectedSuccessor]: removedEntry, ...remainingMap } = cleanupMap;
@@ -669,7 +669,7 @@ export function expectedIdentityObservations(backend) {
     // compares against loadPostgreSqlMigrations() directly (never this
     // static list), so this is only the cross-backend architecture-result
     // comparison catching up to the real, current migration ledger.
-    "cli:postgres migrate": pg ? { code: 0, backend: "postgresql", applied: [], current: ["0001_migration_ledger", "0002_schema_baseline", "0003_machine_identity_key", "0004_machine_display_name", "0005_summary_context_integrity", "0006_transfer_ledger", "0007_promoted_content_digest"] } : refusal,
+    "cli:postgres migrate": pg ? { code: 0, backend: "postgresql", applied: [], current: ["0001_migration_ledger", "0002_schema_baseline", "0003_machine_identity_key", "0004_machine_display_name", "0005_summary_context_integrity", "0006_transfer_ledger", "0007_promoted_content_digest", "0008_transfer_identity_content_digest"] } : refusal,
     "cli:events promote": { code: 0, promoted: 0, errors: 0 },
     "cli:events status": pg ? { code: 0, pending: 0, quarantined: 0, remotePending: "0" } : refusal,
     "cli:events validate": pg ? { code: 0, checked: 0, matched: 0, missing: [], mismatched: [] } : refusal,
