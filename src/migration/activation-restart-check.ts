@@ -21,9 +21,19 @@ import { readBoundedRegularFile } from "../security-files.js";
  *   restarted.
  * - `unresolvable`: a pid file names a process that is running, but its
  *   `/health` endpoint could not be observed (network failure, timeout, or
- *   an unrecognized response body). This is distinct from both definite
+ *   an unrecognized response body); or the pid file itself exists but could
+ *   not be read (`pid-file-unreadable`) or does not parse as a canonical
+ *   pid (`pid-file-malformed`). This is distinct from both definite
  *   answers: the verifier could not look, so it must not be reported as
  *   either "no live daemon" or "stale daemon".
+ *
+ * The pid-file read is itself attributed three ways (plan-v7 A12, raised as
+ * #627 PA-7 against the earlier version of this module, which folded every
+ * unusable pid file into `no-pid-file`): only ENOENT is authoritative
+ * absence. A file that exists with garbage in it, or one the bounded
+ * no-follow reader refuses, says nothing about whether a daemon is running
+ * -- the daemon may be alive under a pid this verifier failed to obtain --
+ * so both are `unresolvable`, never `satisfied`.
  *
  * Collapsing `unresolvable` into either neighbour would either block a
  * correct cutover forever (folded into `unsatisfied`) or let a genuinely
@@ -36,6 +46,13 @@ export type ActivationRestartCheckStatus = "satisfied" | "unsatisfied" | "unreso
 
 export type ActivationRestartCheckReason =
   | "no-pid-file"
+  /** The pid file exists but its content is not a canonical safe-integer
+   * pid; the daemon's pid could not be obtained, so nothing was checked. */
+  | "pid-file-malformed"
+  /** The pid file could not be read for a reason other than ENOENT
+   * (permission denied, a symlink refused by the no-follow reader, I/O
+   * error); the daemon's pid could not be obtained. */
+  | "pid-file-unreadable"
   | "stale-pid-file"
   | "backend-matches"
   | "backend-stale"
@@ -70,9 +87,19 @@ export type ActivationRestartCheckInput = Readonly<{
   healthTimeoutMs?: number;
 }>;
 
+/** One attributed read of the pid file. `absent` is ENOENT only; a file
+ * that exists but cannot be parsed is `malformed`, and any other read
+ * failure is `unreadable`. Never collapse the last two into `absent`. */
+export type ActivationPidFileRead = Readonly<
+  | { kind: "present"; pid: number }
+  | { kind: "absent" }
+  | { kind: "malformed"; detail: string }
+  | { kind: "unreadable"; detail: string }
+>;
+
 export type ActivationRestartCheckDependencies = Readonly<{
-  /** Override pid-file reading. Must return `null` for any unusable pid. */
-  readPidFile?: (pidFilePath: string) => number | null;
+  /** Override pid-file reading with an already-attributed outcome. */
+  readPidFile?: (pidFilePath: string) => ActivationPidFileRead;
   /** Override process-liveness detection. */
   isProcessAlive?: (pid: number) => boolean;
   /** Override the signal-sending primitive used by the default liveness
@@ -90,13 +117,16 @@ const CANONICAL_PID = /^[1-9][0-9]*$/u;
 
 /**
  * Read a pid file through the repository's bounded, no-follow file reader
- * (the same defense used for the daemon's own publication-config reads).
- * Returns `null` for a missing file or content that is not, after
- * trimming surrounding whitespace, exactly a canonical positive decimal
- * pid (no sign, leading zero, fraction, exponent or trailing text) within
- * the safe-integer range; any other read failure propagates.
+ * (the same defense used for the daemon's own publication-config reads)
+ * and attribute the outcome: `absent` only for ENOENT; `unreadable` for
+ * any other read failure (the error's code or message is carried as
+ * detail; the reader's own messages name the refused path, never file
+ * content); `malformed` for content that is not, after trimming
+ * surrounding whitespace, exactly a canonical positive decimal pid (no
+ * sign, leading zero, fraction, exponent or trailing text) within the
+ * safe-integer range; `present` otherwise.
  */
-function defaultReadPidFile(pidFilePath: string): number | null {
+function defaultReadPidFile(pidFilePath: string): ActivationPidFileRead {
   let content: string;
   try {
     content = readBoundedRegularFile(pidFilePath, {
@@ -104,13 +134,22 @@ function defaultReadPidFile(pidFilePath: string): number | null {
       maxBytes: MAX_PID_FILE_BYTES,
     });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { kind: "absent" };
+    return {
+      kind: "unreadable",
+      detail: "reading " + pidFilePath + " failed: " + (typeof code === "string" ? code : (error as Error).message),
+    };
   }
   const text = content.trim();
-  if (!CANONICAL_PID.test(text)) return null;
+  if (!CANONICAL_PID.test(text)) {
+    return { kind: "malformed", detail: "the content of " + pidFilePath + " is not a canonical pid" };
+  }
   const pid = Number(text);
-  return Number.isSafeInteger(pid) ? pid : null;
+  if (!Number.isSafeInteger(pid)) {
+    return { kind: "malformed", detail: "the content of " + pidFilePath + " is not a canonical pid (out of range)" };
+  }
+  return { kind: "present", pid };
 }
 
 function defaultIsProcessAlive(
@@ -213,17 +252,38 @@ export async function checkActivationRestartAdmission(
   const timeoutMs = input.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS;
   const { selectedBackend, pidFilePath, port } = input;
 
-  const pid = readPidFile(pidFilePath);
-  if (pid === null) {
+  const read = readPidFile(pidFilePath);
+  if (read.kind === "absent") {
     return buildResult(
       "satisfied",
       "no-pid-file",
-      `no usable pid file at ${pidFilePath}; there is no live daemon to admit against the "${selectedBackend}" selection`,
+      `no pid file at ${pidFilePath}; there is no live daemon to admit against the "${selectedBackend}" selection`,
       null,
       null,
       selectedBackend,
     );
   }
+  if (read.kind === "malformed") {
+    return buildResult(
+      "unresolvable",
+      "pid-file-malformed",
+      `the pid file at ${pidFilePath} exists but could not be parsed, so no daemon pid was obtained: ${read.detail}`,
+      null,
+      null,
+      selectedBackend,
+    );
+  }
+  if (read.kind === "unreadable") {
+    return buildResult(
+      "unresolvable",
+      "pid-file-unreadable",
+      `the pid file at ${pidFilePath} could not be read, so no daemon pid was obtained: ${read.detail}`,
+      null,
+      null,
+      selectedBackend,
+    );
+  }
+  const pid = read.pid;
 
   if (!isProcessAlive(pid)) {
     return buildResult(
