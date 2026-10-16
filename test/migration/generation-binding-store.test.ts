@@ -27,8 +27,10 @@ import {
   migrationWitnessBindingPath,
   recordMigrationSelectionBinding,
   recordMigrationWitnessBinding,
+  resolveMigrationWitnessBindings,
   type MigrationSelectionBinding,
   type MigrationWitnessBinding,
+  type ReadGenerationScopedFilesDependencies,
 } from "../../src/migration/generation-binding-store.js";
 import {
   BoundedFileIdentityChangedError,
@@ -2029,6 +2031,272 @@ describe("reconcileWriterScratchTwin: containing-directory durability after the 
         if (path === scratchPath) unlinked = true;
       }) as never, () => recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }))),
     ).toThrow(boom);
+  });
+});
+
+
+describe("resolveMigrationWitnessBindings", () => {
+  const generationDirectory = (homeDir: string): string =>
+    migrationGenerationBindingDirectory(homeDir, GENERATION_ID);
+  const resolve = (homeDir: string, dependencies?: ReadGenerationScopedFilesDependencies) =>
+    resolveMigrationWitnessBindings({ homeDir, generationId: GENERATION_ID }, dependencies);
+  const unresolvable = (homeDir: string): string => {
+    const result = resolve(homeDir);
+    if (result.state !== "unresolvable") throw new Error("expected unresolvable, got " + result.state);
+    return result.reason;
+  };
+
+  it("is authoritatively absent, and creates nothing, when the store directory does not exist", () => {
+    const homeDir = home();
+    expect(resolve(homeDir)).toEqual({ state: "authoritatively-absent" });
+    expect(existsSync(migrationGenerationBindingStoreDirectory(homeDir))).toBe(false);
+  });
+
+  it("is authoritatively absent when the store holds only another generation", () => {
+    const homeDir = home();
+    recordMigrationSelectionBinding({ homeDir, generationId: "generation-other", binding: selectionBinding() });
+    expect(resolve(homeDir)).toEqual({ state: "authoritatively-absent" });
+    expect(existsSync(generationDirectory(homeDir))).toBe(false);
+  });
+
+  it("is authoritatively absent for an authenticated, empty generation directory", () => {
+    const homeDir = home();
+    mkdirSync(generationDirectory(homeDir), { recursive: true, mode: 0o700 });
+    expect(resolve(homeDir)).toEqual({ state: "authoritatively-absent" });
+  });
+
+  it("is unresolvable, never absent, when the private LCM root is missing", () => {
+    expect(unresolvable(homeWithoutLcmRoot())).toContain("cannot be read");
+  });
+
+  it("is unresolvable when the store path is not a directory", () => {
+    const homeDir = home();
+    writeFileSync(migrationGenerationBindingStoreDirectory(homeDir), "not a directory", { mode: 0o600 });
+    expect(unresolvable(homeDir)).toContain("cannot be read");
+  });
+
+  it("is unresolvable, never absent, for a symlinked generation directory", () => {
+    const homeDir = home();
+    const elsewhere = join(home(), "elsewhere");
+    mkdirSync(elsewhere, { mode: 0o700 });
+    mkdirSync(migrationGenerationBindingStoreDirectory(homeDir), { recursive: true, mode: 0o700 });
+    symlinkSync(elsewhere, generationDirectory(homeDir));
+    expect(unresolvable(homeDir)).toContain("cannot be read");
+  });
+
+  it("is unresolvable, never absent, for an unreadable generation directory", () => {
+    const homeDir = home();
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding: selectionBinding() });
+    chmodSync(generationDirectory(homeDir), 0o000);
+    try {
+      expect(unresolvable(homeDir)).toContain("cannot be read");
+    } finally {
+      chmodSync(generationDirectory(homeDir), 0o700);
+    }
+  });
+
+  it("resolves every recorded binding in manifestRevision order, not directory order", () => {
+    const homeDir = home();
+    // Directory order is selection-activation < selection-rollback and, for
+    // the witnesses, HASH_A < HASH_B: each pair is recorded so that revision
+    // order is the opposite of file-name order.
+    recordMigrationSelectionBinding({
+      homeDir, generationId: GENERATION_ID, binding: selectionBinding({ kind: "activation", manifestRevision: 9 }),
+    });
+    recordMigrationSelectionBinding({
+      homeDir, generationId: GENERATION_ID,
+      binding: selectionBinding({ kind: "rollback", manifestRevision: 3, witnessChecksumSha256: HASH_B }),
+    });
+    recordMigrationWitnessBinding({
+      homeDir, generationId: GENERATION_ID, binding: witnessBinding({ witnessChecksumSha256: HASH_A, manifestRevision: 7 }),
+    });
+    recordMigrationWitnessBinding({
+      homeDir, generationId: GENERATION_ID, binding: witnessBinding({ witnessChecksumSha256: HASH_B, manifestRevision: 2 }),
+    });
+    const result = resolve(homeDir);
+    if (result.state !== "resolved") throw new Error("expected resolved");
+    expect(result.selections.map((entry) => entry.kind)).toEqual(["rollback", "activation"]);
+    expect(result.witnesses.map((entry) => entry.witnessChecksumSha256)).toEqual([HASH_B, HASH_A]);
+  });
+
+  it("breaks manifestRevision ties by kind for selections and by checksum for witnesses", () => {
+    const homeDir = home();
+    recordMigrationSelectionBinding({
+      homeDir, generationId: GENERATION_ID, binding: selectionBinding({ kind: "rollback", manifestRevision: 4 }),
+    });
+    recordMigrationSelectionBinding({
+      homeDir, generationId: GENERATION_ID, binding: selectionBinding({ kind: "activation", manifestRevision: 4 }),
+    });
+    for (const checksum of ["c".repeat(64), HASH_B, HASH_A]) {
+      recordMigrationWitnessBinding({
+        homeDir, generationId: GENERATION_ID, binding: witnessBinding({ witnessChecksumSha256: checksum, manifestRevision: 4 }),
+      });
+    }
+    const result = resolve(homeDir);
+    if (result.state !== "resolved") throw new Error("expected resolved");
+    expect(result.selections.map((entry) => entry.kind)).toEqual(["activation", "rollback"]);
+    expect(result.witnesses.map((entry) => entry.witnessChecksumSha256)).toEqual([HASH_A, HASH_B, "c".repeat(64)]);
+  });
+
+  it("returns exactly what the writers recorded", () => {
+    const homeDir = home();
+    const selection = selectionBinding();
+    const witness = witnessBinding();
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding: selection });
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witness });
+    expect(resolve(homeDir)).toEqual({ state: "resolved", witnesses: [witness], selections: [selection] });
+  });
+
+  const witnessKey = witnessBinding();
+  const witnessFile = (): string => "witness-" + witnessKey.witnessChecksumSha256 + ".binding";
+  const envelope = (binding: unknown, overrides: Record<string, unknown> = {}): string =>
+    JSON.stringify({ version: 1, generationId: GENERATION_ID, binding, ...overrides }) + "\n";
+
+  const corruptions: ReadonlyArray<readonly [string, string, string]> = [
+    ["garbage bytes", witnessFile(), "{not json"],
+    ["a non-object envelope", witnessFile(), "[]\n"],
+    ["an envelope with an unknown key", witnessFile(), envelope(witnessKey, { extra: true })],
+    ["an unrecognised wire version", witnessFile(), envelope(witnessKey, { version: 2 })],
+    ["a different generationId", witnessFile(), envelope(witnessKey, { generationId: "generation-2" })],
+    ["a witness that fails validation", witnessFile(), envelope({ ...witnessKey, kind: "bogus" })],
+    ["a witness whose checksum disagrees with its file name", "witness-" + HASH_B + ".binding", envelope(witnessKey)],
+    [
+      "a witness that is not the writers' canonical bytes",
+      witnessFile(),
+      JSON.stringify({ version: 1, generationId: GENERATION_ID, binding: witnessKey }, null, 1) + "\n",
+    ],
+    ["a selection that fails validation", "selection-activation.binding", envelope({ ...selectionBinding(), publicationId: "" })],
+    ["a selection whose kind disagrees with its file name", "selection-rollback.binding", envelope(selectionBinding())],
+    [
+      "a selection that is not the writers' canonical bytes",
+      "selection-activation.binding",
+      JSON.stringify({ version: 1, generationId: GENERATION_ID, binding: selectionBinding() }, null, 1) + "\n",
+    ],
+  ];
+
+  it.each(corruptions)("is unresolvable, never absent, for %s", (_label, fileName, content) => {
+    const homeDir = home();
+    recordMigrationWitnessBinding({
+      homeDir, generationId: GENERATION_ID, binding: witnessBinding({ witnessChecksumSha256: HASH_B }),
+    });
+    writeFileSync(join(generationDirectory(homeDir), fileName), content, { mode: 0o600 });
+    expect(unresolvable(homeDir)).toContain(fileName);
+  });
+
+  it("is unresolvable when one corrupted witness sits beside valid bindings", () => {
+    const homeDir = home();
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding: selectionBinding() });
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witnessBinding() });
+    const path = migrationWitnessBindingPath(homeDir, GENERATION_ID, HASH_A);
+    writeFileSync(path, readFileSync(path, "utf8").replace(GENERATION_ID, "generation-2"));
+    expect(unresolvable(homeDir)).toContain("witness-");
+  });
+
+  it("is unresolvable for a final file that exceeds the size bound", () => {
+    const homeDir = home();
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witnessBinding() });
+    writeFileSync(migrationWitnessBindingPath(homeDir, GENERATION_ID, HASH_A), "x".repeat(5000), { mode: 0o600 });
+    expect(unresolvable(homeDir)).toContain("cannot be read");
+  });
+
+  it("is unresolvable for a final file with an untrusted mode", () => {
+    const homeDir = home();
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witnessBinding() });
+    chmodSync(migrationWitnessBindingPath(homeDir, GENERATION_ID, HASH_A), 0o644);
+    expect(unresolvable(homeDir)).toContain("cannot be read");
+  });
+
+  it("is unresolvable for an unknown directory entry", () => {
+    const homeDir = home();
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witnessBinding() });
+    writeFileSync(join(generationDirectory(homeDir), "notes.txt"), "stray", { mode: 0o600 });
+    expect(unresolvable(homeDir)).toContain("unknown entry notes.txt");
+  });
+
+  it("is unresolvable for a scratch-shaped entry that names no binding file", () => {
+    const homeDir = home();
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witnessBinding() });
+    writeFileSync(join(generationDirectory(homeDir), ".notes.txt.abcd.tmp"), "stray", { mode: 0o600 });
+    expect(unresolvable(homeDir)).toContain("unknown entry");
+  });
+
+  it("ignores, and never deletes, lone scratch debris from a crash before the link step", () => {
+    const homeDir = home();
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witnessBinding() });
+    const debris = join(generationDirectory(homeDir), ".selection-activation.binding.0123abcd.tmp");
+    writeFileSync(debris, "half written", { mode: 0o600 });
+    expect(resolve(homeDir)).toMatchObject({ state: "resolved" });
+    expect(existsSync(debris)).toBe(true);
+  });
+
+  it("is absent, not resolved, when the directory holds only lone scratch debris", () => {
+    const homeDir = home();
+    mkdirSync(generationDirectory(homeDir), { recursive: true, mode: 0o700 });
+    writeFileSync(join(generationDirectory(homeDir), ".selection-activation.binding.0123abcd.tmp"), "x", { mode: 0o600 });
+    expect(resolve(homeDir)).toEqual({ state: "authoritatively-absent" });
+  });
+
+  it("is unresolvable for scratch debris with an untrusted mode", () => {
+    const homeDir = home();
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witnessBinding() });
+    const debris = join(generationDirectory(homeDir), ".selection-activation.binding.0123abcd.tmp");
+    writeFileSync(debris, "x", { mode: 0o644 });
+    chmodSync(debris, 0o644);
+    expect(unresolvable(homeDir)).toContain("not an authenticated writer scratch file");
+  });
+
+  it("is unresolvable for scratch debris that is a symlink", () => {
+    const homeDir = home();
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witnessBinding() });
+    symlinkSync("/nonexistent", join(generationDirectory(homeDir), ".selection-activation.binding.0123abcd.tmp"));
+    expect(unresolvable(homeDir)).toContain("not an authenticated writer scratch file");
+  });
+
+  it("is unresolvable for scratch debris that has another hard link", () => {
+    const homeDir = home();
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witnessBinding() });
+    const debris = join(generationDirectory(homeDir), ".selection-activation.binding.0123abcd.tmp");
+    writeFileSync(debris, "x", { mode: 0o600 });
+    linkSync(debris, join(home(), "alias"));
+    expect(unresolvable(homeDir)).toContain("not an authenticated writer scratch file");
+  });
+
+  it("accepts an authenticated crash twin read-only: it resolves and leaves both links in place", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const bytes = captureCleanSelectionBytes(binding);
+    const twin = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", bytes);
+    expect(resolve(homeDir)).toEqual({ state: "resolved", witnesses: [], selections: [binding] });
+    expect(statSync(twin.finalPath).nlink).toBe(2);
+    expect(existsSync(twin.scratchPath)).toBe(true);
+  });
+
+  it("is unresolvable for a multi-link file that no scratch twin authenticates", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding });
+    const finalPath = migrationSelectionBindingPath(homeDir, GENERATION_ID, "activation");
+    // A scratch-shaped alias for a different final name does not authenticate.
+    linkSync(finalPath, join(generationDirectory(homeDir), ".selection-rollback.binding.0123abcd.tmp"));
+    expect(unresolvable(homeDir)).toContain("not an authenticated scratch twin");
+  });
+
+  it("is unresolvable when a bounded read fails for any reason", () => {
+    const homeDir = home();
+    recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding: witnessBinding() });
+    const readWithStat = (): BoundedFileResult => { throw new Error("injected read failure"); };
+    expect(resolve(homeDir, { readWithStat })).toMatchObject({
+      state: "unresolvable",
+      reason: expect.stringContaining("injected read failure"),
+    });
+  });
+
+  it("rejects invalid input before any I/O", () => {
+    const homeDir = home();
+    expect(() => resolveMigrationWitnessBindings({ homeDir: "", generationId: GENERATION_ID }))
+      .toThrow(MigrationBindingValidationError);
+    expect(() => resolveMigrationWitnessBindings({ homeDir, generationId: "../escape" }))
+      .toThrow(MigrationBindingValidationError);
   });
 });
 
