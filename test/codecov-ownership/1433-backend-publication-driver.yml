@@ -6,7 +6,11 @@ rationale: >-
   publication coordinator and join its existing storage-abstractions owner.
   src/project-map.ts only exports its existing parseProjectMap so the
   composer reuses the map's own parser; it keeps its project-worktrees owner.
+  src/storage/backend-publication.ts gains the
+  readAuthenticatedBackendPublicationMaterial export that the
+  retained-material reader uses; it keeps its storage-abstractions owner.
 pins:
   - ["src/storage/backend-publication-driver.ts", "unit-storage-abstractions"]
   - ["src/storage/backend-publication-material.ts", "unit-storage-abstractions"]
   - ["src/project-map.ts", "unit-project-worktrees"]
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
