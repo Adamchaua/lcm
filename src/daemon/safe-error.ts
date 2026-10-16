@@ -115,6 +115,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let foundFilePath = false;
   let filePathBracketDepth = 0;
   let filePathStartedInBrackets = false;
+  let filePathQueryHasPublicUrl = false;
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
   let quotedQueryTail = false;
@@ -659,6 +660,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         nestedPublicUrlBracketDepth = brackets;
       }
       if (
+        exactFileScheme &&
+        foundFilePath &&
+        queryOrFragmentStart > separator &&
+        brackets === 0 &&
+        isUrlSchemeColon(chars, index, queryOrFragmentStart + 1)
+      ) {
+        // The rest of this query belongs to an unbracketed public URL.
+        filePathQueryHasPublicUrl = true;
+      }
+      if (
         quotedQueryTail &&
         brackets === 0 &&
         char === "/" &&
@@ -685,8 +696,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         (chars[index - 1] === "&" ||
           (chars[index - 1] === "?" && chars[index - 2] === "&") ||
           // A question mark or equals sign after a path that did not start
-          // inside an authority bracket also starts a fresh root.
-          ((chars[index - 1] === "?" || chars[index - 1] === "=") && !filePathStartedInBrackets)) &&
+          // inside an authority bracket also starts a fresh root, unless an
+          // unbracketed public URL in the query owns that delimiter.
+          ((chars[index - 1] === "?" || chars[index - 1] === "=") &&
+            !filePathStartedInBrackets &&
+            !filePathQueryHasPublicUrl)) &&
         scanAbsolutePath(chars, index, false, -1, true, nestedFileSchemeStarts).sawNonSeparator
       ) {
         // An ampersand after the path starts a fresh root, not URL authority.
@@ -708,9 +722,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       ) {
         file[index] = 1;
         fileQuote[index] = schemeQuote;
+        if (!foundFilePath) {
+          filePathStartedInBrackets = brackets > 0;
+          filePathQueryHasPublicUrl = false;
+        }
         foundFilePath = true;
         filePathBracketDepth = brackets;
-        filePathStartedInBrackets = brackets > 0;
       }
       continue;
     }
