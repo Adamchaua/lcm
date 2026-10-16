@@ -198,6 +198,10 @@ describe("SQLiteLocalHookOutboxFactory", () => {
         run: () => repository.markReplicated(eventUuid, "closed-owner", 1n),
       },
       {
+        operation: "requeueReplicated",
+        run: () => repository.requeueReplicated(eventUuid, 1n),
+      },
+      {
         operation: "markDeliveryRetry",
         run: () => repository.markDeliveryRetry(
           eventUuid,
@@ -336,6 +340,22 @@ describe("SQLiteLocalHookOutboxFactory", () => {
     expect(await repository.markReplicated(
       claimed[0].event_uuid,
       "test-owner",
+      9n,
+    )).toBe(true);
+    // A replicated row goes back to the queue only for its recorded inbox id.
+    expect(await repository.requeueReplicated(claimed[0].event_uuid, 8n)).toBe(false);
+    expect(await repository.requeueReplicated(claimed[0].event_uuid, 9n)).toBe(true);
+    expect(await repository.listAwaitingRemote()).toEqual([]);
+    const reclaimed = await repository.claimDeliveries({
+      machineId: activeMachineId,
+      claimOwner: "test-owner-again",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+    expect(reclaimed.map(({ event_uuid }) => event_uuid)).toEqual([claimed[0].event_uuid]);
+    expect(await repository.markReplicated(
+      claimed[0].event_uuid,
+      "test-owner-again",
       9n,
     )).toBe(true);
     expect(await repository.markAcknowledged(claimed[0].event_uuid, 9n)).toBe(true);

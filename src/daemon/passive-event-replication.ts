@@ -8,6 +8,7 @@ import {
   PostgreSqlPassiveEventDataError,
   PostgreSqlPassiveEventRepository,
   type PostgreSqlPassiveEventRecord,
+  type PostgreSqlPassiveEventReleaseResult,
 } from "../storage/postgresql/passive-event-repository.js";
 import type {
   PostgreSqlPassiveEventClaim,
@@ -524,9 +525,17 @@ export class PassiveEventReplicationWorker {
       signal,
     );
     const byId = new Map(remote.map((event) => [event.eventId, event]));
+    const unbound: LocalHookEventRow[] = [];
     for (const event of local) {
       const record = byId.get(event.event_uuid);
-      if (!record || !sameEnvelope(event, record)) continue;
+      if (!record) {
+        // Not in the bound project: either it went to a project this
+        // machine was bound to before a relink, or it is gone everywhere.
+        // Only this machine's own rows are ever recovered (#1509).
+        if (event.machine_id === this.dependencies.remote.machineId) unbound.push(event);
+        continue;
+      }
+      if (!sameEnvelope(event, record)) continue;
       if (record.status === "applied") {
         if (await this.dependencies.local.markAcknowledged(
           event.event_uuid,
@@ -543,6 +552,76 @@ export class PassiveEventReplicationWorker {
           summary.quarantined += 1;
         }
       }
+    }
+    if (unbound.length > 0) await this.recoverUnbound(unbound, summary, signal);
+  }
+
+  /**
+   * Rows that were replicated to a previous remote project (#1509). The
+   * remote repository withdraws or settles this machine's copies in every
+   * other project, and the outcome decides the local transition: a withdrawn
+   * or missing copy is queued again for the current binding, an applied one
+   * is acknowledged, and a quarantined one stays quarantined. A live claim
+   * is left for a later pass. A failure only postpones the recovery, so it
+   * never blocks the prune phase that follows.
+   */
+  private async recoverUnbound(
+    rows: readonly LocalHookEventRow[],
+    summary: { acknowledged: number; quarantined: number },
+    signal?: AbortSignal,
+  ): Promise<void> {
+    let outcomes: PostgreSqlPassiveEventReleaseResult[];
+    try {
+      outcomes = await this.dependencies.remote.releaseFromOtherProjects(
+        rows.map((event) => ({
+          inboxId: BigInt(event.remote_inbox_id!),
+          machineId: event.machine_id!,
+          eventId: event.event_uuid,
+          eventVersion: event.event_version,
+          machineSequence: BigInt(event.machine_sequence),
+          eventType: event.type,
+          payload: eventPayload(event),
+        })),
+        { staleClaimMs: this.options.staleClaimMs, signal },
+      );
+    } catch (error) {
+      await this.reportError(error);
+      return;
+    }
+    const requested = new Map(rows.map((event) => [event.event_uuid, event]));
+    const mismatched: string[] = [];
+    for (const outcome of outcomes) {
+      // Only keys that were asked about are ever acted on.
+      const event = requested.get(outcome.eventId);
+      if (event === undefined) continue;
+      if (outcome.outcome === "absent" || outcome.outcome === "released") {
+        await this.dependencies.local.requeueReplicated(
+          event.event_uuid,
+          BigInt(event.remote_inbox_id!),
+        );
+      } else if (outcome.outcome === "applied") {
+        if (await this.dependencies.local.markAcknowledged(
+          event.event_uuid,
+          outcome.inboxId,
+        )) {
+          summary.acknowledged += 1;
+        }
+      } else if (outcome.outcome === "quarantined") {
+        if (await this.dependencies.local.markQuarantined(
+          event.event_uuid,
+          outcome.inboxId,
+          outcome.quarantineReason,
+        )) {
+          summary.quarantined += 1;
+        }
+      } else if (outcome.outcome === "mismatch") {
+        mismatched.push(event.event_uuid);
+      }
+    }
+    if (mismatched.length > 0) {
+      await this.reportError(new Error(
+        `replicated rows differ from their copy in another remote project: ${mismatched.join(", ")}`,
+      ));
     }
   }
 

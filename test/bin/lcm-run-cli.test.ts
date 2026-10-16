@@ -126,6 +126,7 @@ const state = vi.hoisted(() => ({
   migrateLegacyHome: vi.fn(),
   install: vi.fn(async () => undefined),
   createInstallerPublicationConvergence: vi.fn(),
+  startMcpServer: vi.fn(async (_options?: unknown): Promise<undefined> => undefined),
   ensureAuthToken: vi.fn(),
   createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })),
   privateFsRoots: [] as string[],
@@ -280,7 +281,7 @@ vi.mock("../../src/cli-help.js", () => ({
   printHelp: state.printHelp,
 }));
 vi.mock("../../src/hooks/dispatch.js", () => ({ dispatchHook: state.dispatchHook }));
-vi.mock("../../src/mcp/server.js", () => ({ startMcpServer: vi.fn(async () => undefined) }));
+vi.mock("../../src/mcp/server.js", () => ({ startMcpServer: state.startMcpServer }));
 vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (options: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
   options.onProgress?.(state.batchProgressLast ? { lastResult: { ok: true } } : {});
   return state.batchResult;
@@ -712,6 +713,39 @@ describe("runCli registration and help dispatch", () => {
     await invoke(args);
     expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
     expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries mcp startup publication contention and hands the wrapper to the server", async () => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.migrateLegacyHome.mockImplementationOnce(() => { throw contention; }).mockImplementationOnce(() => undefined);
+
+    expect(await invoke(["mcp"])).toBeUndefined();
+
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+    expect(state.startMcpServer).toHaveBeenCalledOnce();
+    const options = state.startMcpServer.mock.calls[0]?.[0] as {
+      withPublicationAdmissionRetry: <T>(run: () => T | Promise<T>) => Promise<T>;
+    };
+    const retried = vi.fn()
+      .mockImplementationOnce(() => { throw contention; })
+      .mockImplementationOnce(() => "admitted");
+    expect(await options.withPublicationAdmissionRetry(retried)).toBe("admitted");
+    expect(retried).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps mcp startup fail-closed when the lock owner is not the authenticated daemon", async () => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence(
+      () => ({ version: 1, pid: 43, processStartTime: "birth", nonce: "a".repeat(32) }),
+    ));
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.migrateLegacyHome.mockImplementation(() => { throw contention; });
+
+    expect(await invoke(["mcp"])).toBe(contention);
+
+    expect(state.migrateLegacyHome).toHaveBeenCalledOnce();
+    expect(state.startMcpServer).not.toHaveBeenCalled();
   });
 
   it.each([

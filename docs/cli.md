@@ -201,6 +201,13 @@ read preparation retry only the lock-acquisition callback. Output, exit status,
 and export file writes happen once after the callback succeeds. Mutation and
 lifecycle commands keep their existing admission and migration behavior.
 
+`lcm mcp` startup admission (the legacy-home gate, MCP storage admission, and
+the daemon lifecycle assertion) waits within the same authenticated two-second
+publication convergence when the managed daemon itself holds publication. Any
+other owner or failed evidence still exits with the publication-busy
+diagnostic. Admission failures for individual MCP requests are returned as tool
+errors.
+
 When version 1 knowledge export/import or compaction discovery opens project
 storage, its selected backend stays protected until the storage work and
 connection cleanup finish.

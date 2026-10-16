@@ -921,6 +921,32 @@ export class EventsDb {
     return Number(result.changes) === 1;
   }
 
+  /**
+   * Return a row that was replicated to a remote project the daemon is no
+   * longer bound to (#1509) to the pending queue, so a later pass uploads it
+   * to the current binding. The inbox id guard keeps a row that was already
+   * moved or acknowledged from being re-queued by a stale decision.
+   */
+  requeueReplicated(eventId: string, remoteInboxId: bigint): boolean {
+    const inboxId = formatRemoteInboxId(remoteInboxId);
+    const result = this.db.prepare(`
+      UPDATE events
+      SET delivery_state = 'pending',
+          delivery_generation = delivery_generation + 1,
+          delivery_owner = NULL,
+          delivery_claimed_at = NULL,
+          delivery_next_attempt_at = datetime('now'),
+          delivery_last_error = NULL,
+          remote_inbox_id = NULL,
+          quarantine_reason = NULL,
+          delivery_updated_at = datetime('now')
+      WHERE event_uuid = ?
+        AND delivery_state = 'replicated'
+        AND remote_inbox_id = ?
+    `).run(eventUuid(eventId), inboxId);
+    return Number(result.changes) === 1;
+  }
+
   markDeliveryRetry(
     eventId: string,
     claimOwner: string,

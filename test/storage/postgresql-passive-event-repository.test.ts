@@ -822,4 +822,168 @@ describe("PostgreSqlPassiveEventRepository", () => {
       projectId: PROJECT_ID,
     });
   });
+
+  describe("releaseFromOtherProjects (#1509)", () => {
+    const OTHER_PROJECT_ID = "0195d250-0000-7000-8000-000000000009";
+    const ids = Array.from(
+      { length: 12 },
+      (_, index) => `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+    );
+
+    function key(index: number, overrides: Record<string, unknown> = {}) {
+      return {
+        inboxId: BigInt(100 + index),
+        machineId: MACHINE_ID,
+        eventId: ids[index],
+        eventVersion: 1,
+        machineSequence: BigInt(index + 1),
+        eventType: "choice",
+        payload: { sessionId: "session" },
+        ...overrides,
+      };
+    }
+
+    function located(
+      index: number,
+      overrides: Parameters<typeof eventRow>[0] & { claim_stale?: unknown } = {},
+    ): QueryResultRow {
+      return {
+        ...eventRow({
+          inbox_id: String(100 + index),
+          project_id: OTHER_PROJECT_ID,
+          event_id: ids[index],
+          machine_sequence: String(index + 1),
+          payload: { sessionId: "session" },
+          ...overrides,
+        }),
+        claim_stale: overrides.claim_stale ?? false,
+      };
+    }
+
+    function releaseRepository(
+      rows: QueryResultRow[],
+      deleteCount: (values: unknown[]) => number = () => 1,
+    ) {
+      return repository(async (config) => {
+        if (config.text.includes("FOR UPDATE")) return queryResult(rows);
+        if (config.text.includes("DELETE FROM")) {
+          const count = deleteCount(config.values ?? []);
+          return queryResult(
+            Array.from({ length: count }, () => ({ inbox_id: "1" })),
+          );
+        }
+        throw new Error(`unexpected query: ${config.text}`);
+      });
+    }
+
+    const deletions = (execution: ReturnType<typeof executors>) =>
+      execution.query.mock.calls.filter(([config]) => config.text.includes("DELETE FROM"));
+
+    it("locks this machine's copies in every project and classifies each on the locked row", async () => {
+      const { repository: subject, execution } = releaseRepository([
+        located(1),
+        located(2, { status: "retry" }),
+        located(3, { status: "claimed", claimed_at: "2026-07-29T12:00:01.000Z", claimed_by: "w", claim_stale: true }),
+        located(4, { status: "applied", applied_at: "2026-07-29T12:00:02.000Z" }),
+      ]);
+      const signal = new AbortController().signal;
+      const results = await subject.releaseFromOtherProjects(
+        [key(0), key(1), key(2), key(3), key(4)],
+        { staleClaimMs: 60_000, signal },
+      );
+      expect(results).toEqual([
+        { eventId: ids[0], outcome: "absent" },
+        { eventId: ids[1], outcome: "released" },
+        { eventId: ids[2], outcome: "released" },
+        { eventId: ids[3], outcome: "released" },
+        { eventId: ids[4], outcome: "applied", inboxId: 104n },
+      ]);
+
+      const select = execution.query.mock.calls.find(([config]) => config.text.includes("FOR UPDATE"))!;
+      expect(select[0].text).toContain("event.machine_id = $1");
+      expect(select[0].text).not.toContain("SKIP LOCKED");
+      expect(select[0].text).toContain("ORDER BY event.inbox_id");
+      expect(select[0].text).not.toContain("project_id");
+      expect(select[0].values).toEqual([MACHINE_ID, ids.slice(0, 5), 60_000]);
+      expect(select[1]).toMatchObject({
+        domain: "passive-events",
+        operation: "releaseFromOtherProjects",
+        signal,
+      });
+      // Each delete names the exact copy, its project, and the observed status.
+      expect(deletions(execution).map(([config]) => config.values)).toEqual([
+        ["101", MACHINE_ID, ids[1], OTHER_PROJECT_ID, "pending"],
+        ["102", MACHINE_ID, ids[2], OTHER_PROJECT_ID, "retry"],
+        ["103", MACHINE_ID, ids[3], OTHER_PROJECT_ID, "claimed"],
+        ["104", MACHINE_ID, ids[4], OTHER_PROJECT_ID, "applied"],
+      ]);
+      expect(deletions(execution)[0][0].text).toContain("RETURNING inbox_id");
+    });
+
+    it("keeps quarantined copies, live claims, bound copies, and mismatched copies", async () => {
+      const { repository: subject, execution } = releaseRepository([
+        located(0, {
+          status: "quarantined",
+          quarantined_at: "2026-07-29T12:00:03.000Z",
+          quarantine_reason: "poison",
+        }),
+        located(1, { status: "claimed", claimed_at: "2026-07-29T12:00:01.000Z", claimed_by: "w", claim_stale: false }),
+        located(2, { project_id: PROJECT_ID }),
+        located(3, { inbox_id: "999" }),
+        located(4, { payload: { sessionId: "different" } }),
+        located(5, { event_version: 2 }),
+      ]);
+      await expect(subject.releaseFromOtherProjects(
+        [key(0), key(1), key(2), key(3), key(4), key(5)],
+        { staleClaimMs: 1_000 },
+      )).resolves.toEqual([
+        { eventId: ids[0], outcome: "quarantined", inboxId: 100n, quarantineReason: "poison" },
+        { eventId: ids[1], outcome: "busy" },
+        { eventId: ids[2], outcome: "bound" },
+        { eventId: ids[3], outcome: "mismatch" },
+        { eventId: ids[4], outcome: "mismatch" },
+        { eventId: ids[5], outcome: "mismatch" },
+      ]);
+      expect(deletions(execution)).toEqual([]);
+    });
+
+    it("reports busy when the observed copy is no longer deletable", async () => {
+      const { repository: subject } = releaseRepository([located(0)], () => 0);
+      await expect(subject.releaseFromOtherProjects([key(0)], { staleClaimMs: 1_000 }))
+        .resolves.toEqual([{ eventId: ids[0], outcome: "busy" }]);
+    });
+
+    it("rejects invalid input before touching the database", async () => {
+      const { repository: subject, execution } = releaseRepository([]);
+      await expect(subject.releaseFromOtherProjects([], { staleClaimMs: 1_000 }))
+        .rejects.toThrow("batch must contain 1-500");
+      for (const staleClaimMs of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+        await expect(subject.releaseFromOtherProjects([key(0)], { staleClaimMs }))
+          .rejects.toThrow("stale claim milliseconds must be a positive safe integer");
+      }
+      // A key of another machine is never authority to touch its rows.
+      await expect(subject.releaseFromOtherProjects(
+        [key(0, { machineId: OTHER_MACHINE_ID })],
+        { staleClaimMs: 1_000 },
+      )).rejects.toMatchObject(expectDataError("machine_id"));
+      await expect(subject.releaseFromOtherProjects(
+        [key(0, { inboxId: 0n })],
+        { staleClaimMs: 1_000 },
+      )).rejects.toMatchObject(expectDataError("inbox_id"));
+      await expect(subject.releaseFromOtherProjects(
+        [key(0), key(1, { eventId: ids[0] })],
+        { staleClaimMs: 1_000 },
+      )).rejects.toMatchObject(expectDataError("duplicate_batch_event_id"));
+      expect(execution.query).not.toHaveBeenCalled();
+    });
+
+    it("fails closed on a malformed located row", async () => {
+      const { repository: subject, execution } = releaseRepository([
+        located(0, { status: "claimed" }),
+      ]);
+      await expect(subject.releaseFromOtherProjects([key(0)], { staleClaimMs: 1_000 }))
+        .rejects.toMatchObject(expectDataError("status_timestamps"));
+      expect(deletions(execution)).toEqual([]);
+    });
+  });
 });
