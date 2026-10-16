@@ -114,6 +114,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let exactFileScheme = false;
   let foundFilePath = false;
   let filePathBracketDepth = 0;
+  let filePathStartedInBrackets = false;
+  let filePathQueryHasPublicUrl = false;
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
   let quotedQueryTail = false;
@@ -658,6 +660,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         nestedPublicUrlBracketDepth = brackets;
       }
       if (
+        exactFileScheme &&
+        foundFilePath &&
+        brackets === 0 &&
+        isPublicUrlTailColon(chars, index, separator + 1)
+      ) {
+        // The rest of this tail belongs to an unbracketed public URL.
+        filePathQueryHasPublicUrl = true;
+      }
+      if (
         quotedQueryTail &&
         brackets === 0 &&
         char === "/" &&
@@ -681,11 +692,19 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         foundFilePath &&
         char === "/" &&
         nestedPublicUrlBracketDepth === 0 &&
-        (chars[index - 1] === "&" || (chars[index - 1] === "?" && chars[index - 2] === "&")) &&
+        (chars[index - 1] === "&" ||
+          (chars[index - 1] === "?" && chars[index - 2] === "&") ||
+          // A question mark or equals sign after a path that did not start
+          // inside an authority bracket also starts a fresh root, unless an
+          // unbracketed public URL in the query owns that delimiter.
+          ((chars[index - 1] === "?" || chars[index - 1] === "=") &&
+            !filePathStartedInBrackets &&
+            !filePathQueryHasPublicUrl)) &&
         scanAbsolutePath(chars, index, false, -1, true, nestedFileSchemeStarts).sawNonSeparator
       ) {
         // An ampersand after the path starts a fresh root, not URL authority.
         forcedPath[index] = 1;
+        filePathQueryHasPublicUrl = false;
         continue;
       }
       if (char === "/" && !quotedPathEnded) authority[index] = 1;
@@ -703,6 +722,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       ) {
         file[index] = 1;
         fileQuote[index] = schemeQuote;
+        if (!foundFilePath) {
+          filePathStartedInBrackets = brackets > 0;
+          filePathQueryHasPublicUrl = false;
+        }
         foundFilePath = true;
         filePathBracketDepth = brackets;
       }
@@ -815,10 +838,20 @@ function startsUrlSchemeLiteral(chars: readonly string[], index: number): boolea
 }
 
 function isUrlSchemeColon(chars: readonly string[], index: number, lowerBound: number): boolean {
-  if (chars[index] !== ":" || chars[index + 1] !== "/" || chars[index + 2] !== "/") return false;
+  return urlSchemeStart(chars, index, lowerBound) >= 0;
+}
+
+function isPublicUrlTailColon(chars: readonly string[], index: number, lowerBound: number): boolean {
+  const start = urlSchemeStart(chars, index, lowerBound);
+  // A scheme directly after a path separator belongs to a private path span.
+  return start >= 0 && chars[start - 1] !== "/" && chars[start - 1] !== "\\";
+}
+
+function urlSchemeStart(chars: readonly string[], index: number, lowerBound: number): number {
+  if (chars[index] !== ":" || chars[index + 1] !== "/" || chars[index + 2] !== "/") return -1;
   let start = index;
   while (start > lowerBound && URL_SCHEME_CHARACTER_PATTERN.test(chars[start - 1])) start -= 1;
-  return URL_SCHEME_START_PATTERN.test(chars[start]);
+  return URL_SCHEME_START_PATTERN.test(chars[start]) ? start : -1;
 }
 
 function isSpanLocalSchemeColon(chars: readonly string[], start: number, index: number): boolean {

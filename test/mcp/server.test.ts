@@ -10,6 +10,7 @@ import { DEFAULT_SEARCH_RESULT_LIMIT, MAX_SEARCH_RESULT_LIMIT } from "../../src/
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { StatsUnavailableError } from "../../src/stats.js";
 import type { BackendDiagnosticSnapshot } from "../../src/storage/diagnostics.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 type LocalToolHandler = (request: { params: { name: string; arguments?: Record<string, unknown> } }) => Promise<{
   content: Array<{ type: "text"; text: string }>;
@@ -27,7 +28,13 @@ vi.mock("../../src/stats.js", async importOriginal => {
 });
 
 const ensureDaemonMcpMock = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true, port: 9999, spawned: false }));
+const startupAdmissionMock = vi.hoisted(() => vi.fn());
 
+vi.mock("../../src/storage/backend.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/storage/backend.js")>();
+  startupAdmissionMock.mockImplementation(actual.assertStorageBackendPublication);
+  return { ...actual, assertStorageBackendPublication: startupAdmissionMock };
+});
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: ensureDaemonMcpMock,
 }));
@@ -668,6 +675,47 @@ describe("startMcpServer", () => {
       enforceUserManagerParent: true,
     }));
     expect(call.spawnArgs[0]).toBe(call.expectedEntrypoint);
+  });
+
+  it("leaves ensureDaemon publication admission unwrapped when no wrapper is supplied", async () => {
+    const { startMcpServer } = await import("../../src/mcp/server.js");
+
+    await startMcpServer();
+
+    expect(ensureDaemonMcpMock.mock.calls.at(-1)?.[0]).not.toHaveProperty("_withPublicationAdmissionRetry");
+  });
+
+  it("propagates startup publication contention when no wrapper is supplied", async () => {
+    ensureDaemonMcpMock.mockClear();
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    startupAdmissionMock.mockImplementationOnce(() => { throw contention; });
+    const { startMcpServer } = await import("../../src/mcp/server.js");
+
+    await expect(startMcpServer()).rejects.toBe(contention);
+    expect(ensureDaemonMcpMock).not.toHaveBeenCalled();
+  });
+
+  it("retries startup storage admission through the supplied wrapper and shares it with the daemon lifecycle", async () => {
+    ensureDaemonMcpMock.mockClear();
+    startupAdmissionMock.mockClear();
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    startupAdmissionMock.mockImplementationOnce(() => { throw contention; });
+    const wrapper = vi.fn(async <T>(step: () => T | Promise<T>): Promise<T> => {
+      try {
+        return await step();
+      } catch (error) {
+        if (error !== contention) throw error;
+        return await step();
+      }
+    });
+    const { startMcpServer } = await import("../../src/mcp/server.js");
+
+    await startMcpServer({ withPublicationAdmissionRetry: wrapper });
+
+    expect(wrapper).toHaveBeenCalledOnce();
+    expect(startupAdmissionMock).toHaveBeenCalledTimes(2);
+    expect(ensureDaemonMcpMock).toHaveBeenCalledOnce();
+    expect(ensureDaemonMcpMock.mock.calls[0]?.[0]).toMatchObject({ _withPublicationAdmissionRetry: wrapper });
   });
 });
 
