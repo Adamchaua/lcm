@@ -412,6 +412,12 @@ describe("composeBackendPublicationMaterial: source backend and project-map rule
     });
     expect(activation.sourceBackend).toBe("sqlite");
     expect(activation.targetBackend).toBe("postgresql");
+    // The backend comes from the very bytes the publication can restore.
+    expect(activation.material.source.config.presence).toBe("present");
+    if (activation.material.source.config.presence === "present") {
+      const captured = JSON.parse(Buffer.from(activation.material.source.config.content).toString("utf-8"));
+      expect(captured.storage.backend).toBe(activation.sourceBackend);
+    }
 
     writeConfig(home, { storage: { backend: "postgresql" } });
     writeMap(home, { [HASH_A]: { canonical: "/repos/one", aliases: [], remoteProjectId: REMOTE_ID_A } });

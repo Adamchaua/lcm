@@ -525,12 +525,12 @@ has been re-established through the supported owning flow.
 ## Constructing a coordinator and composing publication material
 
 Library callers (the migration activation and rollback work under Epic #92)
-do not construct a coordinator or build recovery material by hand. Three
-exports in `src/storage` cover that:
+do not construct a coordinator, build recovery material or implement a remote
+guard by hand. Four exports in `src/storage` cover that.
 
 - `createBackendPublicationCoordinator` (`backend-publication-driver.ts`) is
   the one production construction site. It binds the coordinator to the merged
-  permit-gated config and project-map writers; it adds no file-mutation code
+  permit-gated config and project-map writers and adds no file-mutation code
   of its own. The caller must state a remote guard choice, and there is no
   default:
   - `{ mode: "delegated", provider }` wires the three remote-guard hooks to a
@@ -540,28 +540,116 @@ exports in `src/storage` cover that:
     guard provider.
   - `{ mode: "absent", acknowledged: true }` is valid only for a publication
     that names no projects. A bare `{ mode: "absent" }` is refused.
+- `createPostgreSqlBackendPublicationRemoteGuard`
+  (`postgresql/publication-remote-guard.ts`) is the production provider over
+  the PostgreSQL fenced publication lease. It takes the guard (for example
+  `PostgreSqlRuntime#backendPublicationGuard()`), this machine's PostgreSQL
+  machine id (a UUIDv7) and the lease lifetime in milliseconds (an integer up
+  to 24 hours), and it validates all three when it is created.
 - `composeBackendPublicationMaterial` (`backend-publication-material.ts`)
   reads the live `config.json` and `map.json` and returns
-  `{ sourceBackend, targetBackend, material, projects }`, which is the input
-  `prepare()` takes. `sourceBackend` comes from the live config (PostgreSQL
-  only when it selects PostgreSQL), and composing a target equal to the live
-  backend is refused. The live project map is parsed with the project map's
-  own rules, so an entry the map layer would reject is refused here too.
-  The listed projects are the only entries whose remote binding changes: a
-  PostgreSQL target binds projects that are currently unbound, a SQLite target
-  unbinds projects that are currently bound to exactly the stated remote, and
-  the list must be non-empty and name no project or remote twice. A stated
-  remote that another map entry already holds is refused. Every other entry is
-  carried through unchanged, and its existing remote binding is not part of the
-  publication and not fenced by it.
+  `{ sourceBackend, targetBackend, material, projects }`.
 - `readRetainedBackendPublicationMaterial` returns the retained recovery
-  material of the last completed publication. It answers `present` (with the
-  journal and the authenticated material), `authoritatively-absent` (the
-  publication directory is confirmed absent, or the journal is not at
-  `completed`), or `unresolvable` with a reason. A publication directory
-  that exists without a readable journal, and a completed journal whose
-  material file is missing or fails authentication, are `unresolvable`;
-  neither is treated as "nothing to reverse".
+  material of the last completed publication.
+
+### How the pieces fit
+
+The consumer composes once, then passes the result on without re-deriving
+anything. Activation stores the recovery material with
+`publishActivationArtifact`, and both consumers prepare the publication:
+
+```ts
+const composed = composeBackendPublicationMaterial({ homeDir, targetBackend, bindings });
+
+publishActivationArtifact({
+  homeDir,
+  material: {
+    version: 1,
+    publicationId,
+    source: composed.material.source,
+    target: composed.material.target,
+    projects: composed.projects,
+  },
+});
+
+const coordinator = createBackendPublicationCoordinator({
+  homeDir,
+  remoteGuard: {
+    mode: "delegated",
+    provider: createPostgreSqlBackendPublicationRemoteGuard({ guard, machineId, ttlMs }),
+  },
+});
+await coordinator.prepare({
+  publicationId,
+  sourceBackend: composed.sourceBackend,
+  targetBackend: composed.targetBackend,
+  material: composed.material,
+  projects: composed.projects,
+});
+```
+
+`sourceBackend` is derived from the same captured `config.json` bytes that
+become `material.source.config`, so the backend the journal records always
+describes the bytes the publication can restore. It is PostgreSQL only when
+that config selects PostgreSQL, and a target equal to it is refused. Callers
+pass these values through and do not write the backends as literals.
+
+Each binding carries its own `evidenceSha256` from the caller. The composer
+checks only its shape and does not compute or verify the digest.
+
+### What the composed project map changes
+
+The enforced invariant is that the project-map entries whose remote binding
+differs between the live map and the composed target map are exactly the
+bindings, which are exactly `projects`. The live map is parsed with the
+project map's own rules, so an entry the map layer would reject is refused
+here too. The list must be non-empty and name no project or remote twice. A
+PostgreSQL target binds projects that are currently unbound, and a SQLite
+target unbinds projects that are currently bound to exactly the stated remote.
+A stated remote that another map entry already holds is refused.
+
+Every other entry is carried through unchanged, and its existing remote
+binding is not part of the publication and not fenced by it. "Unchanged"
+means value-identical after the project map's normalization and serialization
+(unknown fields are dropped and remote ids are lowercased). Consumers that
+compare a composed target with retained material must run both sides through
+the same normalization, which holds when both come from the composer.
+
+### The remote guard provider
+
+The consumer acquires and renews the lease for each project before it drives
+the coordinator, so the coordinator normally finds an active fence for this
+publication and adopts it by reading it. The provider never renews a lease.
+When the coordinator does ask it to acquire, the provider reads the row first:
+
+- no row, or a released row: the guard inserts or replaces it;
+- an unexpired row of this exact generation (machine, publication, target
+  backend and evidence): the guard returns it unchanged;
+- an expired, unreleased row of this exact generation: the provider takes over
+  its own lapsed lease by naming that row's token, so the token advances and
+  the new fence is recorded in the journal. The journal's earlier token is
+  never used;
+- an unreleased row of any other generation: the guard refuses with
+  `publication-conflict` and the coordinator fails closed. A row held by a
+  different machine under this publication id is refused by the provider
+  itself, so a foreign fence is never journalled as ours.
+
+The activation step's lease assertion before it drives the coordinator is a
+fail-fast check only. The coordinator re-reads the fence independently, so a
+lease that lapses in between is taken over by the coordinator's own
+acquisition as described above rather than failing there.
+
+### Reading retained material
+
+`readRetainedBackendPublicationMaterial` answers `present` (with the journal
+and the authenticated material), `authoritatively-absent` (the publication
+directory is confirmed absent, or the journal is not at `completed`), or
+`unresolvable` with a reason. A publication directory that exists without a
+readable journal, and a completed journal whose material file is missing or
+fails authentication, are `unresolvable`; neither is treated as "nothing to
+reverse".
+
+### What the driver leaves to the coordinator
 
 The driver deliberately leaves `retainCompletedMaterial` and
 `cleanupAbortedMaterial` undefined. The coordinator already keeps a completed
