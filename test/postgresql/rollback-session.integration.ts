@@ -24,6 +24,7 @@ import {
 } from "../../src/storage/backend-publication.js";
 import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
+import { resolveMigrationWitnessBindings } from "../../src/migration/generation-binding-store.js";
 import {
   beginMigrationEffect,
   completeMigrationEffect,
@@ -356,6 +357,45 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
       }, scenario)).rejects.toMatchObject({ name: "RollbackSessionError", reason: "lease-lost" });
       expect(existsSync(canonicalPath)).toBe(false);
       expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+    });
+  });
+
+  it("A17: refuses an in-place update after the export snapshot that preserves every count and identity, leaving PostgreSQL authoritative", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-a17", async (database) => {
+      const { homeDir, canonicalPath, scenario } = await prepared(database, "gen-a17");
+      // Post-write by an in-place edit before the export; the delta carries no content.
+      await editFirstMessage(database, "Edited after activation");
+      const counts = async () => (await database.migrator.query<{ conversations: string; messages: string; ids: string }>({
+        text: "SELECT (SELECT count(*) FROM lcm.conversations WHERE project_id = $1)::text AS conversations, "
+          + "(SELECT count(*) FROM lcm.messages WHERE project_id = $1)::text AS messages, "
+          + "(SELECT string_agg(conversation_id::text || ':' || seq::text, ',' ORDER BY conversation_id, seq) "
+          + "FROM lcm.messages WHERE project_id = $1) AS ids",
+        values: [fixture.projectId],
+      }, factoryContext)).rows[0]!;
+      const beforeUpdate = await counts();
+      await expect(runRollback({
+        homeDir, generationId: "gen-a17", canonicalPath, database,
+        wrap: (session) => {
+          const renew = session.renew.bind(session);
+          // renew() is the first thing step 10 does, after the export snapshot was built from.
+          session.renew = async () => {
+            await editFirstMessage(database, "Changed once more after the export snapshot");
+            expect(await counts()).toEqual(beforeUpdate);
+            await renew();
+          };
+        },
+      }, scenario)).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("census differs") });
+
+      expect(existsSync(canonicalPath)).toBe(false);
+      const journal = readBackendMaintenanceJournal(homeDir);
+      expect(journal?.phase).toBe("maintenance-held");
+      expect(journal?.targetBackend ?? null).toBeNull();
+      expect(resolveMigrationWitnessBindings({ homeDir, generationId: "gen-a17" }))
+        .toMatchObject({ state: "authoritatively-absent" });
+      const manifest = new MigrationManifestStore({ homeDir }).read("gen-a17");
+      expect(manifest.phase).toBe("rolling-back");
+      expect(manifest.pendingEffect).toBeNull();
+      expect((await leaseRow(database))!.released).toBe(true);
     });
   });
 

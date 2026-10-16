@@ -22,7 +22,8 @@
  * the explicit list of what remains.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, chmodSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, chmodSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -1140,7 +1141,10 @@ describe("runMigrationRollback", () => {
   // continueAfterPrepareRollback -- the SAME resume path already
   // covered above, exercised here specifically in post-write mode so a
   // retry rebuilds/reinstalls the generation rather than skipping it.
-  it("resumes after a crash between install and the maintenance-selection flip completing (post-write, plan-v2 section 7)", async () => {
+  // Plan-v3.2 A16a begins publish-rollback before the install, so this crash leaves a pending effect whose
+  // recovery is the conservative abandonment; resuming it in place is the A9 resume table (S4). The retry
+  // that follows abandonment starts a fresh rollback from the sealed return phase.
+  it("abandons a crash between install and the maintenance-selection flip, and the next attempt rebuilds (post-write)", async () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });
     manifestAtVerified(store, "gen-install-config");
@@ -1197,8 +1201,18 @@ describe("runMigrationRollback", () => {
 
     const midManifest = new MigrationManifestStore({ homeDir }).read("gen-install-config");
     expect(midManifest.phase).toBe("rolling-back");
-    expect(midManifest.pendingEffect).toBeNull();
+    expect(midManifest.pendingEffect?.kind).toBe("publish-rollback");
     expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+
+    const abandoned = await runRollback({
+      homeDir, generationId: "gen-install-config", canonicalPath,
+      projectIdentity: identity, localProjectId: "local-ic",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, deps);
+    expect(abandoned.manifest.phase).toBe("verified");
+    expect(abandoned.report?.kind).toBe("abandonment");
+    expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-aborted");
+    expect(prepareCalls).toBe(1);
 
     const outcome = await runRollback({
       homeDir, generationId: "gen-install-config", canonicalPath,
@@ -1221,13 +1235,10 @@ describe("runMigrationRollback", () => {
     // attempt's evidence.
     const buildRoot = join(homeDir, ".lcm", "migration-rollback-generations");
     const buildEntries = readdirSync(buildRoot).filter((name) => name.startsWith("gen-install-config-rb"));
+    // The abandonment moved the manifest to a later revision, so the second attempt's target is named for it.
     expect(buildEntries).toHaveLength(2);
-    const firstAttempt = buildEntries.find((name) => name.endsWith("-1"));
-    const secondAttempt = buildEntries.find((name) => name.endsWith("-2"));
-    expect(firstAttempt).toBeDefined();
-    expect(secondAttempt).toBeDefined();
-    expect(existsSync(join(buildRoot, firstAttempt!, "witness.json"))).toBe(true);
-    expect(existsSync(join(buildRoot, secondAttempt!, "witness.json"))).toBe(true);
+    expect(new Set(buildEntries).size).toBe(2);
+    for (const entry of buildEntries) expect(existsSync(join(buildRoot, entry, "witness.json"))).toBe(true);
   });
 
   // Red-first: the enumeration must REFUSE when the read fails, never
@@ -1331,111 +1342,239 @@ describe("runMigrationRollback", () => {
 // and rewrites the binding from the authoritative readback, which the
 // writer's idempotency rule makes safe.
 describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-written", () => {
-  it("the manifest reaches rolled-back durably even when recordSelectionBinding crashes, replay admission already routes to sqlite from the maintenance journal alone, and the same deterministic binding can be re-derived from durable state and rewritten idempotently", async () => {
-    const homeDir = tempHome();
-    const store = new MigrationManifestStore({ homeDir });
-    manifestAtVerified(store, "gen-1431");
-    const canonicalPath = join(homeDir, "live.sqlite");
+  describe("selection binding recovery (plan-v3.2 A16, A16a)", () => {
+    const GEN = "gen-a16";
     const destinationIdentity = fixtureDestinationIdentity("d");
-    const baseline = fixtureCanonicalDelta("1431-baseline");
-    const census = fixtureCensusVector("1431-census");
-    const scenario1431 = fixtureActivationScenario({
-      generationId: "gen-1431", destinationIdentity, censusVector: census, canonicalDeltaBaseline: baseline,
+    const baseline = fixtureCanonicalDelta("a16-baseline");
+    const census = fixtureCensusVector("a16-census");
+    const scenarioFor = (generationId: string) => fixtureActivationScenario({
+      generationId, destinationIdentity, censusVector: census, canonicalDeltaBaseline: baseline,
     });
-
-    let attemptedBinding: unknown = null;
-    let bindingCalls = 0;
-
-    await expect(runRollback({
-      homeDir, generationId: "gen-1431", canonicalPath,
-      projectIdentity: identity, localProjectId: "local-1431",
+    const unchangedSession = async () => fakeSession({
+      observations: [{
+        manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+        destinationIdentity, postEpochDelta: baseline, postEpochCensus: census,
+      }],
+      source: sqliteSourceStream,
+    });
+    const unactivatedSession = async () => fakeSession({
+      observations: [{
+        manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
+        destinationIdentity, postEpochDelta: fixtureCanonicalDelta("delta"), postEpochCensus: null,
+      }],
+      source: sqliteSourceStream,
+    });
+    const RUN = (homeDir: string, generationId = GEN) => ({
+      homeDir, generationId, canonicalPath: join(homeDir, "live.sqlite"),
+      projectIdentity: identity, localProjectId: "local-a16",
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
-    }, {
-      coordinator: coordinatorFor(homeDir),
-      ...authoritativeDeps(scenario1431),
-      recordSelectionBinding: (input) => {
-        bindingCalls += 1;
-        attemptedBinding = input.binding;
-        throw new Error("simulated crash: selection completed but the binding write never landed");
-      },
-      recordWitnessBinding: () => undefined,
-      openFencedSession: async () => fakeSession({
-        observations: [{
-          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
-          destinationIdentity, postEpochDelta: baseline, postEpochCensus: census,
-        }],
-        source: sqliteSourceStream,
-      }),
-    })).rejects.toThrow("simulated crash: selection completed but the binding write never landed");
-    expect(bindingCalls).toBe(1);
-
-    // The manifest completed publish-rollback and was durably persisted
-    // BEFORE recordSelectionBinding ever ran (rollback.ts calls it last,
-    // after publishManifest for the publish-rollback completion) -- so
-    // the crash inside the binding writer does not roll the manifest
-    // back. This is the absence section 17 requires a consumer not to
-    // conclude "never published" from.
-    const terminal = new MigrationManifestStore({ homeDir }).read("gen-1431");
-    expect(terminal.phase).toBe("rolled-back");
-    expect(terminal.pendingEffect).toBeNull();
-    expect(terminal.rollbackLineage.mode).toBe("pre-write");
-
-    // assertMigrationReplayAdmission -- the ACTUAL replay-admission
-    // consumer this codebase has today -- keys on the maintenance
-    // journal alone (selection-completed + terminalEvidenceSha256), not
-    // on the selection-binding store, so it already routes correctly to
-    // sqlite even though the binding write crashed. This is the
-    // concrete claim rollback.ts's own step-11 comment makes; proven
-    // here rather than asserted.
-    const maintenance = readBackendMaintenanceJournal(homeDir);
-    expect(maintenance?.phase).toBe("selection-completed");
-    expect(maintenance?.targetBackend).toBe("sqlite");
-    const admission = assertMigrationReplayAdmission({
-      homeDir, generationId: "gen-1431", evidenceSha256: maintenance!.terminalEvidenceSha256!,
     });
-    expect(admission).toEqual({ backend: "sqlite", disposition: "selected" });
-
-    // Re-derive the SAME selection binding independently from durable
-    // state left behind -- exactly what section 17 requires recovery to
-    // do -- and prove it is byte-identical to what runPostPrepareSequence
-    // actually attempted, which is what makes "rewrite it" safe per the
-    // idempotency rule (contract section 17: accept a re-write of an
-    // identical binding for the same generation and kind).
-    const rollbackReportRef = terminal.reports.find((report) => report.kind === "rollback");
-    expect(rollbackReportRef).toBeDefined();
-    const rollbackReport = readRollbackReport(homeDir, "gen-1431", rollbackReportRef!.reportId);
-    expect(rollbackReport).not.toBeNull();
-    expect(rollbackReport!.epochId).toBe(scenario1431.epoch.epochId);
-    expect(rollbackReport!.attemptId).toBe(scenario1431.attempt.attemptId);
-
-    const rederivedBinding = {
-      kind: "rollback" as const,
-      epochId: rollbackReport!.epochId!,
-      attemptId: rollbackReport!.attemptId!,
-      manifestRevision: terminal.revision,
-      witnessChecksumSha256: maintenance!.terminalEvidenceSha256!,
-      publicationId: deriveRollbackPublicationId("gen-1431"),
+    /** Real binding recorders (the defaults), with the scenario's stores and a session; `coordinator` and overrides vary. */
+    const depsFor = (homeDir: string, generationId: string, extra: Partial<RunMigrationRollbackDependencies> = {}) => ({
+      coordinator: coordinatorFor(homeDir),
+      ...authoritativeDeps(scenarioFor(generationId)),
+      openFencedSession: unchangedSession,
+      ...extra,
+    });
+    const realUnlinkSync = (createRequire(import.meta.url)("node:fs") as { unlinkSync: (p: string) => void }).unlinkSync;
+    /** A coordinator whose selection completes durably and then the process "dies". */
+    const crashAfterSelectionCompleted = (homeDir: string): BackendPublicationCoordinator => {
+      const coordinator = coordinatorFor(homeDir);
+      const real = coordinator.completeMaintenanceSelection.bind(coordinator);
+      coordinator.completeMaintenanceSelection = (async (...args: Parameters<typeof real>) => {
+        await real(...args);
+        throw new Error("simulated crash right after the maintenance selection completed");
+      }) as typeof coordinator.completeMaintenanceSelection;
+      return coordinator;
     };
-    expect(rederivedBinding).toEqual(attemptedBinding);
 
-    // A recovery agent's rewrite with this re-derived value must be
-    // ACCEPTED as an idempotent identical rewrite (never refused, never
-    // treated as a conflict) -- proven here against a recorder that
-    // distinguishes "first write" from "rewrite of the identical value"
-    // the same way #625's real writer must, per contract section 17.
-    const recovered: unknown[] = [];
-    const recoveryRecorder: MigrationSelectionBindingRecorder = (input) => {
-      const existing = recovered.find((entry) => (
-        (entry as { kind: string; attemptId: string }).kind === input.binding.kind
-      ));
-      if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(input.binding)) {
-        throw new Error("conflict: a different binding was already recorded for this generation and kind");
+    it("records the selection binding right after the selection completes, before the report and the effect's completion", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), GEN);
+      const events: string[] = [];
+      const coordinator = coordinatorFor(homeDir);
+      const realComplete = coordinator.completeMaintenanceSelection.bind(coordinator);
+      coordinator.completeMaintenanceSelection = (async (...args: Parameters<typeof realComplete>) => {
+        const result = await realComplete(...args);
+        events.push("selection-completed");
+        return result;
+      }) as typeof coordinator.completeMaintenanceSelection;
+      let pendingAtBinding: string | null = null;
+      const outcome = await runRollback(RUN(homeDir), depsFor(homeDir, GEN, {
+        coordinator,
+        recordSelectionBinding: (input) => {
+          events.push("binding");
+          pendingAtBinding = new MigrationManifestStore({ homeDir }).read(GEN).pendingEffect?.kind ?? null;
+          expect(input.binding.manifestRevision).toBe(new MigrationManifestStore({ homeDir }).read(GEN).revision);
+          expect(existsSync(join(homeDir, ".lcm", "migration-reports", GEN))).toBe(false);
+        },
+      }));
+      expect(events).toEqual(["selection-completed", "binding"]);
+      expect(pendingAtBinding).toBe("publish-rollback");
+      expect(outcome.manifest.phase).toBe("rolled-back");
+    });
+
+    it("converges after a crash inside the real binding writer between link and unlink: the retry through the entry reuses the binding", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), GEN);
+      const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+      nodeFs.unlinkSync = ((path: string) => {
+        if (/\.selection-rollback\.binding\.[0-9a-f]+\.tmp$/u.test(path)) throw Object.assign(new Error("simulated crash after link"), { code: "EIO" });
+        return realUnlinkSync(path);
+      });
+      syncBuiltinESMExports();
+      try {
+        await expect(runRollback(RUN(homeDir), depsFor(homeDir, GEN))).rejects.toThrow("simulated crash after link");
+      } finally {
+        nodeFs.unlinkSync = realUnlinkSync;
+        syncBuiltinESMExports();
       }
-      recovered.push(input.binding);
-    };
-    recoveryRecorder({ homeDir, generationId: "gen-1431", binding: rederivedBinding });
-    expect(() => recoveryRecorder({ homeDir, generationId: "gen-1431", binding: rederivedBinding })).not.toThrow();
-    expect(recovered).toHaveLength(2);
+      const bindingDirectory = migrationGenerationBindingDirectory(homeDir, GEN);
+      const published = join(bindingDirectory, "selection-rollback.binding");
+      expect(statSync(published).nlink).toBe(2);
+      const crashed = new MigrationManifestStore({ homeDir }).read(GEN);
+      expect(crashed.pendingEffect?.kind).toBe("publish-rollback");
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-completed");
+      // Nothing in memory survives: a fresh coordinator and a fresh call, through the same entry.
+      const outcome = await runRollback(RUN(homeDir), depsFor(homeDir, GEN, { coordinator: coordinatorFor(homeDir) }));
+
+      expect(outcome.manifest.phase).toBe("rolled-back");
+      expect(outcome.report).toMatchObject({
+        kind: "rollback", epochId: scenarioFor(GEN).epoch.epochId, attemptId: scenarioFor(GEN).attempt.attemptId,
+      });
+      expect(statSync(published).nlink).toBe(1);
+      expect(readdirSync(bindingDirectory).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+      const resolved = resolveMigrationWitnessBindings({ homeDir, generationId: GEN });
+      expect(resolved).toMatchObject({ state: "resolved" });
+      const selections = (resolved as { selections: readonly { kind: string; manifestRevision: number; witnessChecksumSha256: string }[] }).selections;
+      expect(selections).toEqual([expect.objectContaining({ kind: "rollback", manifestRevision: crashed.revision })]);
+      expect(assertMigrationReplayAdmission({ homeDir, generationId: GEN, evidenceSha256: selections[0]!.witnessChecksumSha256 }))
+        .toEqual({ backend: "sqlite", disposition: "selected" });
+    });
+
+    it("finishes a completed selection from a pending effect with the authority's epoch and attempt, never null", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), GEN);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, GEN, { coordinator: crashAfterSelectionCompleted(homeDir) })))
+        .rejects.toThrow("simulated crash right after the maintenance selection completed");
+      const attempted: unknown[] = [];
+      const outcome = await runRollback(RUN(homeDir), depsFor(homeDir, GEN, {
+        recordSelectionBinding: (input) => { attempted.push(input.binding); },
+      }));
+      const scenario = scenarioFor(GEN);
+      expect(outcome.manifest.phase).toBe("rolled-back");
+      expect(outcome.report).toMatchObject({ epochId: scenario.epoch.epochId, attemptId: scenario.attempt.attemptId });
+      expect(attempted).toEqual([expect.objectContaining({ kind: "rollback", epochId: scenario.epoch.epochId, attemptId: scenario.attempt.attemptId })]);
+    });
+
+    it("finishes an unactivated rollback from a pending effect: pre-write, no epoch or attempt, no binding", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a16-unactivated");
+      const unactivatedDeps = (extra: Partial<RunMigrationRollbackDependencies>) => ({
+        coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: unactivatedSession, ...extra,
+      });
+      await expect(runRollback(RUN(homeDir, "gen-a16-unactivated"), unactivatedDeps({ coordinator: crashAfterSelectionCompleted(homeDir) })))
+        .rejects.toThrow("simulated crash");
+      const recorded: unknown[] = [];
+      const outcome = await runRollback(RUN(homeDir, "gen-a16-unactivated"), unactivatedDeps({
+        recordSelectionBinding: (input) => { recorded.push(input.binding); },
+      }));
+      expect(outcome.manifest.phase).toBe("rolled-back");
+      expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
+      expect(outcome.report).toMatchObject({ eligibility: "unactivated", mode: "pre-write", epochId: null, attemptId: null });
+      expect(recorded).toEqual([]);
+    });
+
+    it("refuses a pending effect whose rollback authority artifact is gone", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), GEN);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, GEN, { coordinator: crashAfterSelectionCompleted(homeDir) })))
+        .rejects.toThrow("simulated crash");
+      realUnlinkSync(join(homeDir, ".lcm", "migration-rollback-authority", deriveRollbackAuthorityArtifactId(GEN) + ".json"));
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, GEN)))
+        .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("rollback authority artifact") });
+    });
+
+    it("refuses to finish a pending effect whose maintenance selection was prepared but not completed", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), GEN);
+      const coordinator = coordinatorFor(homeDir);
+      coordinator.completeMaintenanceSelection = (async () => {
+        throw new Error("simulated crash between prepare and complete");
+      }) as typeof coordinator.completeMaintenanceSelection;
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, GEN, { coordinator }))).rejects.toThrow("simulated crash between prepare");
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, GEN)))
+        .rejects.toMatchObject({ reason: "not-implemented", message: expect.stringContaining("prepared but not completed") });
+    });
+
+    describe("terminal recovery of a missing binding at rolled-back", () => {
+      /** A completed rollback whose selection binding never reached the store. */
+      async function rolledBackWithoutBinding(homeDir: string, generationId = GEN) {
+        manifestAtVerified(new MigrationManifestStore({ homeDir }), generationId);
+        const attempted: Parameters<MigrationSelectionBindingRecorder>[0][] = [];
+        const outcome = await runRollback(RUN(homeDir, generationId), depsFor(homeDir, generationId, {
+          recordSelectionBinding: (input) => { attempted.push(input); },
+        }));
+        expect(outcome.manifest.phase).toBe("rolled-back");
+        expect(resolveMigrationWitnessBindings({ homeDir, generationId })).toMatchObject({ state: "resolved", selections: [] });
+        return { outcome, attempted };
+      }
+
+      it("rewrites the exact binding the fresh path attempted, through the entry, and is idempotent", async () => {
+        const homeDir = tempHome();
+        const { outcome, attempted } = await rolledBackWithoutBinding(homeDir);
+        const recovered = await runRollback(RUN(homeDir), depsFor(homeDir, GEN));
+        expect(recovered.manifest).toEqual(outcome.manifest);
+        expect(recovered.report).toEqual(outcome.report);
+        const resolved = resolveMigrationWitnessBindings({ homeDir, generationId: GEN });
+        expect(resolved).toMatchObject({ state: "resolved", selections: [attempted[0]!.binding] });
+        await expect(runRollback(RUN(homeDir), depsFor(homeDir, GEN))).resolves.toMatchObject({ manifest: outcome.manifest });
+        expect(resolveMigrationWitnessBindings({ homeDir, generationId: GEN })).toEqual(resolved);
+      });
+
+      it("records nothing for an unactivated rollback", async () => {
+        const homeDir = tempHome();
+        manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a16-unact-terminal");
+        const deps = { coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: unactivatedSession };
+        const done = await runRollback(RUN(homeDir, "gen-a16-unact-terminal"), deps);
+        const recorded: unknown[] = [];
+        const again = await runRollback(RUN(homeDir, "gen-a16-unact-terminal"), {
+          ...deps, recordSelectionBinding: (input) => { recorded.push(input); },
+        });
+        expect(again.manifest).toEqual(done.manifest);
+        expect(recorded).toEqual([]);
+      });
+
+      it("refuses when the rollback report or the rollback authority artifact cannot be read", async () => {
+        const noReport = tempHome();
+        const first = await rolledBackWithoutBinding(noReport);
+        const reportId = first.outcome.report!.reportId;
+        realUnlinkSync(join(noReport, ".lcm", "migration-reports", GEN, reportId + ".json"));
+        await expect(runRollback(RUN(noReport), depsFor(noReport, GEN)))
+          .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("rollback report cannot be read") });
+
+        const noArtifact = tempHome();
+        await rolledBackWithoutBinding(noArtifact);
+        realUnlinkSync(join(noArtifact, ".lcm", "migration-rollback-authority", deriveRollbackAuthorityArtifactId(GEN) + ".json"));
+        await expect(runRollback(RUN(noArtifact), depsFor(noArtifact, GEN)))
+          .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("authority artifact is absent") });
+      });
+
+      it("refuses when the report names another epoch or attempt than the authority artifact", async () => {
+        for (const field of ["epochId", "attemptId"] as const) {
+          const homeDir = tempHome();
+          await rolledBackWithoutBinding(homeDir);
+          const path = join(homeDir, ".lcm", "migration-rollback-authority", deriveRollbackAuthorityArtifactId(GEN) + ".json");
+          const artifact = readRollbackAuthorityArtifact(homeDir, GEN)!;
+          const { checksumSha256: _checksum, ...body } = artifact;
+          realUnlinkSync(path);
+          writeRollbackAuthorityArtifact(homeDir, { ...body, [field]: "another-" + field });
+          await expect(runRollback(RUN(homeDir), depsFor(homeDir, GEN)))
+            .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("does not agree") });
+        }
+      });
+    });
   });
 });
 
@@ -2270,6 +2409,114 @@ describe("runMigrationRollback: only the covered project may be remotely bound (
     // Maintenance is held, but the selection was never prepared: both projects stay on PostgreSQL.
     expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
     expect(readBackendMaintenanceJournal(homeDir)?.targetBackend ?? null).toBeNull();
+  });
+});
+
+
+describe("runMigrationRollback: recovery guards on settled and pending manifests", () => {
+  const GEN = "gen-guards";
+  const RUN = (homeDir: string) => ({
+    homeDir, generationId: GEN, canonicalPath: join(homeDir, "live.sqlite"),
+    projectIdentity: identity, localProjectId: "local-guards",
+    sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+  });
+  const deps = (homeDir: string): RunMigrationRollbackDependencies => ({
+    coordinator: coordinatorFor(homeDir),
+    ...absentDeps(),
+    openFencedSession: async () => { throw new Error("must not open a session"); },
+  });
+  const begin = (store: MigrationManifestStore, manifest: MigrationManifest, kind: string): MigrationManifest =>
+    store.update(GEN, manifest.checksumSha256, (c) => beginMigrationEffect(c, {
+      kind: kind as never, effectId: kind, inputSha256: "a".repeat(64), startedAt: capturedAt,
+    }));
+  const complete = (store: MigrationManifestStore, manifest: MigrationManifest, kind: string, extra: Record<string, unknown>): MigrationManifest =>
+    store.update(GEN, manifest.checksumSha256, (c) => completeMigrationEffect(c, { effectId: kind, completedAt: capturedAt, ...extra }));
+
+  it("refuses a manifest settled at aborted", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    let m = manifestAtVerified(store, GEN);
+    m = complete(store, begin(store, m, "abort"), "abort", {
+      report: { kind: "abort", reportId: "r-abort", reportSha256: "b".repeat(64), createdAt: capturedAt },
+    });
+    expect(m.phase).toBe("aborted");
+    await expect(runRollback(RUN(homeDir), deps(homeDir)))
+      .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("settled at phase aborted") });
+  });
+
+  it("refuses a pending irreversible effect that is not a publish-rollback", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    let m = manifestAtVerified(store, GEN);
+    m = complete(store, begin(store, m, "prepare-activation"), "prepare-activation", {});
+    m = begin(store, m, "publish-activation");
+    expect(m.pendingEffect?.kind).toBe("publish-activation");
+    await expect(runRollback(RUN(homeDir), deps(homeDir)))
+      .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("without a pending publish-rollback") });
+  });
+
+  it("abandons a pending publish-rollback when no maintenance journal remains to reconcile", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    let m = manifestAtVerified(store, GEN);
+    m = complete(store, begin(store, m, "prepare-rollback"), "prepare-rollback", {});
+    begin(store, m, "publish-rollback");
+    expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+    const outcome = await runRollback(RUN(homeDir), deps(homeDir));
+    expect(outcome.manifest.phase).toBe("verified");
+    expect(outcome.report).toMatchObject({ kind: "abandonment", epochId: null, attemptId: null });
+  });
+
+  it("builds the retry of a post-write rollback into the next ordinal when a crash left an earlier build (step 10)", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), GEN);
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const baseline = fixtureCanonicalDelta("ordinal-baseline");
+    const retryDeps = (renewCrash: boolean): RunMigrationRollbackDependencies => ({
+      coordinator: coordinatorFor(homeDir),
+      ...authoritativeDeps(fixtureActivationScenario({
+        generationId: GEN, destinationIdentity, censusVector: fixtureCensusVector("ordinal-census"), canonicalDeltaBaseline: baseline,
+      })),
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      openFencedSession: async () => {
+        const session = fakeSession({
+          observations: [{
+            manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+            destinationIdentity, postEpochDelta: fixtureCanonicalDelta("ordinal-changed"), postEpochCensus: null,
+          }],
+          source: sqliteSourceStream,
+        });
+        if (renewCrash) session.renew = async () => { throw new Error("simulated crash at step 10"); };
+        return session;
+      },
+    });
+    await expect(runRollback(RUN(homeDir), retryDeps(true))).rejects.toThrow("simulated crash at step 10");
+    const outcome = await runRollback(RUN(homeDir), retryDeps(false));
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    const builds = readdirSync(join(homeDir, ".lcm", "migration-rollback-generations")).filter((name) => name.startsWith(GEN + "-rb"));
+    expect(builds.map((name) => name.slice(name.lastIndexOf("-") + 1)).sort()).toEqual(["1", "2"]);
+  });
+
+  it("refuses to abandon a pending publish-rollback whose maintenance selection completed for another backend", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    let m = manifestAtVerified(store, GEN);
+    m = complete(store, begin(store, m, "prepare-rollback"), "prepare-rollback", {});
+    begin(store, m, "publish-rollback");
+    const coordinator = coordinatorFor(homeDir);
+    const held = await coordinator.enterMaintenance({
+      publicationId: deriveRollbackPublicationId(GEN), generationId: GEN, sourceSelectionSha256: "5".repeat(64),
+      queueEvidenceSha256: "6".repeat(64), roster: ROSTER, now: new Date(capturedAt),
+    });
+    const prepared = await coordinator.prepareMaintenanceSelection({
+      expectedChecksumSha256: held.checksumSha256, generationId: GEN, targetBackend: "postgresql", terminalEvidenceSha256: "9".repeat(64),
+    });
+    await coordinator.completeMaintenanceSelection({
+      expectedChecksumSha256: prepared.checksumSha256, generationId: GEN, terminalEvidenceSha256: "9".repeat(64),
+    });
+    await expect(runRollback(RUN(homeDir), deps(homeDir)))
+      .rejects.toMatchObject({ reason: "not-implemented", message: expect.stringContaining("re-selecting postgresql") });
   });
 });
 
