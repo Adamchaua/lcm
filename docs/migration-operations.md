@@ -108,7 +108,8 @@ rather than silently applying against a different generation.
 captured. The emitted envelope reports the confirmed candidate with `applied: false`.
 
 Exit 0 postcondition: the maintenance journal re-reads at the expected phase and checksum; the
-captured snapshot classifies `complete`; the manifest head reads at the expected phase (`copied`).
+captured snapshot classifies `complete`; the manifest head is read back and reads at the expected
+phase (`copied`) -- the phase the envelope reports is the one read, not the copy layer's own report.
 
 **Read "Before you run apply" above before using this command for real.**
 
@@ -144,7 +145,19 @@ consults) is in "Machine-readable inventory" at the end of this document; the en
 knowing by name:
 
 - `confirmation-missing` / `confirmation-generation-moved` (exit 3): re-run `plan` and pass its
-  printed id.
+  printed id. `apply` checks the id twice: against its preflight, and again inside the capture step
+  immediately before it takes the hold. If another local actor occupied your candidate generation
+  in between, the second check refuses `confirmation-generation-moved` and nothing is written.
+- `hold-entry-contention` / `hold-entry-slot-occupied` (exit 4), `hold-entry-precondition`
+  (exit 2), `hold-entry-evidence` (exit 5): the maintenance hold was **not** entered, so there is
+  nothing of yours to `abort`. Wait for the other actor, or re-run `plan`, or run `lcm doctor`,
+  as the remedy says.
+- `capture-contention` (exit 4) / `capture-unresolvable` (exit 5): capture was interrupted after the
+  hold was taken. The hold is still in place; re-run `apply` with the same `--confirm-generation` to
+  continue, or `abort` to release it. `capture-failed` (exit 7) is reserved for capture's own
+  failures.
+- `continuation-partial-snapshot` (exit 2): a held generation whose snapshot is partial or replaced
+  cannot be continued. `abort` is the only command that applies.
 - `daemon-presence-unresolvable` (exit 5): `apply` could not positively determine whether a daemon
   is running. Run `lcm daemon status`, resolve the failure, and retry. A daemon that genuinely is
   not running is **not** a refusal here — see "Daemon presence" below.
@@ -244,8 +257,9 @@ before taking the hold (never assumed, and never refused merely because none is 
 "Daemon presence" below). If a daemon **is** running, ordinary consumer admission -- including that
 daemon's own passive-event sweep -- is fenced for the whole hold. A running daemon will log-and-
 retry rather than make progress for the duration of the window; this is expected non-progress, not
-corruption, and it resolves itself once the hold ends (via `abort` in this release). `apply` states
-this on stderr and in the JSON evidence when a daemon is observed running.
+corruption, and it resolves itself once the hold ends (via `abort` in this release). `apply` writes
+one line to stderr, before it takes the hold, when a daemon is observed running, and records
+`daemonPresent` (and `daemonStorageBackend` when present) in its JSON evidence, as `plan` does.
 
 ### Daemon presence
 
@@ -578,9 +592,24 @@ above.
       "remedy": "This project is shared across machines. SQLite-to-PostgreSQL migration requires a single-machine (local) project."
     },
     {
-      "reason": "hold-entry-failed",
+      "reason": "hold-entry-contention",
       "exitClass": "refused-contention",
-      "remedy": "Entering the maintenance hold was refused. Wait and retry, or run `lcm migration abort` if a prior attempt is stuck."
+      "remedy": "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`."
+    },
+    {
+      "reason": "hold-entry-slot-occupied",
+      "exitClass": "refused-contention",
+      "remedy": "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`."
+    },
+    {
+      "reason": "hold-entry-precondition",
+      "exitClass": "refused-precondition",
+      "remedy": "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints."
+    },
+    {
+      "reason": "hold-entry-evidence",
+      "exitClass": "refused-evidence",
+      "remedy": "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying."
     },
     {
       "reason": "hold-entry-readback-mismatch",
@@ -593,9 +622,24 @@ above.
       "remedy": "SQLite snapshot capture failed after the hold was taken. Run `lcm migration abort` to release the hold, then investigate before retrying."
     },
     {
+      "reason": "capture-contention",
+      "exitClass": "refused-contention",
+      "remedy": "Another actor held a lock during capture. The maintenance hold is still in place; re-run `lcm migration apply` with the same --confirm-generation to continue, or run `lcm migration abort` to release it."
+    },
+    {
+      "reason": "capture-unresolvable",
+      "exitClass": "refused-evidence",
+      "remedy": "The maintenance journal could not be verified during capture. The maintenance hold is still in place; run `lcm doctor`, then re-run `lcm migration apply` to continue or `lcm migration abort` to release it."
+    },
+    {
       "reason": "continuation-mismatched-hold",
       "exitClass": "refused-precondition",
       "remedy": "An existing maintenance hold does not match this project's current selection. Run `lcm migration abort` before retrying."
+    },
+    {
+      "reason": "continuation-partial-snapshot",
+      "exitClass": "refused-precondition",
+      "remedy": "The held generation's snapshot is partial or replaced and cannot be resumed. Run `lcm migration abort` to release the hold; the captured evidence is preserved."
     },
     {
       "reason": "continuation-resume-required",

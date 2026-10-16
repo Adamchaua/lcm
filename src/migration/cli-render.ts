@@ -7,6 +7,7 @@ import {
   type MigrationEvidence,
 } from "./envelope.js";
 import type { MigrationPlanOutcome } from "./cli-plan.js";
+import type { MigrationApplyDaemonPresence } from "./cli-apply.js";
 import type { MigrationDryRunOutcome } from "./cli-dry-run.js";
 import { migrationDryRunEvidence } from "./cli-dry-run.js";
 import type { MigrationApplyOutcome } from "./cli-apply.js";
@@ -28,17 +29,25 @@ import type { MigrationAbortCommandOutcome } from "./cli-abort.js";
 
 /**
  * The known set of `apply`'s own refusal reasons that occur strictly
- * after capture has already durably taken the hold and written a
- * snapshot -- `capture-failed` (a held, partially-captured state) and
- * every genesis/copy-stage failure (`genesis-*`, `copy-failed`), which
- * only run after capture already succeeded in the same invocation. Every
- * other apply refusal reason (preflight, confirmation fence, journal
- * resolution) occurs before any durable mutation in this invocation.
- * `applied` in the envelope reports this distinction so an operator
- * reading a failed `apply` knows whether state moved.
+ * after a durable write in this invocation: the hold entry's own readback
+ * (`hold-entry-readback-mismatch` follows a successful
+ * `enterMaintenance`), every capture failure (`capture-*`, which run
+ * only once the hold is taken), and every genesis/copy-stage failure
+ * (`genesis-*`, `snapshot-unresolvable`, `capture-incomplete`,
+ * `manifest-unresolvable`, `copy-failed`), which only run after capture.
+ * Every other apply refusal reason (preflight, confirmation fence, journal
+ * resolution, a failed hold entry) occurs before any durable mutation in
+ * this invocation. `applied` in the envelope reports this distinction so
+ * an operator reading a failed `apply` knows whether state moved.
  */
 const APPLY_REASONS_WITH_DURABLE_MUTATION: ReadonlySet<string> = new Set([
+  "hold-entry-readback-mismatch",
   "capture-failed",
+  "capture-contention",
+  "capture-unresolvable",
+  "snapshot-unresolvable",
+  "capture-incomplete",
+  "manifest-unresolvable",
   "genesis-inspection-failed",
   "genesis-create-failed",
   "genesis-dry-run-begin-failed",
@@ -94,6 +103,16 @@ function okEnvelope(input: Readonly<{
   });
 }
 
+/** Both plan and apply record the daemon-presence answer in their exit-0 evidence (plan section 7, round-1 A-8). */
+function daemonPresenceEvidence(
+  presence: MigrationApplyDaemonPresence,
+): MigrationEvidence {
+  return {
+    daemonPresent: presence.status === "present",
+    ...(presence.status === "present" ? { daemonStorageBackend: presence.storageBackend } : {}),
+  };
+}
+
 export function renderMigrationPlanEnvelope(outcome: MigrationPlanOutcome): MigrationEnvelope {
   if (outcome.status === "refuse") {
     return refusalEnvelope({
@@ -105,13 +124,7 @@ export function renderMigrationPlanEnvelope(outcome: MigrationPlanOutcome): Migr
     applied: false,
     generation: outcome.generationId,
     next: "apply",
-    evidence: {
-      disposition: outcome.disposition,
-      daemonPresent: outcome.daemonPresence.status === "present",
-      ...(outcome.daemonPresence.status === "present"
-        ? { daemonStorageBackend: outcome.daemonPresence.storageBackend }
-        : {}),
-    },
+    evidence: { disposition: outcome.disposition, ...daemonPresenceEvidence(outcome.daemonPresence) },
   });
 }
 
@@ -143,6 +156,7 @@ export function renderMigrationApplyEnvelope(outcome: MigrationApplyOutcome): Mi
     generation: outcome.generationId,
     manifestPhase: outcome.phase ?? null,
     next: outcome.applied ? null : "apply (drop --dry-run to copy for real)",
+    evidence: daemonPresenceEvidence(outcome.daemonPresence),
   });
 }
 

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   classifyEnteringRecoveryFailure,
+  classifyHoldEntryFailure,
   hasMigrationQueueEvidenceRebindOccurred,
   migrationEntryRoster,
   migrationQueueEvidenceSentinel,
@@ -201,3 +202,31 @@ describe("classifyEnteringRecoveryFailure (owner-requested: classify by reason, 
   });
 });
 
+describe("classifyHoldEntryFailure (round-1 B-5/A-11: the fresh hold entry is classified by reason)", () => {
+  it("classifies lock contention as contention", () => {
+    expect(classifyHoldEntryFailure(new PrivateMutationLockContentionError("held"))).toEqual({ class: "contention", evidence: "lock-contention" });
+  });
+
+  it("classifies unresolved-publication as an occupied slot, distinct from contention (a v2 publication is not ours to abort)", () => {
+    expect(classifyHoldEntryFailure(new BackendPublicationJournalError("unresolved-publication", "x")))
+      .toEqual({ class: "slot-occupied", evidence: "journal-unresolved-publication" });
+  });
+
+  it("classifies unexpected-state as a precondition, and nothing else as one", () => {
+    expect(classifyHoldEntryFailure(new BackendPublicationJournalError("unexpected-state", "x")))
+      .toEqual({ class: "precondition", evidence: "journal-unexpected-state" });
+  });
+
+  it.each(["unsafe-storage", "malformed-journal", "checksum-mismatch", "publication-evidence-missing", "invalid-input"] as const)(
+    "classifies %s as unresolvable evidence",
+    (reason) => {
+      expect(classifyHoldEntryFailure(new BackendPublicationJournalError(reason, "x")))
+        .toEqual({ class: "evidence", evidence: `journal-${reason}` });
+    },
+  );
+
+  it("classifies an unrecognised failure shape as internal-error evidence", () => {
+    expect(classifyHoldEntryFailure(new Error("boom"))).toEqual({ class: "evidence", evidence: "journal-internal-error" });
+    expect(classifyHoldEntryFailure("not even an error")).toEqual({ class: "evidence", evidence: "journal-internal-error" });
+  });
+});

@@ -90,7 +90,7 @@ describe("renderMigrationDryRunEnvelope", () => {
 
 describe("renderMigrationApplyEnvelope", () => {
   it("builds an ok envelope for a real copy, applied true, next null", () => {
-    const envelope = renderMigrationApplyEnvelope({ status: "ok", generationId: "gen-1", applied: true, phase: "copied" });
+    const envelope = renderMigrationApplyEnvelope({ status: "ok", generationId: "gen-1", applied: true, phase: "copied", daemonPresence: { status: "authoritatively-absent" } });
     expect(envelope.outcome).toBe("ok");
     expect(envelope.applied).toBe(true);
     expect(envelope.generation).toBe("gen-1");
@@ -99,7 +99,7 @@ describe("renderMigrationApplyEnvelope", () => {
   });
 
   it("builds an ok envelope for --dry-run, applied false, next suggests dropping --dry-run", () => {
-    const envelope = renderMigrationApplyEnvelope({ status: "ok", generationId: "gen-1", applied: false });
+    const envelope = renderMigrationApplyEnvelope({ status: "ok", generationId: "gen-1", applied: false, daemonPresence: { status: "authoritatively-absent" } });
     expect(envelope.applied).toBe(false);
     expect(envelope.manifestPhase).toBeNull();
     expect(envelope.next).toMatch(/--dry-run/u);
@@ -124,6 +124,40 @@ describe("renderMigrationApplyEnvelope", () => {
   it("reports applied: false for a confirmation-fence refusal", () => {
     const envelope = renderMigrationApplyEnvelope({ status: "refuse", reason: "confirmation-missing" });
     expect(envelope.applied).toBe(false);
+  });
+});
+
+describe("renderMigrationApplyEnvelope, applied and presence evidence (round-1 A-2/B-6, A-8)", () => {
+  it.each([
+    "hold-entry-readback-mismatch", "capture-failed", "capture-contention", "capture-unresolvable",
+    "snapshot-unresolvable", "capture-incomplete", "manifest-unresolvable",
+    "genesis-inspection-failed", "genesis-create-failed", "genesis-dry-run-begin-failed",
+    "genesis-dry-run-complete-failed", "copy-failed",
+  ])("reports applied:true for %s, which follows a durable write in the same invocation", (reason) => {
+    expect(renderMigrationApplyEnvelope({ status: "refuse", reason }).applied).toBe(true);
+  });
+
+  it.each([
+    "confirmation-missing", "confirmation-generation-moved", "hold-entry-contention", "hold-entry-slot-occupied",
+    "hold-entry-precondition", "hold-entry-evidence", "entering-recovery-contention", "continuation-mismatched-hold",
+    "continuation-partial-snapshot", "journal-unresolvable", "publication-occupies-slot",
+  ])("reports applied:false for %s, which is raised before this invocation writes anything", (reason) => {
+    expect(renderMigrationApplyEnvelope({ status: "refuse", reason }).applied).toBe(false);
+  });
+
+  it("records a present daemon and its backend in the exit-0 evidence, as plan does", () => {
+    const envelope = renderMigrationApplyEnvelope({
+      status: "ok", generationId: "g", applied: true, phase: "copied",
+      daemonPresence: { status: "present", storageBackend: "postgresql", pid: 7, daemonInstanceId: "d1" },
+    });
+    expect(envelope.evidence).toEqual({ daemonPresent: true, daemonStorageBackend: "postgresql" });
+  });
+
+  it("records an authoritative absence as daemonPresent:false with no backend field", () => {
+    const envelope = renderMigrationApplyEnvelope({
+      status: "ok", generationId: "g", applied: false, daemonPresence: { status: "authoritatively-absent" },
+    });
+    expect(envelope.evidence).toEqual({ daemonPresent: false });
   });
 });
 
@@ -173,7 +207,7 @@ describe("every command's ok and refusal envelopes keep outcome/exitCode agreeme
     for (const envelope of [
       renderMigrationPlanEnvelope({ status: "ok", generationId: "g", disposition: "fresh", daemonPresence: { status: "authoritatively-absent" } }),
       renderMigrationDryRunEnvelope({ status: "ok", dryRun: DRY_RUN_FIXTURE }),
-      renderMigrationApplyEnvelope({ status: "ok", generationId: "g", applied: true, phase: "copied" }),
+      renderMigrationApplyEnvelope({ status: "ok", generationId: "g", applied: true, phase: "copied", daemonPresence: { status: "authoritatively-absent" } }),
       renderMigrationAbortEnvelope({ status: "ok", generationId: "g", journalPhase: "maintenance-aborted", manifestPhase: null, applied: true }),
     ]) {
       expect(migrationExitClassForName(envelope.outcome).code).toBe(envelope.exitCode);

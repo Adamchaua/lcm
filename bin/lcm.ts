@@ -2086,7 +2086,8 @@ export function registerMachineCommand(program: Command): void {
  */
 function migrationHumanSummary(envelope: MigrationEnvelope): string {
   if (envelope.refusal !== null) {
-    return `Refused (${envelope.outcome}, exit ${envelope.exitCode}): ${envelope.refusal.reason} -- ${envelope.refusal.remedy}`;
+    const generation = envelope.generation === null ? "" : ` [generation=${envelope.generation}]`;
+    return `Refused (${envelope.outcome}, exit ${envelope.exitCode}): ${envelope.refusal.reason}${generation} -- ${envelope.refusal.remedy}`;
   }
   const parts = [`${envelope.command}: ok (exit 0)`];
   if (envelope.generation !== null) parts.push(`generation=${envelope.generation}`);
@@ -2166,6 +2167,11 @@ export function registerMigrationCommand(program: Command): void {
         dryRun: opts.dryRun,
         maxRecords,
         maxBytes,
+        onDaemonObserved: (presence) => {
+          writeCliError(
+            `A running LCM daemon was observed (pid ${presence.pid}, ${presence.storageBackend} backend). The maintenance hold fences its storage operations until the hold ends.\n`,
+          );
+        },
       });
       writeCliError("Migration apply finished.\n");
       emitMigrationEnvelope(renderMigrationApplyEnvelope(outcome), opts.json);

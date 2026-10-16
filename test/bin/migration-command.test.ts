@@ -151,7 +151,7 @@ describe("lcm migration command group", () => {
   });
 
   it("apply: passes --confirm-generation, --max-records and --max-bytes through as parsed values, and succeeds", async () => {
-    state.apply.mockResolvedValueOnce({ status: "ok", generationId: "gen-1", applied: true, phase: "copied" });
+    state.apply.mockResolvedValueOnce({ status: "ok", generationId: "gen-1", applied: true, phase: "copied", daemonPresence: { status: "authoritatively-absent" } });
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     await invoke("migration", "apply", "--confirm-generation", "gen-1", "--max-records", "250", "--max-bytes", "4096");
     expect(state.apply).toHaveBeenCalledWith(expect.objectContaining({
@@ -160,6 +160,21 @@ describe("lcm migration command group", () => {
     expect(stdoutText(out)).toContain("generation=gen-1");
     expect(stdoutText(out)).toContain("phase=copied");
     expect(process.exitCode).toBe(0);
+  });
+
+  it("apply: wires onDaemonObserved to one stderr line (never stdout) naming the observed daemon (round-1 A-8)", async () => {
+    state.apply.mockImplementationOnce(async (applyInput: { onDaemonObserved: (presence: unknown) => void }) => {
+      applyInput.onDaemonObserved({ status: "present", storageBackend: "postgresql", pid: 4242, daemonInstanceId: "d1" });
+      return { status: "ok", generationId: "gen-1", applied: false, daemonPresence: { status: "present", storageBackend: "postgresql", pid: 4242, daemonInstanceId: "d1" } };
+    });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await invoke("migration", "apply", "--confirm-generation", "gen-1", "--dry-run", "--json");
+    const lines = stderrText(err).split("\n").filter((line) => line.includes("running LCM daemon"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("4242");
+    expect(stdoutText(out)).not.toContain("running LCM daemon");
+    expect(JSON.parse(stdoutText(out)).evidence).toEqual({ daemonPresent: true, daemonStorageBackend: "postgresql" });
   });
 
   it("apply: omitting --confirm-generation still reaches the orchestration layer (never a Commander-level usage error), which refuses confirmation-missing at exit 3", async () => {
@@ -172,7 +187,7 @@ describe("lcm migration command group", () => {
   });
 
   it("apply --dry-run: applied false, next names dropping --dry-run", async () => {
-    state.apply.mockResolvedValueOnce({ status: "ok", generationId: "gen-1", applied: false });
+    state.apply.mockResolvedValueOnce({ status: "ok", generationId: "gen-1", applied: false, daemonPresence: { status: "authoritatively-absent" } });
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     await invoke("migration", "apply", "--confirm-generation", "gen-1", "--dry-run");
     expect(state.apply).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
@@ -195,7 +210,7 @@ describe("lcm migration command group", () => {
   });
 
   it("apply: stdout is byte-identical whether stderr progress writes actually occur or are suppressed (section 10\u0027s stream-separation proof)", async () => {
-    state.apply.mockResolvedValue({ status: "ok", generationId: "gen-1", applied: true, phase: "copied" });
+    state.apply.mockResolvedValue({ status: "ok", generationId: "gen-1", applied: true, phase: "copied", daemonPresence: { status: "authoritatively-absent" } });
 
     const outWithProgress = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const errWithProgress = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
@@ -220,6 +235,24 @@ describe("lcm migration command group", () => {
     await invoke("migration", "abort", "--json");
     const envelope = JSON.parse(stdoutText(out));
     expect(envelope).toMatchObject({ command: "abort", applied: true, generation: "gen-1", manifestPhase: "aborted" });
+  });
+
+  it("abort: passes --confirm-generation and --dry-run through", async () => {
+    state.abort.mockResolvedValueOnce({
+      status: "ok", generationId: "gen-1", journalPhase: "maintenance-held", manifestPhase: null, applied: false,
+    });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "abort", "--confirm-generation", "gen-1", "--dry-run", "--json");
+    expect(state.abort).toHaveBeenCalledWith(expect.objectContaining({ confirmGenerationId: "gen-1", dryRun: true }));
+    expect(JSON.parse(stdoutText(out))).toMatchObject({ command: "abort", applied: false });
+  });
+
+  it("abort: a confirmation refusal exits 3 and prints the live generation id even in the human summary", async () => {
+    state.abort.mockResolvedValueOnce({ status: "refuse", reason: "abort-confirmation-missing", generationId: "gen-live" });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "abort");
+    expect(process.exitCode).toBe(3);
+    expect(stdoutText(out)).toContain("generation=gen-live");
   });
 
   it("abort: nothing-to-abort refuses at exit 2", async () => {

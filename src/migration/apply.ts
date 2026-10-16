@@ -1,6 +1,8 @@
 import {
   BackendPublicationCoordinator,
   BackendPublicationJournalError,
+  isTerminalBackendMaintenancePhase,
+  readBackendMaintenanceJournal,
   withBackendPublicationAppendBarrierAsync,
   type BackendMaintenanceJournal,
   type BackendPublicationDriver,
@@ -18,7 +20,14 @@ import {
   type MigrationHoldDisposition,
 } from "./hold-continuation.js";
 import { resolveConfirmedMigrationGenerationId, MigrationIdentityError } from "./generation-identity.js";
-import { classifyEnteringRecoveryFailure, migrationEntryRoster, migrationQueueEvidenceSentinel } from "./hold-entry.js";
+import {
+  classifyEnteringRecoveryFailure,
+  classifyHoldEntryFailure,
+  migrationEntryRoster,
+  migrationQueueEvidenceSentinel,
+} from "./hold-entry.js";
+import { classifySqliteSnapshotArtifact } from "./sqlite-snapshot.js";
+import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import { classifyMigrationAbortGate } from "./abort.js";
 import { MigrationManifestStore } from "./manifest-store.js";
 import type { AuthenticatedSqliteMigrationSnapshot } from "./queue-evidence.js";
@@ -106,10 +115,6 @@ export function maintenanceOnlyDriver(): BackendPublicationDriver {
   };
 }
 
-function journalFailureEvidence(error: unknown): string {
-  if (error instanceof BackendPublicationJournalError) return `journal-${error.reason}`;
-  return "journal-internal-error";
-}
 
 export type MigrationApplyThroughCaptureOutcome =
   | Readonly<{ status: "captured"; generationId: string; maintenanceChecksumSha256: string; snapshot: AuthenticatedSqliteMigrationSnapshot }>
@@ -121,12 +126,21 @@ export type MigrationApplyOperations = Readonly<{
   classifyEnteringFailure: typeof classifyEnteringRecoveryFailure;
   observeJournal: typeof observeMigrationMaintenanceJournal;
   captureSource: typeof captureAuthenticatedSqliteMigrationSource;
+  classifySnapshot: typeof classifySqliteSnapshotArtifact;
 }>;
 
 export type MigrationApplyThroughCaptureInput = Readonly<{
   cwd: string;
   homeDir: string;
   base: string;
+  /**
+   * The generation id the operator confirmed (plan section 9). It is carried
+   * to the point of use and compared against the generation this span is
+   * about to act on, immediately before the first durable write, and never
+   * re-derived (round-1 A-3/B-2): a candidate that moved since the
+   * confirmation refuses `confirmation-generation-moved`.
+   */
+  confirmGenerationId: string;
   maxProbeOrdinal?: number;
   manifestStore?: MigrationManifestStore;
   now?: Date;
@@ -172,8 +186,36 @@ async function captureUnderBarrier(
       expectedSourceBytes,
       lockToken: token,
     });
+    // Plan section 4.4 / round-1 A-15: a successful capture is not evidence
+    // that the queue evidence was rebound. Read the journal back and require
+    // that its queue evidence moved off the entry sentinel. The roster
+    // cutoff is deliberately not part of this check: an empty queue
+    // legitimately rebinds to a null cutoff, which
+    // hasMigrationQueueEvidenceRebindOccurred's both-sides test would call
+    // "not rebound".
+    const rebound = readBackendMaintenanceJournal(input.homeDir);
+    const sentinel = migrationQueueEvidenceSentinel({
+      generationId,
+      sourceSelectionSha256: authority.sourceSelectionSha256,
+    });
+    if (rebound === null || rebound.queueEvidenceSha256 === sentinel) {
+      return { status: "refuse", reason: "capture-failed", evidence: "queue-evidence-not-rebound" };
+    }
     return { status: "captured", generationId, maintenanceChecksumSha256, snapshot };
   } catch (error) {
+    // Round-1 A-9: classify by the actual failure, not by the fact that
+    // something threw. Contention is a retry (exit 4), a journal failure
+    // is unresolvable evidence (exit 5), and only capture's own failures
+    // keep the operator-required class (exit 7).
+    if (error instanceof PrivateMutationLockContentionError) {
+      return { status: "refuse", reason: "capture-contention", evidence: "lock-contention" };
+    }
+    if (error instanceof BackendPublicationJournalError && error.reason === "unresolved-publication") {
+      return { status: "refuse", reason: "capture-contention", evidence: "journal-unresolved-publication" };
+    }
+    if (error instanceof BackendPublicationJournalError) {
+      return { status: "refuse", reason: "capture-unresolvable", evidence: `journal-${error.reason}` };
+    }
     return {
       status: "refuse",
       reason: "capture-failed",
@@ -225,6 +267,14 @@ async function freshCutoverUnderBarrier(
   if (resolution.status === "refuse") {
     return { status: "refuse", reason: `generation-${resolution.reason}`, evidence: resolution.evidence };
   }
+  // Round-1 A-3/B-2: the confirmed id is compared with the candidate this
+  // span just re-probed, inside the span, immediately before the hold. A
+  // concurrent same-host actor that occupied the confirmed candidate since
+  // the preflight made the re-probe advance; that must refuse, not capture a
+  // generation the operator never confirmed.
+  if (resolution.generationId !== input.confirmGenerationId) {
+    return { status: "refuse", reason: "confirmation-generation-moved" };
+  }
 
   const authority = authenticateSqliteMigrationSource(input.cwd, input.homeDir, token);
   if (authority.projectIdentity.scope !== "local") {
@@ -252,7 +302,8 @@ async function freshCutoverUnderBarrier(
       now: input.now,
     }, token);
   } catch (error) {
-    return { status: "refuse", reason: "hold-entry-failed", evidence: journalFailureEvidence(error) };
+    const failure = classifyHoldEntryFailure(error);
+    return { status: "refuse", reason: `hold-entry-${failure.class}`, evidence: failure.evidence };
   }
   // Readback follows every write (section 4.4): a write is not evidence of
   // its own effect.
@@ -340,6 +391,24 @@ async function continueUnderBarrier(
     return freshCutoverUnderBarrier(input, coordinator, manifestStore, token);
   }
   if (disposition.action === "continue-held") {
+    // Round-1 A-7 (plan section 8): a held journal whose snapshot is partial
+    // or replaced is immutable, unresumable evidence. Route it to abort here,
+    // as exit 2, rather than letting capture refuse snapshot-partial and be
+    // reported as an operator-required failure (exit 7).
+    let snapshot: Awaited<ReturnType<typeof classifySqliteSnapshotArtifact>>;
+    try {
+      const classifySnapshot = input._operationsForTesting?.classifySnapshot ?? classifySqliteSnapshotArtifact;
+      snapshot = await classifySnapshot(journal.generationId, { homeDir: input.homeDir });
+    } catch (error) {
+      return {
+        status: "refuse",
+        reason: "snapshot-unresolvable",
+        evidence: error instanceof Error ? error.name : "unknown-snapshot-failure",
+      };
+    }
+    if (snapshot.state === "partial" || snapshot.state === "replaced") {
+      return { status: "refuse", reason: "continuation-partial-snapshot", evidence: `snapshot-${snapshot.state}` };
+    }
     return captureUnderBarrier(input, journal.generationId, disposition.observedChecksumSha256, token);
   }
   // disposition.action is "recover-entering" or "refuse" here, and both are
@@ -379,6 +448,13 @@ export async function performMigrationApplyThroughCapture(
 
   const journal = observation.journal;
 
+  // Round-1 A-3/B-2, for a live (non-terminal) journal: the generation it
+  // names is fixed, so the confirmed id is compared with it before anything
+  // below can write.
+  if (!isTerminalBackendMaintenancePhase(journal.phase) && journal.generationId !== input.confirmGenerationId) {
+    return { status: "refuse", reason: "confirmation-generation-moved" };
+  }
+
   if (journal.phase === "maintenance-entering") {
     // No protected read is needed, and none is possible: the append barrier
     // does not admit this phase (module doc above), and
@@ -409,6 +485,16 @@ export async function performMigrationApplyThroughCapture(
   // (assertBackendPublicationConsumerAccessUnlocked refuses any
   // unauthenticated project-map read while a non-terminal hold exists), so
   // the barrier is acquired first and classification runs inside it.
+  //
+  // Why acquiring the barrier succeeds while a hold exists (round-1 A-6,
+  // traced and proven by "re-applying against an already-held ..." in
+  // apply.test.ts): withBackendPublicationAppendBarrierAsync runs its
+  // admission with allowUnresolved: true (backend-publication.ts, the
+  // runAppendAdmissionAttempt mode), and withBackendPublicationConsumerLockAsync
+  // guards both of its assertBackendPublicationConsumerAccessUnlocked calls
+  // with !options.allowUnresolved, so the consumer-access refusal that
+  // blocks an ordinary consumer is skipped; the barrier's own phase
+  // allowlist then admits maintenance-held.
   return withBackendPublicationAppendBarrierAsync(input.homeDir, async (token) => {
     const authority = authenticateSqliteMigrationSource(input.cwd, input.homeDir, token);
     const candidate: MigrationHoldCandidate = {

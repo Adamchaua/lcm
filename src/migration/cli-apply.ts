@@ -9,6 +9,8 @@ import {
   type MigrationApplyGenesisAndCopyOutcome,
 } from "./apply-genesis-copy.js";
 import { MigrationManifestStore } from "./manifest-store.js";
+import { MigrationProtocolError } from "./protocol.js";
+import type { MigrationDaemonPresence } from "./daemon-presence.js";
 import type { BackendPublicationCoordinator } from "../storage/backend-publication.js";
 
 /**
@@ -50,12 +52,20 @@ import type { BackendPublicationCoordinator } from "../storage/backend-publicati
 export const DEFAULT_MIGRATION_APPLY_MAX_RECORDS = 500;
 export const DEFAULT_MIGRATION_APPLY_MAX_BYTES = 16 * 1024 * 1024;
 
+/** The two presence answers that reach an ok outcome; `unresolvable` refuses upstream. */
+export type MigrationApplyDaemonPresence = Extract<
+  MigrationDaemonPresence,
+  { status: "present" } | { status: "authoritatively-absent" }
+>;
+
 export type MigrationApplyOutcome =
   | Readonly<{
     status: "ok";
     generationId: string;
     applied: boolean;
     phase?: string;
+    /** The preflight's daemon-presence answer, carried into the exit-0 evidence (round-1 A-8). */
+    daemonPresence: MigrationApplyDaemonPresence;
   }>
   | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
 
@@ -75,6 +85,12 @@ export async function performMigrationApply(input: Readonly<{
   coordinator?: BackendPublicationCoordinator;
   manifestStore?: MigrationManifestStore;
   now?: Date;
+  /**
+   * Called once, before the confirmation fence and any write, when the
+   * preflight observed a running daemon, so the operator hears about the
+   * fenced consumer before the hold is taken (round-1 A-8).
+   */
+  onDaemonObserved?: (presence: Extract<MigrationDaemonPresence, { status: "present" }>) => void;
   /**
    * @internal Test-only escape hatch, matching `cli-plan.ts`'s own
    * convention, to reuse `resolveMigrationPreflight`'s injection seam
@@ -97,6 +113,8 @@ export async function performMigrationApply(input: Readonly<{
   if (preflight.status === "refuse") {
     return preflight;
   }
+  const daemonPresence = preflight.presence;
+  if (daemonPresence.status === "present") input.onDaemonObserved?.(daemonPresence);
 
   // Section 9's confirmation fence: a missing token refuses like any other
   // missing confirmation; a moved candidate refuses distinctly. Neither is
@@ -109,13 +127,14 @@ export async function performMigrationApply(input: Readonly<{
   }
 
   if (input.dryRun === true) {
-    return { status: "ok", generationId: preflight.candidate.generationId, applied: false };
+    return { status: "ok", generationId: preflight.candidate.generationId, applied: false, daemonPresence };
   }
 
   const captureResult: MigrationApplyThroughCaptureOutcome = await performCapture({
     cwd: input.cwd,
     homeDir: input.homeDir,
     base: preflight.base,
+    confirmGenerationId: input.confirmGenerationId,
     coordinator: input.coordinator,
     manifestStore: input.manifestStore,
     now: input.now,
@@ -125,6 +144,7 @@ export async function performMigrationApply(input: Readonly<{
   }
 
   const ownerProcessId = mintOwnerProcessId();
+  const manifestStore = input.manifestStore ?? new MigrationManifestStore({ homeDir: input.homeDir });
   const genesisCopyResult: MigrationApplyGenesisAndCopyOutcome = await performGenesisAndCopy({
     homeDir: input.homeDir,
     generationId: captureResult.generationId,
@@ -135,17 +155,35 @@ export async function performMigrationApply(input: Readonly<{
     ownerProcessId,
     maxRecords: input.maxRecords ?? DEFAULT_MIGRATION_APPLY_MAX_RECORDS,
     maxBytes: input.maxBytes ?? DEFAULT_MIGRATION_APPLY_MAX_BYTES,
-    manifestStore: input.manifestStore ?? new MigrationManifestStore({ homeDir: input.homeDir }),
+    manifestStore,
     now: input.now,
   });
   if (genesisCopyResult.status === "refuse") {
     return genesisCopyResult;
   }
 
+  // Plan section 5.1 / round-1 A-16: the manifest head is read back, and the
+  // phase the envelope reports is the one read, not the copy layer's own
+  // return value.
+  let head;
+  try {
+    head = manifestStore.read(captureResult.generationId);
+  } catch (error) {
+    return {
+      status: "refuse",
+      reason: "manifest-unresolvable",
+      evidence: error instanceof MigrationProtocolError ? `manifest-${error.reason}` : "manifest-internal-error",
+    };
+  }
+  if (head.phase !== genesisCopyResult.result.phase) {
+    return { status: "refuse", reason: "copy-failed", evidence: "manifest-readback-mismatch" };
+  }
+
   return {
     status: "ok",
     generationId: captureResult.generationId,
     applied: true,
-    phase: genesisCopyResult.result.phase,
+    phase: head.phase,
+    daemonPresence,
   };
 }

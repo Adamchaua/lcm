@@ -122,9 +122,24 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   }),
 
   // --- Section 4.4/4.9: hold entry ---
+  // Round-1 B-5/A-11: the fresh hold entry's failures are classified by
+  // reason, each with a remedy that matches the fact. None of them names
+  // `abort`: no hold of ours exists yet at this point.
   Object.freeze({
-    reason: "hold-entry-failed", exitClass: "refused-contention",
-    remedy: "Entering the maintenance hold was refused. Wait and retry, or run `lcm migration abort` if a prior attempt is stuck.",
+    reason: "hold-entry-contention", exitClass: "refused-contention",
+    remedy: "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`.",
+  }),
+  Object.freeze({
+    reason: "hold-entry-slot-occupied", exitClass: "refused-contention",
+    remedy: "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`.",
+  }),
+  Object.freeze({
+    reason: "hold-entry-precondition", exitClass: "refused-precondition",
+    remedy: "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints.",
+  }),
+  Object.freeze({
+    reason: "hold-entry-evidence", exitClass: "refused-evidence",
+    remedy: "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying.",
   }),
   Object.freeze({
     reason: "hold-entry-readback-mismatch", exitClass: "refused-evidence",
@@ -137,10 +152,26 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     remedy: "SQLite snapshot capture failed after the hold was taken. Run `lcm migration abort` to release the hold, then investigate before retrying.",
   }),
 
+  // Round-1 A-9: capture's contention and journal failures are siblings of
+  // capture-failed, so only capture's own failures stay exit 7. The hold is
+  // in place for all three.
+  Object.freeze({
+    reason: "capture-contention", exitClass: "refused-contention",
+    remedy: "Another actor held a lock during capture. The maintenance hold is still in place; re-run `lcm migration apply` with the same --confirm-generation to continue, or run `lcm migration abort` to release it.",
+  }),
+  Object.freeze({
+    reason: "capture-unresolvable", exitClass: "refused-evidence",
+    remedy: "The maintenance journal could not be verified during capture. The maintenance hold is still in place; run `lcm doctor`, then re-run `lcm migration apply` to continue or `lcm migration abort` to release it.",
+  }),
+
   // --- Section 4.5: continuation match predicates ---
   Object.freeze({
     reason: "continuation-mismatched-hold", exitClass: "refused-precondition",
     remedy: "An existing maintenance hold does not match this project's current selection. Run `lcm migration abort` before retrying.",
+  }),
+  Object.freeze({
+    reason: "continuation-partial-snapshot", exitClass: "refused-precondition",
+    remedy: "The held generation's snapshot is partial or replaced and cannot be resumed. Run `lcm migration abort` to release the hold; the captured evidence is preserved.",
   }),
   Object.freeze({
     reason: "continuation-resume-required", exitClass: "refused-precondition",

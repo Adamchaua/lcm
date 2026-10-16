@@ -26,6 +26,17 @@ import { closeLcmConnection } from "../../src/db/connection.js";
 import { clearProjectMapCache } from "../../src/project-map.js";
 import type { IdentityRepository } from "../../src/identity-service.js";
 
+/**
+ * Calls the real entry point with the confirmed generation id defaulting to
+ * the first candidate ordinal, the id a fresh project's `plan` would print.
+ * Tests that act on a later generation pass their own.
+ */
+function capture(
+  input: Omit<Parameters<typeof performMigrationApplyThroughCapture>[0], "confirmGenerationId"> & { confirmGenerationId?: string },
+): ReturnType<typeof performMigrationApplyThroughCapture> {
+  return performMigrationApplyThroughCapture({ confirmGenerationId: `${input.base}-0`, ...input });
+}
+
 const roots: string[] = [];
 const REGISTERED_MACHINE = "018f0b5d-1234-7abc-8def-1234567890ab";
 
@@ -115,7 +126,7 @@ describe("resolveMigrationApplyCandidate: agreement with the real apply pipeline
     expect(preview).toEqual({ status: "candidate", disposition: "fresh", generationId: `${fixture.base}-0` });
 
     const coordinator = coordinatorFor(fixture.homeDir);
-    const real = await performMigrationApplyThroughCapture({
+    const real = await capture({
       cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
     });
     expect(real.status).toBe("captured");
@@ -132,7 +143,7 @@ describe("resolveMigrationApplyCandidate: agreement with the real apply pipeline
   it("agrees with the real pipeline for a continue-held disposition too: a real held-and-captured journal previews as continue-held at the same generation id", async () => {
     const fixture = await enrolled();
     const coordinator = coordinatorFor(fixture.homeDir);
-    const first = await performMigrationApplyThroughCapture({
+    const first = await capture({
       cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
     });
     expect(first.status).toBe("captured");
@@ -189,7 +200,7 @@ describe("resolveMigrationApplyCandidate: refusal paths", () => {
   it("refuses continuation-mismatched-hold when a real held journal's stable fields disagree with the live authenticated candidate", async () => {
     const fixture = await enrolled();
     const coordinator = coordinatorFor(fixture.homeDir);
-    const first = await performMigrationApplyThroughCapture({
+    const first = await capture({
       cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
     });
     expect(first.status).toBe("captured");
@@ -224,7 +235,7 @@ describe("resolveMigrationApplyCandidate: refusal paths", () => {
   it("previews a fresh next-ordinal candidate for a real terminal (maintenance-aborted) journal with no manifest yet (section 4.6's abort gate lets a genuinely absent manifest through)", async () => {
     const fixture = await enrolled();
     const coordinator = coordinatorFor(fixture.homeDir);
-    const first = await performMigrationApplyThroughCapture({
+    const first = await capture({
       cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
     });
     expect(first.status).toBe("captured");
@@ -244,7 +255,7 @@ describe("resolveMigrationApplyCandidate: refusal paths", () => {
   it("refuses abort-or-resume-required when the abort gate finds a present-but-unsettled manifest for the terminal journal's generation (section 4.6)", async () => {
     const fixture = await enrolled();
     const coordinator = coordinatorFor(fixture.homeDir);
-    const first = await performMigrationApplyThroughCapture({
+    const first = await capture({
       cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
     });
     expect(first.status).toBe("captured");
@@ -299,7 +310,7 @@ describe("resolveMigrationApplyCandidate: refusal paths", () => {
   it("refuses abort-gate-unresolvable when the manifest presence probe itself cannot be established for the terminal journal's generation", async () => {
     const fixture = await enrolled();
     const coordinator = coordinatorFor(fixture.homeDir);
-    const first = await performMigrationApplyThroughCapture({
+    const first = await capture({
       cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
     });
     expect(first.status).toBe("captured");
@@ -324,7 +335,7 @@ describe("resolveMigrationApplyCandidate: refusal paths", () => {
   it("refuses continuation-unclassified if resolveHoldContinuation ever returned recover-entering for a non-entering phase journal (a type-level guard, proven via the injection seam since a real journal cannot produce this)", async () => {
     const fixture = await enrolled();
     const coordinator = coordinatorFor(fixture.homeDir);
-    const first = await performMigrationApplyThroughCapture({
+    const first = await capture({
       cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
     });
     expect(first.status).toBe("captured");

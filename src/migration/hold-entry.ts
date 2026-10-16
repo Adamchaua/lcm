@@ -98,6 +98,37 @@ export function classifyEnteringRecoveryFailure(error: unknown): MigrationEnteri
 }
 
 /**
+ * How `apply` classifies a failure from the *fresh* `enterMaintenance` call
+ * (round-1 B-5/A-11). Like `classifyEnteringRecoveryFailure` it classifies by
+ * the actual reason rather than by the fact that something threw:
+ *
+ * - lock contention: another actor holds the publication lock; retry.
+ * - `unresolved-publication`: a v2 publication (or another maintenance hold)
+ *   occupies the journal slot. This is not ours to abort, so its remedy must
+ *   not name `abort`.
+ * - `unexpected-state`: the journal moved under the compare-and-swap.
+ * - everything else (`unsafe-storage`, `malformed-journal`, checksum and
+ *   evidence failures, an unrecognised error): unresolvable evidence.
+ */
+export type MigrationHoldEntryFailureClass = "contention" | "slot-occupied" | "precondition" | "evidence";
+
+export function classifyHoldEntryFailure(error: unknown): Readonly<{ class: MigrationHoldEntryFailureClass; evidence: string }> {
+  if (error instanceof PrivateMutationLockContentionError) {
+    return { class: "contention", evidence: "lock-contention" };
+  }
+  if (error instanceof BackendPublicationJournalError) {
+    if (error.reason === "unresolved-publication") {
+      return { class: "slot-occupied", evidence: "journal-unresolved-publication" };
+    }
+    if (error.reason === "unexpected-state") {
+      return { class: "precondition", evidence: "journal-unexpected-state" };
+    }
+    return { class: "evidence", evidence: `journal-${error.reason}` };
+  }
+  return { class: "evidence", evidence: "journal-internal-error" };
+}
+
+/**
  * The section 9 operative test for whether the rebind has run against a
  * held journal: equal to the sentinel before capture, different after,
  * with `roster[0].queueCutoff` moving null to non-null as the independent

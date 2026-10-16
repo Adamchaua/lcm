@@ -23,7 +23,13 @@ const REASONS_APPLY_TS_AND_CANDIDATE_TS_CAN_EMIT = [
   "generation-probe-bound-exceeded",
   "generation-occupancy-refused",
   "multi-machine-installation",
-  "hold-entry-failed",
+  "hold-entry-contention",
+  "hold-entry-slot-occupied",
+  "hold-entry-precondition",
+  "hold-entry-evidence",
+  "capture-contention",
+  "capture-unresolvable",
+  "continuation-partial-snapshot",
   "hold-entry-readback-mismatch",
   "capture-failed",
   "continuation-mismatched-hold",
@@ -97,6 +103,35 @@ describe("MIGRATION_REFUSAL_REASONS (section 12's single exported constant)", ()
   );
 });
 
+describe("round-1 classified reasons (B-5, A-9, A-11, A-7)", () => {
+  it.each([
+    ["hold-entry-contention", "refused-contention"],
+    ["hold-entry-slot-occupied", "refused-contention"],
+    ["hold-entry-precondition", "refused-precondition"],
+    ["hold-entry-evidence", "refused-evidence"],
+    ["capture-contention", "refused-contention"],
+    ["capture-unresolvable", "refused-evidence"],
+    ["capture-failed", "failed-operator-required"],
+    ["continuation-partial-snapshot", "refused-precondition"],
+    ["abort-confirmation-missing", "refused-confirmation"],
+    ["abort-confirmation-moved", "refused-confirmation"],
+  ])("maps %s to %s", (reason, exitClass) => {
+    expect(migrationRefusalMapping(reason).exitClass).toBe(exitClass);
+  });
+
+  it("the hold-entry reasons never tell the operator to abort: no hold of ours exists when entry fails (A-11)", () => {
+    const holdEntry = MIGRATION_REFUSAL_REASONS.filter((entry) => entry.reason.startsWith("hold-entry-") && entry.reason !== "hold-entry-readback-mismatch");
+    expect(holdEntry.map((entry) => entry.reason).sort()).toEqual([
+      "hold-entry-contention", "hold-entry-evidence", "hold-entry-precondition", "hold-entry-slot-occupied",
+    ]);
+    for (const entry of holdEntry) expect(entry.remedy).not.toMatch(/abort/u);
+  });
+
+  it("the collapsed hold-entry-failed reason no longer exists", () => {
+    expect(() => migrationRefusalMapping("hold-entry-failed")).toThrow(/no exit-class mapping/u);
+  });
+});
+
 describe("migrationRefusalMapping", () => {
   it("resolves the exact same entry object the table itself contains", () => {
     const fromTable = MIGRATION_REFUSAL_REASONS.find((entry) => entry.reason === "capture-failed")!;
@@ -150,7 +185,12 @@ describe("MIGRATION_REFUSAL_REASONS covers the target-resolution and ownership r
 });
 
 describe("MIGRATION_REFUSAL_REASONS covers the abort command orchestration's own reasons", () => {
-  const REASONS_CLI_ABORT_CAN_EMIT = ["abort-nothing-to-abort", "abort-readback-mismatch"];
+  const REASONS_CLI_ABORT_CAN_EMIT = [
+    "abort-nothing-to-abort",
+    "abort-readback-mismatch",
+    "abort-confirmation-missing",
+    "abort-confirmation-moved",
+  ];
 
   it.each(REASONS_CLI_ABORT_CAN_EMIT)(
     "covers real reason %s",

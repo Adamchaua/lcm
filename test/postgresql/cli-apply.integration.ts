@@ -163,6 +163,7 @@ it(
 
         expect(result).toEqual({
           status: "ok", generationId: planPreflight.candidate.generationId, applied: true, phase: "copied",
+          daemonPresence: presentPresence(),
         });
 
         // Positive control: genesis and copy really happened, not just a

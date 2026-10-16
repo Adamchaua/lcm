@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { performMigrationApply, DEFAULT_MIGRATION_APPLY_MAX_RECORDS, DEFAULT_MIGRATION_APPLY_MAX_BYTES } from "../../src/migration/cli-apply.js";
 import type { MigrationPreflightResult } from "../../src/migration/cli-preflight.js";
+import type { MigrationManifestStore } from "../../src/migration/manifest-store.js";
+import { MigrationProtocolError } from "../../src/migration/protocol.js";
+
+const PRESENT = { status: "present", storageBackend: "sqlite", pid: 1, daemonInstanceId: "gen-1" } as const;
+
+/** A manifest store whose head reads at `phase`, for tests that mock the copy layer above it. */
+function headStore(phase = "copied"): MigrationManifestStore {
+  return { read: () => ({ phase }) } as unknown as MigrationManifestStore;
+}
 
 function readyPreflight(overrides: Partial<Extract<MigrationPreflightResult, { status: "ready" }>> = {}): MigrationPreflightResult {
   return {
@@ -17,7 +26,7 @@ function readyPreflight(overrides: Partial<Extract<MigrationPreflightResult, { s
         statementTimeoutMs: 1000,
       },
     },
-    presence: { status: "present", storageBackend: "sqlite", pid: 1, daemonInstanceId: "gen-1" },
+    presence: PRESENT,
     candidate: { status: "candidate", disposition: "fresh", generationId: "generation-0" },
     expectedIdentity: {
       id: "remote-project-1",
@@ -47,6 +56,7 @@ describe("performMigrationApply: preflight and confirmation fence", () => {
     const result = await performMigrationApply({
       cwd: "/tmp/project",
       homeDir: "/tmp/home",
+      manifestStore: headStore(),
       _preflight: async () => readyPreflight(),
     });
     expect(result).toEqual({ status: "refuse", reason: "confirmation-missing" });
@@ -57,6 +67,7 @@ describe("performMigrationApply: preflight and confirmation fence", () => {
       cwd: "/tmp/project",
       homeDir: "/tmp/home",
       confirmGenerationId: "generation-stale",
+      manifestStore: headStore(),
       _preflight: async () => readyPreflight(),
     });
     expect(result).toEqual({ status: "refuse", reason: "confirmation-generation-moved" });
@@ -68,9 +79,10 @@ describe("performMigrationApply: preflight and confirmation fence", () => {
       homeDir: "/tmp/home",
       confirmGenerationId: "generation-0",
       dryRun: true,
+      manifestStore: headStore(),
       _preflight: async () => readyPreflight(),
     });
-    expect(result).toEqual({ status: "ok", generationId: "generation-0", applied: false });
+    expect(result).toEqual({ status: "ok", generationId: "generation-0", applied: false, daemonPresence: PRESENT });
   });
 });
 
@@ -83,13 +95,14 @@ describe("performMigrationApply: --dry-run never reaches a mutating seam", () =>
       homeDir: "/tmp/home",
       confirmGenerationId: "generation-0",
       dryRun: true,
+      manifestStore: headStore(),
       _preflight: async () => readyPreflight(),
       _operationsForTesting: {
         performCapture: async () => { captureCalled = true; return { status: "captured", generationId: "generation-0", maintenanceChecksumSha256: "a".repeat(64), snapshot: {} as never }; },
         performGenesisAndCopy: async () => { genesisCalled = true; return { status: "copied", result: {} as never }; },
       },
     });
-    expect(result).toEqual({ status: "ok", generationId: "generation-0", applied: false });
+    expect(result).toEqual({ status: "ok", generationId: "generation-0", applied: false, daemonPresence: PRESENT });
     expect(captureCalled).toBe(false);
     expect(genesisCalled).toBe(false);
   });
@@ -102,6 +115,7 @@ describe("performMigrationApply: the mutating path", () => {
       cwd: "/tmp/project",
       homeDir: "/tmp/home",
       confirmGenerationId: "generation-0",
+      manifestStore: headStore(),
       _preflight: async () => readyPreflight(),
       _operationsForTesting: {
         performCapture: async () => ({ status: "refuse", reason: "capture-failed", evidence: "Error" }),
@@ -117,6 +131,7 @@ describe("performMigrationApply: the mutating path", () => {
       cwd: "/tmp/project",
       homeDir: "/tmp/home",
       confirmGenerationId: "generation-0",
+      manifestStore: headStore(),
       _preflight: async () => readyPreflight(),
       _operationsForTesting: {
         performCapture: async () => ({ status: "captured", generationId: "generation-0", maintenanceChecksumSha256: "a".repeat(64), snapshot: {} as never }),
@@ -136,6 +151,7 @@ describe("performMigrationApply: the mutating path", () => {
       cwd: "/tmp/project",
       homeDir: "/tmp/home",
       confirmGenerationId: "generation-0",
+      manifestStore: headStore(),
       _preflight: async () => readyPreflight(),
       _operationsForTesting: {
         performCapture: async () => ({ status: "captured", generationId: "generation-0", maintenanceChecksumSha256: "a".repeat(64), snapshot: {} as never }),
@@ -150,7 +166,7 @@ describe("performMigrationApply: the mutating path", () => {
         mintOwnerProcessId: () => "minted-owner-id-1",
       },
     });
-    expect(result).toEqual({ status: "ok", generationId: "generation-0", applied: true, phase: "copied" });
+    expect(result).toEqual({ status: "ok", generationId: "generation-0", applied: true, phase: "copied", daemonPresence: PRESENT });
     expect(capturedOwnerProcessId).toBe("minted-owner-id-1");
     expect(capturedExpectedOwner).toBe("lcm_migrator");
     expect(capturedExpectedIdentityId).toBe("remote-project-1");
@@ -167,6 +183,7 @@ describe("performMigrationApply: the mutating path", () => {
       confirmGenerationId: "generation-0",
       maxRecords: 42,
       maxBytes: 4096,
+      manifestStore: headStore(),
       _preflight: async () => readyPreflight(),
       _operationsForTesting: {
         performCapture: async () => ({ status: "captured", generationId: "generation-0", maintenanceChecksumSha256: "a".repeat(64), snapshot: {} as never }),
@@ -187,6 +204,7 @@ describe("performMigrationApply: the mutating path", () => {
       cwd: "/tmp/project",
       homeDir: "/tmp/home",
       confirmGenerationId: "generation-0",
+      manifestStore: headStore(),
       _preflight: async () => readyPreflight(),
       _operationsForTesting: {
         performCapture: async () => ({ status: "captured", generationId: "generation-0", maintenanceChecksumSha256: "a".repeat(64), snapshot: {} as never }),
@@ -218,5 +236,90 @@ describe("performMigrationApply: the mutating path", () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+
+describe("performMigrationApply: round-1 fixes", () => {
+  const captured = async () => ({ status: "captured" as const, generationId: "generation-0", maintenanceChecksumSha256: "a".repeat(64), snapshot: {} as never });
+  const copied = async () => ({ status: "copied" as const, result: { phase: "copied" } as never });
+
+  it("A-3/B-2: carries the confirmed generation id into capture, so capture can compare it where it acts", async () => {
+    let received: string | undefined;
+    await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore(),
+      _preflight: async () => readyPreflight(),
+      _operationsForTesting: {
+        performCapture: async (captureInput) => { received = captureInput.confirmGenerationId; return captured(); },
+        performGenesisAndCopy: copied,
+      },
+    });
+    expect(received).toBe("generation-0");
+  });
+
+  it("A-8: carries a present daemon's evidence into the ok outcome and announces it before the fence and any write", async () => {
+    const events: string[] = [];
+    const result = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore(),
+      onDaemonObserved: (presence) => { events.push("observed:" + String(presence.pid)); },
+      _preflight: async () => readyPreflight(),
+      _operationsForTesting: {
+        performCapture: async () => { events.push("capture"); return captured(); },
+        performGenesisAndCopy: copied,
+      },
+    });
+    expect(result).toMatchObject({ status: "ok", daemonPresence: PRESENT });
+    expect(events).toEqual(["observed:1", "capture"]);
+  });
+
+  it("A-8: announces a daemon even when the fence then refuses, since the operator should hear about it before retrying", async () => {
+    const observed: number[] = [];
+    await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-stale", manifestStore: headStore(),
+      onDaemonObserved: (presence) => { observed.push(presence.pid); },
+      _preflight: async () => readyPreflight(),
+    });
+    expect(observed).toEqual([1]);
+  });
+
+  it("A-8: records an authoritative absence as such and never announces a daemon", async () => {
+    let announced = false;
+    const result = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", dryRun: true,
+      onDaemonObserved: () => { announced = true; },
+      _preflight: async () => readyPreflight({ presence: { status: "authoritatively-absent" } }),
+    });
+    expect(result).toEqual({ status: "ok", generationId: "generation-0", applied: false, daemonPresence: { status: "authoritatively-absent" } });
+    expect(announced).toBe(false);
+  });
+
+  it("A-16: reports the phase it read back from the manifest head", async () => {
+    const result = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore("copied"),
+      _preflight: async () => readyPreflight(),
+      _operationsForTesting: { performCapture: captured, performGenesisAndCopy: copied },
+    });
+    expect(result).toMatchObject({ status: "ok", phase: "copied" });
+  });
+
+  it("A-16: refuses copy-failed with distinct evidence when the head reads at a phase other than the one the copy layer reported", async () => {
+    const result = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore("copying"),
+      _preflight: async () => readyPreflight(),
+      _operationsForTesting: { performCapture: captured, performGenesisAndCopy: copied },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "copy-failed", evidence: "manifest-readback-mismatch" });
+  });
+
+  it.each([
+    ["a protocol error", new MigrationProtocolError("checksum-mismatch", "test"), "manifest-checksum-mismatch"],
+    ["an unrecognised failure", new Error("boom"), "manifest-internal-error"],
+  ])("A-16: refuses manifest-unresolvable when the head read fails with %s", async (_name, failure, evidence) => {
+    const result = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0",
+      manifestStore: { read: () => { throw failure; } } as unknown as MigrationManifestStore,
+      _preflight: async () => readyPreflight(),
+      _operationsForTesting: { performCapture: captured, performGenesisAndCopy: copied },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "manifest-unresolvable", evidence });
   });
 });
