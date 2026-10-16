@@ -1373,6 +1373,7 @@ function shouldUsePublicationConvergence(actionCommand: Command): boolean {
   const topLevel = actionCommand.parent?.name() === "lcm";
   if (topLevel && action === "install") return true;
   if (topLevel && action === "export") return true;
+  if (topLevel && action === "mcp") return true;
   if (isNestedUnderRoot(actionCommand, "machine", "show")) return true;
   if (isNestedUnderRoot(actionCommand, "project", "list")
     || isNestedUnderRoot(actionCommand, "project", "show")) return true;
@@ -3129,7 +3130,7 @@ export async function runCli(
         printHelp("mcp"); exit(0);
       }
       const { startMcpServer } = await import("../src/mcp/server.js");
-      await startMcpServer();
+      await startMcpServer({ withPublicationAdmissionRetry: publicationAdmissionRetry });
     });
 
   // ─── install ───────────────────────────────────────────────────────────────

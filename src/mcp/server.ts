@@ -316,9 +316,22 @@ export async function handleDaemonRequest(
   return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 }
 
-export async function startMcpServer(): Promise<void> {
+export type McpPublicationAdmissionRetry = <T>(step: () => T | Promise<T>) => Promise<T>;
+
+export type StartMcpServerOptions = {
+  /**
+   * Retries only the short startup publication-admission asserts. It is never
+   * held across daemon spawn or health waits, which would deadlock the child's
+   * own admission.
+   */
+  readonly withPublicationAdmissionRetry?: McpPublicationAdmissionRetry | undefined;
+};
+
+export async function startMcpServer(options: StartMcpServerOptions = {}): Promise<void> {
+  const retryAdmission = options.withPublicationAdmissionRetry;
+  const admit: McpPublicationAdmissionRetry = retryAdmission ?? (async step => await step());
   const publicationConfigPath = defaultConfigPath();
-  const config = assertMcpStorageAdmission(publicationConfigPath);
+  const config = await admit(() => assertMcpStorageAdmission(publicationConfigPath));
   const port = config.daemon.port;
   const pidFilePath = daemonPidPath();
 
@@ -331,6 +344,7 @@ export async function startMcpServer(): Promise<void> {
     spawnArgs: [lcmBin, "daemon", "start", "--foreground"],
     expectedEntrypoint: lcmBin,
     enforceUserManagerParent: true,
+    ...(retryAdmission === undefined ? {} : { _withPublicationAdmissionRetry: retryAdmission }),
   });
   if (!daemon.connected) {
     throw new Error("Refusing to start MCP server: daemon endpoint identity could not be verified.");
