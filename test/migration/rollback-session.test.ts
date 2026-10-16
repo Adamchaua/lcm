@@ -146,7 +146,7 @@ function harness(options: Readonly<{
   const census = options.census ?? domainCensus("session");
   const dependencies = {
     createRuntime: vi.fn(() => runtime as unknown as RollbackSessionRuntime),
-    verifyTransferSchema: vi.fn(async () => undefined),
+    verifyRuntimeSchema: vi.fn(async () => undefined),
     assertReadOnlyGuard: vi.fn(async () => undefined),
     captureDestinationIdentity: vi.fn(async () => fixtureDestinationIdentity("dest")),
     captureDestinationSchemaWitness: vi.fn(async () => fixtureSchemaWitness("schema")),
@@ -270,7 +270,7 @@ describe("openRollbackFencedSession: opening", () => {
     const { guard, calls } = statefulGuard();
     const h = harness({
       guard,
-      overrides: { verifyTransferSchema: vi.fn(async () => { throw new Error("schema is not admitted"); }) } as never,
+      overrides: { verifyRuntimeSchema: vi.fn(async () => { throw new Error("schema is not admitted"); }) } as never,
     });
     await expect(open(h)).rejects.toThrow("schema is not admitted");
     expect(calls).toEqual([]);
@@ -279,7 +279,7 @@ describe("openRollbackFencedSession: opening", () => {
 
   it("swallows a failing runtime close during cleanup of a failed open", async () => {
     const h = harness({
-      overrides: { verifyTransferSchema: vi.fn(async () => { throw new Error("schema is not admitted"); }) } as never,
+      overrides: { verifyRuntimeSchema: vi.fn(async () => { throw new Error("schema is not admitted"); }) } as never,
     });
     h.runtime.close.mockRejectedValue(new Error("pool close failed"));
     await expect(open(h)).rejects.toThrow("schema is not admitted");
@@ -314,7 +314,7 @@ describe("openRollbackFencedSession: opening", () => {
     expect(Object.keys(DEFAULT_ROLLBACK_SESSION_DEPENDENCIES).sort()).toEqual([
       "assertReadOnlyGuard", "captureDestinationIdentity", "captureDestinationSchemaWitness", "checkQuiescence",
       "createPortableSource", "createRuntime", "createStream", "readDomainCensus", "readFencedDestinationCensus",
-      "verifyTransferSchema",
+      "verifyRuntimeSchema",
     ]);
   });
 });
@@ -404,7 +404,7 @@ describe("captureReadback", () => {
     await session.captureReadback({ manifestDestinationWitnessSha256: witnessSha, canonicalDeltaBaseline: fixtureCanonicalDelta("x") });
     const snapshot = await (h.runtime.openReadOnlySnapshot as ReturnType<typeof vi.fn>).mock.results[0]!.value;
     expect(h.dependencies.assertReadOnlyGuard).toHaveBeenCalledWith(snapshot, undefined);
-    expect(h.dependencies.verifyTransferSchema).toHaveBeenCalledWith(snapshot, { expectedOwner: "lcm_owner", signal: undefined });
+    expect(h.dependencies.verifyRuntimeSchema).toHaveBeenCalledWith(snapshot, { expectedOwner: "lcm_owner", signal: undefined });
     expect(h.dependencies.captureDestinationIdentity).toHaveBeenCalledWith(snapshot, REMOTE, undefined);
     expect(h.dependencies.readFencedDestinationCensus).toHaveBeenCalledWith(snapshot, {
       settings: target.settings, expectedOwner: "lcm_owner", expectedIdentity: target.expectedIdentity,

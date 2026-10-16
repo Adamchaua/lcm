@@ -5,7 +5,7 @@ import type { StorageIdentityContext } from "../storage/contracts.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
 import { createPostgreSqlPortableSource, readPostgreSqlPortableSourceDomainCensus } from "../storage/postgresql/portable-source.js";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
-import { verifyPostgreSqlTransferSchema } from "../storage/postgresql/runtime-readiness.js";
+import { verifyPostgreSqlRuntimeSchema } from "../storage/postgresql/runtime-readiness.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
 import {
   acquireActivationLease,
@@ -59,6 +59,11 @@ import {
  * asserts the same identity; anything but a satisfied assertion throws. An
  * expired lease refuses: there is no silent token rotation under an open
  * snapshot.
+ *
+ * Admission. Rollback runs after activation, under the runtime role the
+ * activated configuration names, so the schema is admitted with the runtime
+ * privilege profile (not the transfer profile the copy and verification
+ * drivers use).
  *
  * Snapshots. Every readback opens its own read-only snapshot, so steps 4
  * and 10 never share one. Each captures the destination identity and the
@@ -132,7 +137,7 @@ export interface RollbackSessionRuntime extends PostgreSqlQueryExecutor {
 
 export interface RollbackSessionDependencies {
   createRuntime(settings: PostgreSqlConnectionSettings): RollbackSessionRuntime;
-  verifyTransferSchema: typeof verifyPostgreSqlTransferSchema;
+  verifyRuntimeSchema: typeof verifyPostgreSqlRuntimeSchema;
   assertReadOnlyGuard: typeof assertPermanentReadOnlyGuard;
   captureDestinationIdentity: typeof captureDestinationIdentity;
   captureDestinationSchemaWitness: typeof captureDestinationSchemaWitness;
@@ -145,7 +150,7 @@ export interface RollbackSessionDependencies {
 
 export const DEFAULT_ROLLBACK_SESSION_DEPENDENCIES: RollbackSessionDependencies = {
   createRuntime: (settings) => new PostgreSqlRuntime(settings),
-  verifyTransferSchema: verifyPostgreSqlTransferSchema,
+  verifyRuntimeSchema: verifyPostgreSqlRuntimeSchema,
   assertReadOnlyGuard: assertPermanentReadOnlyGuard,
   captureDestinationIdentity,
   captureDestinationSchemaWitness,
@@ -247,7 +252,7 @@ class FencedRollbackSession implements RollbackProductionSession {
     this.snapshots.add(snapshot);
     try {
       await this.dependencies.assertReadOnlyGuard(snapshot, this.signal);
-      await this.dependencies.verifyTransferSchema(snapshot, {
+      await this.dependencies.verifyRuntimeSchema(snapshot, {
         expectedOwner: this.target.expectedOwner, signal: this.signal,
       });
     } catch (error) {
@@ -411,7 +416,7 @@ export async function openRollbackFencedSession(
   const runtime = dependencies.createRuntime(target.settings);
   let session: FencedRollbackSession | undefined;
   try {
-    await dependencies.verifyTransferSchema(runtime, { expectedOwner: target.expectedOwner, signal: input.signal });
+    await dependencies.verifyRuntimeSchema(runtime, { expectedOwner: target.expectedOwner, signal: input.signal });
     const guard = runtime.backendPublicationGuard();
     const fence = await acquireRollbackLease(guard, tuple, input.signal);
     // From here the lease exists: a failure must release it through the same path release() uses.
