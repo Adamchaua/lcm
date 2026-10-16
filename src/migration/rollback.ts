@@ -79,6 +79,7 @@ import {
   type MigrationReportReference,
 } from "./protocol.js";
 import { MigrationManifestStore } from "./manifest-store.js";
+import { readProjectMapSnapshot } from "../project-map.js";
 import {
   migrationCanonicalDeltaChanged,
   migrationCensusVectorsEqual,
@@ -819,6 +820,8 @@ export interface RunMigrationRollbackDependencies {
   readonly recordWitnessBinding?: MigrationWitnessBindingRecorder;
   /** Boundary E. Defaults to resolveRollbackAuthoritativeContext. */
   readonly resolveAuthoritativeContext?: RollbackAuthoritativeContextResolver;
+  /** The project map the single-project check (plan-v3.2 A14) reads. Defaults to readProjectMapSnapshot. */
+  readonly readProjectMap?: typeof readProjectMapSnapshot;
 }
 
 type ResolvedRollbackDependencies = Required<RunMigrationRollbackDependencies>;
@@ -834,7 +837,59 @@ function withDefaultDependencies(
     recordSelectionBinding: deps.recordSelectionBinding ?? recordMigrationSelectionBinding,
     recordWitnessBinding: deps.recordWitnessBinding ?? recordMigrationWitnessBinding,
     resolveAuthoritativeContext: deps.resolveAuthoritativeContext ?? resolveRollbackAuthoritativeContext,
+    readProjectMap: deps.readProjectMap ?? readProjectMapSnapshot,
   };
+}
+
+/**
+ * Plan-v3.2 A14. The maintenance selection flip is global: it moves the
+ * whole installation's backend selection to sqlite. Another remotely bound
+ * project would be silently stranded on a backend it no longer routes to, so
+ * a rollback is only offered when the covered project is the one and only
+ * project the project map binds to PostgreSQL. Two observations must agree --
+ * the map's entries and the covered project (its local id and, when shared,
+ * its remote id) -- and either one alone being wrong refuses. An unreadable
+ * map refuses too. A local-only entry (no remoteProjectId) never blocks.
+ */
+function assertCoveredProjectIsSoleRemoteBinding(
+  deps: Readonly<ResolvedRollbackDependencies>,
+  input: Readonly<RunMigrationRollbackInput>,
+  token?: BackendPublicationLockToken,
+): void {
+  let map: ReturnType<typeof readProjectMapSnapshot>;
+  try {
+    map = deps.readProjectMap(input.homeDir, token);
+  } catch (error) {
+    throw new RollbackOrchestrationError(
+      "not-eligible",
+      "project-map-unreadable: the project map cannot be read, so other remotely bound projects cannot be ruled out: "
+        + describeUnresolvable(error),
+    );
+  }
+  const covered = map[input.localProjectId];
+  if (covered?.remoteProjectId === undefined) {
+    throw new RollbackOrchestrationError(
+      "not-eligible",
+      "covered-project-unbound: the project map does not bind the covered project to PostgreSQL",
+    );
+  }
+  if (input.projectIdentity.scope === "shared" && covered.remoteProjectId !== input.projectIdentity.projectId) {
+    throw new RollbackOrchestrationError(
+      "not-eligible",
+      "covered-project-mismatch: the project map binds the covered project to a different PostgreSQL project",
+    );
+  }
+  const others = Object.entries(map).filter(
+    ([hash, entry]) => hash !== input.localProjectId && entry.remoteProjectId !== undefined,
+  );
+  if (others.length > 0) {
+    throw new RollbackOrchestrationError(
+      "not-eligible",
+      "multiple-remote-projects: rolling back would also reroute " + others.length
+        + " other remotely bound project(s) (" + others.map(([hash]) => hash).join(", ")
+        + "); reduce the installation to one remotely bound project first",
+    );
+  }
 }
 
 export interface RunMigrationRollbackInput {
@@ -1036,6 +1091,7 @@ export async function runMigrationRollback(
   // enterMaintenance has already run and archived the live slot -- falls
   // back to the durable rollback-authority artifact instead of observing
   // "unresolvable" and refusing permanently.
+  assertCoveredProjectIsSoleRemoteBinding(deps, input);
   const { fact: operabilityFact, artifact: priorAuthorityArtifact } = await resolveRollbackOperabilityFact({
     homeDir: input.homeDir,
     generationId: input.generationId,
@@ -1552,6 +1608,9 @@ async function runPostPrepareSequence(
       machineId: input.roster[0]!.machineId,
     });
   }
+
+  // A14: the project map may have changed since the pre-maintenance check.
+  assertCoveredProjectIsSoleRemoteBinding(deps, input, token);
 
   const heldChecksum = requireMaintenanceChecksum(input.homeDir);
   const prepared = await deps.coordinator.prepareMaintenanceSelection({

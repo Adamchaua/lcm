@@ -12,7 +12,7 @@
  * build-versus-revalidation equality of plan-v3.1 amendment A6.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -22,6 +22,7 @@ import {
   readBackendMaintenanceJournal,
   type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
+import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import {
   beginMigrationEffect,
@@ -189,7 +190,7 @@ type Run = Readonly<{
 async function runRollback(run: Run, scenario: Awaited<ReturnType<typeof activationFor>>) {
   const input: RunMigrationRollbackInput = {
     homeDir: run.homeDir, generationId: run.generationId, canonicalPath: run.canonicalPath,
-    projectIdentity: { scope: "shared", projectId: fixture.projectId }, localProjectId: "local-1",
+    projectIdentity: { scope: "shared", projectId: fixture.projectId }, localProjectId: fixture.localProjectId,
     sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
   };
   return runMigrationRollback(input, {
@@ -205,11 +206,20 @@ async function runRollback(run: Run, scenario: Awaited<ReturnType<typeof activat
   });
 }
 
+/** The real project map file the rollback's single-project check (plan-v3.2 A14) reads. */
+function writeProjectMap(homeDir: string, map: Record<string, { canonical: string; aliases: string[]; remoteProjectId?: string }>): void {
+  clearProjectMapCache();
+  writeFileSync(projectMapPath(homeDir), JSON.stringify(map), { mode: 0o600 });
+}
+
 async function prepared(database: PostgreSqlTestDatabase, generationId: string) {
   await applyAllRuntimeGrants(database);
   await seedPortablePostgreSql(database.migrator);
   const homeDir = tempHome();
   manifestAtVerified(new MigrationManifestStore({ homeDir }), generationId);
+  writeProjectMap(homeDir, {
+    [fixture.localProjectId]: { canonical: fixture.path, aliases: [], remoteProjectId: fixture.projectId },
+  });
   return { homeDir, canonicalPath: join(homeDir, "live.sqlite"), scenario: await activationFor(database, generationId) };
 }
 
@@ -283,6 +293,21 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
     });
   });
 
+  it("refuses a second remotely bound project before any lease, maintenance or manifest change (A14)", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-two-projects", async (database) => {
+      const { homeDir, canonicalPath, scenario } = await prepared(database, "gen-two-projects");
+      writeProjectMap(homeDir, {
+        [fixture.localProjectId]: { canonical: fixture.path, aliases: [], remoteProjectId: fixture.projectId },
+        ["f".repeat(64)]: { canonical: "/another", aliases: [], remoteProjectId: "01990000-0000-7000-8000-0000000000ff" },
+      });
+      await expect(runRollback({ homeDir, generationId: "gen-two-projects", canonicalPath, database }, scenario))
+        .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("multiple-remote-projects") });
+      expect(await leaseRow(database)).toBeUndefined();
+      expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+      expect(new MigrationManifestStore({ homeDir }).read("gen-two-projects").phase).toBe("verified");
+    });
+  });
+
   it("rolls back post-write after a racing post-epoch write, exporting the written data into the installed database", async () => {
     await withPostgreSqlTestDatabase("rollback-session-post-write", async (database) => {
       const { homeDir, canonicalPath, scenario } = await prepared(database, "gen-post");
@@ -294,7 +319,7 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
         const row = installed.prepare("SELECT count(*) AS n FROM conversations WHERE session_id = ?").get("raced-session") as { n: number };
         expect(row.n).toBe(1);
         // Both machines hold a session instruction under one scope hash; the machine-local cache keeps this machine's only.
-        const cache = installed.prepare("SELECT content FROM session_instruction_cache WHERE project_id = ?").all("local-1");
+        const cache = installed.prepare("SELECT content FROM session_instruction_cache WHERE project_id = ?").all(fixture.localProjectId);
         expect(cache).toEqual([{ content: "Primary instruction" }]);
       } finally {
         installed.close();
