@@ -30,7 +30,11 @@ import {
   type MigrationManifest,
   type MigrationStorageWitness,
 } from "../../src/migration/protocol.js";
-import { runMigrationRollback, type RunMigrationRollbackInput } from "../../src/migration/rollback.js";
+import {
+  deriveRollbackPublicationId,
+  runMigrationRollback,
+  type RunMigrationRollbackInput,
+} from "../../src/migration/rollback.js";
 import {
   DEFAULT_ROLLBACK_SESSION_DEPENDENCIES,
   RollbackSessionError,
@@ -222,7 +226,22 @@ describe("production rollback session against PostgreSQL 18", { timeout: 180_000
       const held = await leaseRow(database);
       expect(held).toMatchObject({ released: false, live: true, owner_machine_id: fixture.machineId });
       expect(held!.operation).toMatch(/^backend-publication:sqlite:[0-9a-f]{64}$/u);
-      expect(session.selectionAuthority.resourceKey).toBe(fixture.projectId);
+      // The selection authority describes the real fence, field for field.
+      const row = (await database.migrator.query<{
+        resource_type: string; resource_key: string; fencing_token: string; owner_process_id: string;
+      }>({
+        text: "SELECT resource_type, resource_key, fencing_token::text AS fencing_token, owner_process_id "
+          + "FROM lcm.fenced_leases WHERE project_id = $1",
+        values: [fixture.projectId],
+      }, factoryContext)).rows[0]!;
+      expect(session.selectionAuthority).toEqual({
+        version: 1,
+        resourceType: row.resource_type,
+        resourceKey: row.resource_key,
+        fencingToken: row.fencing_token,
+        ownerProcessId: row.owner_process_id,
+      });
+      expect(row.owner_process_id).toBe(deriveRollbackPublicationId("gen-lease"));
 
       await session.renew();
 

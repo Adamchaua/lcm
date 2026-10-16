@@ -197,8 +197,8 @@ describe("openRollbackFencedSession: opening", () => {
     });
     expect(state.row?.fencingToken).toBe(1n);
     expect(session.selectionAuthority).toEqual({
-      version: 1, resourceType: "backend-publication", resourceKey: REMOTE, fencingToken: "1",
-      ownerProcessId: "rollback-" + process.pid.toString(),
+      version: 1, resourceType: "backend-publication", resourceKey: "selection", fencingToken: "1",
+      ownerProcessId: PUBLICATION_ID,
     });
     expect(h.dependencies.checkQuiescence).toHaveBeenCalledWith({ homeDir: "/home", lockToken });
     expect(session.quiescenceFenceEvidenceSha256).toMatch(/^[0-9a-f]{64}$/u);

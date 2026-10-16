@@ -6,6 +6,10 @@ import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../s
 import { createPostgreSqlPortableSource, readPostgreSqlPortableSourceDomainCensus } from "../storage/postgresql/portable-source.js";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
 import { verifyPostgreSqlRuntimeSchema } from "../storage/postgresql/runtime-readiness.js";
+import {
+  POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_KEY,
+  POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+} from "../storage/postgresql/publication-guard.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
 import {
   acquireActivationLease,
@@ -222,12 +226,14 @@ class FencedRollbackSession implements RollbackProductionSession {
     private readonly dependencies: RollbackSessionDependencies,
   ) {
     this.fence = fence;
+    // Field for field the lease row the fence acquired: its resource coordinates, its token, and
+    // owner_process_id, which the guard stores as the publicationId.
     this.selectionAuthority = {
       version: 1,
-      resourceType: "backend-publication",
-      resourceKey: tuple.projectId,
+      resourceType: POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+      resourceKey: POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_KEY,
       fencingToken: fence.fencingToken.toString(),
-      ownerProcessId: "rollback-" + process.pid.toString(),
+      ownerProcessId: fence.publicationId,
     };
   }
 
