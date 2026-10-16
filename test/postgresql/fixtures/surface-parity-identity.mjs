@@ -379,6 +379,10 @@ async function identity(context) {
     const { [expectedSuccessor]: removedEntry, ...remainingMap } = cleanupMap;
     assert.ok(removedEntry);
     writeFileSync(mapPath, `${JSON.stringify(remainingMap)}\n`, { mode: 0o600 });
+    // Completes removal of this scenario's own artifacts: the documented project-metadata backfill would otherwise re-add the map entry from its meta.json.
+    const successorDirectory = join(projectsRoot, expectedSuccessor);
+    assert.deepEqual(readdirSync(successorDirectory), ["meta.json"], "surface-identity:retired-successor-directory");
+    rmSync(successorDirectory, { recursive: true });
   } else {
     await ingest(context, retiredRoot, "surface-identity-retired", "Identity corpus violet retired renewal");
     assert.equal((await matches(context, retiredRoot, "violet retired renewal")).length, 1);
