@@ -442,11 +442,101 @@ describe("PostgreSQL 18 passive-event repository", () => {
       return rows.rows.map(({ label }) => label).sort();
     }
 
-    async function settlesWithin(promise: Promise<unknown>, milliseconds: number): Promise<boolean> {
-      let settled = false;
-      void promise.then(() => { settled = true; }, () => { settled = true; });
-      await new Promise((resolve) => setTimeout(resolve, milliseconds));
-      return settled;
+    type HeldTransaction = Parameters<Parameters<PostgreSqlTestDatabase["runtime"]["transaction"]>[0]>[0];
+
+    const heldRowCapMs = 5_000;
+    const blockedPollAttempts = 40;
+    const blockedPollIntervalMs = 50;
+
+    function within<T>(promise: Promise<T>, milliseconds: number, what: string): Promise<T> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const expired = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${what} did not happen within ${milliseconds} ms`)),
+          milliseconds,
+        );
+      });
+      return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+    }
+
+    // Polls, a finite number of times, until a backend of the runtime role is
+    // waiting on a lock held by the holder's backend while running the release
+    // statement, and returns that backend's pid.
+    async function findBlockedRelease(
+      database: PostgreSqlTestDatabase,
+      projectId: string,
+      holderPid: number,
+    ): Promise<number> {
+      for (let attempt = 0; attempt < blockedPollAttempts; attempt += 1) {
+        const blocked = await database.runtime.query<{ pid: number }>({
+          text: `SELECT pid FROM pg_catalog.pg_stat_activity
+                 WHERE datname = pg_catalog.current_database()
+                   AND wait_event_type = 'Lock'
+                   AND pg_catalog.pg_blocking_pids(pid) @> ARRAY[$1::pg_catalog.int4]
+                   AND query LIKE '%FOR UPDATE OF event%'`,
+          values: [holderPid],
+        }, { domain: "passive-events", operation: "findBlockedPassiveEventRelease", projectId });
+        if (blocked.rows.length === 1) return blocked.rows[0].pid;
+        await new Promise((resolve) => setTimeout(resolve, blockedPollIntervalMs));
+      }
+      throw new Error("the release statement was never blocked on the holder's row lock");
+    }
+
+    // Starts the release while another transaction holds every row of the
+    // machine, proves from pg_stat_activity that the release statement is
+    // blocked on that transaction's row lock, then lets writeWhileHeld change
+    // rows inside the holder (given the release backend's pid) and commit.
+    // Every wait is bounded, and on every failure path the holder is rolled
+    // back and both promises are settled before this returns or throws.
+    async function releaseWhileRowsAreHeld<T>(
+      database: PostgreSqlTestDatabase,
+      machineId: string,
+      projectId: string,
+      startRelease: () => Promise<T>,
+      writeWhileHeld: (transaction: HeldTransaction, releasePid: number) => Promise<void>,
+    ): Promise<T> {
+      let proceed!: (releasePid: number) => void;
+      let abort!: (reason: Error) => void;
+      const holderMayFinish = new Promise<number>((resolve, reject) => {
+        proceed = resolve;
+        abort = reject;
+      });
+      holderMayFinish.catch(() => undefined);
+      let holderLocked!: (holderPid: number) => void;
+      let holderFailed!: (reason: unknown) => void;
+      const locked = new Promise<number>((resolve, reject) => {
+        holderLocked = resolve;
+        holderFailed = reject;
+      });
+      const context = { domain: "passive-events", operation: "holdReleasedPassiveEvents", projectId };
+      const holder = database.runtime.transaction(async (transaction) => {
+        const pid = await transaction.query<{ pid: number }>({
+          text: "SELECT pg_catalog.pg_backend_pid() AS pid",
+        }, context);
+        await transaction.query({
+          text: `SELECT 1 FROM lcm.passive_event_inbox
+                 WHERE machine_id = $1 FOR UPDATE`,
+          values: [machineId],
+        }, context);
+        holderLocked(pid.rows[0].pid);
+        await writeWhileHeld(transaction, await holderMayFinish);
+      }, context);
+      holder.catch(holderFailed);
+      let release: Promise<T> | undefined;
+      try {
+        const holderPid = await within(locked, heldRowCapMs, "the holder taking its row locks");
+        release = startRelease();
+        proceed(await findBlockedRelease(database, projectId, holderPid));
+        await within(holder, heldRowCapMs, "the holder committing");
+        return await within(release, heldRowCapMs, "the release finishing");
+      } finally {
+        abort(new Error("release race aborted"));
+        await within(
+          Promise.allSettled(release === undefined ? [holder] : [holder, release]),
+          heldRowCapMs,
+          "the holder and the release settling",
+        );
+      }
     }
 
     it("deletes only safe copies of its own rows and reports the rest", async () => {
@@ -588,50 +678,113 @@ describe("PostgreSQL 18 passive-event repository", () => {
           inboxId: event.inboxId,
         }));
 
-        let finishHolder!: () => void;
-        const holderMayFinish = new Promise<void>((resolve) => { finishHolder = resolve; });
-        let locked!: () => void;
-        const holderLocked = new Promise<void>((resolve) => { locked = resolve; });
-        // Another process holds both rows and changes them before committing.
-        const holder = database.runtime.transaction(async (transaction) => {
-          await transaction.query({
-            text: `SELECT 1 FROM lcm.passive_event_inbox
-                   WHERE machine_id = $1 FOR UPDATE`,
-            values: [machineId],
-          }, { domain: "passive-events", operation: "holdReleasedPassiveEvents", projectId: oldId });
-          locked();
-          await holderMayFinish;
-          await transaction.query({
-            text: `UPDATE lcm.passive_event_inbox
-                   SET status = 'claimed', claimed_by = 'live',
-                       claimed_at = pg_catalog.statement_timestamp()
-                   WHERE event_id = $1`,
-            values: [claimedLater],
-          }, { domain: "passive-events", operation: "claimReleasedPassiveEvent", projectId: oldId });
-          await transaction.query({
-            text: `UPDATE lcm.passive_event_inbox
-                   SET status = 'applied', applied_at = pg_catalog.statement_timestamp()
-                   WHERE event_id = $1`,
-            values: [appliedLater],
-          }, { domain: "passive-events", operation: "applyReleasedPassiveEvent", projectId: oldId });
-        }, { domain: "passive-events", operation: "holdReleasedPassiveEvents", projectId: oldId });
-        await holderLocked;
-
-        const release = bound.releaseFromOtherProjects(keys, { staleClaimMs: 60_000 });
-        try {
-          // The release waits for the holder instead of skipping its rows.
-          expect(await settlesWithin(release, 300)).toBe(false);
-        } finally {
-          finishHolder();
-          await holder;
-        }
+        // Another process holds both rows and changes them before committing;
+        // the release statement is proven blocked on that row lock first.
+        const released = await releaseWhileRowsAreHeld(
+          database,
+          machineId,
+          oldId,
+          () => bound.releaseFromOtherProjects(keys, { staleClaimMs: 60_000 }),
+          async (transaction) => {
+            await transaction.query({
+              text: `UPDATE lcm.passive_event_inbox
+                     SET status = 'claimed', claimed_by = 'live',
+                         claimed_at = pg_catalog.statement_timestamp()
+                     WHERE event_id = $1`,
+              values: [claimedLater],
+            }, { domain: "passive-events", operation: "claimReleasedPassiveEvent", projectId: oldId });
+            await transaction.query({
+              text: `UPDATE lcm.passive_event_inbox
+                     SET status = 'applied', applied_at = pg_catalog.statement_timestamp()
+                     WHERE event_id = $1`,
+              values: [appliedLater],
+            }, { domain: "passive-events", operation: "applyReleasedPassiveEvent", projectId: oldId });
+          },
+        );
         // It then judges the committed versions: a live claim is left alone
         // and an applied copy is deleted.
-        await expect(release).resolves.toEqual([
+        expect(released).toEqual([
           { eventId: claimedLater, outcome: "busy" },
           { eventId: appliedLater, outcome: "applied", inboxId: inserted[1].inboxId },
         ]);
         expect(await remaining(database)).toEqual([`old:${claimedLater}:claimed`]);
+      });
+    });
+
+    it("counts a claim exactly staleClaimMs old on database time as stale", async () => {
+      await withPostgreSqlTestDatabase("passive-release-boundary", async (database) => {
+        await grantPassiveEventRuntimePrivileges(database);
+        const oldId = await createProject(database, "old");
+        const boundId = await createProject(database, "bound");
+        const machineId = await createMachine(database, "Passive release boundary machine");
+        const old = new PostgreSqlPassiveEventRepository(database.runtime, oldId, machineId);
+        const bound = new PostgreSqlPassiveEventRepository(database.runtime, boundId, machineId);
+        const [onCutoff, newerThanCutoff, olderThanCutoff] = eventIds;
+        const inserted = await old.insertEvents(
+          [onCutoff, newerThanCutoff, olderThanCutoff]
+            .map((eventId, index) => input(machineId, eventId, BigInt(index + 1), eventId)),
+        );
+        // Every claim starts on the side of the cutoff opposite to the one it
+        // ends on, so only the version committed by the holder can give the
+        // expected outcome.
+        for (const [eventId, claimedAt] of [
+          [onCutoff, "pg_catalog.statement_timestamp()"],
+          [newerThanCutoff, "pg_catalog.statement_timestamp() - interval '30 minutes'"],
+          [olderThanCutoff, "pg_catalog.statement_timestamp()"],
+        ]) {
+          await seed(
+            database,
+            eventId,
+            `received_at = pg_catalog.statement_timestamp() - interval '1 hour',
+              status = 'claimed', claimed_by = 'dead', claimed_at = ${claimedAt}`,
+          );
+        }
+        const staleClaimMs = 60_000;
+
+        // The release statement's statement_timestamp() is its pg_stat_activity
+        // query_start, known only once it runs. While it waits for the row
+        // locks, the holder moves each claim to that cutoff plus a skew,
+        // computed in SQL with the production expression.
+        const released = await releaseWhileRowsAreHeld(
+          database,
+          machineId,
+          oldId,
+          () => bound.releaseFromOtherProjects(
+            inserted.map((event) => ({
+              ...input(machineId, event.eventId, event.machineSequence, event.eventId),
+              inboxId: event.inboxId,
+            })),
+            { staleClaimMs },
+          ),
+          async (transaction, releasePid) => {
+            for (const [eventId, skew] of [
+              [onCutoff, "0 microseconds"],
+              [newerThanCutoff, "1 microsecond"],
+              [olderThanCutoff, "-1 microsecond"],
+            ]) {
+              const moved = await transaction.query({
+                text: `UPDATE lcm.passive_event_inbox
+                       SET claimed_at = (
+                         SELECT query_start FROM pg_catalog.pg_stat_activity
+                         WHERE pid = $1::pg_catalog.int4
+                       ) - $2::pg_catalog.float8 * interval '1 millisecond'
+                         + $3::pg_catalog.interval
+                       WHERE event_id = $4`,
+                values: [releasePid, staleClaimMs, skew, eventId],
+              }, { domain: "passive-events", operation: "moveClaimToCutoff", projectId: oldId });
+              expect(moved.rowCount).toBe(1);
+            }
+          },
+        );
+
+        // A claim on the cutoff is stale, one a microsecond newer is live and
+        // one a microsecond older is stale.
+        expect(released).toEqual([
+          { eventId: onCutoff, outcome: "released" },
+          { eventId: newerThanCutoff, outcome: "busy" },
+          { eventId: olderThanCutoff, outcome: "released" },
+        ]);
+        expect(await remaining(database)).toEqual([`old:${newerThanCutoff}:claimed`]);
       });
     });
 
