@@ -86,6 +86,35 @@ function abortEffectId(generationId: string): string {
   return backendPublicationCanonicalSha256({ kind: "migration-abort-effect", generationId });
 }
 
+/**
+ * The completion evidence of the manifest's `abort` effect, the single
+ * formula both `performMigrationAbort` and `completePendingMigrationAbort`
+ * use, so a completion by either is byte-identical.
+ */
+function abortCompletion(
+  generationId: string,
+  effectId: string,
+  abortEvidenceSha256: string,
+  completedAt: string,
+): Parameters<typeof completeMigrationEffect>[1] {
+  return {
+    effectId,
+    completedAt,
+    report: {
+      kind: "abort",
+      reportId: backendPublicationCanonicalSha256({ kind: "migration-abort-report-id", generationId, effectId }),
+      reportSha256: backendPublicationCanonicalSha256({
+        version: 1,
+        kind: "migration-abort-report",
+        generationId,
+        abortEvidenceSha256,
+        completedAt,
+      }),
+      createdAt: completedAt,
+    },
+  };
+}
+
 function manifestFailureEvidence(error: unknown): string {
   return error instanceof MigrationProtocolError ? `manifest-${error.reason}` : "manifest-internal-error";
 }
@@ -210,22 +239,7 @@ export async function performMigrationAbort(input: Readonly<{
   mutated = true;
   let candidate: MigrationManifest;
   try {
-    candidate = completeEffect(begun, {
-      effectId,
-      completedAt: now,
-      report: {
-        kind: "abort",
-        reportId: backendPublicationCanonicalSha256({ kind: "migration-abort-report-id", generationId: journal.generationId, effectId }),
-        reportSha256: backendPublicationCanonicalSha256({
-          version: 1,
-          kind: "migration-abort-report",
-          generationId: journal.generationId,
-          abortEvidenceSha256: input.abortEvidenceSha256,
-          completedAt: now,
-        }),
-        createdAt: now,
-      },
-    });
+    candidate = completeEffect(begun, abortCompletion(journal.generationId, effectId, input.abortEvidenceSha256, now));
   } catch (error) {
     return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
   }
@@ -233,6 +247,56 @@ export async function performMigrationAbort(input: Readonly<{
     store.update(journal.generationId, begun.checksumSha256, () => candidate);
   } catch (error) {
     return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
+  }
+  return { status: "completed", mutated: true };
+}
+
+/**
+ * Completes an `abort` effect that an earlier invocation began and did not
+ * finish (router row 6: the journal is already `maintenance-aborted` and the
+ * manifest carries a pending `abort`). `performMigrationAbort` cannot do
+ * this: `classifyMigrationRecovery` calls the pending effect `resume` and it
+ * refuses. It never touches the journal, so `abortMaintenance` is not called
+ * again.
+ *
+ * The carried effect is checked against what `performMigrationAbort` would
+ * have begun for this journal: the same effect id, and an input digest equal
+ * to the aborted journal's checksum. The aborted journal's own
+ * `abortEvidenceSha256` is the evidence the original completion used, and
+ * the effect's `startedAt` is the `now` both of its writes used, so the
+ * completion is byte-identical to an uninterrupted run. A mismatch writes
+ * nothing.
+ */
+export function completePendingMigrationAbort(input: Readonly<{
+  homeDir: string;
+  journal: BackendMaintenanceJournal;
+  manifestStore?: MigrationManifestStore;
+}>): MigrationAbortResult {
+  const { journal } = input;
+  const abortEvidenceSha256 = journal.abortEvidenceSha256;
+  if (journal.phase !== "maintenance-aborted" || abortEvidenceSha256 === null) {
+    return { status: "refuse", evidence: "carried-effect-mismatch", mutated: false };
+  }
+  const store = input.manifestStore ?? new MigrationManifestStore({ homeDir: input.homeDir });
+  let manifest: MigrationManifest;
+  try {
+    manifest = store.read(journal.generationId);
+  } catch (error) {
+    return { status: "refuse", evidence: manifestFailureEvidence(error), mutated: false };
+  }
+  const pending = manifest.pendingEffect;
+  if (pending === null || pending.kind !== "abort"
+    || pending.effectId !== abortEffectId(journal.generationId)
+    || pending.inputSha256 !== journal.checksumSha256) {
+    return { status: "refuse", evidence: "carried-effect-mismatch", mutated: false };
+  }
+  try {
+    store.update(journal.generationId, manifest.checksumSha256, (current) => completeMigrationEffect(
+      current,
+      abortCompletion(journal.generationId, pending.effectId, abortEvidenceSha256, pending.startedAt),
+    ));
+  } catch (error) {
+    return { status: "refuse", evidence: manifestFailureEvidence(error), mutated: false };
   }
   return { status: "completed", mutated: true };
 }
@@ -289,6 +353,9 @@ export function classifyMigrationAbortRefusal(evidence: string): MigrationAbortR
   }
   if (evidence === "journal-unexpected-state") {
     return { reason: "abort-journal-moved", class: "precondition" };
+  }
+  if (evidence === "carried-effect-mismatch") {
+    return { reason: "abort-carried-effect-mismatch", class: "evidence" };
   }
   if (evidence === "journal-invalid-input") {
     return { reason: "abort-invalid-input", class: "unresumable" };

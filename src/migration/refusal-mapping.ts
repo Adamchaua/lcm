@@ -408,6 +408,10 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     remedy: "The verification appeared to complete but the manifest and its report do not read back as verified. Run `lcm migration report` and inspect the evidence.",
   }),
   Object.freeze({
+    reason: "abort-carried-effect-mismatch", exitClass: "refused-evidence",
+    remedy: "The pending abort effect on the manifest is not the one an abort of this generation begins. Nothing was changed; run `lcm doctor` and inspect the evidence.",
+  }),
+  Object.freeze({
     reason: "abort-readback-mismatch", exitClass: "failed-operator-required",
     remedy: "The abort appeared to complete but its terminal state could not be confirmed on readback. Run `lcm doctor` and inspect the maintenance journal and manifest directly.",
   }),

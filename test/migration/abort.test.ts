@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   classifyMigrationAbortGate,
   classifyMigrationAbortRefusal,
+  completePendingMigrationAbort,
   performMigrationAbort,
 } from "../../src/migration/abort.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
@@ -540,3 +541,117 @@ describe("classifyMigrationAbortRefusal (classified by actual reason, never by t
     expect(classifyMigrationAbortRefusal("garbage")).toEqual({ reason: "abort-unresolvable", class: "evidence" });
   });
 });
+
+describe("completePendingMigrationAbort (owner ruling R10: completes the begun abort effect, never re-aborts the journal)", () => {
+  const AT = new Date(CREATED_AT);
+  const EVIDENCE = "c".repeat(64);
+
+  /** A crash after the abort effect began: the journal is terminal and the manifest carries the real pending abort. */
+  async function crashedAfterBegin(): Promise<{ home: string; store: MigrationManifestStore; aborted: BackendMaintenanceJournal }> {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(manifest());
+    const crashed = await performMigrationAbort({
+      homeDir: home, coordinator: coordinatorFor(home), journal: held, abortEvidenceSha256: EVIDENCE, manifestStore: store, now: AT,
+      _operationsForTesting: { completeEffect: () => { throw new MigrationProtocolError("unexpected-state", "crash before completion"); } },
+    });
+    expect(crashed).toEqual({ status: "refuse", evidence: "manifest-unexpected-state", mutated: true });
+    const aborted = readBackendMaintenanceJournal(home)!;
+    expect(aborted.phase).toBe("maintenance-aborted");
+    expect(store.read("generation-1").pendingEffect?.kind).toBe("abort");
+    return { home, store, aborted };
+  }
+
+  it("completes the carried effect with exactly the completion an uninterrupted abort writes, and leaves the journal alone", async () => {
+    const { home, store, aborted } = await crashedAfterBegin();
+    const journalBefore = readFileSync(backendPublicationJournalPath(home));
+    const result = completePendingMigrationAbort({ homeDir: home, journal: aborted, manifestStore: store });
+    expect(result).toEqual({ status: "completed", mutated: true });
+    expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
+
+    // The same abort, uninterrupted, in a twin home.
+    const twinHome = makeHome();
+    const twinHeld = await heldJournal(twinHome);
+    const twinStore = new MigrationManifestStore({ homeDir: twinHome });
+    twinStore.create(manifest());
+    await performMigrationAbort({
+      homeDir: twinHome, coordinator: coordinatorFor(twinHome), journal: twinHeld, abortEvidenceSha256: EVIDENCE, manifestStore: twinStore, now: AT,
+    });
+    const completed = store.read("generation-1");
+    const uninterrupted = twinStore.read("generation-1");
+    expect(completed.phase).toBe("aborted");
+    expect(completed.pendingEffect).toBeNull();
+    // The report reference is a function of the generation, the abort evidence and the effect's own timestamps only.
+    expect(completed.reports).toEqual(uninterrupted.reports);
+    expect(completed.updatedAt).toBe(uninterrupted.updatedAt);
+  });
+
+  it("is a refusal, not a repeat, once nothing is pending: it writes nothing", async () => {
+    const { home, store, aborted } = await crashedAfterBegin();
+    completePendingMigrationAbort({ homeDir: home, journal: aborted, manifestStore: store });
+    const before = store.read("generation-1").checksumSha256;
+    expect(completePendingMigrationAbort({ homeDir: home, journal: aborted, manifestStore: store }))
+      .toEqual({ status: "refuse", evidence: "carried-effect-mismatch", mutated: false });
+    expect(store.read("generation-1").checksumSha256).toBe(before);
+  });
+
+  it("refuses a carried effect whose id is not the one an abort of this generation begins, writing nothing", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    const created = store.create(manifest());
+    const aborted = await coordinatorFor(home).abortMaintenance({
+      expectedChecksumSha256: held.checksumSha256, sourceSelectionSha256: held.sourceSelectionSha256, abortEvidenceSha256: EVIDENCE,
+    });
+    store.update("generation-1", created.checksumSha256, (current) => beginMigrationEffect(current, {
+      effectId: "some-other-effect", kind: "abort", inputSha256: aborted.checksumSha256, startedAt: CREATED_AT,
+    }));
+    const before = store.read("generation-1").checksumSha256;
+    expect(completePendingMigrationAbort({ homeDir: home, journal: aborted, manifestStore: store }))
+      .toEqual({ status: "refuse", evidence: "carried-effect-mismatch", mutated: false });
+    expect(store.read("generation-1").checksumSha256).toBe(before);
+  });
+
+  it("refuses a carried effect begun over a different journal state (input digest mismatch), writing nothing", async () => {
+    const { home, store, aborted } = await crashedAfterBegin();
+    const before = store.read("generation-1").checksumSha256;
+    const other = { ...aborted, checksumSha256: "d".repeat(64) } as BackendMaintenanceJournal;
+    expect(completePendingMigrationAbort({ homeDir: home, journal: other, manifestStore: store }))
+      .toEqual({ status: "refuse", evidence: "carried-effect-mismatch", mutated: false });
+    expect(store.read("generation-1").checksumSha256).toBe(before);
+  });
+
+  it("refuses a journal that is not an aborted one with its own evidence", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    expect(completePendingMigrationAbort({ homeDir: home, journal: held }))
+      .toEqual({ status: "refuse", evidence: "carried-effect-mismatch", mutated: false });
+  });
+
+  it("refuses with the manifest's protocol reason when the manifest cannot be read", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const aborted = await coordinatorFor(home).abortMaintenance({
+      expectedChecksumSha256: held.checksumSha256, sourceSelectionSha256: held.sourceSelectionSha256, abortEvidenceSha256: EVIDENCE,
+    });
+    const result = completePendingMigrationAbort({ homeDir: home, journal: aborted });
+    expect(result.status).toBe("refuse");
+    expect(result).toMatchObject({ mutated: false, evidence: expect.stringMatching(/^manifest-/u) });
+  });
+
+  it("reports a failure of the completing write with the manifest's reason, nothing applied", async () => {
+    const { home, store, aborted } = await crashedAfterBegin();
+    const failing = {
+      read: (id: string) => store.read(id),
+      update: () => { throw new Error("disk"); },
+    } as unknown as MigrationManifestStore;
+    expect(completePendingMigrationAbort({ homeDir: home, journal: aborted, manifestStore: failing }))
+      .toEqual({ status: "refuse", evidence: "manifest-internal-error", mutated: false });
+  });
+
+  it("classifies its carried-effect refusal as evidence", () => {
+    expect(classifyMigrationAbortRefusal("carried-effect-mismatch")).toEqual({ reason: "abort-carried-effect-mismatch", class: "evidence" });
+  });
+});
+

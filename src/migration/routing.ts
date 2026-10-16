@@ -15,11 +15,13 @@ import type { MigrationEffectKind, MigrationPhase } from "./protocol.js";
  *   performs no write, exits 0 and reports `applied: false` with read-back
  *   evidence of the settled pair (plan-v2 section 4.6, finding PA-6).
  *
- * - R9 (proposed to the owner, not yet ruled): `verify` is allowed at row 24
- *   (held, `verified`, nothing pending) so that re-running it is the
- *   idempotent confirmation from persisted evidence plan-v4 section 5 step 2
- *   specifies ("verified, no pending: exit 0"), instead of exit 7. It writes
- *   nothing there. Revert this one entry if the owner rules otherwise.
+ * - R9: `verify` is allowed at row 24 (held, `verified`, nothing pending) as
+ *   a read-back-only action, so that re-running it is the idempotent
+ *   confirmation from persisted evidence plan-v4 section 5 step 2 specifies
+ *   ("verified, no pending: exit 0"), instead of exit 7. It writes nothing.
+ * - R10: row 6 (journal aborted, pending `abort`) is completed by
+ *   `completePendingMigrationAbort`, which shares its effect id and
+ *   completion formulas with `performMigrationAbort`.
  *
  * Plan-v5 Part B (1): the one pure router for an explicit existing
  * generation. It is shared by every existing-generation command (as the
