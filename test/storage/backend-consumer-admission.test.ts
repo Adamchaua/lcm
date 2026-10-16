@@ -1,7 +1,7 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -681,11 +681,39 @@ describe("backend publication consumer admission", () => {
     },
   );
 
+  it("reports the live publication owner under the lock path convergence resolves", () => {
+    const home = makeHome(true);
+    const lockPath = join(home, ".lcm.backend-publication.lock");
+    const stat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
+    const processStartTime = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+    writeFileSync(lockPath, `${JSON.stringify({
+      version: 1, pid: process.pid, processStartTime, nonce: "a".repeat(32), createdAtMs: 1,
+    })}\n`, { mode: 0o600 });
+    for (const spelling of [home, `${home}/`, join(home, ".", "."), join(home, "child", "..")]) {
+      let thrown: unknown;
+      try {
+        withBackendPublicationConsumerLock(spelling, () => undefined);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(PrivateMutationLockContentionError);
+      const contended = (thrown as PrivateMutationLockContentionError).contendedLock;
+      expect(contended?.path).toBe(lockPath);
+      expect(contended?.path).toBe(resolve(join(spelling, ".lcm.backend-publication.lock")));
+      expect(contended?.owner).toMatchObject({ pid: process.pid, processStartTime });
+    }
+  });
+
   it.each(cleanupConsumerActions)(
     "keeps %s publication-contention classification when descriptor cleanup also fails",
     async (_label, action) => {
       const home = makeHome(true);
-      const contention = new PrivateMutationLockContentionError("publication busy");
+      const contention = new PrivateMutationLockContentionError("publication busy", {
+        contendedLock: {
+          path: join(home, ".lcm.backend-publication.lock"),
+          owner: { version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) },
+        },
+      });
       const publicationCleanupFailure = new Error("injected publication descriptor cleanup failure");
       const observed = await observeConsumerDescriptorLifetimes(home, () => action(home, () => {
         throw contention;
@@ -699,6 +727,7 @@ describe("backend publication consumer admission", () => {
       expect(observed.error).toBeInstanceOf(PrivateMutationLockContentionError);
       const classified = observed.error as PrivateMutationLockContentionError;
       expect(classified.message).toBe(contention.message);
+      expect(classified.contendedLock).toBe(contention.contendedLock);
       expect(classified.cause).toBeInstanceOf(AggregateError);
       const aggregate = classified.cause as AggregateError;
       expect(aggregate.errors).toEqual([contention, publicationCleanupFailure]);
