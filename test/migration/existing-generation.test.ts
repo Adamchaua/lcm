@@ -1,0 +1,202 @@
+import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { refuseUnlessRouted, resolveExistingMigrationGeneration } from "../../src/migration/existing-generation.js";
+import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
+import { beginMigrationEffect, createMigrationManifest, type MigrationManifest } from "../../src/migration/protocol.js";
+import { routeMigrationGeneration, type MigrationRouteInput } from "../../src/migration/routing.js";
+import type { MigrationJournalObservation } from "../../src/migration/journal-observation.js";
+import type { BackendMaintenanceJournal, BackendMaintenancePhase } from "../../src/storage/backend-publication.js";
+
+const roots: string[] = [];
+const AT = "2026-08-12T12:00:00.000Z";
+const GEN = "generation-1";
+
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+function home(): string {
+  const value = mkdtempSync(join(tmpdir(), "lcm-existing-generation-"));
+  mkdirSync(join(value, ".lcm"), { mode: 0o700 });
+  roots.push(value);
+  return value;
+}
+
+function witness(sha: string, backend: "sqlite" | "postgresql") {
+  return { version: 1 as const, backend, identitySha256: sha, schemaSha256: sha, contentSha256: sha, capturedAt: AT };
+}
+
+function planned(generationId = GEN): MigrationManifest {
+  return createMigrationManifest({
+    generationId, source: witness("1".repeat(64), "sqlite"), destination: witness("2".repeat(64), "postgresql"),
+    parentGenerationId: null, preservedSourceGenerationId: generationId, createdAt: AT,
+  });
+}
+
+function hold(phase: BackendMaintenancePhase, generationId = GEN): MigrationJournalObservation {
+  return { kind: "hold", journal: { phase, generationId } as BackendMaintenanceJournal };
+}
+
+const complete = async () => ({ state: "complete" as const, witness: {} as never });
+const absentSnapshot = async () => ({ state: "absent" as const });
+
+describe("resolveExistingMigrationGeneration", () => {
+  it("resolves an omitted --generation to the live non-terminal hold and routes the observed cell", async () => {
+    const homeDir = home();
+    const result = await resolveExistingMigrationGeneration({
+      homeDir, _operationsForTesting: { observeJournal: () => hold("maintenance-held"), classifySnapshot: absentSnapshot },
+    });
+    expect(result.status).toBe("resolved");
+    if (result.status !== "resolved") throw new Error("unreachable");
+    expect(result.context.generationId).toBe(GEN);
+    expect(result.context.manifest).toBeNull();
+    expect(result.context.route.row).toBe(15);
+  });
+
+  it.each([
+    ["an absent journal", { kind: "absent" } as MigrationJournalObservation],
+    ["a terminal hold", hold("maintenance-aborted")],
+    ["a v2 publication", { kind: "publication", publicationId: "p", phase: "preparing" } as MigrationJournalObservation],
+  ])("requires --generation when it is omitted and the journal is %s", async (_name, observation) => {
+    const result = await resolveExistingMigrationGeneration({ homeDir: home(), _operationsForTesting: { observeJournal: () => observation } });
+    expect(result).toEqual({ status: "refuse", reason: "generation-required" });
+  });
+
+  it("surfaces an unresolvable journal as evidence when --generation is omitted, never as an absent one", async () => {
+    const result = await resolveExistingMigrationGeneration({
+      homeDir: home(), _operationsForTesting: { observeJournal: () => ({ kind: "unresolvable", evidence: "journal-checksum-mismatch" }) },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "journal-unresolvable", evidence: "journal-checksum-mismatch" });
+  });
+
+  it("refuses a malformed explicit id as a usage error", async () => {
+    const result = await resolveExistingMigrationGeneration({
+      homeDir: home(), generation: "../escape", _operationsForTesting: { observeJournal: () => hold("maintenance-held") },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "generation-invalid" });
+  });
+
+  it("refuses an explicit id with no manifest and no journal as unknown", async () => {
+    const result = await resolveExistingMigrationGeneration({
+      homeDir: home(), generation: GEN, _operationsForTesting: { observeJournal: () => ({ kind: "absent" }) },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "generation-unknown" });
+  });
+
+  it("reads a present manifest once and routes its phase and pending effect (row 19: held, complete snapshot, planned)", async () => {
+    const homeDir = home();
+    new MigrationManifestStore({ homeDir }).create(planned());
+    const result = await resolveExistingMigrationGeneration({
+      homeDir, generation: GEN, _operationsForTesting: { observeJournal: () => hold("maintenance-held"), classifySnapshot: complete },
+    });
+    if (result.status !== "resolved") throw new Error("unreachable");
+    expect(result.context.manifest?.phase).toBe("planned");
+    expect(result.context.route.row).toBe(19);
+  });
+
+  it("routes a pending effect (row 20: pending verify-dry-run)", async () => {
+    const homeDir = home();
+    const store = new MigrationManifestStore({ homeDir });
+    const created = store.create(planned());
+    store.update(GEN, created.checksumSha256, (m) => beginMigrationEffect(m, { kind: "verify-dry-run", effectId: "e", inputSha256: "c".repeat(64), startedAt: AT }));
+    const result = await resolveExistingMigrationGeneration({
+      homeDir, generation: GEN, _operationsForTesting: { observeJournal: () => hold("maintenance-held"), classifySnapshot: complete },
+    });
+    if (result.status !== "resolved") throw new Error("unreachable");
+    expect(result.context.route.row).toBe(20);
+  });
+
+  it("treats an unreadable manifest tree as unresolvable evidence (row 1), never as absence", async () => {
+    const homeDir = home();
+    const migrations = join(homeDir, ".lcm", "migrations");
+    mkdirSync(migrations, { mode: 0o700 });
+    chmodSync(migrations, 0o755);
+    let result;
+    try {
+      result = await resolveExistingMigrationGeneration({
+        homeDir, generation: GEN, _operationsForTesting: { observeJournal: () => hold("maintenance-held"), classifySnapshot: absentSnapshot },
+      });
+    } finally {
+      chmodSync(migrations, 0o700);
+    }
+    if (result.status !== "resolved") throw new Error("unreachable");
+    expect(result.context.route.row).toBe(1);
+  });
+
+  it("treats a manifest read that throws something unrecognised as unresolvable (row 1)", async () => {
+    const throwingStore = {
+      probeManifestPresence: () => ({ status: "present" as const }),
+      read: () => { throw new Error("boom"); },
+    } as unknown as MigrationManifestStore;
+    const result = await resolveExistingMigrationGeneration({
+      homeDir: home(), generation: GEN, manifestStore: throwingStore,
+      _operationsForTesting: { observeJournal: () => hold("maintenance-held"), classifySnapshot: absentSnapshot },
+    });
+    if (result.status !== "resolved") throw new Error("unreachable");
+    expect(result.context.route.row).toBe(1);
+  });
+
+  it("treats a snapshot classification that throws as unresolvable (row 1)", async () => {
+    const result = await resolveExistingMigrationGeneration({
+      homeDir: home(), generation: GEN,
+      _operationsForTesting: {
+        observeJournal: () => hold("maintenance-held"),
+        classifySnapshot: async () => { throw new Error("boom"); },
+      },
+    });
+    if (result.status !== "resolved") throw new Error("unreachable");
+    expect(result.context.route.row).toBe(1);
+  });
+
+  it("does not treat a stranger's v2 publication as exit 4 when the explicit id is known: the router decides (row 3 for a completed one)", async () => {
+    const homeDir = home();
+    new MigrationManifestStore({ homeDir }).create(planned());
+    const result = await resolveExistingMigrationGeneration({
+      homeDir, generation: GEN,
+      _operationsForTesting: {
+        observeJournal: () => ({ kind: "publication", publicationId: "p", phase: "completed" }),
+        classifySnapshot: absentSnapshot,
+      },
+    });
+    if (result.status !== "resolved") throw new Error("unreachable");
+    expect(result.context.route.row).toBe(3);
+  });
+
+  it("reads a real journal from disk when none is injected", async () => {
+    const result = await resolveExistingMigrationGeneration({ homeDir: home(), generation: GEN });
+    expect(result).toEqual({ status: "refuse", reason: "generation-unknown" });
+  });
+});
+
+describe("refuseUnlessRouted", () => {
+  const base: MigrationRouteInput = {
+    journal: { kind: "hold", phase: "maintenance-held", generationId: GEN }, resolvedGenerationId: GEN,
+    manifest: { kind: "absent" }, snapshot: "absent", link: { kind: "unavailable" },
+  };
+  const route = (overrides: Partial<MigrationRouteInput>) => routeMigrationGeneration({ ...base, ...overrides });
+
+  it("lets the primary and an allowed command proceed, and report always", () => {
+    const row15 = route({});
+    expect(refuseUnlessRouted("apply", row15)).toBeNull();
+    expect(refuseUnlessRouted("abort", row15)).toBeNull();
+    expect(refuseUnlessRouted("report", row15)).toBeNull();
+  });
+
+  it.each([
+    ["exit 2 names the owner", route({}), "verify", "route-not-owner", "apply"],
+    ["exit 2 for a mismatched hold names abort", route({ manifest: { kind: "present", phase: "copied", pending: null }, snapshot: "complete", journal: { kind: "hold", phase: "maintenance-held", generationId: "other" } }), "verify", "route-not-owner", "abort"],
+    ["exit 4 for a foreign in-flight publication", route({ journal: { kind: "publication", publicationId: "p", phase: "prepared" } }), "verify", "route-publication-in-flight", null],
+    ["exit 6 for a pending effect", route({ snapshot: "complete", manifest: { kind: "present", phase: "planned", pending: "verify-dry-run" } }), "abort", "route-resume-required", "resume"],
+    ["exit 7 for rollback rows", route({ manifest: { kind: "present", phase: "rolling-back", pending: null } }), "verify", "route-requires-rollback", "rollback"],
+    ["exit 7 for activation row 24", route({ snapshot: "complete", manifest: { kind: "present", phase: "verified", pending: null } }), "resume", "route-requires-activation", "activate"],
+    ["exit 7 for activation row 11", route({ journal: { kind: "hold", phase: "selection-prepared", generationId: GEN }, manifest: { kind: "present", phase: "verified", pending: null } }), "verify", "route-requires-activation", "activate"],
+    ["exit 7 for an operator-required cell", route({ journal: { kind: "hold", phase: "maintenance-aborted", generationId: GEN }, manifest: { kind: "present", phase: "copying", pending: "copy-batch" } }), "abort", "route-operator-required", null],
+    ["exit 5 for an unresolvable observation", route({ snapshot: "unresolvable" }), "verify", "route-unresolvable", null],
+    ["exit 5 for a stranger's completed publication", route({ journal: { kind: "publication", publicationId: "p", phase: "completed" } }), "verify", "route-foreign-publication", null],
+    ["exit 5 for a contradiction", route({ manifest: { kind: "present", phase: "copied", pending: null } }), "verify", "route-contradiction", null],
+  ])("%s", (_name, routed, command, reason, next) => {
+    expect(refuseUnlessRouted(command as never, routed)).toEqual({ status: "refuse", reason, next });
+  });
+});

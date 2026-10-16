@@ -2,6 +2,19 @@ import type { BackendMaintenancePhase, BackendPublicationPhase } from "../storag
 import type { MigrationEffectKind, MigrationPhase } from "./protocol.js";
 
 /**
+ * Owner rulings recorded here (owner ruling R7/R8, plan-v5 amendment):
+ *
+ * - R7: `abort` is allowed at row 19 (planned, nothing pending), row 21 only
+ *   when nothing is pending, and row 22, so that abort stays an exit from
+ *   every hold whose manifest side it can settle while verify's fresh path
+ *   waits for #625. With a pending copy effect (row 21), a pending dry-run
+ *   (row 20) or a pending verification (row 23) abort stays a non-owner and
+ *   exits 6, naming resume (or verify for row 23).
+ * - R8: `abort` is allowed at row 5 (journal already `maintenance-aborted`,
+ *   manifest absent or aborted) as a read-only confirmation: the command
+ *   performs no write, exits 0 and reports `applied: false` with read-back
+ *   evidence of the settled pair (plan-v2 section 4.6, finding PA-6).
+ *
  * Plan-v5 Part B (1): the one pure router for an explicit existing
  * generation. It is shared by every existing-generation command (as the
  * owner check), by `resume` (which executes only the cells it owns) and by
@@ -107,11 +120,13 @@ function validate(input: MigrationRouteInput): void {
   assertKnown("link status", link.kind, LINK_KINDS);
 }
 
+type Allowed = readonly Exclude<MigrationRouteCommand, "report">[];
+
 type Row = Readonly<{
   row: number;
   matches: (input: MigrationRouteInput) => boolean;
   primary: MigrationRoutePrimary;
-  allowed: readonly Exclude<MigrationRouteCommand, "report">[];
+  allowed: Allowed | ((input: MigrationRouteInput) => Allowed);
   nextAction?: MigrationRoutePrimary | "report";
   /** The refusal for a command outside primary and allowed. */
   exit: (input: MigrationRouteInput, availability: MigrationRouteAvailability) => MigrationRouteExit;
@@ -167,7 +182,7 @@ const ROWS: readonly Row[] = [
     matches: (i) => i.journal.kind === "publication" && !isOwnPublication(i) },
   { row: 4, primary: "abort", allowed: [], exit: fixed(2),
     matches: (i) => holdPhaseIn(i, ENTERING_OR_HELD) && !holdMatches(i, ENTERING_OR_HELD) },
-  { row: 5, primary: "none", allowed: ["apply"], exit: fixed(2), nextAction: "apply",
+  { row: 5, primary: "none", allowed: ["apply", "abort"], exit: fixed(2), nextAction: "apply",
     matches: (i) => holdPhaseIn(i, ["maintenance-aborted"])
       && (i.manifest.kind === "absent"
         || (present(i)?.phase === "aborted" && present(i)?.pending === null)) },
@@ -213,17 +228,18 @@ const ROWS: readonly Row[] = [
   { row: 18, primary: "none", allowed: [], exit: fixed(7),
     matches: (i) => holdMatches(i, ENTERING_OR_HELD) && BROKEN_SNAPSHOT.includes(i.snapshot)
       && present(i) !== null && present(i)!.pending !== null && present(i)!.pending !== "abort" },
-  { row: 19, primary: "resume", allowed: [], exit: fixed(2),
+  { row: 19, primary: "resume", allowed: ["abort"], exit: fixed(2),
     matches: (i) => holdMatches(i, ["maintenance-held"]) && i.snapshot === "complete"
       && present(i)?.phase === "planned" && present(i)?.pending === null },
   { row: 20, primary: "resume", allowed: [], exit: fixed(6),
     matches: (i) => holdMatches(i, ["maintenance-held"]) && i.snapshot === "complete"
       && present(i)?.pending === "verify-dry-run" },
-  { row: 21, primary: "resume", allowed: [], exit: (i) => isCopyEffect(present(i)!.pending) ? 6 : 2,
+  { row: 21, primary: "resume", allowed: (i) => present(i)!.pending === null ? ["abort"] : [],
+    exit: (i) => isCopyEffect(present(i)!.pending) ? 6 : 2,
     matches: (i) => holdMatches(i, ["maintenance-held"]) && i.snapshot === "complete" && present(i) !== null
       && ((present(i)!.pending === null && (present(i)!.phase === "dry-run-verified" || present(i)!.phase === "copying"))
         || isCopyEffect(present(i)!.pending)) },
-  { row: 22, primary: "verify", allowed: [], exit: fixed(2),
+  { row: 22, primary: "verify", allowed: ["abort"], exit: fixed(2),
     matches: (i) => holdMatches(i, ["maintenance-held"]) && i.snapshot === "complete"
       && present(i)?.phase === "copied" && present(i)?.pending === null },
   { row: 23, primary: "verify", allowed: ["resume"], exit: fixed(6),
@@ -249,7 +265,7 @@ export function routeMigrationGeneration(
   const row = ROWS.find((candidate) => candidate.matches(input))!;
   return Object.freeze({
     primary: row.primary,
-    allowed: Object.freeze([...row.allowed]),
+    allowed: Object.freeze([...(typeof row.allowed === "function" ? row.allowed(input) : row.allowed)]),
     exitIfRefused: row.exit(input, availability),
     row: row.row,
     nextAction: row.nextAction ?? row.primary,

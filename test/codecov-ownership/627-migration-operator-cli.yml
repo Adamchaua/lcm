@@ -30,6 +30,7 @@ pins:
   - ["src/migration/daemon-presence.ts", "unit-migration-cutover"]
   - ["src/migration/envelope.ts", "unit-migration-cutover"]
   - ["src/migration/exit-classes.ts", "unit-migration-cutover"]
+  - ["src/migration/existing-generation.ts", "unit-migration-cutover"]
   - ["src/migration/generation-identity.ts", "unit-migration-cutover"]
   - ["src/migration/hold-continuation.ts", "unit-migration-cutover"]
   - ["src/migration/hold-entry.ts", "unit-migration-cutover"]
