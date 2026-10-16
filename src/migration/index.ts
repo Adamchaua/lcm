@@ -186,3 +186,16 @@ export type {
   MigrationTargetUnresolvableReason,
 } from "./target-health.js";
 
+export {
+  ActivationGenerationLinkConflictError,
+  activationGenerationLinkPath,
+  readActivationGenerationLink,
+  recordActivationGenerationLink,
+} from "./activation-artifact-store.js";
+export type {
+  ActivationGenerationLink,
+  ActivationGenerationLinkReadResult,
+  ActivationGenerationLinkRecordResult,
+  ActivationGenerationLinkUnresolvableReason,
+} from "./activation-artifact-store.js";
+

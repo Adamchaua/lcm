@@ -16,4 +16,5 @@ rationale: >-
 pins:
   - ["src/migration/activation-publication-id.ts", "unit-migration-cutover"]
   - ["src/migration/target-health.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-artifact-store.ts", "unit-migration-cutover"]
   - ["src/migration/index.ts", "unit-migration-cutover"]
