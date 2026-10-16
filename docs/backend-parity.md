@@ -131,7 +131,7 @@ There are three distinct transfer contracts:
 | Canonical storage transfer API | Complete backend archive transfer, including all 22 populated record domains and native database readback checks. |
 
 Canonical evidence requires SQLite → SQLite, SQLite → PostgreSQL, PostgreSQL →
-SQLite, and PostgreSQL → PostgreSQL in each PostgreSQL CI leg. Backend-specific
+SQLite, and PostgreSQL → PostgreSQL in the PostgreSQL CI run. Backend-specific
 constructor rows declare their applicable directions. Every domain must pass in
 all four directions. These library APIs do not add a canonical-transfer CLI or
 HTTP endpoint.
@@ -157,11 +157,11 @@ annotations.
 
 ## Read a run's evidence
 
-Each of the two PostgreSQL 18 CI jobs independently runs the complete SQLite and
-PostgreSQL comparison, fresh control tests, and all four canonical directions.
-The jobs upload separate artifacts named
-`surface-parity-<run-id>-<attempt>-<leg>`. Both must pass. Results from two
-incomplete jobs cannot be combined into one complete result.
+The single PostgreSQL 18 CI job runs the complete SQLite and PostgreSQL
+comparison, fresh control tests, and all four canonical directions. It uploads
+one artifact named `surface-parity-<run-id>-<attempt>`, which must pass. Each
+re-run attempt produces its own artifact; results from separate or incomplete
+attempts cannot be combined into one complete result.
 
 Each artifact contains:
 

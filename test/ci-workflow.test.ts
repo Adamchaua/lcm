@@ -558,7 +558,13 @@ describe("CI workflow", () => {
     expect(postgresql.strategy).toBeUndefined();
     expect(postgresql.steps.some((step) => step.uses === "./.github/actions/setup-node")).toBe(true);
     expect(postgresql.steps.some((step) => step.uses === "./.github/actions/stage-postgresql")).toBe(true);
-    expect(postgresql.steps.at(-1)?.run).toBe("pnpm run test:postgresql");
+    // The harness runs once; the parity evidence steps follow it (see the parity test).
+    expect(postgresql.steps.filter((step) => step.run?.includes("pnpm run test:postgresql"))).toHaveLength(1);
+    expect(postgresql.steps.map((step) => step.name).slice(-3)).toEqual([
+      "Run isolated PostgreSQL 18 conformance harness",
+      "Validate surface parity evidence",
+      "Upload surface parity evidence",
+    ]);
     expect(stagePostgresqlSource.match(/uses: actions\/cache\/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9/gu)).toHaveLength(2);
     expect(stagePostgresqlSource.match(/uses: actions\/cache\/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9/gu)).toHaveLength(2);
     expect(stagePostgresqlSource).not.toContain("restore-keys:");
