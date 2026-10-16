@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -17,6 +17,7 @@ import {
 } from "../../src/migration/protocol.js";
 import {
   BackendPublicationCoordinator,
+  backendPublicationJournalPath,
   readBackendMaintenanceJournal,
   type BackendMaintenanceJournal,
   type BackendPublicationDriver,
@@ -137,7 +138,7 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
     const result = await performMigrationAbort({
       homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64),
     });
-    expect(result).toEqual({ status: "completed" });
+    expect(result).toEqual({ status: "completed", mutated: true });
   });
 
   it("completes both writes when the journal is held and the manifest is present but not settled", async () => {
@@ -150,7 +151,7 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
     const result = await performMigrationAbort({
       homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
     });
-    expect(result).toEqual({ status: "completed" });
+    expect(result).toEqual({ status: "completed", mutated: true });
     const settledManifest = store.read("generation-1");
     expect(settledManifest.phase).toBe("aborted");
     const settledJournal = readBackendMaintenanceJournal(home)!;
@@ -165,15 +166,15 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
     const coordinator = coordinatorFor(home);
 
     const first = await performMigrationAbort({ homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store });
-    expect(first).toEqual({ status: "completed" });
+    expect(first).toEqual({ status: "completed", mutated: true });
 
     const aborted = readBackendMaintenanceJournal(home)!;
     expect(aborted.phase).toBe("maintenance-aborted");
 
     const second = await performMigrationAbort({ homeDir: home, coordinator, journal: aborted, abortEvidenceSha256: "c".repeat(64), manifestStore: store });
-    expect(second).toEqual({ status: "completed" });
+    expect(second).toEqual({ status: "completed", mutated: false });
     const third = await performMigrationAbort({ homeDir: home, coordinator, journal: aborted, abortEvidenceSha256: "c".repeat(64), manifestStore: store });
-    expect(third).toEqual({ status: "completed" });
+    expect(third).toEqual({ status: "completed", mutated: false });
 
     // Confirm repetition never re-touched either durable write: same journal
     // checksum, same manifest revision and checksum as after the first call.
@@ -181,6 +182,24 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
     expect(stillAborted.checksumSha256).toBe(aborted.checksumSha256);
     const stillSettled = store.read("generation-1");
     expect(stillSettled.revision).toBe(2);
+  });
+
+  it("dryRun reads and classifies everything but writes nothing: the journal and manifest stay byte-identical, and the same call without dryRun then completes", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(manifest());
+    const coordinator = coordinatorFor(home);
+    const journalBefore = readFileSync(backendPublicationJournalPath(home));
+    const manifestBefore = store.read("generation-1").checksumSha256;
+
+    const dry = await performMigrationAbort({ homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store, dryRun: true });
+    expect(dry).toEqual({ status: "dry-run" });
+    expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
+    expect(store.read("generation-1").checksumSha256).toBe(manifestBefore);
+
+    const real = await performMigrationAbort({ homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store });
+    expect(real).toEqual({ status: "completed", mutated: true });
   });
 
   it("refuses rather than silently succeeding when the caller's in-hand journal is stale (a genuinely different on-disk state, not the idempotent case above)", async () => {
@@ -193,7 +212,7 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
     // held is now stale: the coordinator will refuse a second abortMaintenance
     // call built from it, because the real on-disk journal has moved on.
     const result = await performMigrationAbort({ homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store });
-    expect(result).toEqual({ status: "refuse", evidence: "journal-unexpected-state" });
+    expect(result).toEqual({ status: "refuse", evidence: "journal-unexpected-state", mutated: false });
   });
 
   it("refuses a selection-completed journal (a successful cutover is not an abort target)", async () => {
@@ -209,7 +228,7 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
       terminalEvidenceSha256: prepared.terminalEvidenceSha256!,
     });
     const result = await performMigrationAbort({ homeDir: home, coordinator, journal: completed, abortEvidenceSha256: "c".repeat(64) });
-    expect(result).toEqual({ status: "refuse", evidence: "journal-selection-completed" });
+    expect(result).toEqual({ status: "refuse", evidence: "journal-selection-completed", mutated: false });
   });
 
   it("refuses a selection-prepared journal (neither held/entering nor an abort target)", async () => {
@@ -221,7 +240,7 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
       targetBackend: "postgresql", terminalEvidenceSha256: "c".repeat(64),
     });
     const result = await performMigrationAbort({ homeDir: home, coordinator, journal: prepared, abortEvidenceSha256: "c".repeat(64) });
-    expect(result).toEqual({ status: "refuse", evidence: "journal-selection-prepared" });
+    expect(result).toEqual({ status: "refuse", evidence: "journal-selection-prepared", mutated: false });
   });
 
   it("refuses when abortMaintenance itself fails (stale expectedChecksumSha256)", async () => {
@@ -230,7 +249,7 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
     const coordinator = coordinatorFor(home);
     const stale: BackendMaintenanceJournal = { ...held, checksumSha256: "f".repeat(64) };
     const result = await performMigrationAbort({ homeDir: home, coordinator, journal: stale, abortEvidenceSha256: "c".repeat(64) });
-    expect(result).toEqual({ status: "refuse", evidence: "journal-unexpected-state" });
+    expect(result).toEqual({ status: "refuse", evidence: "journal-unexpected-state", mutated: false });
   });
 
   it("refuses when the manifest has a pending mid-flight effect rather than attempting to override resume's territory (copy-batch is authoritative-readback-required, classified as readback)", async () => {
@@ -251,9 +270,20 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
     store.update("generation-1", dryRunDone.checksumSha256, () => copying);
     expect(copying.pendingEffect).not.toBeNull();
 
+    const journalBefore = readFileSync(backendPublicationJournalPath(home));
+    const manifestBefore = store.read("generation-1");
+
     const coordinator = coordinatorFor(home);
     const result = await performMigrationAbort({ homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-readback" });
+
+    // A-1 (red first): the refusal must not have terminalized the journal.
+    // Before the fix abortMaintenance ran first, leaving a terminal journal
+    // paired with a manifest whose pending effect nothing could settle.
+    expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-held");
+    expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
+    expect(store.read("generation-1").checksumSha256).toBe(manifestBefore.checksumSha256);
+    // A-2: no durable write preceded this refusal, so none is claimed.
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-readback", mutated: false });
   });
 
   it("refuses when the manifest presence probe cannot be established", async () => {
@@ -269,7 +299,7 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
     } finally {
       chmodSync(migrations, 0o700);
     }
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error" });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error", mutated: false });
   });
 });
 
@@ -293,7 +323,7 @@ describe("abort.ts's non-protocol-error fallback branches (deterministic injecti
       abortMaintenance: async () => { throw new Error("unrecognised failure"); },
     } as unknown as BackendPublicationCoordinator;
     const result = await performMigrationAbort({ homeDir: home, coordinator: fakeCoordinator, journal: held, abortEvidenceSha256: "c".repeat(64) });
-    expect(result).toEqual({ status: "refuse", evidence: "journal-internal-error" });
+    expect(result).toEqual({ status: "refuse", evidence: "journal-internal-error", mutated: false });
   });
 
   it("performMigrationAbort: refuses with manifest-internal-error when the manifest read throws an unrecognised error shape", async () => {
@@ -305,7 +335,7 @@ describe("abort.ts's non-protocol-error fallback branches (deterministic injecti
       read: () => { throw new Error("unrecognised failure"); },
     } as unknown as MigrationManifestStore;
     const result = await performMigrationAbort({ homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: fakeStore });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error" });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error", mutated: false });
   });
 
   it("performMigrationAbort: refuses with manifest-internal-error when beginEffect throws an unrecognised error shape", async () => {
@@ -318,7 +348,7 @@ describe("abort.ts's non-protocol-error fallback branches (deterministic injecti
       homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
       _operationsForTesting: { beginEffect: () => { throw new Error("unrecognised failure"); } },
     });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error" });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error", mutated: true });
   });
 
   it("performMigrationAbort: refuses with manifest-internal-error when the first (begin) store.update throws an unrecognised error shape", async () => {
@@ -333,7 +363,7 @@ describe("abort.ts's non-protocol-error fallback branches (deterministic injecti
     } as unknown as MigrationManifestStore;
     const coordinator = coordinatorFor(home);
     const result = await performMigrationAbort({ homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: fakeStore });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error" });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error", mutated: true });
   });
 
   it("performMigrationAbort: refuses with manifest-internal-error when completeEffect throws an unrecognised error shape", async () => {
@@ -346,7 +376,7 @@ describe("abort.ts's non-protocol-error fallback branches (deterministic injecti
       homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
       _operationsForTesting: { completeEffect: () => { throw new Error("unrecognised failure"); } },
     });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error" });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error", mutated: true });
   });
 
   it("performMigrationAbort: refuses with manifest-internal-error when the second (complete) store.update throws an unrecognised error shape", async () => {
@@ -366,7 +396,7 @@ describe("abort.ts's non-protocol-error fallback branches (deterministic injecti
     } as unknown as MigrationManifestStore;
     const coordinator = coordinatorFor(home);
     const result = await performMigrationAbort({ homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: fakeStore });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error" });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-internal-error", mutated: true });
     expect(updateCalls).toBe(2);
   });
 });
@@ -391,7 +421,7 @@ describe("abort.ts's protocol-error-instance branch, for the same fallback terna
       read: () => { throw new MigrationProtocolError("recovery-required", "test"); },
     } as unknown as MigrationManifestStore;
     const result = await performMigrationAbort({ homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: fakeStore });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-recovery-required" });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-recovery-required", mutated: false });
   });
 
   it("performMigrationAbort: preserves the MigrationProtocolError reason when beginEffect throws one", async () => {
@@ -404,7 +434,7 @@ describe("abort.ts's protocol-error-instance branch, for the same fallback terna
       homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
       _operationsForTesting: { beginEffect: () => { throw new MigrationProtocolError("unexpected-state", "test"); } },
     });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-unexpected-state" });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-unexpected-state", mutated: true });
   });
 
   it("performMigrationAbort: preserves the MigrationProtocolError reason when the first (begin) store.update throws one", async () => {
@@ -419,7 +449,7 @@ describe("abort.ts's protocol-error-instance branch, for the same fallback terna
     } as unknown as MigrationManifestStore;
     const coordinator = coordinatorFor(home);
     const result = await performMigrationAbort({ homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: fakeStore });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-unexpected-state" });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-unexpected-state", mutated: true });
   });
 
   it("performMigrationAbort: preserves the MigrationProtocolError reason when completeEffect throws one", async () => {
@@ -432,7 +462,7 @@ describe("abort.ts's protocol-error-instance branch, for the same fallback terna
       homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
       _operationsForTesting: { completeEffect: () => { throw new MigrationProtocolError("unexpected-state", "test"); } },
     });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-unexpected-state" });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-unexpected-state", mutated: true });
   });
 
   it("performMigrationAbort: preserves the MigrationProtocolError reason when the second (complete) store.update throws one", async () => {
@@ -452,7 +482,7 @@ describe("abort.ts's protocol-error-instance branch, for the same fallback terna
     } as unknown as MigrationManifestStore;
     const coordinator = coordinatorFor(home);
     const result = await performMigrationAbort({ homeDir: home, coordinator, journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: fakeStore });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-unexpected-state" });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-unexpected-state", mutated: true });
   });
 });
 

@@ -112,14 +112,25 @@ captured snapshot classifies `complete`; the manifest head reads at the expected
 
 **Read "Before you run apply" above before using this command for real.**
 
-### `lcm migration abort [--json]`
+### `lcm migration abort --confirm-generation <id> [--dry-run] [--json]`
 
-Mutating. The only way to leave a maintenance hold in this release. Classifies the live maintenance
-journal and, whatever its exact state, completes whichever of the journal termination and the
-manifest settlement is still outstanding — idempotent under repetition, so running it again against
-an already-aborted state is safe and simply confirms the terminal state. Discards the captured
-snapshot's standing as a migration-in-progress; nothing on the PostgreSQL side is deleted or
-undone, since `abort` never reaches PostgreSQL at all.
+Mutating (unless `--dry-run` is given). The only way to leave a maintenance hold in this release.
+Classifies the live maintenance journal and the manifest first, and only then completes whichever
+of the journal termination and the manifest settlement is still outstanding — idempotent under
+repetition, so running it again against an already-aborted state is safe and simply confirms the
+terminal state. Discards the captured snapshot's standing as a migration-in-progress; nothing on
+the PostgreSQL side is deleted or undone, since `abort` never reaches PostgreSQL at all.
+
+`abort` writes nothing unless it can finish the whole recovery. If the manifest carries an
+in-progress copy effect that only `resume` can settle, `abort` refuses
+(`abort-manifest-needs-resume`) while the hold is still intact, rather than releasing the hold and
+leaving a manifest nothing can settle.
+
+`--confirm-generation <id>` must equal the generation id of the live maintenance hold. Omitting it
+refuses `abort-confirmation-missing` and a different id refuses `abort-confirmation-moved` (both
+exit 3, nothing changed); either refusal reports the live generation id in its `generation` field,
+so you can re-run with it. `--dry-run` runs every read and check, reports `applied: false`, and
+changes nothing; it still requires the token and refuses with the class the real run would get.
 
 Exit 0 postcondition: the maintenance journal reads terminal and the manifest reads settled, both
 read back after the operation, not assumed from the operation reporting success.
@@ -699,12 +710,22 @@ above.
     {
       "reason": "abort-manifest-needs-resume",
       "exitClass": "failed-operator-required",
-      "remedy": "The manifest has an in-progress copy effect that only `resume` can complete or abandon. This candidate does not implement resume; file an issue."
+      "remedy": "The manifest has an in-progress copy effect that only `resume` can complete or abandon. Nothing was changed. This release does not register resume; file an issue."
     },
     {
       "reason": "abort-unresolvable",
       "exitClass": "refused-evidence",
       "remedy": "The abort could not be classified into a known precondition or defect. Run `lcm doctor` before retrying."
+    },
+    {
+      "reason": "abort-confirmation-missing",
+      "exitClass": "refused-confirmation",
+      "remedy": "Pass --confirm-generation with the generation id of the live maintenance hold. This refusal reports that id in its generation field; nothing was changed."
+    },
+    {
+      "reason": "abort-confirmation-moved",
+      "exitClass": "refused-confirmation",
+      "remedy": "--confirm-generation does not match the live maintenance hold. Pass the generation id this refusal reports; nothing was changed."
     },
     {
       "reason": "abort-nothing-to-abort",

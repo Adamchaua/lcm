@@ -249,11 +249,19 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   }),
   Object.freeze({
     reason: "abort-manifest-needs-resume", exitClass: "failed-operator-required",
-    remedy: "The manifest has an in-progress copy effect that only `resume` can complete or abandon. This candidate does not implement resume; file an issue.",
+    remedy: "The manifest has an in-progress copy effect that only `resume` can complete or abandon. Nothing was changed. This release does not register resume; file an issue.",
   }),
   Object.freeze({
     reason: "abort-unresolvable", exitClass: "refused-evidence",
     remedy: "The abort could not be classified into a known precondition or defect. Run `lcm doctor` before retrying.",
+  }),
+  Object.freeze({
+    reason: "abort-confirmation-missing", exitClass: "refused-confirmation",
+    remedy: "Pass --confirm-generation with the generation id of the live maintenance hold. This refusal reports that id in its generation field; nothing was changed.",
+  }),
+  Object.freeze({
+    reason: "abort-confirmation-moved", exitClass: "refused-confirmation",
+    remedy: "--confirm-generation does not match the live maintenance hold. Pass the generation id this refusal reports; nothing was changed.",
   }),
   Object.freeze({
     reason: "abort-nothing-to-abort", exitClass: "refused-precondition",

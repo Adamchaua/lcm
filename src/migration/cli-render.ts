@@ -149,12 +149,16 @@ export function renderMigrationApplyEnvelope(outcome: MigrationApplyOutcome): Mi
 export function renderMigrationAbortEnvelope(outcome: MigrationAbortCommandOutcome): MigrationEnvelope {
   if (outcome.status === "refuse") {
     return refusalEnvelope({
-      command: "abort", reason: outcome.reason, evidenceDetail: outcome.evidence, applied: false,
+      command: "abort",
+      reason: outcome.reason,
+      evidenceDetail: outcome.evidence,
+      applied: outcome.applied ?? false,
+      generation: outcome.generationId,
     });
   }
   return okEnvelope({
     command: "abort",
-    applied: true,
+    applied: outcome.applied,
     generation: outcome.generationId,
     manifestPhase: outcome.manifestPhase,
     evidence: { journalPhase: outcome.journalPhase },

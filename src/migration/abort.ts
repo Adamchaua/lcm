@@ -72,11 +72,22 @@ export function classifyMigrationAbortGate(input: Readonly<{
 }
 
 export type MigrationAbortResult =
-  | Readonly<{ status: "completed" }>
-  | Readonly<{ status: "refuse"; evidence: string }>;
+  /** `mutated` is false for an idempotent repeat that found both writes already made. */
+  | Readonly<{ status: "completed"; mutated: boolean }>
+  | Readonly<{ status: "dry-run" }>
+  /**
+   * `mutated` reports whether a durable write (the journal termination or
+   * either manifest write) was made before this refusal, so a caller never
+   * has to guess whether state moved (round-1 A-2).
+   */
+  | Readonly<{ status: "refuse"; evidence: string; mutated: boolean }>;
 
 function abortEffectId(generationId: string): string {
   return backendPublicationCanonicalSha256({ kind: "migration-abort-effect", generationId });
+}
+
+function manifestFailureEvidence(error: unknown): string {
+  return error instanceof MigrationProtocolError ? `manifest-${error.reason}` : "manifest-internal-error";
 }
 
 /**
@@ -84,6 +95,12 @@ function abortEffectId(generationId: string): string {
  * settlement) is missing, and is idempotent under repetition: calling this
  * again once both are already settled observes that and reports `completed`
  * without attempting either write again.
+ *
+ * **Classify, then mutate (round-1 A-1).** Every read and the manifest's
+ * recovery classification happen before the first durable write. A manifest
+ * whose pending copy effect only `resume` can settle is refused while the
+ * journal is still untouched: terminalizing the journal first would strand a
+ * terminal journal beside a manifest no registered command can settle.
  *
  * `abortEvidenceSha256` and `sourceSelectionSha256` for the journal-side
  * write come from the caller's confirmed evidence, never re-derived here
@@ -109,6 +126,8 @@ export async function performMigrationAbort(input: Readonly<{
   abortEvidenceSha256: string;
   manifestStore?: MigrationManifestStore;
   now?: Date;
+  /** Run every read and classification, then stop before the first write. */
+  dryRun?: boolean;
   /**
    * @internal Deterministic failure-injection seam for tests only, matching
    * the `_operationsForTesting` convention used elsewhere in
@@ -122,49 +141,53 @@ export async function performMigrationAbort(input: Readonly<{
   const beginEffect = input._operationsForTesting?.beginEffect ?? beginMigrationEffect;
   const completeEffect = input._operationsForTesting?.completeEffect ?? completeMigrationEffect;
   let journal = input.journal;
-  if (!isTerminalBackendMaintenancePhase(journal.phase)) {
+  const journalNeedsWrite = !isTerminalBackendMaintenancePhase(journal.phase);
+  if (journalNeedsWrite) {
     if (journal.phase !== "maintenance-held" && journal.phase !== "maintenance-entering") {
-      return { status: "refuse", evidence: `journal-${journal.phase}` };
+      return { status: "refuse", evidence: `journal-${journal.phase}`, mutated: false };
     }
+  } else if (journal.phase !== "maintenance-aborted") {
+    // selection-completed: a successful cutover, not an abort target.
+    return { status: "refuse", evidence: `journal-${journal.phase}`, mutated: false };
+  }
+
+  // Everything below up to the first write is read-only.
+  const store = input.manifestStore ?? new MigrationManifestStore({ homeDir: input.homeDir });
+  const presence = store.probeManifestPresence(journal.generationId);
+  if (presence.status === "unresolvable") {
+    return { status: "refuse", evidence: `manifest-${presence.reason}`, mutated: false };
+  }
+  let manifest: MigrationManifest | null = null;
+  if (presence.status === "present") {
+    try {
+      manifest = store.read(journal.generationId);
+    } catch (error) {
+      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated: false };
+    }
+    const recovery = classifyMigrationRecovery(manifest);
+    if (recovery.action === "settled") {
+      manifest = null;
+    } else if (recovery.action !== "ready") {
+      return { status: "refuse", evidence: `manifest-${recovery.action}`, mutated: false };
+    }
+  }
+
+  if (input.dryRun === true) return { status: "dry-run" };
+
+  let mutated = false;
+  if (journalNeedsWrite) {
     try {
       journal = await input.coordinator.abortMaintenance({
         expectedChecksumSha256: journal.checksumSha256,
         sourceSelectionSha256: journal.sourceSelectionSha256,
         abortEvidenceSha256: input.abortEvidenceSha256,
       });
+      mutated = true;
     } catch (error) {
-      return { status: "refuse", evidence: journalFailureEvidence(error) };
+      return { status: "refuse", evidence: journalFailureEvidence(error), mutated: false };
     }
-  } else if (journal.phase !== "maintenance-aborted") {
-    // selection-completed: a successful cutover, not an abort target.
-    return { status: "refuse", evidence: `journal-${journal.phase}` };
   }
-
-  const store = input.manifestStore ?? new MigrationManifestStore({ homeDir: input.homeDir });
-  const presence = store.probeManifestPresence(journal.generationId);
-  if (presence.status === "unresolvable") {
-    return { status: "refuse", evidence: `manifest-${presence.reason}` };
-  }
-  if (presence.status === "absent") {
-    return { status: "completed" };
-  }
-
-  let manifest: MigrationManifest;
-  try {
-    manifest = store.read(journal.generationId);
-  } catch (error) {
-    return {
-      status: "refuse",
-      evidence: error instanceof MigrationProtocolError ? `manifest-${error.reason}` : "manifest-internal-error",
-    };
-  }
-  const recovery = classifyMigrationRecovery(manifest);
-  if (recovery.action === "settled") {
-    return { status: "completed" };
-  }
-  if (recovery.action !== "ready") {
-    return { status: "refuse", evidence: `manifest-${recovery.action}` };
-  }
+  if (manifest === null) return { status: "completed", mutated };
 
   const now = (input.now ?? new Date()).toISOString();
   const effectId = abortEffectId(journal.generationId);
@@ -177,19 +200,14 @@ export async function performMigrationAbort(input: Readonly<{
       startedAt: now,
     });
   } catch (error) {
-    return {
-      status: "refuse",
-      evidence: error instanceof MigrationProtocolError ? `manifest-${error.reason}` : "manifest-internal-error",
-    };
+    return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
   }
   try {
     store.update(journal.generationId, manifest.checksumSha256, () => begun);
   } catch (error) {
-    return {
-      status: "refuse",
-      evidence: error instanceof MigrationProtocolError ? `manifest-${error.reason}` : "manifest-internal-error",
-    };
+    return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
   }
+  mutated = true;
   let candidate: MigrationManifest;
   try {
     candidate = completeEffect(begun, {
@@ -209,20 +227,14 @@ export async function performMigrationAbort(input: Readonly<{
       },
     });
   } catch (error) {
-    return {
-      status: "refuse",
-      evidence: error instanceof MigrationProtocolError ? `manifest-${error.reason}` : "manifest-internal-error",
-    };
+    return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
   }
   try {
     store.update(journal.generationId, begun.checksumSha256, () => candidate);
   } catch (error) {
-    return {
-      status: "refuse",
-      evidence: error instanceof MigrationProtocolError ? `manifest-${error.reason}` : "manifest-internal-error",
-    };
+    return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
   }
-  return { status: "completed" };
+  return { status: "completed", mutated: true };
 }
 
 export type MigrationAbortRefusalClass = "precondition" | "unresumable" | "evidence";

@@ -2174,11 +2174,17 @@ export function registerMigrationCommand(program: Command): void {
   migrationCmd
     .command("abort")
     .description("Abort a held or entering migration, completing whichever recovery write is missing")
+    .option("--confirm-generation <id>", "The generation id of the live maintenance hold")
+    .option("--dry-run", "Run every read and check, then stop before changing anything")
     .option("--json", "Output structured JSON")
     .helpOption(false).option("-h, --help", "Show help")
-    .action(async (opts: MigrationJsonOptions) => {
+    .action(async (opts: MigrationApplyOptions) => {
       writeCliError("Aborting the migration hold...\n");
-      const outcome = await performMigrationAbortCommand({ homeDir: homedir() });
+      const outcome = await performMigrationAbortCommand({
+        homeDir: homedir(),
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+      });
       writeCliError("Migration abort finished.\n");
       emitMigrationEnvelope(renderMigrationAbortEnvelope(outcome), opts.json);
     });

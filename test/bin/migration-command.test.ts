@@ -212,9 +212,9 @@ describe("lcm migration command group", () => {
     expect(suppressed).toBe(withProgress);
   });
 
-  it("abort: ok envelope, always applied", async () => {
+  it("abort: ok envelope reports the operation's own applied flag", async () => {
     state.abort.mockResolvedValueOnce({
-      status: "ok", generationId: "gen-1", journalPhase: "maintenance-aborted", manifestPhase: "aborted",
+      status: "ok", generationId: "gen-1", journalPhase: "maintenance-aborted", manifestPhase: "aborted", applied: true,
     });
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     await invoke("migration", "abort", "--json");

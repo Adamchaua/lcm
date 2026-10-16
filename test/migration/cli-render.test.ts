@@ -128,11 +128,14 @@ describe("renderMigrationApplyEnvelope", () => {
 });
 
 describe("renderMigrationAbortEnvelope", () => {
-  it("builds an ok envelope, always applied (abort always writes at least one terminal state)", () => {
+  it("builds an ok envelope whose applied flag is the operation's own report of whether it wrote", () => {
     const envelope = renderMigrationAbortEnvelope({
-      status: "ok", generationId: "gen-1", journalPhase: "maintenance-aborted", manifestPhase: "aborted",
+      status: "ok", generationId: "gen-1", journalPhase: "maintenance-aborted", manifestPhase: "aborted", applied: true,
     });
     expect(envelope.applied).toBe(true);
+    expect(renderMigrationAbortEnvelope({
+      status: "ok", generationId: "gen-1", journalPhase: "maintenance-held", manifestPhase: null, applied: false,
+    }).applied).toBe(false);
     expect(envelope.generation).toBe("gen-1");
     expect(envelope.manifestPhase).toBe("aborted");
     expect(envelope.evidence).toEqual({ journalPhase: "maintenance-aborted" });
@@ -140,9 +143,22 @@ describe("renderMigrationAbortEnvelope", () => {
 
   it("builds an ok envelope with a null manifestPhase when the manifest was genuinely never created", () => {
     const envelope = renderMigrationAbortEnvelope({
-      status: "ok", generationId: "gen-1", journalPhase: "maintenance-aborted", manifestPhase: null,
+      status: "ok", generationId: "gen-1", journalPhase: "maintenance-aborted", manifestPhase: null, applied: true,
     });
     expect(envelope.manifestPhase).toBeNull();
+  });
+
+  it("reports applied:true on a refusal that followed a durable write, in each direction independently (A-2)", () => {
+    const after = renderMigrationAbortEnvelope({ status: "refuse", reason: "abort-unresolvable", evidence: "manifest-unexpected-state", applied: true });
+    const before = renderMigrationAbortEnvelope({ status: "refuse", reason: "abort-unresolvable", evidence: "manifest-unexpected-state" });
+    expect(after.applied).toBe(true);
+    expect(before.applied).toBe(false);
+  });
+
+  it("carries the live generation on a confirmation refusal so the operator learns what to confirm", () => {
+    const envelope = renderMigrationAbortEnvelope({ status: "refuse", reason: "abort-confirmation-moved", generationId: "gen-live" });
+    expect(envelope.generation).toBe("gen-live");
+    expect(envelope.exitCode).toBe(3);
   });
 
   it("builds a refusal envelope for abort-nothing-to-abort, never applied", () => {
@@ -158,7 +174,7 @@ describe("every command's ok and refusal envelopes keep outcome/exitCode agreeme
       renderMigrationPlanEnvelope({ status: "ok", generationId: "g", disposition: "fresh", daemonPresence: { status: "authoritatively-absent" } }),
       renderMigrationDryRunEnvelope({ status: "ok", dryRun: DRY_RUN_FIXTURE }),
       renderMigrationApplyEnvelope({ status: "ok", generationId: "g", applied: true, phase: "copied" }),
-      renderMigrationAbortEnvelope({ status: "ok", generationId: "g", journalPhase: "maintenance-aborted", manifestPhase: null }),
+      renderMigrationAbortEnvelope({ status: "ok", generationId: "g", journalPhase: "maintenance-aborted", manifestPhase: null, applied: true }),
     ]) {
       expect(migrationExitClassForName(envelope.outcome).code).toBe(envelope.exitCode);
     }

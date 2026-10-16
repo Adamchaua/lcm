@@ -33,8 +33,23 @@ import { maintenanceOnlyDriver } from "./apply.js";
  */
 
 export type MigrationAbortCommandOutcome =
-  | Readonly<{ status: "ok"; generationId: string; journalPhase: string; manifestPhase: string | null }>
-  | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
+  | Readonly<{
+    status: "ok";
+    generationId: string;
+    journalPhase: string;
+    manifestPhase: string | null;
+    /** False for `--dry-run` and for an idempotent repeat that found both writes already made. */
+    applied: boolean;
+  }>
+  | Readonly<{
+    status: "refuse";
+    reason: string;
+    evidence?: string;
+    /** The live journal's generation, so a confirmation refusal tells the operator what to confirm. */
+    generationId?: string;
+    /** Present (true) only when a durable write preceded this refusal (round-1 A-2). */
+    applied?: true;
+  }>;
 
 export type MigrationAbortCommandOperations = Readonly<{
   observeJournal: typeof observeMigrationMaintenanceJournal;
@@ -48,6 +63,14 @@ function manifestProtocolEvidence(error: unknown): string {
 
 export async function performMigrationAbortCommand(input: Readonly<{
   homeDir: string;
+  /**
+   * The generation id of the live journal this invocation intends to abort
+   * (plan section 9: `abort` confirms `--confirm-generation` against the
+   * live journal's own generation id). Compared before anything is written.
+   */
+  confirmGenerationId?: string;
+  /** Run every read and classification, then stop before the first durable write. */
+  dryRun?: boolean;
   coordinator?: BackendPublicationCoordinator;
   manifestStore?: MigrationManifestStore;
   now?: Date;
@@ -79,6 +102,17 @@ export async function performMigrationAbortCommand(input: Readonly<{
   }
 
   const journal: BackendMaintenanceJournal = observation.journal;
+
+  // Section 9's fence: the token is compared against the generation of the
+  // journal this invocation just observed, before any write. A missing and a
+  // mismatched token are distinct facts with distinct reasons.
+  if (input.confirmGenerationId === undefined) {
+    return { status: "refuse", reason: "abort-confirmation-missing", generationId: journal.generationId };
+  }
+  if (input.confirmGenerationId !== journal.generationId) {
+    return { status: "refuse", reason: "abort-confirmation-moved", generationId: journal.generationId };
+  }
+
   const abortEvidenceSha256 = backendPublicationCanonicalSha256({
     version: 1,
     kind: "migration-abort-cli-request",
@@ -93,47 +127,73 @@ export async function performMigrationAbortCommand(input: Readonly<{
     abortEvidenceSha256,
     manifestStore: store,
     now: input.now,
+    dryRun: input.dryRun,
   });
 
   if (result.status === "refuse") {
     const classified = classifyMigrationAbortRefusal(result.evidence);
-    return { status: "refuse", reason: classified.reason, evidence: result.evidence };
+    return {
+      status: "refuse",
+      reason: classified.reason,
+      evidence: result.evidence,
+      ...(result.mutated ? { applied: true as const } : {}),
+    };
+  }
+  if (result.status === "dry-run") {
+    // Nothing was written, so there is nothing to read back: report the state
+    // the real run would act on.
+    return {
+      status: "ok",
+      generationId: journal.generationId,
+      journalPhase: journal.phase,
+      manifestPhase: null,
+      applied: false,
+    };
   }
 
   // Section 5.1's exit-0 postcondition: read back, never trust the
-  // operation's own "completed" claim as the readback itself.
+  // operation's own "completed" claim as the readback itself. A readback
+  // refusal follows the operation's writes, so it carries their `applied`.
+  const applied = result.mutated;
+  const readbackRefusal = (reason: string, evidence?: string): MigrationAbortCommandOutcome => ({
+    status: "refuse",
+    reason,
+    ...(evidence === undefined ? {} : { evidence }),
+    ...(applied ? { applied: true as const } : {}),
+  });
   const finalJournal = readJournal(input.homeDir);
   if (finalJournal === null || !isTerminalBackendMaintenancePhase(finalJournal.phase)) {
-    return { status: "refuse", reason: "abort-readback-mismatch" };
+    return readbackRefusal("abort-readback-mismatch");
   }
 
   const presence = store.probeManifestPresence(journal.generationId);
   if (presence.status === "unresolvable") {
-    return { status: "refuse", reason: "abort-unresolvable", evidence: `manifest-${presence.reason}` };
+    return readbackRefusal("abort-unresolvable", `manifest-${presence.reason}`);
   }
   if (presence.status === "absent") {
     // Genuinely absent is a legitimate terminal state (aborted before
     // capture ever reached genesis), not a readback failure.
-    return { status: "ok", generationId: journal.generationId, journalPhase: finalJournal.phase, manifestPhase: null };
+    return { status: "ok", generationId: journal.generationId, journalPhase: finalJournal.phase, manifestPhase: null, applied };
   }
 
   let manifest;
   try {
     manifest = store.read(journal.generationId);
   } catch (error) {
-    return { status: "refuse", reason: "abort-unresolvable", evidence: manifestProtocolEvidence(error) };
+    return readbackRefusal("abort-unresolvable", manifestProtocolEvidence(error));
   }
   const recovery = classifyMigrationRecovery(manifest);
   if (recovery.action !== "settled") {
     // performMigrationAbort itself would not have reported "completed"
     // with an unsettled manifest, so this is a genuine readback
     // disagreement rather than an expected state.
-    return { status: "refuse", reason: "abort-readback-mismatch" };
+    return readbackRefusal("abort-readback-mismatch");
   }
   return {
     status: "ok",
     generationId: journal.generationId,
     journalPhase: finalJournal.phase,
     manifestPhase: recovery.phase,
+    applied,
   };
 }

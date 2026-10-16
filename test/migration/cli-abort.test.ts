@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,6 +13,7 @@ import {
 } from "../../src/migration/protocol.js";
 import {
   BackendPublicationCoordinator,
+  backendPublicationJournalPath,
   readBackendMaintenanceJournal,
   type BackendMaintenanceJournal,
   type BackendPublicationDriver,
@@ -73,8 +74,8 @@ describe("performMigrationAbortCommand: real end-to-end paths", () => {
     const home = makeHome();
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
-    const result = await performMigrationAbortCommand({ homeDir: home, coordinator });
-    expect(result).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: null });
+    const result = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
+    expect(result).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: null, applied: true });
     // Positive control: the real journal really is terminal on disk.
     expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-aborted");
   });
@@ -92,17 +93,19 @@ describe("performMigrationAbortCommand: real end-to-end paths", () => {
         report: { kind: "abort", reportId: "r1", reportSha256: "b".repeat(64), createdAt: CREATED_AT },
       }));
     const coordinator = coordinatorFor(home);
-    const result = await performMigrationAbortCommand({ homeDir: home, coordinator, manifestStore: store });
-    expect(result).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: "aborted" });
+    const result = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator, manifestStore: store });
+    expect(result).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: "aborted", applied: true });
   });
 
   it("is idempotent for real: aborting an already-aborted generation still reports ok with the same readback", async () => {
     const home = makeHome();
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
-    const first = await performMigrationAbortCommand({ homeDir: home, coordinator });
-    const second = await performMigrationAbortCommand({ homeDir: home, coordinator });
-    expect(second).toEqual(first);
+    const first = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
+    const second = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
+    // Same readback, but a repeat finds both writes already made: nothing was applied.
+    expect(second).toEqual({ ...first, applied: false });
+    expect(first).toMatchObject({ applied: true });
   });
 });
 
@@ -110,6 +113,7 @@ describe("performMigrationAbortCommand: refusal paths", () => {
   it("refuses publication-occupies-slot when injected observation reports a v2 publication journal", async () => {
     const home = makeHome();
     const result = await performMigrationAbortCommand({
+      confirmGenerationId: "generation-1",
       homeDir: home,
       _operationsForTesting: { observeJournal: () => ({ kind: "publication" }) },
     });
@@ -119,6 +123,7 @@ describe("performMigrationAbortCommand: refusal paths", () => {
   it("refuses journal-unresolvable, carrying the observation's evidence", async () => {
     const home = makeHome();
     const result = await performMigrationAbortCommand({
+      confirmGenerationId: "generation-1",
       homeDir: home,
       _operationsForTesting: { observeJournal: () => ({ kind: "unresolvable", evidence: "journal-checksum-mismatch" }) },
     });
@@ -127,7 +132,7 @@ describe("performMigrationAbortCommand: refusal paths", () => {
 
   it("refuses abort-nothing-to-abort for a real absent journal (no injection: a genuinely fresh home with nothing to abort)", async () => {
     const home = makeHome();
-    const result = await performMigrationAbortCommand({ homeDir: home });
+    const result = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home });
     expect(result).toEqual({ status: "refuse", reason: "abort-nothing-to-abort" });
   });
 
@@ -136,11 +141,12 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
     const result = await performMigrationAbortCommand({
+      confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
       _operationsForTesting: {
         observeJournal: () => ({ kind: "hold", journal: held }),
-        performAbort: async () => ({ status: "refuse", evidence: "journal-unexpected-state" }),
+        performAbort: async () => ({ status: "refuse", evidence: "journal-unexpected-state", mutated: false }),
       },
     });
     expect(result).toEqual({ status: "refuse", reason: "abort-journal-moved", evidence: "journal-unexpected-state" });
@@ -151,15 +157,16 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
     const result = await performMigrationAbortCommand({
+      confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
       _operationsForTesting: {
         observeJournal: () => ({ kind: "hold", journal: held }),
-        performAbort: async () => ({ status: "completed" }),
+        performAbort: async () => ({ status: "completed", mutated: true }),
         readJournal: () => held, // still "maintenance-held", not terminal
       },
     });
-    expect(result).toEqual({ status: "refuse", reason: "abort-readback-mismatch" });
+    expect(result).toEqual({ status: "refuse", reason: "abort-readback-mismatch", applied: true });
   });
 
   it("refuses abort-readback-mismatch when the readback journal is entirely absent despite performAbort reporting completed", async () => {
@@ -167,15 +174,16 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
     const result = await performMigrationAbortCommand({
+      confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
       _operationsForTesting: {
         observeJournal: () => ({ kind: "hold", journal: held }),
-        performAbort: async () => ({ status: "completed" }),
+        performAbort: async () => ({ status: "completed", mutated: true }),
         readJournal: () => null,
       },
     });
-    expect(result).toEqual({ status: "refuse", reason: "abort-readback-mismatch" });
+    expect(result).toEqual({ status: "refuse", reason: "abort-readback-mismatch", applied: true });
   });
 
   it("refuses abort-unresolvable when the manifest presence probe cannot be established on readback (a real terminal journal from a prior real abort, then an injected unresolvable manifestStore for the readback itself -- proving this is a distinct check from performMigrationAbort's own internal one, not merely unreachable code)", async () => {
@@ -183,21 +191,22 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
     // Real abort first, so the journal is genuinely terminal on disk.
-    const real = await performMigrationAbortCommand({ homeDir: home, coordinator });
+    const real = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
     expect(real.status).toBe("ok");
     const unresolvableStore = {
       probeManifestPresence: () => ({ status: "unresolvable" as const, reason: "internal-error" }),
     } as unknown as MigrationManifestStore;
     const result = await performMigrationAbortCommand({
+      confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
       manifestStore: unresolvableStore,
       _operationsForTesting: {
         observeJournal: () => ({ kind: "hold", journal: held }),
-        performAbort: async () => ({ status: "completed" }),
+        performAbort: async () => ({ status: "completed", mutated: true }),
       },
     });
-    expect(result).toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "manifest-internal-error" });
+    expect(result).toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "manifest-internal-error", applied: true });
   });
 
   it("refuses abort-unresolvable when reading the present manifest throws on readback (a real terminal journal from a prior real abort, plus a real manifest present, then an injected read failure for the readback step specifically)", async () => {
@@ -206,22 +215,23 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const store = new MigrationManifestStore({ homeDir: home });
     store.create(manifest(held.generationId));
     const coordinator = coordinatorFor(home);
-    const real = await performMigrationAbortCommand({ homeDir: home, coordinator, manifestStore: store });
+    const real = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator, manifestStore: store });
     expect(real.status).toBe("ok");
     const throwingStore = {
       probeManifestPresence: () => store.probeManifestPresence(held.generationId),
       read: () => { throw new MigrationProtocolError("checksum-mismatch", "test"); },
     } as unknown as MigrationManifestStore;
     const result = await performMigrationAbortCommand({
+      confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
       manifestStore: throwingStore,
       _operationsForTesting: {
         observeJournal: () => ({ kind: "hold", journal: held }),
-        performAbort: async () => ({ status: "completed" }),
+        performAbort: async () => ({ status: "completed", mutated: true }),
       },
     });
-    expect(result).toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "manifest-checksum-mismatch" });
+    expect(result).toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "manifest-checksum-mismatch", applied: true });
   });
 
   it("refuses abort-readback-mismatch when the present manifest reads back as not settled, after a real terminal journal (an unexpected disagreement performMigrationAbort itself would not have produced, isolated from the journal-not-terminal case by first making the journal genuinely terminal for real)", async () => {
@@ -240,15 +250,16 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     });
     expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-aborted");
     const result = await performMigrationAbortCommand({
+      confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
       manifestStore: store,
       _operationsForTesting: {
         observeJournal: () => ({ kind: "hold", journal: held }),
-        performAbort: async () => ({ status: "completed" }),
+        performAbort: async () => ({ status: "completed", mutated: true }),
       },
     });
-    expect(result).toEqual({ status: "refuse", reason: "abort-readback-mismatch" });
+    expect(result).toEqual({ status: "refuse", reason: "abort-readback-mismatch", applied: true });
   });
 
   it("refuses abort-unresolvable with manifest-internal-error evidence when reading the present manifest throws a non-MigrationProtocolError on readback", async () => {
@@ -257,21 +268,163 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const store = new MigrationManifestStore({ homeDir: home });
     store.create(manifest(held.generationId));
     const coordinator = coordinatorFor(home);
-    const real = await performMigrationAbortCommand({ homeDir: home, coordinator, manifestStore: store });
+    const real = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator, manifestStore: store });
     expect(real.status).toBe("ok");
     const throwingStore = {
       probeManifestPresence: () => store.probeManifestPresence(held.generationId),
       read: () => { throw new Error("an unrelated internal failure"); },
     } as unknown as MigrationManifestStore;
     const result = await performMigrationAbortCommand({
+      confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
       manifestStore: throwingStore,
       _operationsForTesting: {
         observeJournal: () => ({ kind: "hold", journal: held }),
-        performAbort: async () => ({ status: "completed" }),
+        performAbort: async () => ({ status: "completed", mutated: true }),
       },
     });
-    expect(result).toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "manifest-internal-error" });
+    expect(result).toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "manifest-internal-error", applied: true });
+  });
+});
+function pendingCopyBatchManifest(store: MigrationManifestStore): MigrationManifest {
+  const planned = manifest();
+  store.create(planned);
+  const dryRun = beginMigrationEffect(planned, { effectId: "e".repeat(64), kind: "verify-dry-run", inputSha256: "f".repeat(64), startedAt: CREATED_AT });
+  store.update("generation-1", planned.checksumSha256, () => dryRun);
+  const dryRunDone = completeMigrationEffect(dryRun, {
+    effectId: "e".repeat(64),
+    completedAt: CREATED_AT,
+    report: { kind: "dry-run", reportId: "report-1", reportSha256: "9".repeat(64), createdAt: CREATED_AT },
+  });
+  store.update("generation-1", dryRun.checksumSha256, () => dryRunDone);
+  const copying = beginMigrationEffect(dryRunDone, { effectId: "d".repeat(64), kind: "copy-batch", inputSha256: "f".repeat(64), startedAt: CREATED_AT });
+  store.update("generation-1", dryRunDone.checksumSha256, () => copying);
+  return copying;
+}
+
+describe("performMigrationAbortCommand: the confirmation fence (plan section 9, round-1 B-1/A-10)", () => {
+  it("an omitted token refuses abort-confirmation-missing, names the live generation, and leaves journal and manifest bytes identical", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(manifest(held.generationId));
+    const journalBefore = readFileSync(backendPublicationJournalPath(home));
+    const manifestBefore = store.read(held.generationId).checksumSha256;
+
+    const result = await performMigrationAbortCommand({ homeDir: home, coordinator: coordinatorFor(home), manifestStore: store });
+
+    expect(result).toEqual({ status: "refuse", reason: "abort-confirmation-missing", generationId: held.generationId });
+    expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
+    expect(store.read(held.generationId).checksumSha256).toBe(manifestBefore);
+    expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-held");
+  });
+
+  it("a mismatched token refuses abort-confirmation-moved and leaves journal and manifest bytes identical", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(manifest(held.generationId));
+    const journalBefore = readFileSync(backendPublicationJournalPath(home));
+    const manifestBefore = store.read(held.generationId).checksumSha256;
+
+    const result = await performMigrationAbortCommand({
+      confirmGenerationId: "some-other-generation", homeDir: home, coordinator: coordinatorFor(home), manifestStore: store,
+    });
+
+    expect(result).toEqual({ status: "refuse", reason: "abort-confirmation-moved", generationId: held.generationId });
+    expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
+    expect(store.read(held.generationId).checksumSha256).toBe(manifestBefore);
+  });
+
+  it("positive control: the matching token performs the same abort for real", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(manifest(held.generationId));
+
+    const result = await performMigrationAbortCommand({
+      confirmGenerationId: held.generationId, homeDir: home, coordinator: coordinatorFor(home), manifestStore: store,
+    });
+
+    expect(result).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: "aborted", applied: true });
+  });
+});
+
+describe("performMigrationAbortCommand: --dry-run (round-1 B-1/A-10)", () => {
+  it("runs every read, reports applied:false, and leaves journal and manifest bytes identical; the real run afterwards does the work", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(manifest(held.generationId));
+    const journalBefore = readFileSync(backendPublicationJournalPath(home));
+    const manifestBefore = store.read(held.generationId).checksumSha256;
+    const coordinator = coordinatorFor(home);
+
+    const dry = await performMigrationAbortCommand({
+      confirmGenerationId: held.generationId, dryRun: true, homeDir: home, coordinator, manifestStore: store,
+    });
+    expect(dry).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-held", manifestPhase: null, applied: false });
+    expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
+    expect(store.read(held.generationId).checksumSha256).toBe(manifestBefore);
+
+    const real = await performMigrationAbortCommand({
+      confirmGenerationId: held.generationId, homeDir: home, coordinator, manifestStore: store,
+    });
+    expect(real).toMatchObject({ status: "ok", applied: true, manifestPhase: "aborted" });
+  });
+
+  it("refuses with the class the real run would get when the manifest has a pending copy effect", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    pendingCopyBatchManifest(store);
+
+    const dry = await performMigrationAbortCommand({
+      confirmGenerationId: held.generationId, dryRun: true, homeDir: home, coordinator: coordinatorFor(home), manifestStore: store,
+    });
+    expect(dry).toEqual({ status: "refuse", reason: "abort-manifest-needs-resume", evidence: "manifest-readback" });
+  });
+
+  it("still enforces the fence under --dry-run", async () => {
+    const home = makeHome();
+    await heldJournal(home);
+    const dry = await performMigrationAbortCommand({ dryRun: true, homeDir: home, coordinator: coordinatorFor(home) });
+    expect(dry).toMatchObject({ status: "refuse", reason: "abort-confirmation-missing" });
+  });
+});
+
+describe("performMigrationAbortCommand: applied tracks whether a durable write preceded the refusal (round-1 A-2/B-6)", () => {
+  it("a refusal after the journal was terminalized reports applied:true (the manifest write fails)", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const real = new MigrationManifestStore({ homeDir: home });
+    real.create(manifest(held.generationId));
+    const failingStore = {
+      probeManifestPresence: (id: string) => real.probeManifestPresence(id),
+      read: (id: string) => real.read(id),
+      update: () => { throw new MigrationProtocolError("unexpected-state", "test"); },
+    } as unknown as MigrationManifestStore;
+
+    const result = await performMigrationAbortCommand({
+      confirmGenerationId: held.generationId, homeDir: home, coordinator: coordinatorFor(home), manifestStore: failingStore,
+    });
+
+    expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-aborted");
+    expect(result).toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "manifest-unexpected-state", applied: true });
+  });
+
+  it("a refusal before any write reports no applied flag (the pending-effect refusal leaves the journal held)", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    pendingCopyBatchManifest(store);
+
+    const result = await performMigrationAbortCommand({
+      confirmGenerationId: held.generationId, homeDir: home, coordinator: coordinatorFor(home), manifestStore: store,
+    });
+
+    expect(result).toEqual({ status: "refuse", reason: "abort-manifest-needs-resume", evidence: "manifest-readback" });
+    expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-held");
   });
 });
