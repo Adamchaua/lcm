@@ -92,7 +92,7 @@ export interface PostgreSqlFactoryDependencies {
   normalizePath(path: string): string;
 }
 
-const DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES: PostgreSqlFactoryDependencies = {
+export const DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES: PostgreSqlFactoryDependencies = {
   createRuntime: (settings) => new PostgreSqlRuntime(settings),
   verifyRuntimeSchema: verifyPostgreSqlRuntimeSchema,
   withConsumerLock: withStorageBackendConsumerLockAsync,

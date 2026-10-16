@@ -33,6 +33,7 @@ import {
   createPostgreSqlStorageBackendFactoryForTesting,
   createPostgreSqlStorageBackendFactoryWithHome,
   capturePublicationWitnessOutcome,
+  DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES,
   FactorySignalExecutor,
   type PostgreSqlFactoryDependencies,
 } from "../../src/storage/postgresql/factory.js";
@@ -1523,6 +1524,16 @@ describe("publication witness classification against real publication state", ()
     expect(existsSync(join(home, ".lcm", "backend-publication"))).toBe(false);
     await expect(withStorageBackendClassificationLockAsync(home, async () => "ran"))
       .resolves.toBe("ran");
+  });
+
+  it("classifies a journal-less publication directory as unresolvable with the production default dependencies", async () => {
+    const empty = makeHome();
+    mkdirSync(join(empty, ".lcm", "backend-publication"), { mode: 0o700 });
+    await expect(capturePublicationWitnessOutcome(DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES, empty))
+      .resolves.toMatchObject({
+        status: "unresolvable",
+        cause: { name: "BackendPublicationJournalError", reason: "publication-evidence-missing" },
+      });
   });
 
   it("reports an existing journal-less publication directory as unresolvable evidence", async () => {

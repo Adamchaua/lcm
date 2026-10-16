@@ -635,8 +635,9 @@ Verification refuses outright, before any report is written, when:
   expectation from the new cluster. A manifest written before the copy
   recorded the system identifier is refused with `destination-drift`; copy
   again to produce a manifest that binds the cluster. Resuming an interrupted
-  verification also refuses a persisted report whose destination identity
-  differs from the manifest's;
+  verification also refuses a persisted report whose destination identity or
+  system identifier differs from the manifest's, including a manifest that
+  never recorded a system identifier;
 - the destination's search configuration is absent, malformed, or present
   but does not match the digest this build's schema installer expects
   (a stable configuration installed from a different revision, for

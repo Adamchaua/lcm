@@ -2177,7 +2177,9 @@ export async function inspectMigrationVerification(
  * of the expensive destination work below. Resume binds the frozen report
  * to the sealed manifest: it refuses unless the report's own recorded
  * destination identity equals manifest.destination.identitySha256, by
- * comparing persisted values only. This is what makes a crash
+ * comparing persisted values only, and unless its recorded cluster system
+ * identifier equals manifest.destination.systemIdentifier (a manifest that
+ * never recorded one is refused). This is what makes a crash
  * between begin and complete resumable without recomputation, and what
  * makes destination drift after begin harmless: this path never reopens
  * the destination at all.
@@ -2197,8 +2199,11 @@ export async function verifyMigrationGeneration(
     // this report, the report has to be one that was eligible when it was
     // built, and the destination identity it froze has to be the manifest's
     // sealed one (an eligible report from before the manifest binding was
-    // enforced must not complete); any failure refuses before the manifest
-    // is touched. Persisted values only: the destination is never reopened.
+    // enforced must not complete), and the cluster system identifier it
+    // froze has to be the one the copy recorded in the manifest (a legacy
+    // manifest that never recorded one must not complete); any failure
+    // refuses before the manifest is touched. Persisted values only: the
+    // destination is never reopened.
     if (pending.effectId !== migrationVerificationEffectId(persistedReport.reportSha256)) {
       driverError("report-identity-conflict", "the pending verification effect does not name the persisted report");
     }
@@ -2207,6 +2212,10 @@ export async function verifyMigrationGeneration(
     }
     if (persistedReport.body.destinationIdentity.sealedWitnessSha256 !== resumeManifest.destination.identitySha256) {
       driverError("destination-drift", "the persisted verification report destination identity does not match the sealed manifest");
+    }
+    const recordedSystemIdentifier = resumeManifest.destination.systemIdentifier;
+    if (recordedSystemIdentifier === undefined || recordedSystemIdentifier !== persistedReport.body.destinationIdentity.systemIdentifier) {
+      driverError("destination-drift", "the persisted verification report system identifier does not match the one the copy recorded in the manifest");
     }
     const completedAt = new Date().toISOString();
     manifestStore.update(input.generationId, resumeManifest.checksumSha256, (current) => completeMigrationEffect(current, {

@@ -2274,6 +2274,42 @@ describe("verifyMigrationGeneration", () => {
     expect(resumeManifestStore.current.pendingEffect).not.toBe(null);
   }, 15000);
 
+  it.each([
+    ["a legacy manifest that never recorded a system identifier", undefined],
+    ["a manifest that recorded a different cluster's system identifier", "7000000001"],
+  ] as const)("refuses to resume a pending effect for %s, leaving the manifest pending", async (_label, recordedIdentifier) => {
+    const homeDir = "/tmp/lcm-verify-resume-system-identifier-" + String(recordedIdentifier);
+    rmSync(homeDir, { recursive: true, force: true });
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const firstResult = await verifyMigrationGeneration(
+      baseInput({ homeDir }), dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime()),
+    );
+    expect(firstResult.report.activationEligible).toBe(true);
+    // The persisted eligible report froze the live cluster identifier
+    // "7123456789" and the sealed witness matches the manifest, so only the
+    // manifest's recorded system identifier can refuse this resume.
+    const resumeManifestStore = fakeManifestStore();
+    const begun = beginMigrationEffect(resumeManifestStore.current, {
+      kind: "verify-generation", effectId: firstResult.effectId, inputSha256: firstResult.inputSha256,
+      startedAt: MANIFEST_FIXTURE_AT,
+    });
+    const { systemIdentifier: _recorded, ...withoutIdentifier } = begun.destination;
+    resumeManifestStore.current = {
+      ...begun,
+      destination: recordedIdentifier === undefined ? withoutIdentifier : { ...withoutIdentifier, systemIdentifier: recordedIdentifier },
+    };
+    const beforeManifest = resumeManifestStore.current;
+    const error = await verifyMigrationGeneration(baseInput({ homeDir }), dependenciesFor(fakeCopySource(), fakeRuntime()))
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(MigrationVerificationDriverError);
+    expect((error as MigrationVerificationDriverError).reason).toBe("destination-drift");
+    expect((error as MigrationVerificationDriverError).message).toContain("system identifier");
+    expect(resumeManifestStore.current).toBe(beforeManifest);
+    expect(resumeManifestStore.current.phase).toBe("copied");
+    expect(resumeManifestStore.current.pendingEffect).not.toBe(null);
+  }, 15000);
+
   it("refuses when a different effect is already pending for the generation, rather than silently adopting it", async () => {
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
     const manifest = stubDestinationPrimitives();
