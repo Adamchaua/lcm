@@ -681,7 +681,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         foundFilePath &&
         char === "/" &&
         nestedPublicUrlBracketDepth === 0 &&
-        isPathWord(chars[index + 1]) &&
+        scanAbsolutePath(chars, index, false, -1, true, nestedFileSchemeStarts).sawNonSeparator &&
         (chars[index - 1] === "&" || (chars[index - 1] === "?" && chars[index - 2] === "&"))
       ) {
         // An ampersand after the path starts a fresh root, not URL authority.

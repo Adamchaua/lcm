@@ -4063,6 +4063,8 @@ describe("sanitizeError", () => {
     ["ampersand then query", "file://h/a&?/Users/A/secret.db", "file://h<path>&?<path>"],
     ["query parameter then ampersand", "file://h/a?q=1&/Users/alice/secret.db", "file://h<path>?q=1&<path>"],
     ["surrounding text", "see file://h/a&?/Users/A/secret.db end", "see file://h<path>&?<path> end"],
+    ["Unicode symbol component", "file://h/a&/📁/secret.db", "file://h<path>&<path>"],
+    ["Unicode symbol component after a question mark", "file://h/a&?/📁/secret.db", "file://h<path>&?<path>"],
   ] as const)("redacts a root after an unbracketed file URL path ampersand on the first pass: %s", (_name, input, expected) => {
     const first = sanitizeError(input);
 
@@ -4085,6 +4087,7 @@ describe("sanitizeError", () => {
     ["top-level public URL", "https://h/a?x=1&/word", "https://h/a?x=1&/word"],
     ["plain text", "a&/b", "a&<path>"],
     ["repeated ampersand with a bare slash", "file:///a?q=&&/ end", "file://<path>?q=&&/ end"],
+    ["trailing bare slash", "file://h/a&/", "file://h<path>&/"],
   ] as const)("keeps the first-pass output of a non-private ampersand successor: %s", (_name, input, expected) => {
     const first = sanitizeError(input);
 
