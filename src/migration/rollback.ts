@@ -472,7 +472,7 @@ async function resolveRollbackOperabilityFact(
   }
   return {
     fact: artifact.operabilityFactState === "present"
-      ? { state: "present", valueSha256: artifact.operabilityFactValueSha256 ?? "" }
+      ? { state: "present", valueSha256: artifact.operabilityFactValueSha256! }
       : { state: "authoritatively-absent" },
     artifact,
   };
@@ -817,6 +817,8 @@ export interface RunMigrationRollbackInput {
   readonly signal?: AbortSignal;
   /** @internal Clock seam for tests. */
   readonly _now?: () => Date;
+  /** @internal Scan-bound seam for tests (defaults to MAX_ROLLBACK_GENERATION_BUILD_ATTEMPT_ENTRIES). */
+  readonly _maxBuildAttemptEntries?: number;
 }
 
 export type RollbackOrchestrationErrorReason =
@@ -1003,6 +1005,12 @@ export async function runMigrationRollback(
     homeDir: input.homeDir,
     generationId: input.generationId,
   });
+  // An unresolvable operability fact refuses whatever the other readers say
+  // (resolveActivationAuthority's first row); refusing here as well narrows
+  // the type, so the authority artifact below can never be written with it.
+  if (operabilityFact.state === "unresolvable") {
+    throw new RollbackOrchestrationError("not-eligible", "operability-fact:unresolvable: " + operabilityFact.reason);
+  }
   const witnessResolution = deps.resolveWitnessBindings({
     homeDir: input.homeDir,
     generationId: input.generationId,
@@ -1016,16 +1024,6 @@ export async function runMigrationRollback(
     throw new RollbackOrchestrationError("not-eligible", authority.reason);
   }
   assertAuthorityAgreesWithArtifact(authority, priorAuthorityArtifact);
-  if (operabilityFact.state === "unresolvable") {
-    // Unreachable: resolveActivationAuthority's row 4 refuses (and
-    // returns above) whenever operabilityFact.state is "unresolvable".
-    // Stated as a runtime assertion, not just a comment, because the
-    // artifact write two lines below must never persist that state.
-    throw new RollbackOrchestrationError(
-      "unexpected-state",
-      "internal: authority resolved non-refused with an unresolvable operability fact",
-    );
-  }
 
   let authoritativeContext: RollbackAuthoritativeContext | null = null;
   if (authority.status === "authoritative") {
@@ -1232,6 +1230,7 @@ function highestRollbackGenerationBuildAttempt(
   homeDir: string,
   baseGenerationId: string,
   revision: number,
+  maxEntries: number,
 ): number {
   const root = rollbackGenerationBuildRoot(homeDir);
   try {
@@ -1253,7 +1252,7 @@ function highestRollbackGenerationBuildAttempt(
           const entry = directory.readSync();
           if (entry === null) break;
           seen += 1;
-          if (seen > MAX_ROLLBACK_GENERATION_BUILD_ATTEMPT_ENTRIES) {
+          if (seen > maxEntries) {
             throw new RollbackOrchestrationError(
               "unexpected-state",
               "rollback generation build root has more entries than this enumeration will scan; refusing rather than risk an undercounted ordinal",
@@ -1305,16 +1304,10 @@ async function runPostPrepareSequence(
   session: RollbackFencedSession,
   authority: ActivationAuthority,
   authoritativeContext: RollbackAuthoritativeContext | null,
-  decision: RollbackEligibilityDecision,
+  decision: Exclude<RollbackEligibilityDecision, Readonly<{ eligibility: "refused" }>>,
   token: BackendPublicationLockToken,
   now: () => Date,
 ): Promise<RunMigrationRollbackOutcome> {
-  if (decision.eligibility === "refused") {
-    throw new RollbackOrchestrationError(
-      "unexpected-state",
-      "internal: runPostPrepareSequence received a refused decision",
-    );
-  }
   const mode = decision.mode;
 
   // Step 9: build, verify -- post-write only. Corrected by this item's
@@ -1333,7 +1326,7 @@ async function runPostPrepareSequence(
   // are final, so they are skipped identically for pre-write: whatever
   // sidecars already sit beside the live database are untouched by this
   // rollback, exactly like the database itself.
-  let built: RollbackGenerationOutcome | null = null;
+  let built: Extract<RollbackGenerationOutcome, Readonly<{ state: "verified" }>> | null = null;
   if (mode === "post-write") {
     const source = await session.openPortableSource();
     // The build target must be a FRESH physical generation per attempt,
@@ -1360,8 +1353,9 @@ async function runPostPrepareSequence(
     // fails closed rather than overwriting evidence.
     const buildAttemptOrdinal = highestRollbackGenerationBuildAttempt(
       input.homeDir, input.generationId, working.revision,
+      input._maxBuildAttemptEntries ?? MAX_ROLLBACK_GENERATION_BUILD_ATTEMPT_ENTRIES,
     ) + 1;
-    built = await buildRollbackGeneration({
+    const buildOutcome = await buildRollbackGeneration({
       homeDir: input.homeDir,
       generationId: input.generationId + "-rb" + working.revision + "-" + buildAttemptOrdinal,
       projectIdentity: input.projectIdentity,
@@ -1369,12 +1363,13 @@ async function runPostPrepareSequence(
       scratchParent: input.scratchParent,
       signal: input.signal,
     });
-    if (built.state === "quarantined") {
+    if (buildOutcome.state === "quarantined") {
       throw new RollbackOrchestrationError(
         "unexpected-state",
-        "rollback generation build failed and was quarantined: " + built.reason,
+        "rollback generation build failed and was quarantined: " + buildOutcome.reason,
       );
     }
+    built = buildOutcome;
   }
 
   // Step 10: revalidate under a NEW snapshot, never step 4's/9's own.
@@ -1460,17 +1455,12 @@ async function runPostPrepareSequence(
   // the actual "selection reversal" issue #626 asks pre-write and
   // unactivated to perform, for every eligibility.
   if (mode === "post-write") {
-    if (built === null || built.state !== "verified") {
-      throw new RollbackOrchestrationError(
-        "unexpected-state",
-        "internal: post-write mode reached step 11 without a verified built generation",
-      );
-    }
+    // Step 9 built a verified generation for exactly this mode.
     const installOutcome = installRollbackGeneration({
       homeDir: input.homeDir,
-      generationId: built.generationId,
+      generationId: built!.generationId,
       canonicalPath: input.canonicalPath,
-      verifiedDatabasePath: built.databasePath,
+      verifiedDatabasePath: built!.databasePath,
     });
     materializeRollbackSidecars({
       homeDir: input.homeDir,

@@ -22,11 +22,11 @@
  * the explicit list of what remains.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, chmodSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, chmodSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import {
   openSqlitePortableSource,
@@ -37,6 +37,8 @@ import { canonicalSha256, PORTABLE_RECORD_SCHEMA_SHA256 } from "../../src/storag
 import {
   BackendPublicationCoordinator,
   readBackendMaintenanceJournal,
+  withBackendPublicationConsumerLockAsync,
+  backendPublicationJournalPath,
   backendPublicationMaterialWitness,
   type BackendPublicationDriver,
   type BackendPublicationFenceRecord,
@@ -71,6 +73,8 @@ import {
   deriveRollbackPublicationId,
   deriveRollbackPrepareInputSha256,
   writeRollbackAuthorityArtifact,
+  writeRollbackReport,
+  deriveRollbackAuthorityArtifactId,
   readRollbackAuthorityArtifact,
   readBackendPublicationOperabilityFact,
   type RunMigrationRollbackDependencies,
@@ -90,6 +94,10 @@ import {
   fixtureEpoch,
   fixtureEvidenceAbsent,
 } from "../fixtures/migration-activation-records.js";
+
+// Post-write cases build, verify and install real SQLite generations; under
+// coverage instrumentation that exceeds the 5s default.
+vi.setConfig({ testTimeout: 60_000 });
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -1686,6 +1694,385 @@ describe("runMigrationRollback against the real binding and evidence stores", ()
     await expect(runMigrationRollback(RUN(homeDir, "gen-continue-no-context"), {
       coordinator, resolveAuthoritativeContext: async () => null, openFencedSession: neverOpens,
     })).rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("could not be fetched") });
+  });
+});
+
+
+// Refusal, recovery and I/O paths of rollback.ts that the happy-path and
+// real-store tests above do not reach. recoverPendingPublishRollback is
+// deliberately not exercised here: plan-v3.1 amendment A9 rewrites it.
+describe("rollback.ts refusal, recovery and I/O paths", () => {
+  const RUN = (homeDir: string, generationId: string, extra: Record<string, unknown> = {}) => ({
+    homeDir, generationId, canonicalPath: join(homeDir, "live.sqlite"),
+    projectIdentity: identity, localProjectId: "local-1",
+    sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    ...extra,
+  });
+  const destinationIdentity = fixtureDestinationIdentity("d");
+  const baseline = fixtureCanonicalDelta("paths-baseline");
+  const census = fixtureCensusVector("paths-census");
+  const witnessSha = storageWitness("postgresql", "4").identitySha256;
+  const neverOpens = async (): Promise<RollbackFencedSession> => {
+    throw new Error("must not open a session");
+  };
+  const scenarioFor = (generationId: string) => fixtureActivationScenario({
+    generationId, destinationIdentity, censusVector: census, canonicalDeltaBaseline: baseline,
+  });
+  const unchanged = { manifestDestinationWitnessSha256: witnessSha, destinationIdentity, postEpochDelta: baseline, postEpochCensus: census };
+  const sessionOf = (...observations: Parameters<typeof fakeSession>[0]["observations"][number][]) => async () =>
+    fakeSession({ observations, source: sqliteSourceStream });
+  const unactivatedSession = sessionOf({
+    manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
+    destinationIdentity, postEpochDelta: fixtureCanonicalDelta("delta"), postEpochCensus: null,
+  });
+
+  function manifestAtActive(store: MigrationManifestStore, generationId: string): MigrationManifest {
+    let m = manifestAtVerified(store, generationId);
+    const step = (kind: string, completion: Record<string, unknown>) => {
+      m = store.update(generationId, m.checksumSha256, (current) => beginMigrationEffect(current, {
+        kind: kind as never, effectId: kind, inputSha256: "a".repeat(64), startedAt: capturedAt,
+      }));
+      m = store.update(generationId, m.checksumSha256, (current) => completeMigrationEffect(current, {
+        effectId: kind, completedAt: capturedAt, ...completion,
+      }));
+    };
+    step("prepare-activation", {});
+    step("publish-activation", { report: { kind: "activation", reportId: "r-act", reportSha256: "b".repeat(64), createdAt: capturedAt } });
+    return m;
+  }
+
+  it("rolls back from phase active (a settled manifest with no pending effect)", async () => {
+    const homeDir = tempHome();
+    const m = manifestAtActive(new MigrationManifestStore({ homeDir }), "gen-active");
+    expect(m.phase).toBe("active");
+    const outcome = await runMigrationRollback(RUN(homeDir, "gen-active"), {
+      coordinator: coordinatorFor(homeDir),
+      ...authoritativeDeps(scenarioFor("gen-active")),
+      recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+      openFencedSession: sessionOf(unchanged),
+    });
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(outcome.manifest.rollbackLineage.returnPhase).toBe("active");
+  });
+
+  describe("the operability fact", () => {
+    it("records a present fact in the authority artifact when the destination is operable and a selection is bound", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-operable-bound");
+      await establishCompletedPostgresqlPublication(homeDir);
+      const live = await readBackendPublicationOperabilityFact({ homeDir });
+      await runMigrationRollback(RUN(homeDir, "gen-operable-bound"), {
+        coordinator: coordinatorFor(homeDir),
+        ...authoritativeDeps(scenarioFor("gen-operable-bound")),
+        recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+        openFencedSession: sessionOf(unchanged),
+      });
+      expect(readRollbackAuthorityArtifact(homeDir, "gen-operable-bound")).toMatchObject({
+        operabilityFactState: "present",
+        operabilityFactValueSha256: live.state === "present" ? live.valueSha256 : null,
+        authorityStatus: "authoritative",
+      });
+    });
+
+    it("continues a prepared rollback from a present fact recorded in the artifact while maintenance holds the live slot", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-operable-continue");
+      await establishCompletedPostgresqlPublication(homeDir);
+      const coordinator = coordinatorFor(homeDir);
+      const deps = {
+        ...authoritativeDeps(scenarioFor("gen-operable-continue")),
+        recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+      };
+      const crashing = fakeSession({ observations: [unchanged], source: sqliteSourceStream });
+      crashing.renew = async () => { throw new Error("simulated crash after step 8"); };
+      await expect(runMigrationRollback(RUN(homeDir, "gen-operable-continue"), {
+        coordinator, ...deps, openFencedSession: async () => crashing,
+      })).rejects.toThrow("simulated crash after step 8");
+      const outcome = await runMigrationRollback(RUN(homeDir, "gen-operable-continue"), {
+        coordinator, ...deps, openFencedSession: sessionOf(unchanged),
+      });
+      expect(outcome.manifest.phase).toBe("rolled-back");
+    });
+
+    it("refuses when maintenance holds the live slot and no durable artifact exists to recover the fact from", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-foreign-maintenance");
+      await coordinatorFor(homeDir).enterMaintenance({
+        publicationId: "some-other-publication", generationId: "some-other-generation",
+        sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+        now: new Date(capturedAt),
+      });
+      await expect(runMigrationRollback(RUN(homeDir, "gen-foreign-maintenance"), {
+        coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: neverOpens,
+      })).rejects.toMatchObject({
+        reason: "not-eligible",
+        message: expect.stringContaining("no durable rollback-authority artifact exists"),
+      });
+    });
+
+    it("refuses on an unresolvable fact whose cause is not the expected maintenance hold (consumer lock contention)", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-lock");
+      await withBackendPublicationConsumerLockAsync(homeDir, async () => {
+        await expect(runMigrationRollback(RUN(homeDir, "gen-lock"), {
+          coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: neverOpens,
+        })).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("operability-fact:unresolvable") });
+      });
+    });
+
+    it("accepts a live present fact that agrees with the artifact's recorded value, and refuses one that does not", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-fact-agree");
+      await establishCompletedPostgresqlPublication(homeDir);
+      const artifact = (valueSha256: string) => ({
+        version: 1 as const, generationId: "gen-fact-agree", operabilityFactState: "present" as const,
+        operabilityFactValueSha256: valueSha256, authorityStatus: "authoritative" as const,
+        epochId: scenarioFor("gen-fact-agree").epoch.epochId, attemptId: scenarioFor("gen-fact-agree").attempt.attemptId,
+      });
+      const deps = {
+        coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor("gen-fact-agree")),
+        recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+      };
+      writeRollbackAuthorityArtifact(homeDir, artifact("0".repeat(64)));
+      await expect(runMigrationRollback(RUN(homeDir, "gen-fact-agree"), { ...deps, openFencedSession: neverOpens }))
+        .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("disagrees with the durable") });
+
+      const agreeHome = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir: agreeHome }), "gen-fact-agree");
+      await establishCompletedPostgresqlPublication(agreeHome);
+      const agreeLive = await readBackendPublicationOperabilityFact({ homeDir: agreeHome });
+      if (agreeLive.state !== "present") throw new Error("expected a present fact");
+      writeRollbackAuthorityArtifact(agreeHome, artifact(agreeLive.valueSha256));
+      const outcome = await runMigrationRollback(RUN(agreeHome, "gen-fact-agree"), {
+        ...deps, coordinator: coordinatorFor(agreeHome), openFencedSession: sessionOf(unchanged),
+      });
+      expect(outcome.manifest.phase).toBe("rolled-back");
+    });
+  });
+
+  describe("the authority artifact and the report store", () => {
+    const body = (generationId: string, epochId: string | null) => ({
+      version: 1 as const, generationId, operabilityFactState: "authoritatively-absent" as const,
+      operabilityFactValueSha256: null, authorityStatus: epochId === null ? "unactivated" as const : "authoritative" as const,
+      epochId, attemptId: epochId,
+    });
+    const artifactPath = (homeDir: string, generationId: string) =>
+      join(homeDir, ".lcm", "migration-rollback-authority", deriveRollbackAuthorityArtifactId(generationId) + ".json");
+
+    it("reuses an identical artifact and refuses a different one under the same generation", () => {
+      const homeDir = tempHome();
+      const first = writeRollbackAuthorityArtifact(homeDir, body("gen-artifact", null));
+      expect(writeRollbackAuthorityArtifact(homeDir, body("gen-artifact", null))).toEqual(first);
+      expect(() => writeRollbackAuthorityArtifact(homeDir, body("gen-artifact", "e".repeat(64)))).toThrow();
+    });
+
+    it("reports an artifact that cannot be read for a reason other than absence", () => {
+      const homeDir = tempHome();
+      mkdirSync(artifactPath(homeDir, "gen-artifact-dir"), { recursive: true, mode: 0o700 });
+      expect(() => readRollbackAuthorityArtifact(homeDir, "gen-artifact-dir")).toThrow();
+    });
+
+    it("refuses an artifact whose checksum does not match its content", () => {
+      const homeDir = tempHome();
+      writeRollbackAuthorityArtifact(homeDir, body("gen-artifact-sum", null));
+      const path = artifactPath(homeDir, "gen-artifact-sum");
+      chmodSync(path, 0o600);
+      writeFileSync(path, readFileSync(path, "utf8").replace("unactivated", "authoritative"), { mode: 0o400 });
+      chmodSync(path, 0o400);
+      expect(() => readRollbackAuthorityArtifact(homeDir, "gen-artifact-sum")).toThrow(/checksum/);
+    });
+
+    const reportBody = (reason: string | null) => ({
+      version: 1 as const, reportId: "report-1", generationId: "gen-report", effectId: "effect-1",
+      kind: "abandonment" as const, eligibility: null, mode: null, epochId: null, attemptId: null,
+      sealedPublicationMaterialDigestSha256: null, reason,
+    });
+    const reportFile = (homeDir: string) => join(homeDir, ".lcm", "migration-reports", "gen-report", "report-1.json");
+
+    it("returns null for a report that was never written", () => {
+      expect(readRollbackReport(tempHome(), "gen-report", "report-1")).toBeNull();
+    });
+
+    it("reuses an identical report and refuses a different one under the same report id", () => {
+      const homeDir = tempHome();
+      const first = writeRollbackReport(homeDir, reportBody("one"));
+      expect(writeRollbackReport(homeDir, reportBody("one"))).toEqual(first);
+      expect(() => writeRollbackReport(homeDir, reportBody("two"))).toThrow();
+    });
+
+    it("reports a report that cannot be read for a reason other than absence", () => {
+      const homeDir = tempHome();
+      mkdirSync(reportFile(homeDir), { recursive: true, mode: 0o700 });
+      expect(() => readRollbackReport(homeDir, "gen-report", "report-1")).toThrow();
+    });
+
+    it("refuses a report whose checksum does not match its content", () => {
+      const homeDir = tempHome();
+      writeRollbackReport(homeDir, reportBody("one"));
+      chmodSync(reportFile(homeDir), 0o600);
+      writeFileSync(reportFile(homeDir), readFileSync(reportFile(homeDir), "utf8").replace("one", "two"), { mode: 0o400 });
+      chmodSync(reportFile(homeDir), 0o400);
+      expect(() => readRollbackReport(homeDir, "gen-report", "report-1")).toThrow(/checksum/);
+    });
+  });
+
+  describe("publishing a manifest successor", () => {
+    afterEach(() => { vi.restoreAllMocks(); });
+
+    it("converges when an update landed durably but reported failure, for a successor with and without a pending effect", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-landed");
+      const real = MigrationManifestStore.prototype.update;
+      let calls = 0;
+      vi.spyOn(MigrationManifestStore.prototype, "update").mockImplementation(function (this: MigrationManifestStore, ...args: Parameters<typeof real>) {
+        calls += 1;
+        const result = real.apply(this, args);
+        // The first two updates (begin prepare-rollback, complete it) land and then fail.
+        if (calls <= 2) throw new Error("simulated failure after the update landed");
+        return result;
+      });
+      const outcome = await runMigrationRollback(RUN(homeDir, "gen-landed"), {
+        coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: unactivatedSession,
+      });
+      expect(outcome.manifest.phase).toBe("rolled-back");
+    });
+
+    it("rethrows when an update failed and the manifest does not hold the successor", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-not-landed");
+      vi.spyOn(MigrationManifestStore.prototype, "update").mockImplementation(() => {
+        throw new Error("simulated failure before the update landed");
+      });
+      await expect(runMigrationRollback(RUN(homeDir, "gen-not-landed"), {
+        coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: unactivatedSession,
+      })).rejects.toThrow("simulated failure before the update landed");
+    });
+  });
+
+  it("compares maintenance rosters independently of order, adopting a held maintenance only when every field matches", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-roster");
+    const second = "018f0b5d-1234-4abc-8def-1234567890ac";
+    const rosterOf = (...ids: string[]) => ids.map((machineId) => ({ machineId, queueCutoff: null, evidenceSha256: "7".repeat(64) }));
+    const coordinator = coordinatorFor(homeDir);
+    await coordinator.enterMaintenance({
+      publicationId: deriveRollbackPublicationId("gen-roster"), generationId: "gen-roster",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64),
+      roster: rosterOf(MACHINE_ID, second), now: new Date(capturedAt),
+    });
+    writeRollbackAuthorityArtifact(homeDir, {
+      version: 1, generationId: "gen-roster", operabilityFactState: "authoritatively-absent",
+      operabilityFactValueSha256: null, authorityStatus: "unactivated", epochId: null, attemptId: null,
+    });
+    // Same machines in the opposite order, plus a repeated id so every comparison outcome is reached: not the held roster.
+    await expect(runMigrationRollback(RUN(homeDir, "gen-roster", { roster: rosterOf(second, MACHINE_ID, MACHINE_ID) }), {
+      coordinator, ...absentDeps(), openFencedSession: neverOpens,
+    })).rejects.toThrow();
+    // The held roster in the opposite order is adopted.
+    const outcome = await runMigrationRollback(RUN(homeDir, "gen-roster", { roster: rosterOf(second, MACHINE_ID) }), {
+      coordinator, ...absentDeps(), openFencedSession: unactivatedSession,
+    });
+    expect(outcome.manifest.phase).toBe("rolled-back");
+  });
+
+  it("refuses to resume a pending prepare-rollback begun with a different input", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    const verified = manifestAtVerified(store, "gen-wrong-pending");
+    store.update("gen-wrong-pending", verified.checksumSha256, (c) => beginMigrationEffect(c, {
+      kind: "prepare-rollback", effectId: "rollback-prepare-other", inputSha256: "9".repeat(64), startedAt: capturedAt,
+    }));
+    await expect(runMigrationRollback(RUN(homeDir, "gen-wrong-pending"), {
+      coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: unactivatedSession,
+    })).rejects.toMatchObject({ reason: "unexpected-state" });
+  });
+
+  describe("the post-write build", () => {
+    const postWrite = { ...unchanged, postEpochDelta: fixtureCanonicalDelta("paths-changed"), postEpochCensus: null };
+
+    it("quarantines a failed build and refuses rather than installing it", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-quarantine");
+      const failing = async (): Promise<PortableRecordStream> => {
+        const real = await sqliteSourceStream();
+        return {
+          describe: () => real.describe(),
+          readBatch: () => { throw new Error("simulated source failure"); },
+          verify: (checkpoint) => real.verify(checkpoint),
+          close: () => real.close(),
+        };
+      };
+      await expect(runMigrationRollback(RUN(homeDir, "gen-quarantine"), {
+        coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor("gen-quarantine")),
+        recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+        openFencedSession: async () => fakeSession({ observations: [postWrite], source: failing }),
+      })).rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("was quarantined") });
+      expect(existsSync(join(homeDir, "live.sqlite"))).toBe(false);
+    });
+
+    it("counts only this generation and revision's well-formed attempt directories, and refuses an oversized build root", async () => {
+      const homeDir = tempHome();
+      const store = new MigrationManifestStore({ homeDir });
+      manifestAtVerified(store, "gen-enum");
+      const buildRoot = join(homeDir, ".lcm", "migration-rollback-generations");
+      mkdirSync(buildRoot, { mode: 0o700 });
+      for (const name of ["unrelated", "gen-enum-rb10-notanumber", "gen-enum-rb10-99999999999999999999"]) {
+        mkdirSync(join(buildRoot, name), { mode: 0o700 });
+      }
+      const deps = {
+        coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor("gen-enum")),
+        recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+        openFencedSession: async () => fakeSession({ observations: [postWrite], source: sqliteSourceStream }),
+      };
+      await expect(runMigrationRollback(RUN(homeDir, "gen-enum", { _maxBuildAttemptEntries: 2 }), deps))
+        .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("more entries than") });
+      const outcome = await runMigrationRollback(RUN(homeDir, "gen-enum"), deps);
+      expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+    });
+  });
+
+  it("refuses with the revalidation's own reason when step 10 finds a different destination identity", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-revalidate");
+    await expect(runMigrationRollback(RUN(homeDir, "gen-revalidate"), {
+      coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor("gen-revalidate")),
+      recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+      openFencedSession: sessionOf(unchanged, { ...unchanged, destinationIdentity: fixtureDestinationIdentity("swapped") }),
+    })).rejects.toMatchObject({
+      reason: "not-eligible",
+      message: expect.stringContaining("destination identity does not match the authoritative epoch"),
+    });
+  });
+
+  it("refuses at step 11 when the held maintenance journal has vanished from the live slot", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-journal-gone");
+    const session = fakeSession({ observations: [unchanged], source: sqliteSourceStream });
+    session.renew = async () => { unlinkSync(backendPublicationJournalPath(homeDir)); };
+    await expect(runMigrationRollback(RUN(homeDir, "gen-journal-gone"), {
+      coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor("gen-journal-gone")),
+      recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+      openFencedSession: async () => session,
+    })).rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("unexpectedly absent") });
+  });
+
+  it("refuses to continue a prepared rollback when the destination identity changed after the crash", async () => {
+    const homeDir = tempHome();
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-continue-refused");
+    const coordinator = coordinatorFor(homeDir);
+    const deps = {
+      ...authoritativeDeps(scenarioFor("gen-continue-refused")),
+      recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+    };
+    const crashing = fakeSession({ observations: [unchanged], source: sqliteSourceStream });
+    crashing.renew = async () => { throw new Error("simulated crash after step 8"); };
+    await expect(runMigrationRollback(RUN(homeDir, "gen-continue-refused"), {
+      coordinator, ...deps, openFencedSession: async () => crashing,
+    })).rejects.toThrow("simulated crash after step 8");
+    await expect(runMigrationRollback(RUN(homeDir, "gen-continue-refused"), {
+      coordinator, ...deps,
+      openFencedSession: sessionOf({ ...unchanged, destinationIdentity: fixtureDestinationIdentity("swapped") }),
+    })).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("destination identity") });
   });
 });
 
