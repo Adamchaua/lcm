@@ -28,6 +28,7 @@ pins:
   - ["src/migration/cli-plan.ts", "unit-migration-cutover"]
   - ["src/migration/cli-preflight.ts", "unit-migration-cutover"]
   - ["src/migration/cli-render.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-resume.ts", "unit-migration-cutover"]
   - ["src/migration/cli-verify.ts", "unit-migration-cutover"]
   - ["src/migration/daemon-presence.ts", "unit-migration-cutover"]
   - ["src/migration/envelope.ts", "unit-migration-cutover"]

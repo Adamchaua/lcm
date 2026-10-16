@@ -749,6 +749,21 @@ are emitted by no registered command in this release.
       "remedy": "Completing the dry-run copy effect failed. Run `lcm doctor` before retrying."
     },
     {
+      "reason": "genesis-dry-run-effect-mismatch",
+      "exitClass": "refused-evidence",
+      "remedy": "The pending dry-run effect is not the one resume carried. Nothing was changed; run `lcm migration report` and inspect the evidence."
+    },
+    {
+      "reason": "genesis-dry-run-unexpected-state",
+      "exitClass": "refused-precondition",
+      "remedy": "The manifest is no longer waiting for its dry-run effect. Nothing was changed; run `lcm migration report` to see which command owns it now."
+    },
+    {
+      "reason": "resume-readback-mismatch",
+      "exitClass": "refused-evidence",
+      "remedy": "The resumed step appeared to complete but the manifest does not read back at the expected checkpoint. Run `lcm migration report` and inspect the evidence."
+    },
+    {
       "reason": "copy-failed",
       "exitClass": "failed-operator-required",
       "remedy": "Copying captured data to the destination failed. The source snapshot is preserved; run `lcm doctor` before retrying."

@@ -13,6 +13,7 @@ import { migrationDryRunEvidence } from "./cli-dry-run.js";
 import type { MigrationApplyOutcome } from "./cli-apply.js";
 import type { MigrationAbortCommandOutcome } from "./cli-abort.js";
 import type { MigrationVerifyCommandOutcome } from "./cli-verify.js";
+import type { MigrationResumeCommandOutcome } from "./cli-resume.js";
 import { MIGRATION_UNEXPECTED_FAILURE_REASON, unexpectedFailureEvidence } from "./boundary.js";
 
 /**
@@ -200,6 +201,27 @@ export function renderMigrationVerifyEnvelope(outcome: MigrationVerifyCommandOut
   }
   return okEnvelope({
     command: "verify",
+    applied: outcome.applied,
+    generation: outcome.generationId,
+    manifestPhase: outcome.manifestPhase,
+    next: outcome.next,
+    evidence: outcome.evidence,
+  });
+}
+
+export function renderMigrationResumeEnvelope(outcome: MigrationResumeCommandOutcome): MigrationEnvelope {
+  if (outcome.status === "refuse") {
+    return refusalEnvelope({
+      command: "resume",
+      reason: outcome.reason,
+      evidenceDetail: outcome.evidence,
+      applied: outcome.applied ?? false,
+      generation: outcome.generationId,
+      next: outcome.next,
+    });
+  }
+  return okEnvelope({
+    command: "resume",
     applied: outcome.applied,
     generation: outcome.generationId,
     manifestPhase: outcome.manifestPhase,

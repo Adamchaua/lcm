@@ -5,6 +5,7 @@ import {
   renderMigrationApplyEnvelope,
   renderMigrationAbortEnvelope,
   renderMigrationVerifyEnvelope,
+  renderMigrationResumeEnvelope,
   renderMigrationUnexpectedFailureEnvelope,
 } from "../../src/migration/cli-render.js";
 import { migrationExitClassForName } from "../../src/migration/exit-classes.js";
@@ -256,6 +257,38 @@ describe("renderMigrationVerifyEnvelope", () => {
 
   it("reports applied:true on a refusal that followed a durable write", () => {
     expect(renderMigrationVerifyEnvelope({ status: "refuse", reason: "verify-readback-mismatch", applied: true }).applied).toBe(true);
+  });
+});
+
+describe("renderMigrationResumeEnvelope", () => {
+  it("builds an ok envelope for a completed cell", () => {
+    expect(renderMigrationResumeEnvelope({
+      status: "ok", generationId: "gen-1", manifestPhase: "dry-run-verified", applied: true, next: "resume", evidence: { cell: 19 },
+    })).toMatchObject({ command: "resume", outcome: "ok", exitCode: 0, generation: "gen-1", manifestPhase: "dry-run-verified", applied: true, next: "resume", evidence: { cell: 19 } });
+  });
+
+  it("builds a route-only dry-run envelope that is not applied and predicts nothing", () => {
+    const envelope = renderMigrationResumeEnvelope({
+      status: "ok", generationId: "gen-1", manifestPhase: "planned", applied: false, next: "resume (drop --dry-run to run this cell)",
+      evidence: { cell: 19, primary: "resume", predictive: false, coordinationEffects: "none" },
+    });
+    expect(envelope).toMatchObject({ exitCode: 0, applied: false, evidence: { predictive: false, coordinationEffects: "none" } });
+  });
+
+  it.each([
+    ["route-requires-activation", 7],
+    ["route-requires-rollback", 7],
+    ["genesis-dry-run-effect-mismatch", 5],
+    ["genesis-dry-run-unexpected-state", 2],
+    ["resume-readback-mismatch", 5],
+    ["copy-failed", 7],
+  ])("maps the refusal %s to exit %i and carries the generation and next", (reason, exit) => {
+    const envelope = renderMigrationResumeEnvelope({ status: "refuse", reason, generationId: "gen-1", next: "activate" });
+    expect(envelope).toMatchObject({ exitCode: exit, generation: "gen-1", next: "activate", applied: false });
+  });
+
+  it("reports applied on a refusal that followed a write", () => {
+    expect(renderMigrationResumeEnvelope({ status: "refuse", reason: "copy-failed", applied: true }).applied).toBe(true);
   });
 });
 

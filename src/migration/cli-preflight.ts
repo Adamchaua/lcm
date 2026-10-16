@@ -293,7 +293,13 @@ export type MigrationExpectedIdentityResult =
  *   exit 5; neither is created.
  */
 export async function resolveMigrationExpectedIdentity(input: Readonly<{
-  preflight: Extract<MigrationPreflightResult, { status: "ready" }>;
+  /**
+   * What the identity step reads of a preflight: the target, the machine and
+   * the disposition. `resume` has no candidate to resolve and passes the
+   * held disposition directly.
+   */
+  preflight: Pick<Extract<MigrationPreflightResult, { status: "ready" }>, "targetConfig" | "machineId">
+    & Readonly<{ candidate: Pick<Extract<MigrationPreflightResult, { status: "ready" }>["candidate"], "disposition"> }>;
   cwd: string;
   homeDir: string;
   /** @internal Deterministic failure-injection seam for tests only. */

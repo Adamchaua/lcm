@@ -52,6 +52,8 @@ const REASONS_APPLY_GENESIS_COPY_TS_CAN_EMIT = [
   "genesis-create-failed",
   "genesis-dry-run-begin-failed",
   "genesis-dry-run-complete-failed",
+  "genesis-dry-run-effect-mismatch",
+  "genesis-dry-run-unexpected-state",
   "copy-failed",
 ];
 

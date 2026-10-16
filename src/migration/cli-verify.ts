@@ -139,6 +139,47 @@ function readVerifiedEvidence(
   }
 }
 
+/**
+ * Router row 23, shared by `verify` (its own cell) and `resume` (which is
+ * allowed there): finish the pending verify-generation effect from persisted
+ * evidence and read the result back before reporting it.
+ */
+export function completePendingVerificationCell(input: Readonly<{
+  homeDir: string;
+  generationId: string;
+  manifestStore: MigrationManifestStore;
+  reportStore: MigrationVerificationReportStore;
+  completePending: typeof completePendingMigrationVerification;
+}>): MigrationVerifyCommandOutcome {
+  const { generationId } = input;
+  let completed;
+  try {
+    completed = input.completePending({ homeDir: input.homeDir, generationId });
+  } catch (error) {
+    if (error instanceof MigrationVerificationDriverError && DRIVER_REASONS.has(error.reason)) {
+      return { status: "refuse", reason: `verify-${error.reason}`, generationId };
+    }
+    if (error instanceof MigrationProtocolError) {
+      return persistedEvidenceRefusal(generationId, "manifest-unresolvable", `manifest-${error.reason}`);
+    }
+    if (error instanceof MigrationVerificationStoreError) {
+      return persistedEvidenceRefusal(generationId, "verify-report-unresolvable", `report-${error.reason}`);
+    }
+    throw error;
+  }
+  if (completed === null) {
+    // The router saw a pending verify-generation effect a moment ago and
+    // the driver does not: the manifest moved underneath this command.
+    return persistedEvidenceRefusal(generationId, "verify-readback-mismatch", "pending-effect-moved");
+  }
+  const confirmed = readVerifiedEvidence(generationId, input.manifestStore, input.reportStore, completed.report.reportSha256);
+  if (confirmed.status !== "verified") return { ...confirmed, applied: true };
+  return {
+    status: "ok", generationId, manifestPhase: "verified", applied: true, next: "report",
+    evidence: { ...confirmed.evidence, cell: 23, coordinationEffects: "none" },
+  };
+}
+
 async function runMigrationVerifyCommand(input: MigrationVerifyCommandInput): Promise<MigrationVerifyCommandOutcome> {
   const completePending = input._operationsForTesting?.completePending ?? completePendingMigrationVerification;
   const admit = input._operationsForTesting?.admit ?? admitExistingMigrationCommand;
@@ -184,32 +225,7 @@ async function runMigrationVerifyCommand(input: MigrationVerifyCommandInput): Pr
           evidence: { cell: 23, predictive: false, pendingEffect: "verify-generation", coordinationEffects: "none" },
         };
       }
-      let completed;
-      try {
-        completed = completePending({ homeDir: input.homeDir, generationId });
-      } catch (error) {
-        if (error instanceof MigrationVerificationDriverError && DRIVER_REASONS.has(error.reason)) {
-          return { status: "refuse", reason: `verify-${error.reason}`, generationId };
-        }
-        if (error instanceof MigrationProtocolError) {
-          return persistedEvidenceRefusal(generationId, "manifest-unresolvable", `manifest-${error.reason}`);
-        }
-        if (error instanceof MigrationVerificationStoreError) {
-          return persistedEvidenceRefusal(generationId, "verify-report-unresolvable", `report-${error.reason}`);
-        }
-        throw error;
-      }
-      if (completed === null) {
-        // The router saw a pending verify-generation effect a moment ago and
-        // the driver does not: the manifest moved underneath this command.
-        return persistedEvidenceRefusal(generationId, "verify-readback-mismatch", "pending-effect-moved");
-      }
-      const confirmed = readVerifiedEvidence(generationId, manifestStore, reportStore, completed.report.reportSha256);
-      if (confirmed.status !== "verified") return { ...confirmed, applied: true };
-      return {
-        status: "ok", generationId, manifestPhase: "verified", applied: true, next: "report",
-        evidence: { ...confirmed.evidence, cell: 23, coordinationEffects: "none" },
-      };
+      return completePendingVerificationCell({ homeDir: input.homeDir, generationId, manifestStore, reportStore, completePending });
     }
 
     default:
