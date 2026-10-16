@@ -17,8 +17,14 @@ rationale: >-
   writing read seam), extends the coverage module with the G8 stored-data
   inventory and single-project verdict, attributes pid-file read failures
   in the restart check, adds the transfer-ledger copy-binding reader, and
-  adjusts the report body and generation link.
+  adjusts the report body and generation link. The publication step gains
+  the plan-v7.1 version-2 dispatch table (one controlled pre-seal abort and
+  re-prepare, sealed-material comparison, release-tail and abort-family
+  rows without a fence precheck); backend-publication.ts only exports its
+  existing material serialization for that byte comparison and stays in
+  its own storage owner (unit-storage-abstractions).
 pins:
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
   - ["src/migration/copy-binding-reader.ts", "unit-migration-cutover"]
   - ["src/migration/project-map-witness.ts", "unit-migration-cutover"]
   - ["src/migration/activation-coverage.ts", "unit-migration-cutover"]
