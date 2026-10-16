@@ -680,6 +680,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         exactFileScheme &&
         foundFilePath &&
         char === "/" &&
+        nestedPublicUrlBracketDepth === 0 &&
         isPathWord(chars[index + 1]) &&
         (chars[index - 1] === "&" || (chars[index - 1] === "?" && chars[index - 2] === "&"))
       ) {
