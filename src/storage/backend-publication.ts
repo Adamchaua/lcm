@@ -1456,6 +1456,17 @@ export function readBackendPublicationJournal(homeDir?: string): BackendPublicat
   return readJournal(homeDir);
 }
 
+/**
+ * Read the v2 journal with the consumer's evidence rules: `null` only when
+ * the publication directory is confirmed absent. An existing directory
+ * without `journal.json` fails with `publication-evidence-missing` (empty,
+ * history-only or recognized residue) or `unsafe-storage` (unknown residue).
+ * Never creates the directory.
+ */
+export function readBackendPublicationJournalForConsumer(homeDir?: string): BackendPublicationJournal | null {
+  return readPublicationJournalForConsumer(homeDir);
+}
+
 /** Read the exact v3 migration-maintenance record without accepting v2 data. */
 export function readBackendMaintenanceJournal(homeDir?: string): BackendMaintenanceJournal | null {
   return withBackendPublicationDirectoryRead(

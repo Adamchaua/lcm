@@ -49,6 +49,7 @@ class Database {
   queryLog: string[] = [];
   beforeQuery?: (config: QueryConfig) => void | Promise<void>;
   safety: Row[] = [{ tls: true, version: 180000, encoding: 'UTF8' }];
+  systemIdentifier: Row[] = [{ system_identifier: '7123456789' }];
   binding: Row[] = [{ project_id: SHARED_PROJECT_UUID }];
   machines: Row[] = [{ machine_id: MACHINE_A_UUID, identity_key: 'installation:0b7715' }];
   lock = true;
@@ -95,6 +96,7 @@ class Database {
       if (text.includes('FROM lcm.passive_event_inbox r')) return result([{ conflict: foreign.some(row => row.table === 'passive_event_inbox' && row.identity_key === values[1] && (row.event_id === values[2] || row.machine_sequence === values[3])) }]);
     }
     if (text.includes("current_setting('server_version_num')")) return result(this.safety);
+    if (text.includes('pg_control_system()')) return result(this.systemIdentifier);
     if (text.includes('pg_try_advisory_lock')) return result([{ held: this.lock }]);
     // Completion fences the project against canonical writers before reading.
     if (text.includes('pg_advisory_xact_lock')) return result([{}]);
@@ -1172,6 +1174,7 @@ it('probes a target without holding the transfer session lock before opening a w
   const api = await import('../../src/storage/postgresql/portable-destination.js');
   const probe = await api.probePostgreSqlPortableDestination(input);
   expect(probe).toMatchObject({ destinationWitnessSha256: 'f'.repeat(64), nonIdentityDomainsEmpty: true, existingRun: null });
+  expect(probe.systemIdentifier).toBe('7123456789');
   expect(db.queryLog.some(sql=>sql.includes('pg_try_advisory_lock'))).toBe(false);
   await open();
 });
@@ -1285,12 +1288,14 @@ it('refuses an unreadable ledger tally without trusting it',async()=>{
  expect(db.run?.state).toBe('active');
  await db.query({text:'ROLLBACK'});
 });
-it.each(['missing','tls','version','encoding','close','primary-close'] as const)('fails a read-only target probe safely on %s',async fault=>{
+it.each(['missing','tls','version','encoding','close','primary-close','system-identifier','system-identifier-missing'] as const)('fails a read-only target probe safely on %s',async fault=>{
  boundaries.runtime.mockReturnValue({query:db.query.bind(db),transaction:async(fn:(executor:unknown)=>unknown)=>fn({query:db.query.bind(db)}),close:async()=>{if(fault.includes('close'))throw new Error('private close');}});
  if(fault==='missing')db.safety=[];
  if(fault==='tls')db.safety[0]!.tls=false;
  if(fault==='version')db.safety[0]!.version=170000;
  if(fault==='encoding')db.safety[0]!.encoding='LATIN1';
+ if(fault==='system-identifier')db.systemIdentifier=[{system_identifier:'0x1f'}];
+ if(fault==='system-identifier-missing')db.systemIdentifier=[];
  if(fault==='primary-close')boundaries.schema.mockRejectedValue(new PortableTransferError('source-failed'));
  const api=await import('../../src/storage/postgresql/portable-destination.js');
  await expect(api.probePostgreSqlPortableDestination(input)).rejects.toMatchObject({code:fault==='close'?'close-failed':fault==='primary-close'?'source-failed':'destination-conflict'});

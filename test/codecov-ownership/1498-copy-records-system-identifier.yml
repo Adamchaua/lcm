@@ -1,0 +1,11 @@
+references: ["#1498"]
+rationale: >-
+  #1498 records the destination system identifier in the copy's destination
+  witness (probe, protocol, binding) and verifies the live value against the
+  manifest-recorded one; every file keeps its established owner.
+pins:
+  - ["src/migration/copy-source.ts", "unit-migration-cutover"]
+  - ["src/migration/protocol.ts", "unit-migration-cutover"]
+  - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/witness-audit.ts", "unit-migration-cutover"]
+  - ["src/storage/postgresql/portable-destination.ts", "integration-postgresql-portable"]

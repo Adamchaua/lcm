@@ -676,6 +676,8 @@ export async function createPostgreSqlPortableDestination(input:PostgreSqlPortab
 export type PostgreSqlPortableDestinationProbe = Readonly<{
   destinationWitnessSha256:string;
   identityFingerprintSha256:string;
+  /** pg_control_system()'s system_identifier of the probed cluster, as a canonical decimal string. */
+  systemIdentifier:string;
   nonIdentityDomainsEmpty:boolean;
   existingRun:null|Readonly<{runId:string;targetGenerationId:string;manifestSha256:string;projectFingerprintSha256:string;state:'active'|'completed'}>;
 }>;
@@ -690,6 +692,8 @@ export async function probePostgreSqlPortableDestination(input:Pick<PostgreSqlPo
       const safety=await executor.query({text:"SELECT current_setting('server_version_num')::int AS version,current_setting('server_encoding') AS encoding,s.ssl AS tls FROM pg_catalog.pg_stat_ssl s WHERE s.pid=pg_backend_pid()"},options(state,input.signal));
       if(safety.rows[0]?.tls!==true||Math.floor(Number(safety.rows[0]?.version)/10000)!==18||safety.rows[0]?.encoding!=='UTF8')fail('destination-conflict');
       const destinationWitnessSha256=await readPostgreSqlPortableWitness(executor,input.expectedIdentity.id,input.signal);
+      const systemIdentifier=(await executor.query<{system_identifier:unknown}>({text:'SELECT system_identifier::text AS system_identifier FROM pg_catalog.pg_control_system()'},options(state,input.signal))).rows[0]?.system_identifier;
+      if(typeof systemIdentifier!=='string'||!/^(0|[1-9][0-9]{0,19})$/u.test(systemIdentifier))fail('destination-conflict');
       const identityFingerprintSha256=await readIdentityFingerprint(state,input.signal);
       let nonIdentityDomainsEmpty=true;
       for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.filter(domain=>!(IDENTITY_DOMAINS as readonly string[]).includes(domain))){
@@ -699,7 +703,7 @@ export async function probePostgreSqlPortableDestination(input:Pick<PostgreSqlPo
       if(row&&(!/^[A-Za-z0-9_-]{1,128}$/u.test(row.run_id)||!/^[A-Za-z0-9_-]{1,128}$/u.test(row.target_generation)
         || !/^[a-f0-9]{64}$/u.test(row.manifest_sha256)||row.project_sha256!==identityFingerprintSha256
         ||(row.state!=='active'&&row.state!=='completed')))fail('destination-conflict');
-      return {destinationWitnessSha256,identityFingerprintSha256,nonIdentityDomainsEmpty,existingRun:row?{
+      return {destinationWitnessSha256,identityFingerprintSha256,systemIdentifier,nonIdentityDomainsEmpty,existingRun:row?{
         runId:row.run_id,targetGenerationId:row.target_generation,manifestSha256:row.manifest_sha256,
         projectFingerprintSha256:row.project_sha256,state:row.state as 'active'|'completed'}:null};
     },{domain:'factory',operation:'probePortableDestination',projectId:input.expectedIdentity.id,transactionMode:'read-committed-read-write',signal:input.signal});

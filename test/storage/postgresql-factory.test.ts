@@ -11,6 +11,7 @@ import {
   backendPublicationMaterialWitness,
   captureBackendPublicationState,
   readBackendPublicationJournal,
+  readBackendPublicationJournalForConsumer,
 } from "../../src/storage/backend-publication.js";
 import type {
   BackendPublicationJournal,
@@ -32,6 +33,7 @@ import {
   createPostgreSqlStorageBackendFactoryForTesting,
   createPostgreSqlStorageBackendFactoryWithHome,
   capturePublicationWitnessOutcome,
+  DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES,
   FactorySignalExecutor,
   type PostgreSqlFactoryDependencies,
 } from "../../src/storage/postgresql/factory.js";
@@ -1449,7 +1451,7 @@ describe("publication witness classification against real publication state", ()
       ...harness().dependencies,
       withClassificationLock: withStorageBackendClassificationLockAsync,
       assertPublication: assertStorageBackendPublication,
-      readJournal: readBackendPublicationJournal,
+      readJournal: readBackendPublicationJournalForConsumer,
       captureState: captureBackendPublicationState,
     };
   }
@@ -1515,13 +1517,57 @@ describe("publication witness classification against real publication state", ()
     });
   }
 
-  it("reports an empty journal slot as absent through the classification lock", async () => {
+  it("reports a confirmed-absent publication directory as absent without creating it", async () => {
     const home = makeHome();
     await expect(capturePublicationWitnessOutcome(realDependencies(), home))
       .resolves.toEqual({ status: "absent" });
-    expect(existsSync(join(home, ".lcm", "backend-publication", "journal.json"))).toBe(false);
+    expect(existsSync(join(home, ".lcm", "backend-publication"))).toBe(false);
     await expect(withStorageBackendClassificationLockAsync(home, async () => "ran"))
       .resolves.toBe("ran");
+  });
+
+  it("classifies a journal-less publication directory as unresolvable with the production default dependencies", async () => {
+    const empty = makeHome();
+    mkdirSync(join(empty, ".lcm", "backend-publication"), { mode: 0o700 });
+    await expect(capturePublicationWitnessOutcome(DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES, empty))
+      .resolves.toMatchObject({
+        status: "unresolvable",
+        cause: { name: "BackendPublicationJournalError", reason: "publication-evidence-missing" },
+      });
+  });
+
+  it("reports an existing journal-less publication directory as unresolvable evidence", async () => {
+    const empty = makeHome();
+    const emptyDirectory = join(empty, ".lcm", "backend-publication");
+    mkdirSync(emptyDirectory, { mode: 0o700 });
+    await expect(capturePublicationWitnessOutcome(realDependencies(), empty))
+      .resolves.toMatchObject({
+        status: "unresolvable",
+        cause: {
+          name: "BackendPublicationJournalError",
+          reason: "publication-evidence-missing",
+        },
+      });
+    expect(readdirSync(emptyDirectory)).toEqual([]);
+
+    const historyOnly = makeHome();
+    const historyDirectory = join(historyOnly, ".lcm", "backend-publication");
+    mkdirSync(join(historyDirectory, "history"), { recursive: true, mode: 0o700 });
+    await expect(capturePublicationWitnessOutcome(realDependencies(), historyOnly))
+      .resolves.toMatchObject({
+        status: "unresolvable",
+        cause: { reason: "publication-evidence-missing" },
+      });
+
+    const unknown = makeHome();
+    const unknownDirectory = join(unknown, ".lcm", "backend-publication");
+    mkdirSync(unknownDirectory, { mode: 0o700 });
+    writeFileSync(join(unknownDirectory, "unexpected"), "residue", { mode: 0o600 });
+    await expect(capturePublicationWitnessOutcome(realDependencies(), unknown))
+      .resolves.toMatchObject({
+        status: "unresolvable",
+        cause: { reason: "unsafe-storage" },
+      });
   });
 
   it("reports a non-terminal or wrong-target v2 journal as mismatch", async () => {

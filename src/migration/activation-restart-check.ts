@@ -86,15 +86,15 @@ export type ActivationRestartCheckDependencies = Readonly<{
 const MAX_PID_FILE_BYTES = 32;
 const DEFAULT_HEALTH_TIMEOUT_MS = 2_000;
 
-function isPositiveInteger(value: number): boolean {
-  return Number.isInteger(value) && value > 0;
-}
+const CANONICAL_PID = /^[1-9][0-9]*$/u;
 
 /**
  * Read a pid file through the repository's bounded, no-follow file reader
  * (the same defense used for the daemon's own publication-config reads).
- * Returns `null` for a missing file or content that does not name a
- * positive integer pid; any other read failure propagates.
+ * Returns `null` for a missing file or content that is not, after
+ * trimming surrounding whitespace, exactly a canonical positive decimal
+ * pid (no sign, leading zero, fraction, exponent or trailing text) within
+ * the safe-integer range; any other read failure propagates.
  */
 function defaultReadPidFile(pidFilePath: string): number | null {
   let content: string;
@@ -107,8 +107,10 @@ function defaultReadPidFile(pidFilePath: string): number | null {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
-  const pid = Number.parseInt(content.trim(), 10);
-  return isPositiveInteger(pid) ? pid : null;
+  const text = content.trim();
+  if (!CANONICAL_PID.test(text)) return null;
+  const pid = Number(text);
+  return Number.isSafeInteger(pid) ? pid : null;
 }
 
 function defaultIsProcessAlive(

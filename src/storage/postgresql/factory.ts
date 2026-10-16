@@ -7,7 +7,7 @@ import { normalizeProjectPath } from "../../project-map.js";
 import {
   backendPublicationCanonicalSha256,
   captureBackendPublicationState,
-  readBackendPublicationJournal,
+  readBackendPublicationJournalForConsumer,
   type BackendPublicationLockToken,
 } from "../backend-publication.js";
 import {
@@ -87,18 +87,18 @@ export interface PostgreSqlFactoryDependencies {
     selection: { backend: "postgresql"; homeDir?: string },
     token?: BackendPublicationLockToken,
   ): void;
-  readJournal(homeDir?: string): ReturnType<typeof readBackendPublicationJournal>;
+  readJournal(homeDir?: string): ReturnType<typeof readBackendPublicationJournalForConsumer>;
   captureState(homeDir?: string): ReturnType<typeof captureBackendPublicationState>;
   normalizePath(path: string): string;
 }
 
-const DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES: PostgreSqlFactoryDependencies = {
+export const DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES: PostgreSqlFactoryDependencies = {
   createRuntime: (settings) => new PostgreSqlRuntime(settings),
   verifyRuntimeSchema: verifyPostgreSqlRuntimeSchema,
   withConsumerLock: withStorageBackendConsumerLockAsync,
   withClassificationLock: withStorageBackendClassificationLockAsync,
   assertPublication: assertStorageBackendPublication,
-  readJournal: readBackendPublicationJournal,
+  readJournal: readBackendPublicationJournalForConsumer,
   captureState: captureBackendPublicationState,
   normalizePath: normalizeProjectPath,
 };
@@ -118,15 +118,16 @@ type PublicationWitness = Readonly<{
  * the non-present outcomes are reachable with the real dependencies. Only
  * `present` has passed strict admission.
  *
- * - `absent`: the journal slot is empty (no `journal.json`, including a
- *   directory that holds only history residue).
+ * - `absent`: the backend-publication directory itself does not exist.
  * - `mismatch`: a decodable version-2 journal that is not completed or does
  *   not target PostgreSQL. `targetBackend` is the journal's recorded target,
  *   not an admission decision.
  * - `unresolvable`: the state could not be determined or admitted, with its
- *   cause carried. This includes any version-3 maintenance `journal.json`
- *   (held or terminal) and a completed PostgreSQL journal that fails strict
- *   admission.
+ *   cause carried. This includes an existing publication directory without
+ *   `journal.json` (`publication-evidence-missing` for an empty, history-only
+ *   or recognized-residue directory, `unsafe-storage` for unknown residue),
+ *   any version-3 maintenance `journal.json` (held or terminal) and a
+ *   completed PostgreSQL journal that fails strict admission.
  *
  * A caller that must refuse safely needs to know which one it received.
  */
