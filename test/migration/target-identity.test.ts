@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { resolveMigrationTargetProjectId } from "../../src/migration/target-identity.js";
+import { lookupMigrationTargetProjectId, resolveMigrationTargetProjectId } from "../../src/migration/target-identity.js";
 import { PostgreSqlIdentityConflictError } from "../../src/storage/postgresql/identity-repository.js";
 import { normalizeProjectPath, normalizeProjectIdentityPath } from "../../src/project-map.js";
 import { localProjectIdentity } from "../../src/daemon/project.js";
@@ -16,6 +16,30 @@ function repositoryStub(overrides: { resolveProject?: unknown; createProject?: u
     createProject: overrides.createProject ?? vi.fn(),
   } as never;
 }
+
+describe("lookupMigrationTargetProjectId: SELECT only, never creates", () => {
+  it("returns the bound project id at the normalized alias key and never calls createProject", async () => {
+    const createProject = vi.fn();
+    const resolveProject = vi.fn(async () => ({ projectId: "project-1", alias: {} as never }));
+    const result = await lookupMigrationTargetProjectId({
+      repository: repositoryStub({ resolveProject, createProject }),
+      machineId: MACHINE_ID, authorityCanonicalPath: "/tmp/project",
+    });
+    expect(result).toBe("project-1");
+    expect(resolveProject).toHaveBeenCalledWith(MACHINE_ID, normalizeProjectPath("/tmp/project"));
+    expect(createProject).not.toHaveBeenCalled();
+  });
+
+  it("returns null for an absent key without minting one", async () => {
+    const createProject = vi.fn();
+    const result = await lookupMigrationTargetProjectId({
+      repository: repositoryStub({ resolveProject: vi.fn(async () => null), createProject }),
+      machineId: MACHINE_ID, authorityCanonicalPath: "/tmp/project",
+    });
+    expect(result).toBeNull();
+    expect(createProject).not.toHaveBeenCalled();
+  });
+});
 
 describe("resolveMigrationTargetProjectId", () => {
   it("resolves via the fast path when the (machineId, normalizedPath) key already has a bound project -- never calling createProject", async () => {

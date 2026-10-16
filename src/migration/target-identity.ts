@@ -109,6 +109,26 @@ import { normalizeProjectPath } from "../project-map.js";
  * specify, not something to fabricate here.
  */
 
+/**
+ * The SELECT-only half of the resolution above (plan-v5 Part B (3), preview
+ * and held paths): the destination project id at the alias key, or `null`
+ * when none exists. It never inserts, so `plan`, `apply --dry-run` and a
+ * held continuation cannot create a PostgreSQL project or alias row. The same
+ * input constraint applies: `authorityCanonicalPath` is the local identity's
+ * canonical path, never a raw cwd.
+ */
+export async function lookupMigrationTargetProjectId(input: Readonly<{
+  repository: PostgreSqlIdentityRepository;
+  machineId: string;
+  authorityCanonicalPath: string;
+}>): Promise<string | null> {
+  const existing = await input.repository.resolveProject(
+    input.machineId,
+    normalizeProjectPath(input.authorityCanonicalPath),
+  );
+  return existing === null ? null : existing.projectId;
+}
+
 export type MigrationTargetIdentityResolution =
   | Readonly<{ status: "resolved"; projectId: string }>
   | Readonly<{ status: "refuse"; reason: "migration-target-identity-unresolvable"; evidence?: string }>;

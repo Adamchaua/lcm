@@ -8,6 +8,7 @@ import {
   projectMapPath,
   readProjectMapIdentity,
   readProjectMapSnapshot,
+  resolveProjectIdentity,
   UnauthenticatedProjectIdentityError,
 } from "../src/project-map.js";
 import { BackendPublicationCoordinator, type BackendPublicationDriver } from "../src/storage/backend-publication.js";
@@ -99,5 +100,23 @@ describe("readProjectMapIdentity (plan-v5 Part B (3): the held-safe local identi
     const f = fixture();
     writeFileSync(projectMapPath(f.homeDir), "{ not json", { mode: 0o600 });
     expect(() => readProjectMapIdentity({ homeDir: f.homeDir, cwd: f.cwd })).toThrow();
+  });
+});
+
+describe("resolveProjectIdentity with an explicit homeDir (the fresh-mint step of plan-v5 Part B (3))", () => {
+  it("mints the entry into that home's map, and the held-safe reader then returns exactly what it minted", () => {
+    const f = fixture();
+    const minted = resolveProjectIdentity(f.cwd, { homeDir: f.homeDir });
+    expect(minted).toEqual({ id: f.hash, canonical: f.canonical });
+    expect(JSON.parse(readFileSync(projectMapPath(f.homeDir), "utf8"))[f.hash]).toMatchObject({ canonical: f.canonical });
+    expect(readProjectMapIdentity({ homeDir: f.homeDir, cwd: f.cwd })).toEqual(minted);
+  });
+
+  it("returns an existing entry from that home without rewriting the map", () => {
+    const f = fixture();
+    writeMap(f.homeDir, { [f.hash]: { canonical: f.canonical, aliases: [] } });
+    const before = snapshotOfHome(f.homeDir);
+    expect(resolveProjectIdentity(f.cwd, { homeDir: f.homeDir })).toEqual({ id: f.hash, canonical: f.canonical });
+    expect(snapshotOfHome(f.homeDir)).toBe(before);
   });
 });

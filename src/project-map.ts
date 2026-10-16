@@ -1573,10 +1573,13 @@ function resolveProjectIdentityUnlocked(
     readonly _beforeMissingIdentityLockForTesting?: () => void;
     /** @internal Resolve against metadata backfill without publishing it. */
     readonly _suppressMetadataBackfill?: boolean;
+    /** The LCM home whose map is read and written. Omitted means the ambient home. */
+    readonly homeDir?: string;
   } = {},
   publicationLockToken?: BackendPublicationLockToken,
 ): ProjectIdentity {
   const map = loadProjectMapWithMetadata({
+    homeDir: opts.homeDir,
     _suppressMetadataBackfill: opts._suppressMetadataBackfill,
     _beforeMetadataLockForTesting: opts._beforeMetadataLockForTesting,
     _beforeMetadataMutationLockForTesting: opts._beforeMetadataMutationLockForTesting,
@@ -1585,7 +1588,7 @@ function resolveProjectIdentityUnlocked(
   const gitAnchor = resolveGitProjectAnchor(cwd);
   const lookupPath = gitAnchor?.canonical ?? cwd;
   const normalized = gitAnchor?.canonical ?? normalizeProjectPath(cwd);
-  const existing = identityForMatches(map, lookupPath, normalized);
+  const existing = identityForMatches(map, lookupPath, normalized, opts.homeDir);
   if (existing) return existing;
 
   const createMissingIdentity = (): ProjectIdentity => {
@@ -1595,6 +1598,7 @@ function resolveProjectIdentityUnlocked(
       current = loadProjectMapWithMetadata({
         strict: true,
         reload: true,
+        homeDir: opts.homeDir,
         _suppressMetadataBackfill: opts._suppressMetadataBackfill,
         _publicationLockToken: publicationLockToken,
       });
@@ -1607,24 +1611,24 @@ function resolveProjectIdentityUnlocked(
     // Preserve a known-good in-memory snapshot when the file disappeared
     // between the optimistic read and the locked reload. A genuinely fresh
     // bootstrap has an empty snapshot and follows this same path.
-    if (!existsSync(projectMapPath())) current = map;
-    const raced = identityForMatches(current, lookupPath, normalized);
+    if (!existsSync(projectMapPath(opts.homeDir))) current = map;
+    const raced = identityForMatches(current, lookupPath, normalized, opts.homeDir);
     if (raced) return raced;
     const id = hashProjectPath(normalized);
     current[id] ??= { canonical: normalized, aliases: [] };
-    writeProjectMap(current, undefined, { metadataPopulated: true });
+    writeProjectMap(current, opts.homeDir, { metadataPopulated: true });
     return {
       id,
       canonical: resolve(current[id].canonical),
       ...(current[id].remoteProjectId ? { remoteProjectId: current[id].remoteProjectId } : {}),
     };
   };
-  if (activeProjectMapMutationLocks.has(projectMapMutationLockPath())) {
+  if (activeProjectMapMutationLocks.has(projectMapMutationLockPath(opts.homeDir))) {
     return createMissingIdentity();
   }
   return withProjectMapMutationLock(
     () => createMissingIdentity(),
-    undefined,
+    opts.homeDir,
     undefined,
     publicationLockToken,
   );
@@ -1639,6 +1643,8 @@ export function resolveProjectIdentity(
     readonly _beforeMissingIdentityLockForTesting?: () => void;
     /** @internal Token held by a caller that already has publication admission. */
     readonly _publicationLockToken?: BackendPublicationLockToken;
+    /** The LCM home whose map is read and written. Omitted means the ambient home. */
+    readonly homeDir?: string;
   } = {},
 ): ProjectIdentity {
   // These hooks model another process winning the race before this consumer
@@ -1657,7 +1663,7 @@ export function resolveProjectIdentity(
     return resolveWithToken(opts._publicationLockToken);
   }
   return withBackendPublicationConsumerLock(
-    undefined,
+    opts.homeDir,
     resolveWithToken,
   );
 }
