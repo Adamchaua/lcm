@@ -587,6 +587,16 @@ describe("completePendingMigrationAbort (owner ruling R10: completes the begun a
     expect(completed.updatedAt).toBe(uninterrupted.updatedAt);
   });
 
+  it("dryRun makes every check and stops before the completing write, leaving the manifest byte-identical", async () => {
+    const { home, store, aborted } = await crashedAfterBegin();
+    const before = store.read("generation-1").checksumSha256;
+    expect(completePendingMigrationAbort({ homeDir: home, journal: aborted, manifestStore: store, dryRun: true })).toEqual({ status: "dry-run" });
+    expect(store.read("generation-1").checksumSha256).toBe(before);
+    const other = { ...aborted, checksumSha256: "d".repeat(64) } as BackendMaintenanceJournal;
+    expect(completePendingMigrationAbort({ homeDir: home, journal: other, manifestStore: store, dryRun: true }))
+      .toEqual({ status: "refuse", evidence: "carried-effect-mismatch", mutated: false });
+  });
+
   it("is a refusal, not a repeat, once nothing is pending: it writes nothing", async () => {
     const { home, store, aborted } = await crashedAfterBegin();
     completePendingMigrationAbort({ homeDir: home, journal: aborted, manifestStore: store });

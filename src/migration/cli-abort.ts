@@ -7,9 +7,12 @@ import {
 } from "../storage/backend-publication.js";
 import { observeMigrationMaintenanceJournal } from "./journal-observation.js";
 import {
+  completePendingMigrationAbort,
   performMigrationAbort,
   classifyMigrationAbortRefusal,
 } from "./abort.js";
+import { admitExistingMigrationCommand, refuseUnlessConfirmed } from "./cli-existing.js";
+import type { ExistingGenerationInput } from "./existing-generation.js";
 import { MigrationManifestStore } from "./manifest-store.js";
 import { classifyMigrationRecovery, MigrationProtocolError } from "./protocol.js";
 import { maintenanceOnlyDriver } from "./apply.js";
@@ -50,12 +53,16 @@ export type MigrationAbortCommandOutcome =
     generationId?: string;
     /** Present (true) only when a durable write preceded this refusal (round-1 A-2). */
     applied?: true;
+    /** The command the router names as the way forward, when it names one. */
+    next?: string | null;
   }>;
 
 export type MigrationAbortCommandOperations = Readonly<{
   observeJournal: typeof observeMigrationMaintenanceJournal;
   performAbort: typeof performMigrationAbort;
   readJournal: typeof readBackendMaintenanceJournal;
+  completePending: typeof completePendingMigrationAbort;
+  admit: typeof admitExistingMigrationCommand;
 }>;
 
 function manifestProtocolEvidence(error: unknown): string {
@@ -70,8 +77,16 @@ export type MigrationAbortCommandInput = Readonly<{
    * live journal's own generation id). Compared before anything is written.
    */
   confirmGenerationId?: string;
+  /**
+   * The explicit `--generation`. Absent means the journal's own generation:
+   * abort acts on the journal, live or already terminal, so an idempotent
+   * repeat needs no flag.
+   */
+  generation?: string;
   /** Run every read and classification, then stop before the first durable write. */
   dryRun?: boolean;
+  /** @internal Test-only seam into the generation resolver. */
+  _resolution?: Pick<ExistingGenerationInput, "manifestStore" | "_operationsForTesting">;
   coordinator?: BackendPublicationCoordinator;
   manifestStore?: MigrationManifestStore;
   now?: Date;
@@ -96,6 +111,8 @@ async function runMigrationAbortCommand(input: MigrationAbortCommandInput): Prom
   const observeJournal = input._operationsForTesting?.observeJournal ?? observeMigrationMaintenanceJournal;
   const performAbort = input._operationsForTesting?.performAbort ?? performMigrationAbort;
   const readJournal = input._operationsForTesting?.readJournal ?? readBackendMaintenanceJournal;
+  const completePending = input._operationsForTesting?.completePending ?? completePendingMigrationAbort;
+  const admit = input._operationsForTesting?.admit ?? admitExistingMigrationCommand;
   const coordinator = input.coordinator
     ?? new BackendPublicationCoordinator({ homeDir: input.homeDir, driver: maintenanceOnlyDriver() });
   const store = input.manifestStore ?? new MigrationManifestStore({ homeDir: input.homeDir });
@@ -115,33 +132,80 @@ async function runMigrationAbortCommand(input: MigrationAbortCommandInput): Prom
 
   const journal: BackendMaintenanceJournal = observation.journal;
 
+  // Plan-v5 Part B (1): the router decides whether abort may act on this
+  // cell. The journal observed above is the one it routes, so the two reads
+  // cannot disagree. Abort acts on the journal, so an omitted --generation
+  // means the journal's own generation, live or already terminal.
+  const admission = await admit({
+    command: "abort",
+    homeDir: input.homeDir,
+    generation: input.generation ?? journal.generationId,
+    resolution: {
+      manifestStore: input._resolution?.manifestStore ?? store,
+      _operationsForTesting: { ...input._resolution?._operationsForTesting, observeJournal: () => observation },
+    },
+  });
+  if (admission.status === "refuse") return admission;
+  const { context } = admission;
+
+  // A terminal journal belongs to the generation that wrote it. A live hold
+  // of another generation is router row 4, where abort is the owner and acts
+  // on that live hold.
+  if (isTerminalBackendMaintenancePhase(journal.phase) && context.generationId !== journal.generationId) {
+    return { status: "refuse", reason: "abort-other-generation", generationId: journal.generationId };
+  }
+
   // Section 9's fence: the token is compared against the generation of the
   // journal this invocation just observed, before any write. A missing and a
   // mismatched token are distinct facts with distinct reasons.
-  if (input.confirmGenerationId === undefined) {
-    return { status: "refuse", reason: "abort-confirmation-missing", generationId: journal.generationId };
-  }
-  if (input.confirmGenerationId !== journal.generationId) {
-    return { status: "refuse", reason: "abort-confirmation-moved", generationId: journal.generationId };
-  }
-
-  const abortEvidenceSha256 = backendPublicationCanonicalSha256({
-    version: 1,
-    kind: "migration-abort-cli-request",
-    generationId: journal.generationId,
-    checksumSha256: journal.checksumSha256,
+  const unconfirmed = refuseUnlessConfirmed({
+    expectedGenerationId: journal.generationId,
+    confirmGenerationId: input.confirmGenerationId,
+    reasons: { missing: "abort-confirmation-missing", moved: "abort-confirmation-moved" },
   });
+  if (unconfirmed !== null) return unconfirmed;
+
+  const readback = (applied: boolean): MigrationAbortCommandOutcome =>
+    readbackSettledAbort({ homeDir: input.homeDir, journal, store, readJournal, applied });
+
+  // Row 5 (owner ruling R8): the journal is already maintenance-aborted and
+  // the manifest is absent or aborted. Abort is a read-only confirmation:
+  // nothing is written, and the settled pair is read back.
+  if (context.route.row === 5) return readback(false);
+
+  // Row 6 (owner ruling R10): the journal is aborted and the manifest carries
+  // the abort effect an earlier run began. Complete that carried effect; the
+  // journal is never aborted a second time.
+  if (context.route.row === 6) {
+    const completion = completePending({
+      homeDir: input.homeDir, journal, manifestStore: store, ...(input.dryRun === true ? { dryRun: true } : {}),
+    });
+    return finishAbort({ result: completion, journal, readback });
+  }
 
   const result = await performAbort({
     homeDir: input.homeDir,
     coordinator,
     journal,
-    abortEvidenceSha256,
+    abortEvidenceSha256: backendPublicationCanonicalSha256({
+      version: 1,
+      kind: "migration-abort-cli-request",
+      generationId: journal.generationId,
+      checksumSha256: journal.checksumSha256,
+    }),
     manifestStore: store,
     now: input.now,
     dryRun: input.dryRun,
   });
+  return finishAbort({ result, journal, readback });
+}
 
+function finishAbort(input: Readonly<{
+  result: Awaited<ReturnType<typeof performMigrationAbort>>;
+  journal: BackendMaintenanceJournal;
+  readback: (applied: boolean) => MigrationAbortCommandOutcome;
+}>): MigrationAbortCommandOutcome {
+  const { result, journal } = input;
   if (result.status === "refuse") {
     const classified = classifyMigrationAbortRefusal(result.evidence);
     return {
@@ -162,18 +226,27 @@ async function runMigrationAbortCommand(input: MigrationAbortCommandInput): Prom
       applied: false,
     };
   }
-
   // Section 5.1's exit-0 postcondition: read back, never trust the
   // operation's own "completed" claim as the readback itself. A readback
   // refusal follows the operation's writes, so it carries their `applied`.
-  const applied = result.mutated;
+  return input.readback(result.mutated);
+}
+
+function readbackSettledAbort(input: Readonly<{
+  homeDir: string;
+  journal: BackendMaintenanceJournal;
+  store: MigrationManifestStore;
+  readJournal: typeof readBackendMaintenanceJournal;
+  applied: boolean;
+}>): MigrationAbortCommandOutcome {
+  const { journal, store, applied } = input;
   const readbackRefusal = (reason: string, evidence?: string): MigrationAbortCommandOutcome => ({
     status: "refuse",
     reason,
     ...(evidence === undefined ? {} : { evidence }),
     ...(applied ? { applied: true as const } : {}),
   });
-  const finalJournal = readJournal(input.homeDir);
+  const finalJournal = input.readJournal(input.homeDir);
   if (finalJournal === null || !isTerminalBackendMaintenancePhase(finalJournal.phase)) {
     return readbackRefusal("abort-readback-mismatch");
   }
@@ -209,3 +282,4 @@ async function runMigrationAbortCommand(input: MigrationAbortCommandInput): Prom
     applied,
   };
 }
+

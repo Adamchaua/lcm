@@ -1,14 +1,27 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { performMigrationAbortCommand } from "../../src/migration/cli-abort.js";
+import { performMigrationAbort } from "../../src/migration/abort.js";
+import {
+  createFixtureManifest,
+  fixtureVerificationReport,
+  heldFixtureJournal,
+  maintenanceCoordinator,
+  makeFixtureHome,
+  removeFixtureHomes,
+  snapshotHome,
+  type FixtureManifestOptions,
+  type FixtureStage,
+} from "./existing-fixtures.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import {
   beginMigrationEffect,
   completeMigrationEffect,
   createMigrationManifest,
   MigrationProtocolError,
+  type MigrationEffectKind,
   type MigrationManifest,
 } from "../../src/migration/protocol.js";
 import {
@@ -18,6 +31,22 @@ import {
   type BackendMaintenanceJournal,
   type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
+
+/**
+ * Every call goes through the router now, which consults the snapshot class.
+ * These fixtures hold a complete snapshot, the state every manifest-bearing
+ * generation is in (a manifest exists only after capture completed).
+ */
+const completeSnapshot = async () => ({ state: "complete" as const, witness: {} as never });
+function abortCommand(input: Parameters<typeof performMigrationAbortCommand>[0]) {
+  return performMigrationAbortCommand({
+    ...input,
+    _resolution: {
+      ...input._resolution,
+      _operationsForTesting: { classifySnapshot: completeSnapshot, ...input._resolution?._operationsForTesting },
+    },
+  });
+}
 
 const roots: string[] = [];
 const MACHINE_ID = "018f0b5d-1234-4abc-8def-1234567890ab";
@@ -74,26 +103,19 @@ describe("performMigrationAbortCommand: real end-to-end paths", () => {
     const home = makeHome();
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
-    const result = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
+    const result = await abortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
     expect(result).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: null, applied: true });
     // Positive control: the real journal really is terminal on disk.
     expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-aborted");
   });
 
-  it("aborts a real held journal with a real, settled (aborted) manifest, reading back the manifest phase from real durable state", async () => {
+  it("aborts a real held journal with a real planned manifest (router row 19), settling the manifest and reading its phase back from real durable state", async () => {
     const home = makeHome();
     const held = await heldJournal(home);
     const store = new MigrationManifestStore({ homeDir: home });
-    let m = store.create(manifest(held.generationId));
-    m = store.update(held.generationId, m.checksumSha256, (current) =>
-      beginMigrationEffect(current, { kind: "abort", effectId: "e1", inputSha256: "a".repeat(64), startedAt: CREATED_AT }));
-    store.update(held.generationId, m.checksumSha256, (current) =>
-      completeMigrationEffect(current, {
-        effectId: "e1", completedAt: CREATED_AT,
-        report: { kind: "abort", reportId: "r1", reportSha256: "b".repeat(64), createdAt: CREATED_AT },
-      }));
+    store.create(manifest(held.generationId));
     const coordinator = coordinatorFor(home);
-    const result = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator, manifestStore: store });
+    const result = await abortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator, manifestStore: store });
     expect(result).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: "aborted", applied: true });
   });
 
@@ -101,8 +123,8 @@ describe("performMigrationAbortCommand: real end-to-end paths", () => {
     const home = makeHome();
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
-    const first = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
-    const second = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
+    const first = await abortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
+    const second = await abortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
     // Same readback, but a repeat finds both writes already made: nothing was applied.
     expect(second).toEqual({ ...first, applied: false });
     expect(first).toMatchObject({ applied: true });
@@ -113,7 +135,7 @@ describe("performMigrationAbortCommand: the boundary catch (round-1 B-4)", () =>
   it("maps an unknown throw from the journal readback to unexpected-failure, reporting applied:true since a write may already have happened", async () => {
     const home = makeHome();
     await heldJournal(home);
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: "generation-1", homeDir: home, coordinator: coordinatorFor(home),
       _operationsForTesting: { readJournal: () => { throw new TypeError("boom with /a/path"); } },
     });
@@ -126,7 +148,7 @@ describe("performMigrationAbortCommand: the boundary catch (round-1 B-4)", () =>
 describe("performMigrationAbortCommand: refusal paths", () => {
   it("refuses publication-occupies-slot when injected observation reports a v2 publication journal", async () => {
     const home = makeHome();
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: "generation-1",
       homeDir: home,
       _operationsForTesting: { observeJournal: () => ({ kind: "publication", publicationId: "publication-1", phase: "preparing" }) },
@@ -136,7 +158,7 @@ describe("performMigrationAbortCommand: refusal paths", () => {
 
   it("refuses journal-unresolvable, carrying the observation's evidence", async () => {
     const home = makeHome();
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: "generation-1",
       homeDir: home,
       _operationsForTesting: { observeJournal: () => ({ kind: "unresolvable", evidence: "journal-checksum-mismatch" }) },
@@ -146,7 +168,7 @@ describe("performMigrationAbortCommand: refusal paths", () => {
 
   it("refuses abort-nothing-to-abort for a real absent journal (no injection: a genuinely fresh home with nothing to abort)", async () => {
     const home = makeHome();
-    const result = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home });
+    const result = await abortCommand({ confirmGenerationId: "generation-1", homeDir: home });
     expect(result).toEqual({ status: "refuse", reason: "abort-nothing-to-abort" });
   });
 
@@ -154,7 +176,7 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const home = makeHome();
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
@@ -170,7 +192,7 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const home = makeHome();
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
@@ -187,7 +209,7 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const home = makeHome();
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
@@ -205,16 +227,18 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const held = await heldJournal(home);
     const coordinator = coordinatorFor(home);
     // Real abort first, so the journal is genuinely terminal on disk.
-    const real = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
+    const real = await abortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
     expect(real.status).toBe("ok");
     const unresolvableStore = {
       probeManifestPresence: () => ({ status: "unresolvable" as const, reason: "internal-error" }),
     } as unknown as MigrationManifestStore;
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
       manifestStore: unresolvableStore,
+      // The router reads the real (absent) manifest; only the read-back sees the injected store.
+      _resolution: { manifestStore: new MigrationManifestStore({ homeDir: home }) },
       _operationsForTesting: {
         observeJournal: () => ({ kind: "hold", journal: held }),
         performAbort: async () => ({ status: "completed", mutated: true }),
@@ -229,17 +253,19 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const store = new MigrationManifestStore({ homeDir: home });
     store.create(manifest(held.generationId));
     const coordinator = coordinatorFor(home);
-    const real = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator, manifestStore: store });
+    const real = await abortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator, manifestStore: store });
     expect(real.status).toBe("ok");
     const throwingStore = {
       probeManifestPresence: () => store.probeManifestPresence(held.generationId),
       read: () => { throw new MigrationProtocolError("checksum-mismatch", "test"); },
     } as unknown as MigrationManifestStore;
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
       manifestStore: throwingStore,
+      // The router sees the planned manifest the held journal implies; only the read-back sees the injected store.
+      _resolution: { manifestStore: { probeManifestPresence: () => ({ status: "present" as const }), read: () => manifest(held.generationId) } as unknown as MigrationManifestStore },
       _operationsForTesting: {
         observeJournal: () => ({ kind: "hold", journal: held }),
         performAbort: async () => ({ status: "completed", mutated: true }),
@@ -263,7 +289,7 @@ describe("performMigrationAbortCommand: refusal paths", () => {
       abortEvidenceSha256: "c".repeat(64),
     });
     expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-aborted");
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
@@ -282,17 +308,19 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     const store = new MigrationManifestStore({ homeDir: home });
     store.create(manifest(held.generationId));
     const coordinator = coordinatorFor(home);
-    const real = await performMigrationAbortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator, manifestStore: store });
+    const real = await abortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator, manifestStore: store });
     expect(real.status).toBe("ok");
     const throwingStore = {
       probeManifestPresence: () => store.probeManifestPresence(held.generationId),
       read: () => { throw new Error("an unrelated internal failure"); },
     } as unknown as MigrationManifestStore;
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: "generation-1",
       homeDir: home,
       coordinator,
       manifestStore: throwingStore,
+      // The router sees the planned manifest the held journal implies; only the read-back sees the injected store.
+      _resolution: { manifestStore: { probeManifestPresence: () => ({ status: "present" as const }), read: () => manifest(held.generationId) } as unknown as MigrationManifestStore },
       _operationsForTesting: {
         observeJournal: () => ({ kind: "hold", journal: held }),
         performAbort: async () => ({ status: "completed", mutated: true }),
@@ -326,7 +354,7 @@ describe("performMigrationAbortCommand: the confirmation fence (plan section 9, 
     const journalBefore = readFileSync(backendPublicationJournalPath(home));
     const manifestBefore = store.read(held.generationId).checksumSha256;
 
-    const result = await performMigrationAbortCommand({ homeDir: home, coordinator: coordinatorFor(home), manifestStore: store });
+    const result = await abortCommand({ homeDir: home, coordinator: coordinatorFor(home), manifestStore: store });
 
     expect(result).toEqual({ status: "refuse", reason: "abort-confirmation-missing", generationId: held.generationId });
     expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
@@ -342,7 +370,7 @@ describe("performMigrationAbortCommand: the confirmation fence (plan section 9, 
     const journalBefore = readFileSync(backendPublicationJournalPath(home));
     const manifestBefore = store.read(held.generationId).checksumSha256;
 
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: "some-other-generation", homeDir: home, coordinator: coordinatorFor(home), manifestStore: store,
     });
 
@@ -357,7 +385,7 @@ describe("performMigrationAbortCommand: the confirmation fence (plan section 9, 
     const store = new MigrationManifestStore({ homeDir: home });
     store.create(manifest(held.generationId));
 
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: held.generationId, homeDir: home, coordinator: coordinatorFor(home), manifestStore: store,
     });
 
@@ -375,14 +403,14 @@ describe("performMigrationAbortCommand: --dry-run (round-1 B-1/A-10)", () => {
     const manifestBefore = store.read(held.generationId).checksumSha256;
     const coordinator = coordinatorFor(home);
 
-    const dry = await performMigrationAbortCommand({
+    const dry = await abortCommand({
       confirmGenerationId: held.generationId, dryRun: true, homeDir: home, coordinator, manifestStore: store,
     });
     expect(dry).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-held", manifestPhase: null, applied: false });
     expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
     expect(store.read(held.generationId).checksumSha256).toBe(manifestBefore);
 
-    const real = await performMigrationAbortCommand({
+    const real = await abortCommand({
       confirmGenerationId: held.generationId, homeDir: home, coordinator, manifestStore: store,
     });
     expect(real).toMatchObject({ status: "ok", applied: true, manifestPhase: "aborted" });
@@ -394,16 +422,17 @@ describe("performMigrationAbortCommand: --dry-run (round-1 B-1/A-10)", () => {
     const store = new MigrationManifestStore({ homeDir: home });
     pendingCopyBatchManifest(store);
 
-    const dry = await performMigrationAbortCommand({
+    const dry = await abortCommand({
       confirmGenerationId: held.generationId, dryRun: true, homeDir: home, coordinator: coordinatorFor(home), manifestStore: store,
     });
-    expect(dry).toEqual({ status: "refuse", reason: "abort-manifest-needs-resume", evidence: "manifest-readback" });
+    // Router row 21 with a pending copy effect: abort is a non-owner and names resume (exit 6).
+    expect(dry).toEqual({ status: "refuse", reason: "route-resume-required", generationId: held.generationId, next: "resume" });
   });
 
   it("still enforces the fence under --dry-run", async () => {
     const home = makeHome();
     await heldJournal(home);
-    const dry = await performMigrationAbortCommand({ dryRun: true, homeDir: home, coordinator: coordinatorFor(home) });
+    const dry = await abortCommand({ dryRun: true, homeDir: home, coordinator: coordinatorFor(home) });
     expect(dry).toMatchObject({ status: "refuse", reason: "abort-confirmation-missing" });
   });
 });
@@ -420,7 +449,7 @@ describe("performMigrationAbortCommand: applied tracks whether a durable write p
       update: () => { throw new MigrationProtocolError("unexpected-state", "test"); },
     } as unknown as MigrationManifestStore;
 
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: held.generationId, homeDir: home, coordinator: coordinatorFor(home), manifestStore: failingStore,
     });
 
@@ -431,7 +460,7 @@ describe("performMigrationAbortCommand: applied tracks whether a durable write p
   it("a readback refusal after an idempotent repeat that wrote nothing reports no applied flag either", async () => {
     const home = makeHome();
     const held = await heldJournal(home);
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: held.generationId, homeDir: home, coordinator: coordinatorFor(home),
       _operationsForTesting: {
         observeJournal: () => ({ kind: "hold", journal: held }),
@@ -448,11 +477,206 @@ describe("performMigrationAbortCommand: applied tracks whether a durable write p
     const store = new MigrationManifestStore({ homeDir: home });
     pendingCopyBatchManifest(store);
 
-    const result = await performMigrationAbortCommand({
+    const result = await abortCommand({
       confirmGenerationId: held.generationId, homeDir: home, coordinator: coordinatorFor(home), manifestStore: store,
     });
 
-    expect(result).toEqual({ status: "refuse", reason: "abort-manifest-needs-resume", evidence: "manifest-readback" });
+    expect(result).toEqual({ status: "refuse", reason: "route-resume-required", generationId: held.generationId, next: "resume" });
     expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-held");
   });
 });
+
+describe("performMigrationAbortCommand: routed through rows 4 to 9 and the R7 rows (plan-v5 Part B (1))", () => {
+  const AT = new Date(CREATED_AT);
+  const fx = { roots: [] as string[] };
+  afterEach(() => removeFixtureHomes(fx.roots));
+
+  /** A held journal and a real manifest at `stage`; optionally already aborted (the journal side only). */
+  async function crashFixture(stage: FixtureStage | null, options: { abortJournal?: boolean; pending?: MigrationEffectKind; manifest?: FixtureManifestOptions } = {}) {
+    const home = makeFixtureHome(fx.roots);
+    const held = await heldFixtureJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    if (stage !== null) createFixtureManifest(store, stage, { ...(options.pending === undefined ? {} : { pending: options.pending }), ...options.manifest });
+    const aborted = options.abortJournal === true ? await abortedFromHeld(home, held) : null;
+    return { home, held, store, aborted };
+  }
+
+  async function abortedFromHeld(home: string, held: BackendMaintenanceJournal): Promise<BackendMaintenanceJournal> {
+    return maintenanceCoordinator(home).abortMaintenance({
+      expectedChecksumSha256: held.checksumSha256, sourceSelectionSha256: held.sourceSelectionSha256, abortEvidenceSha256: "c".repeat(64),
+    });
+  }
+
+  const noAbortMaintenance = (home: string): BackendPublicationCoordinator => {
+    const real = maintenanceCoordinator(home);
+    return new Proxy(real, {
+      get(target, property, receiver) {
+        if (property === "abortMaintenance") return () => { throw new Error("abortMaintenance must not be called again"); };
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+  };
+
+  describe.each<[string, FixtureStage]>([
+    ["19 (planned, nothing pending)", "planned"],
+    ["21 (dry-run-verified, nothing pending)", "dry-run-verified"],
+    ["21 (copying, nothing pending)", "copying"],
+    ["22 (copied, nothing pending; owner ruling R7)", "copied"],
+  ])("owner ruling R7, row %s", (_label, stage) => {
+    it("abort settles both sides: the journal terminal and the manifest aborted, both read back", async () => {
+      const { home, held, store } = await crashFixture(stage);
+      const result = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId, now: AT });
+      expect(result).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: "aborted", applied: true });
+      expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-aborted");
+      expect(store.read(held.generationId).phase).toBe("aborted");
+    });
+  });
+
+  it("row 20 (pending verify-dry-run): abort is a non-owner, exits 6 naming resume, and changes nothing", async () => {
+    const { home, held } = await crashFixture("planned", { pending: "verify-dry-run" });
+    const before = snapshotHome(home);
+    const result = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId });
+    expect(result).toEqual({ status: "refuse", reason: "route-resume-required", generationId: held.generationId, next: "resume" });
+    expect(snapshotHome(home)).toEqual(before);
+  });
+
+  it("row 23 (pending verify-generation): abort is a non-owner, exits 6 naming verify, and changes nothing", async () => {
+    const report = fixtureVerificationReport();
+    const { home, held } = await crashFixture("copied", { pending: "verify-generation", manifest: { report } });
+    const before = snapshotHome(home);
+    const result = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId });
+    expect(result).toEqual({ status: "refuse", reason: "route-resume-required", generationId: held.generationId, next: "verify" });
+    expect(snapshotHome(home)).toEqual(before);
+  });
+
+  describe("row 5 (owner ruling R8): idempotent, read-only confirmation of a settled pair", () => {
+    it("with the manifest never created: no write, exit 0 with applied:false, and a second invocation agrees", async () => {
+      const { home, held } = await crashFixture(null);
+      const first = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId });
+      expect(first).toMatchObject({ status: "ok", applied: true, manifestPhase: null });
+      const before = snapshotHome(home);
+      const second = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId });
+      const third = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId });
+      expect(second).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: null, applied: false });
+      expect(third).toEqual(second);
+      expect(snapshotHome(home)).toEqual(before);
+    });
+
+    it("with a settled aborted manifest: no write, the settled pair is read back, and the second invocation returns the same", async () => {
+      const { home, held } = await crashFixture("copied");
+      await abortCommand({ homeDir: home, confirmGenerationId: held.generationId, now: AT });
+      const before = snapshotHome(home);
+      const again = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId, coordinator: noAbortMaintenance(home) });
+      expect(again).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: "aborted", applied: false });
+      expect(snapshotHome(home)).toEqual(before);
+    });
+
+    it("still requires the confirmation token", async () => {
+      const { home, held } = await crashFixture(null, { abortJournal: true });
+      const before = snapshotHome(home);
+      expect(await abortCommand({ homeDir: home })).toEqual({ status: "refuse", reason: "abort-confirmation-missing", generationId: held.generationId });
+      expect(snapshotHome(home)).toEqual(before);
+    });
+  });
+
+  describe("row 6 (owner ruling R10): completes the carried abort effect without aborting the journal again", () => {
+    async function crashedAfterBegin() {
+      const fixture = await crashFixture("copied");
+      await performMigrationAbort({
+        homeDir: fixture.home, coordinator: maintenanceCoordinator(fixture.home), journal: fixture.held,
+        abortEvidenceSha256: "c".repeat(64), manifestStore: fixture.store, now: AT,
+        _operationsForTesting: { completeEffect: () => { throw new MigrationProtocolError("unexpected-state", "crash before completion"); } },
+      });
+      expect(fixture.store.read(fixture.held.generationId).pendingEffect?.kind).toBe("abort");
+      return fixture;
+    }
+
+    it("completes the pair, applied:true, with the journal bytes unchanged", async () => {
+      const { home, held, store } = await crashedAfterBegin();
+      const journalBefore = readFileSync(backendPublicationJournalPath(home));
+      const result = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId, coordinator: noAbortMaintenance(home) });
+      expect(result).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: "aborted", applied: true });
+      expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
+      expect(store.read(held.generationId).pendingEffect).toBeNull();
+    });
+
+    it("--dry-run makes the checks and writes nothing", async () => {
+      const { home, held } = await crashedAfterBegin();
+      const before = snapshotHome(home);
+      const result = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId, dryRun: true });
+      expect(result).toMatchObject({ status: "ok", applied: false });
+      expect(snapshotHome(home)).toEqual(before);
+    });
+
+    it("a carried effect that is not this generation's abort writes nothing and refuses exit 5", async () => {
+      const home = makeFixtureHome(fx.roots);
+      const held = await heldFixtureJournal(home);
+      const store = new MigrationManifestStore({ homeDir: home });
+      createFixtureManifest(store, "copied", { pending: "abort", pendingEffectId: "not-the-abort-effect" });
+      await abortedFromHeld(home, held);
+      const before = snapshotHome(home);
+      const result = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId });
+      expect(result).toEqual({ status: "refuse", reason: "abort-carried-effect-mismatch", evidence: "carried-effect-mismatch" });
+      expect(snapshotHome(home)).toEqual(before);
+    });
+  });
+
+  it("row 8 (the crash after abortMaintenance, before the manifest abort began): completes the manifest side without aborting the journal again", async () => {
+    const { home, held, store } = await crashFixture("copied", { abortJournal: true });
+    const journalBefore = readFileSync(backendPublicationJournalPath(home));
+    const result = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId, coordinator: noAbortMaintenance(home), now: AT });
+    expect(result).toEqual({ status: "ok", generationId: held.generationId, journalPhase: "maintenance-aborted", manifestPhase: "aborted", applied: true });
+    expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
+    expect(store.read(held.generationId).phase).toBe("aborted");
+  });
+
+  it("row 7 (aborted journal beside a pending copy effect): operator required, exit 7, nothing changed", async () => {
+    const { home, held } = await crashFixture("copying", { pending: "complete-copy", abortJournal: true });
+    const before = snapshotHome(home);
+    const result = await abortCommand({ homeDir: home, confirmGenerationId: held.generationId });
+    expect(result).toEqual({ status: "refuse", reason: "route-operator-required", generationId: held.generationId, next: null });
+    expect(snapshotHome(home)).toEqual(before);
+  });
+
+  it("row 9 (aborted journal beside an active manifest): refuses exit 5 and never calls performMigrationAbort (S4-3)", async () => {
+    const { home, held } = await crashFixture("verified", { abortJournal: true });
+    const store = new MigrationManifestStore({ homeDir: home });
+    const current = store.read(held.generationId);
+    // An active manifest cannot be built through the abort-capable phases, so route a fabricated one.
+    const performAbort = vi.fn();
+    const completePending = vi.fn();
+    const result = await abortCommand({
+      homeDir: home, confirmGenerationId: held.generationId,
+      _resolution: { manifestStore: { probeManifestPresence: () => ({ status: "present" as const }), read: () => ({ ...current, phase: "active" }) } as unknown as MigrationManifestStore },
+      _operationsForTesting: { performAbort, completePending },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "route-contradiction", generationId: held.generationId, next: null });
+    expect(performAbort).not.toHaveBeenCalled();
+    expect(completePending).not.toHaveBeenCalled();
+  });
+
+  it("a terminal journal of another generation is refused exit 2 when a different --generation is named, writing nothing", async () => {
+    const { home, held, store } = await crashFixture("copied", { abortJournal: true });
+    createFixtureManifest(store, "copied", { generationId: "generation-9" });
+    const before = snapshotHome(home);
+    const result = await abortCommand({ homeDir: home, generation: "generation-9", confirmGenerationId: "generation-9" });
+    expect(result).toEqual({ status: "refuse", reason: "abort-other-generation", generationId: held.generationId });
+    expect(snapshotHome(home)).toEqual(before);
+  });
+
+  it("row 4: naming another generation while a hold is live acts on the live hold, confirmed by the live hold's id", async () => {
+    const { home, held } = await crashFixture(null);
+    const wrong = await abortCommand({ homeDir: home, generation: "generation-9", confirmGenerationId: "generation-9" });
+    expect(wrong).toEqual({ status: "refuse", reason: "abort-confirmation-moved", generationId: held.generationId });
+    const right = await abortCommand({ homeDir: home, generation: "generation-9", confirmGenerationId: held.generationId });
+    expect(right).toMatchObject({ status: "ok", generationId: held.generationId, applied: true });
+  });
+
+  it("passes a malformed --generation through as the resolver's usage refusal", async () => {
+    const { home, held } = await crashFixture(null);
+    expect(await abortCommand({ homeDir: home, generation: "../x", confirmGenerationId: held.generationId }))
+      .toEqual({ status: "refuse", reason: "generation-invalid" });
+  });
+});
+

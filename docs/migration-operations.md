@@ -914,6 +914,11 @@ are emitted by no registered command in this release.
       "remedy": "The pending abort effect on the manifest is not the one an abort of this generation begins. Nothing was changed; run `lcm doctor` and inspect the evidence."
     },
     {
+      "reason": "abort-other-generation",
+      "exitClass": "refused-precondition",
+      "remedy": "The terminal maintenance journal belongs to a different generation than the one named. Nothing was changed; omit --generation to act on the journal's own generation."
+    },
+    {
       "reason": "abort-readback-mismatch",
       "exitClass": "failed-operator-required",
       "remedy": "The abort appeared to complete but its terminal state could not be confirmed on readback. Run `lcm doctor` and inspect the maintenance journal and manifest directly."

@@ -216,6 +216,7 @@ export function renderMigrationAbortEnvelope(outcome: MigrationAbortCommandOutco
       evidenceDetail: outcome.evidence,
       applied: outcome.applied ?? false,
       generation: outcome.generationId,
+      next: outcome.next,
     });
   }
   return okEnvelope({

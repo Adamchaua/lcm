@@ -209,6 +209,11 @@ describe("renderMigrationAbortEnvelope", () => {
     expect(envelope.exitCode).toBe(3);
   });
 
+  it("carries the router's next on a routed refusal", () => {
+    const envelope = renderMigrationAbortEnvelope({ status: "refuse", reason: "route-resume-required", generationId: "gen-1", next: "resume" });
+    expect(envelope).toMatchObject({ exitCode: 6, outcome: "incomplete-recoverable", next: "resume", generation: "gen-1" });
+  });
+
   it("builds a refusal envelope for abort-nothing-to-abort, never applied", () => {
     const envelope = renderMigrationAbortEnvelope({ status: "refuse", reason: "abort-nothing-to-abort" });
     expect(envelope.applied).toBe(false);

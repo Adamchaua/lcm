@@ -271,6 +271,8 @@ export function completePendingMigrationAbort(input: Readonly<{
   homeDir: string;
   journal: BackendMaintenanceJournal;
   manifestStore?: MigrationManifestStore;
+  /** Make every check, then stop before the completing write. */
+  dryRun?: boolean;
 }>): MigrationAbortResult {
   const { journal } = input;
   const abortEvidenceSha256 = journal.abortEvidenceSha256;
@@ -290,6 +292,7 @@ export function completePendingMigrationAbort(input: Readonly<{
     || pending.inputSha256 !== journal.checksumSha256) {
     return { status: "refuse", evidence: "carried-effect-mismatch", mutated: false };
   }
+  if (input.dryRun === true) return { status: "dry-run" };
   try {
     store.update(journal.generationId, manifest.checksumSha256, (current) => completeMigrationEffect(
       current,
