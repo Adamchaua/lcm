@@ -1315,3 +1315,80 @@ it.each(['active','completed','run-id','generation','manifest','project','state'
  if(fault==='active'||fault==='completed')expect(await api.probePostgreSqlPortableDestination(input)).toMatchObject({nonIdentityDomainsEmpty:false,existingRun:{state:fault}});
  else await expect(api.probePostgreSqlPortableDestination(input)).rejects.toMatchObject({code:'destination-conflict'});
 });
+
+describe('expected destination system identifier (#1508)', () => {
+  const LIVE = '7123456789';
+  const OTHER = '9876543210';
+  const writes = () => db.queryLog.filter(sql => /^(INSERT|UPDATE)/u.test(sql));
+  const admittedBound = async (expectedSystemIdentifier: string | null = LIVE) => {
+    const writer = await open({ expectedSystemIdentifier: expectedSystemIdentifier ?? undefined }); const stream = await source(); const manifest = stream.describe();
+    const token = await writer.preflight(manifest, stream); await writer.admit(manifest, token);
+    return { writer, stream, manifest, token };
+  };
+  it('refuses a writer connection to a different cluster before any write', async () => {
+    db.systemIdentifier = [{ system_identifier: OTHER }];
+    await expect(open({ expectedSystemIdentifier: LIVE })).rejects.toMatchObject({ code: 'destination-conflict' });
+    expect(writes()).toEqual([]); expect(db.clients.every(client => client.ended)).toBe(true); expectNoRun();
+  });
+  it.each([[[]], [[{ system_identifier: 7123456789 }]], [[{ system_identifier: '0x1f' }]]])('refuses an unreadable live identifier %j when one is expected', async live => {
+    db.systemIdentifier = live as Row[];
+    await expect(open({ expectedSystemIdentifier: LIVE })).rejects.toMatchObject({ code: 'destination-conflict' }); expect(writes()).toEqual([]); expectNoRun();
+  });
+  it.each(['', 'abc', '01', '1'.repeat(21), '-1', 7123456789])('refuses a malformed expected identifier %j as invalid input', async bad => {
+    await expect(open({ expectedSystemIdentifier: bad as never })).rejects.toMatchObject({ code: 'invalid-input' });
+    expect(db.clients).toEqual([]); expectNoRun();
+  });
+  it('transfers through a matching expected identifier', async () => {
+    const { writer, stream } = await admittedBound(); await transferAll(writer, stream);
+    expect(db.receipts.length).toBeGreaterThan(0);
+  });
+  it('keeps the five-field-only behavior when no identifier is expected', async () => {
+    const { writer, stream } = await admittedBound(null); db.systemIdentifier = [{ system_identifier: OTHER }];
+    await expect(writer.applyBatch(await batch(stream))).resolves.toBeDefined(); expect(db.receipts).toHaveLength(1);
+  });
+  it('refuses a session transaction after the cluster behind the endpoint changes', async () => {
+    const { writer, stream } = await admittedBound(); const first = await batch(stream);
+    db.systemIdentifier = [{ system_identifier: OTHER }]; const before = db.snapshot();
+    await expect(writer.applyBatch(first)).rejects.toMatchObject({ code: 'destination-conflict' });
+    expect(db.snapshot()).toEqual(before);
+  });
+  it('refuses the admit, run, apply and receipt seams when the cluster changes', async () => {
+    const api = await import('../../src/storage/postgresql/portable-destination.js');
+    const writer = await open({ expectedSystemIdentifier: LIVE }); const stream = await source(); const manifest = stream.describe();
+    const token = await writer.preflight(manifest, stream);
+    const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+    db.systemIdentifier = [{ system_identifier: OTHER }]; db.queryLog = [];
+    await db.query({ text: 'BEGIN' });
+    await expect(api.admitPortableDestinationInTransaction(executor, writer, manifest, token)).rejects.toMatchObject({ code: 'destination-conflict' });
+    await expect(api.readPortableRunInTransaction(executor, writer, manifest, token)).rejects.toMatchObject({ code: 'destination-conflict' });
+    await db.query({ text: 'ROLLBACK' });
+    db.systemIdentifier = [{ system_identifier: LIVE }];
+    await db.query({ text: 'BEGIN' });
+    await api.admitPortableDestinationInTransaction(executor, writer, manifest, token);
+    await db.query({ text: 'COMMIT' });
+    const next = await batch(stream); db.systemIdentifier = [{ system_identifier: OTHER }]; db.queryLog = [];
+    await db.query({ text: 'BEGIN' });
+    await expect(api.applyPortableBatchInTransaction(executor, writer, next)).rejects.toMatchObject({ code: 'destination-conflict' });
+    await expect(api.readPortableBatchReceiptInTransaction(executor, writer, next)).rejects.toMatchObject({ code: 'destination-conflict' });
+    await db.query({ text: 'ROLLBACK' });
+    expect(writes()).toEqual([]); expect(db.receipts).toEqual([]);
+  });
+  it('refuses the completion seams when the cluster changes', async () => {
+    const api = await import('../../src/storage/postgresql/portable-destination.js');
+    const { writer, stream, manifest } = await admittedBound(); await transferAll(writer, stream);
+    const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+    const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+    db.systemIdentifier = [{ system_identifier: OTHER }]; db.queryLog = [];
+    await db.query({ text: 'BEGIN' });
+    await expect(api.completePortableDestinationInTransaction(executor, writer, verified)).rejects.toMatchObject({ code: 'destination-conflict' });
+    await expect(api.readPortableCompletedRunInTransaction(executor, writer, verified)).rejects.toMatchObject({ code: 'destination-conflict' });
+    await db.query({ text: 'ROLLBACK' });
+    expect(writes()).toEqual([]); expect(db.run?.state).toBe('active');
+  });
+  it('does not accept a receipt after reconnecting to a different cluster', async () => {
+    const { writer, stream } = await admittedBound(); db.commitFailure = 'after';
+    db.beforeQuery = config => { if (config.text === 'COMMIT') db.systemIdentifier = [{ system_identifier: OTHER }]; };
+    await expect(writer.applyBatch(await batch(stream))).rejects.toEqual(new PortableTransferError('destination-uncertain', true));
+    expect(db.clients).toHaveLength(2);
+  });
+});

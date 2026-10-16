@@ -3,6 +3,7 @@ import { PostgreSqlRuntime } from '../storage/postgresql/runtime.js';
 import { PostgreSqlWorkCoordinator, type PostgreSqlFencedLease } from '../storage/postgresql/coordination.js';
 import {
     createPostgreSqlPortableDestination,
+    assertPostgreSqlSystemIdentifier,
     admitPortableDestinationInTransaction,
     readPortableRunInTransaction,
     readPortableBatchReceiptInTransaction,
@@ -156,13 +157,23 @@ export async function openMigrationCopyDestination(input: MigrationCopyDestinati
         projectId: input.expectedIdentity.id,
         machineId: input.expectedIdentity.machineId,
     };
-    const coordinator = () => new PostgreSqlWorkCoordinator(runtime, input.expectedIdentity.id, input.expectedIdentity.machineId!);
+    const checkCluster = (executor: PostgreSqlTransactionScopeExecutor, signal?: AbortSignal) =>
+        assertPostgreSqlSystemIdentifier(executor, input.expectedSystemIdentifier, input.expectedIdentity.id, signal);
+    // Lease writes commit in their own transaction, separate from the data
+    // transaction, and only after this runtime checkout proved it reaches the
+    // recorded cluster; the coordinator then joins that transaction by savepoint.
+    const leaseTransaction = <T>(operation: (owner: PostgreSqlWorkCoordinator) => Promise<T>, signal?: AbortSignal): Promise<T> =>
+        runtime.transaction(async (executor) => {
+            await checkCluster(executor, signal);
+            return operation(new PostgreSqlWorkCoordinator(executor, input.expectedIdentity.id, input.expectedIdentity.machineId!));
+        }, { ...context, transactionMode: 'read-committed-read-write', signal });
     const reconnect = async () => { await runtime.close(); runtime = new PostgreSqlRuntime(input.settings); };
     const serializeReadback = async <T>(
         read: (executor: PostgreSqlTransactionScopeExecutor) => Promise<T>,
     ): Promise<T> => runtime.transaction(async (executor) => {
         // A readback may observe a committed receipt without acquiring new mutation
         // authority. This row lock waits for the original fenced transaction to settle.
+        await checkCluster(executor);
         const locked = await executor.query({
             text: 'SELECT 1 AS locked FROM lcm.fenced_leases WHERE project_id=$1 AND resource_type=$2 AND resource_key=$3 FOR UPDATE',
             values: [input.expectedIdentity.id, resource.resourceType, resource.resourceKey],
@@ -172,11 +183,13 @@ export async function openMigrationCopyDestination(input: MigrationCopyDestinati
         return read(executor);
     }, { ...context, transactionMode: 'read-committed-read-write' });
     const mutate = async <T>(operation: (executor: PostgreSqlTransactionScopeExecutor) => Promise<T>): Promise<T> => {
-        const owner = coordinator();
-        lease = lease
-            ? await owner.renewLease({ ...resource, fencingToken: lease.fencingToken, ttlMs: input.leaseTtlMs, signal: input.signal })
-            : null;
-        lease ??= await owner.acquireLease({ ...resource, ttlMs: input.leaseTtlMs, signal: input.signal });
+        const held = lease;
+        lease = await leaseTransaction(async (owner) => {
+            const renewed = held
+                ? await owner.renewLease({ ...resource, fencingToken: held.fencingToken, ttlMs: input.leaseTtlMs, signal: input.signal })
+                : null;
+            return renewed ?? await owner.acquireLease({ ...resource, ttlMs: input.leaseTtlMs, signal: input.signal });
+        }, input.signal);
         if (!lease)
             throw new Error('migration copy lease is owned by another worker');
         const fence = { ...resource, fencingToken: lease.fencingToken, signal: input.signal };
@@ -239,8 +252,10 @@ export async function openMigrationCopyDestination(input: MigrationCopyDestinati
             async close() {
                 let primary: unknown;
                 try {
-                    if (lease)
-                        await coordinator().releaseLease({ ...resource, fencingToken: lease.fencingToken });
+                    if (lease) {
+                        const held = lease;
+                        await leaseTransaction(owner => owner.releaseLease({ ...resource, fencingToken: held.fencingToken }));
+                    }
                 }
                 catch (error) {
                     primary = error;
