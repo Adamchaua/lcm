@@ -221,12 +221,79 @@ describe("createPostgreSqlBackendPublicationRemoteGuard row states", () => {
     });
   });
 
-  it("propagates the guard's fence-mismatch when the row names another target or evidence", async () => {
+  it("propagates the guard's fence-mismatch when reading for release a row that names another target or evidence", async () => {
     const table = new FenceTable();
     table.seed({ evidenceSha256: OTHER_EVIDENCE });
-    await expect(providerOver(table).readRemoteGuard(context(), "acquire")).rejects.toMatchObject({
+    await expect(providerOver(table).readRemoteGuard(context(), "release")).rejects.toMatchObject({
       reason: "fence-mismatch",
     });
+    table.seed({ targetBackend: "sqlite" });
+    await expect(providerOver(table).readRemoteGuard(context(), "release")).rejects.toMatchObject({
+      reason: "fence-mismatch",
+    });
+  });
+
+  it("treats a row that names another target or evidence as no usable row when reading to acquire", async () => {
+    const table = new FenceTable();
+    table.seed({ evidenceSha256: OTHER_EVIDENCE });
+    await expect(providerOver(table).readRemoteGuard(context(), "acquire")).resolves.toBeNull();
+    table.seed({ targetBackend: "sqlite" });
+    await expect(providerOver(table).readRemoteGuard(context(), "acquire")).resolves.toBeNull();
+  });
+
+  it("acquires a new generation over a released row that named different evidence", async () => {
+    const table = new FenceTable();
+    table.seed({ evidenceSha256: OTHER_EVIDENCE, releasedAtMs: Date.parse("2026-08-01T00:00:30.000Z") });
+    const fence = await providerOver(table).acquireRemoteGuard(context());
+    expect(fence).toMatchObject({ evidenceSha256: EVIDENCE, fencingToken: "2", releasedAt: null, machineId: MACHINE });
+    expect(table.row).toMatchObject({ evidenceSha256: EVIDENCE, token: 2, releasedAtMs: null });
+  });
+
+  it("acquires a new generation over a released row that named a different target backend", async () => {
+    const table = new FenceTable();
+    table.seed({ targetBackend: "sqlite", releasedAtMs: Date.parse("2026-08-01T00:00:30.000Z") });
+    const fence = await providerOver(table).acquireRemoteGuard(context());
+    expect(fence).toMatchObject({ targetBackend: "postgresql", fencingToken: "2", releasedAt: null });
+  });
+
+  it("refuses with publication-conflict, leaving the row, when an unreleased row names different evidence or target", async () => {
+    for (const other of [{ evidenceSha256: OTHER_EVIDENCE }, { targetBackend: "sqlite" as const }]) {
+      const table = new FenceTable();
+      table.seed({ machineId: OTHER_MACHINE, publicationId: OTHER_PUBLICATION, ...other });
+      const before = { ...table.row! };
+      await expect(providerOver(table).acquireRemoteGuard(context())).rejects.toMatchObject({
+        reason: "publication-conflict",
+      });
+      expect(table.writes).toBe(0);
+      expect(table.row).toEqual(before);
+    }
+  });
+
+  it("returns a released foreign row unchanged and reclaims it on acquire", async () => {
+    const table = new FenceTable();
+    table.seed({ machineId: OTHER_MACHINE, releasedAtMs: Date.parse("2026-08-01T00:00:30.000Z") });
+    const provider = providerOver(table);
+    await expect(provider.readRemoteGuard(context(), "acquire")).resolves.toMatchObject({
+      machineId: OTHER_MACHINE,
+      releasedAt: expect.any(String),
+    });
+    const fence = await provider.acquireRemoteGuard(context());
+    expect(fence).toMatchObject({ machineId: MACHINE, fencingToken: "2", releasedAt: null });
+  });
+
+  it("returns an expired foreign row unchanged; acquiring over it is the guard's conflict", async () => {
+    const table = new FenceTable();
+    table.seed({ machineId: OTHER_MACHINE });
+    table.expire();
+    const provider = providerOver(table);
+    await expect(provider.readRemoteGuard(context(), "acquire")).resolves.toMatchObject({
+      machineId: OTHER_MACHINE,
+      databaseExpired: true,
+    });
+    await expect(provider.acquireRemoteGuard(context())).rejects.toMatchObject({
+      reason: "publication-conflict",
+    });
+    expect(table.writes).toBe(0);
   });
 
   it("acquires when no row exists", async () => {
@@ -337,20 +404,69 @@ describe("createPostgreSqlBackendPublicationRemoteGuard against a guard double",
     } as unknown as PostgreSqlBackendPublicationRemoteGuardPort;
   }
 
-  it("refuses an acquisition result owned by another machine for this publication", async () => {
-    const foreign = {
+  function fenceOf(overrides: Partial<PostgreSqlBackendPublicationFence> = {}): PostgreSqlBackendPublicationFence {
+    return {
       projectId: PROJECT,
       machineId: OTHER_MACHINE,
       publicationId: PUBLICATION,
-    } as PostgreSqlBackendPublicationFence;
-    const provider = createPostgreSqlBackendPublicationRemoteGuard({
-      guard: guardDouble({ acquire: vi.fn(async () => foreign) }),
-      machineId: MACHINE,
-      ttlMs: TTL_MS,
-    });
+      targetBackend: "postgresql",
+      evidenceSha256: EVIDENCE,
+      fencingToken: 3n,
+      acquiredAt: "2026-08-01T00:00:00.000Z",
+      renewedAt: "2026-08-01T00:00:00.000Z",
+      expiresAt: "2026-08-01T00:01:00.000Z",
+      releasedAt: null,
+      databaseExpired: false,
+      ...overrides,
+    };
+  }
+
+  function providerWith(guard: PostgreSqlBackendPublicationRemoteGuardPort) {
+    return createPostgreSqlBackendPublicationRemoteGuard({ guard, machineId: MACHINE, ttlMs: TTL_MS });
+  }
+
+  it("refuses an acquisition result that another machine holds as the active fence of this publication", async () => {
+    const provider = providerWith(guardDouble({ acquire: vi.fn(async () => fenceOf()) }));
     await expect(provider.acquireRemoteGuard(context())).rejects.toMatchObject({
       reason: "publication-conflict",
     });
+  });
+
+  it("refuses a foreign row only when the coordinator would accept it as the active fence", async () => {
+    const accepted: Partial<PostgreSqlBackendPublicationFence>[] = [
+      { releasedAt: "2026-08-01T00:00:30.000Z" },
+      { databaseExpired: true },
+      { publicationId: OTHER_PUBLICATION },
+      { targetBackend: "sqlite" },
+      { evidenceSha256: OTHER_EVIDENCE },
+    ];
+    for (const overrides of accepted) {
+      const foreign = fenceOf(overrides);
+      const provider = providerWith(guardDouble({ read: vi.fn(async () => foreign) }));
+      await expect(provider.readRemoteGuard(context(), "release")).resolves.toMatchObject({
+        machineId: OTHER_MACHINE,
+        fencingToken: "3",
+      });
+    }
+    const provider = providerWith(guardDouble({ read: vi.fn(async () => fenceOf()) }));
+    await expect(provider.readRemoteGuard(context(), "release")).rejects.toMatchObject({
+      reason: "publication-conflict",
+    });
+  });
+
+  it("propagates every read error other than a fence-mismatch, on both paths", async () => {
+    const { PostgreSqlBackendPublicationGuardError } = await import(
+      "../../src/storage/postgresql/publication-guard.js"
+    );
+    for (const error of [
+      new PostgreSqlBackendPublicationGuardError(PROJECT, "readBackendPublication", "invalid-row"),
+      new Error("connection lost"),
+    ]) {
+      const provider = providerWith(guardDouble({ read: vi.fn(async () => { throw error; }) }));
+      await expect(provider.readRemoteGuard(context(), "acquire")).rejects.toBe(error);
+      await expect(provider.acquireRemoteGuard(context())).rejects.toBe(error);
+      await expect(provider.readRemoteGuard(context(), "release")).rejects.toBe(error);
+    }
   });
 
   it("passes the exact release identity with the token as a bigint and the machine id lowercased", async () => {
@@ -598,6 +714,52 @@ describe("composition: real coordinator, driver, provider and guard over a fence
     expect(completed.projects[0]?.fence?.fencingToken).toBe("2");
     expect(table.row).toMatchObject({ token: 2 });
     expect(table.row?.releasedAtMs).not.toBeNull();
+  });
+
+  it("publishes over a released prior generation that named different evidence", async () => {
+    const home = makeHome();
+    const table = new FenceTable();
+    table.seed({ evidenceSha256: OTHER_EVIDENCE, releasedAtMs: Date.parse("2026-08-01T00:00:30.000Z") });
+    const coordinator = createBackendPublicationCoordinator({
+      homeDir: home,
+      remoteGuard: { mode: "delegated", provider: providerOver(table) },
+    });
+    const composed = composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [binding] });
+    await coordinator.prepare({
+      publicationId: PUBLICATION,
+      sourceBackend: composed.sourceBackend,
+      targetBackend: composed.targetBackend,
+      material: composed.material,
+      projects: composed.projects,
+    });
+    const completed = await coordinator.resume();
+    expect(completed.phase).toBe("completed");
+    expect(completed.projects[0]?.fence).toMatchObject({ fencingToken: "2", evidenceSha256: EVIDENCE, machineId: MACHINE });
+    expect(table.row).toMatchObject({ token: 2, evidenceSha256: EVIDENCE });
+    expect(table.row?.releasedAtMs).not.toBeNull();
+    expect(read(home, "config.json").storage.backend).toBe("postgresql");
+  });
+
+  it("fails closed when an unreleased generation with different evidence holds the lease", async () => {
+    const home = makeHome();
+    const table = new FenceTable();
+    table.seed({ machineId: OTHER_MACHINE, publicationId: OTHER_PUBLICATION, evidenceSha256: OTHER_EVIDENCE });
+    const before = { ...table.row! };
+    const coordinator = createBackendPublicationCoordinator({
+      homeDir: home,
+      remoteGuard: { mode: "delegated", provider: providerOver(table) },
+    });
+    const composed = composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [binding] });
+    await coordinator.prepare({
+      publicationId: PUBLICATION,
+      sourceBackend: composed.sourceBackend,
+      targetBackend: composed.targetBackend,
+      material: composed.material,
+      projects: composed.projects,
+    });
+    await expect(coordinator.resume()).rejects.toMatchObject({ reason: "publication-conflict" });
+    expect(table.row).toEqual(before);
+    expect(read(home, "config.json").storage.backend).toBe("sqlite");
   });
 
   it("fails closed and leaves the files untouched when another generation holds the lease", async () => {

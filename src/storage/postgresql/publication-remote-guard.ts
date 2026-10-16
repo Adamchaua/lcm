@@ -87,7 +87,8 @@ function identityOf(context: BackendPublicationRemoteContext) {
  * This provider never renews. It acquires only when the coordinator asks
  * for it:
  *
- * - no row, or a released row: the guard inserts or replaces it;
+ * - no row, or a released row (of any generation, including one that named
+ *   another target backend or evidence): the guard inserts or replaces it;
  * - an unexpired row of this exact generation (machine, publication, target
  *   backend and evidence): the guard returns it unchanged, which adopts the
  *   caller's lease;
@@ -100,8 +101,16 @@ function identityOf(context: BackendPublicationRemoteContext) {
  *   `publication-conflict` and the error propagates, so the coordinator
  *   fails closed.
  *
- * A row held by a different machine under this publication id is refused by
- * this provider, so a foreign fence is never journalled as ours.
+ * While acquiring, a row that names another target backend or evidence is a
+ * different generation, not a failed read: it is treated as no usable
+ * own-generation row, so a released one is replaced and an unreleased one
+ * ends in the guard's `publication-conflict`. The same mismatch propagates
+ * when the coordinator reads for release.
+ *
+ * A row that another machine holds, is still active and names this
+ * publication, target backend and evidence is refused by this provider, so a
+ * foreign fence is never journalled as ours. An inactive foreign row is
+ * returned unchanged so the coordinator can reclaim it.
  */
 export function createPostgreSqlBackendPublicationRemoteGuard(
   options: CreatePostgreSqlBackendPublicationRemoteGuardOptions,
@@ -109,19 +118,48 @@ export function createPostgreSqlBackendPublicationRemoteGuard(
   const machineId = assertOptions(options);
   const { guard, ttlMs } = options;
 
+  // The only foreign row that is refused is one the coordinator would accept
+  // as this publication's active fence: active, and naming this publication,
+  // target backend and evidence. An inactive or differently-identified row is
+  // returned unchanged so the coordinator can reclaim or reject it itself.
   const refuseForeignMachine = (
     fence: PostgreSqlBackendPublicationFence,
     context: BackendPublicationRemoteContext,
   ): void => {
     if (
-      fence.publicationId === context.journal.publicationId
-      && fence.machineId !== machineId
+      fence.machineId !== machineId
+      && fence.releasedAt === null
+      && !fence.databaseExpired
+      && fence.publicationId === context.journal.publicationId
+      && fence.targetBackend === context.journal.targetBackend
+      && fence.evidenceSha256 === context.project.evidenceSha256
     ) {
       throw new PostgreSqlBackendPublicationGuardError(
         fence.projectId,
         "backendPublicationRemoteGuard",
         "publication-conflict",
       );
+    }
+  };
+
+  // guard.read reports fence-mismatch for a decodable row that names another
+  // target backend or evidence. When acquiring, that row is a different
+  // generation, not a failure of the read: a released one is replaced by
+  // guard.acquire and an unreleased one makes guard.acquire refuse with
+  // publication-conflict. Any other error still propagates.
+  const readForAcquire = async (
+    context: BackendPublicationRemoteContext,
+  ): Promise<PostgreSqlBackendPublicationFence | null> => {
+    try {
+      return await guard.read(identityOf(context));
+    } catch (error) {
+      if (
+        error instanceof PostgreSqlBackendPublicationGuardError
+        && error.reason === "fence-mismatch"
+      ) {
+        return null;
+      }
+      throw error;
     }
   };
 
@@ -134,8 +172,10 @@ export function createPostgreSqlBackendPublicationRemoteGuard(
     && fence.evidenceSha256 === context.project.evidenceSha256;
 
   return {
-    async readRemoteGuard(context) {
-      const fence = await guard.read(identityOf(context));
+    async readRemoteGuard(context, operation) {
+      const fence = operation === "acquire"
+        ? await readForAcquire(context)
+        : await guard.read(identityOf(context));
       if (fence === null) return null;
       refuseForeignMachine(fence, context);
       return toFenceRecord(fence);
@@ -143,7 +183,7 @@ export function createPostgreSqlBackendPublicationRemoteGuard(
 
     async acquireRemoteGuard(context) {
       const identity = identityOf(context);
-      const row = await guard.read(identity);
+      const row = await readForAcquire(context);
       if (row !== null) refuseForeignMachine(row, context);
       const takeover = row !== null
         && row.releasedAt === null
