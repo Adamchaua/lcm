@@ -14,7 +14,6 @@ import {
 } from "../security-files.js";
 import { canonicalJson, canonicalSha256, sha256 } from "../storage/portable-record.js";
 import { attributeNullableRead } from "./activation-absence.js";
-import type { ActivationRestartCheckReason, ActivationRestartCheckStatus } from "./activation-restart-check.js";
 import type { MigrationReportReference } from "./protocol.js";
 
 /**
@@ -26,11 +25,17 @@ import type { MigrationReportReference } from "./protocol.js";
  *
  * - The body is a closed set of fields, every one of which is already
  *   durable elsewhere (epoch, attempt, witness checksum, publicationId,
- *   artifact identity digest, manifest revision, the post-publication
- *   project-map witness, and the restart verdict S15 returned). The report
- *   adds no new fact; it binds the facts of one completed activation
- *   together under one identity so a later reader can check them against
- *   each other rather than trust any one alone.
+ *   artifact identity digest, manifest revision and the post-publication
+ *   project-map witness). The report adds no new fact; it binds the facts
+ *   of one completed activation together under one identity so a later
+ *   reader can check them against each other rather than trust any one
+ *   alone. The body is therefore a pure function of durable state: a
+ *   retried S16 re-derives byte-identical bytes. That is why the S15
+ *   restart verdict is deliberately NOT in the body (plan-v7 A7 / S-1): it
+ *   is a live observation of a process that may have been restarted
+ *   between two retries, so carrying it would make two honest retries
+ *   disagree about one activation's identity. The verdict travels only in
+ *   the orchestrator's outcome.
  * - reportSha256 is the canonical SHA-256 of the body, and reportId is
  *   derived from it ("publish-activation-" + reportSha256), mirroring
  *   verification-report.ts's "verify-generation-" + reportSha256. Two
@@ -74,21 +79,6 @@ const HASH_PATTERN = /^[0-9a-f]{64}$/u;
  * stores' convention. */
 const MAX_ACTIVATION_REPORT_BYTES = 16 * 1024;
 
-const RESTART_STATUSES = Object.keys({
-  satisfied: true,
-  unsatisfied: true,
-  unresolvable: true,
-} satisfies Record<ActivationRestartCheckStatus, true>) as readonly ActivationRestartCheckStatus[];
-
-const RESTART_REASONS = Object.keys({
-  "no-pid-file": true,
-  "stale-pid-file": true,
-  "backend-matches": true,
-  "backend-stale": true,
-  "health-unreachable": true,
-  "health-pid-mismatch": true,
-} satisfies Record<ActivationRestartCheckReason, true>) as readonly ActivationRestartCheckReason[];
-
 const BODY_KEYS = [
   "attemptId",
   "createdAt",
@@ -99,21 +89,12 @@ const BODY_KEYS = [
   "manifestRevisionAtComplete",
   "postPublicationProjectMapWitnessSha256",
   "publicationId",
-  "restart",
   "version",
   "witnessChecksumSha256",
 ] as const;
 const REPORT_KEYS = ["body", "reportId", "reportSha256", "version"] as const;
 /** The caller supplies every body field except the two constants. */
 const CREATE_INPUT_KEYS = BODY_KEYS.filter((key) => key !== "version" && key !== "kind");
-
-/** The restart verdict S15 returned, carried verbatim (status and reason
- * only; the verifier's detail and observed pid are diagnostics, not
- * identity). */
-export type MigrationActivationRestartVerdict = Readonly<{
-  status: ActivationRestartCheckStatus;
-  reason: ActivationRestartCheckReason;
-}>;
 
 export type MigrationActivationReportBody = Readonly<{
   version: typeof ACTIVATION_REPORT_VERSION;
@@ -129,7 +110,6 @@ export type MigrationActivationReportBody = Readonly<{
   /** computeMigrationProjectMapWitnessSha256 in mode "post-publication" at
    * S16's authoritative readback (plan-v6 section 2). */
   postPublicationProjectMapWitnessSha256: string;
-  restart: MigrationActivationRestartVerdict;
   /** The pending publish-activation effect's startedAt (S10), never a fresh clock read. */
   createdAt: string;
 }>;
@@ -207,7 +187,6 @@ function parseBody(value: unknown, reason: MigrationActivationReportReason): Mig
   if (!isRecord(value) || !exactKeys(value, BODY_KEYS)) {
     reportError(reason, "migration activation report body has an invalid shape");
   }
-  const restart = value.restart;
   if (
     value.version !== ACTIVATION_REPORT_VERSION
     || value.kind !== ACTIVATION_REPORT_KIND
@@ -220,10 +199,6 @@ function parseBody(value: unknown, reason: MigrationActivationReportReason): Mig
     || !Number.isSafeInteger(value.manifestRevisionAtComplete)
     || (value.manifestRevisionAtComplete as number) < 0
     || !isHash(value.postPublicationProjectMapWitnessSha256)
-    || !isRecord(restart)
-    || !exactKeys(restart, ["reason", "status"])
-    || !RESTART_STATUSES.includes(restart.status as ActivationRestartCheckStatus)
-    || !RESTART_REASONS.includes(restart.reason as ActivationRestartCheckReason)
     || !isIsoTimestamp(value.createdAt)
   ) {
     reportError(reason, "migration activation report body is invalid");
@@ -239,7 +214,6 @@ function parseBody(value: unknown, reason: MigrationActivationReportReason): Mig
     identityDigest: value.identityDigest,
     manifestRevisionAtComplete: value.manifestRevisionAtComplete as number,
     postPublicationProjectMapWitnessSha256: value.postPublicationProjectMapWitnessSha256,
-    restart: { status: restart.status as ActivationRestartCheckStatus, reason: restart.reason as ActivationRestartCheckReason },
     createdAt: value.createdAt,
   });
 }

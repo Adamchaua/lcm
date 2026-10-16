@@ -69,7 +69,6 @@ function baseInput(overrides: Partial<CreateMigrationActivationReportInput> = {}
     identityDigest: HASH_D,
     manifestRevisionAtComplete: 7,
     postPublicationProjectMapWitnessSha256: HASH_A,
-    restart: { status: "satisfied", reason: "no-pid-file" },
     createdAt: STARTED_AT,
     ...overrides,
   };
@@ -99,7 +98,6 @@ describe("createMigrationActivationReport", () => {
     expect(report.reportId).toBe("publish-activation-" + report.reportSha256);
     expect(Object.isFrozen(report)).toBe(true);
     expect(Object.isFrozen(report.body)).toBe(true);
-    expect(Object.isFrozen(report.body.restart)).toBe(true);
   });
 
   it("is deterministic for identical input and changes identity for any field difference", () => {
@@ -108,20 +106,23 @@ describe("createMigrationActivationReport", () => {
     for (const overrides of [
       { epochId: HASH_B },
       { manifestRevisionAtComplete: 8 },
-      { restart: { status: "unresolvable", reason: "health-unreachable" } },
       { createdAt: "2026-10-16T12:00:05.000Z" },
     ] as const) {
       expect(createMigrationActivationReport(baseInput(overrides)).reportSha256).not.toBe(first.reportSha256);
     }
   });
 
-  it.each([
-    ["satisfied", "no-pid-file"],
-    ["unsatisfied", "backend-stale"],
-    ["unresolvable", "health-pid-mismatch"],
-  ] as const)("carries the restart verdict %s/%s verbatim", (status, reason) => {
-    const report = createMigrationActivationReport(baseInput({ restart: { status, reason } }));
-    expect(report.body.restart).toEqual({ status, reason });
+  it("is a pure function of durable state: the body carries no restart verdict (plan-v7 A7 / S-1)", () => {
+    const report = createMigrationActivationReport(baseInput());
+    expect(Object.keys(report.body).sort()).toEqual([
+      "attemptId", "createdAt", "epochId", "generationId", "identityDigest", "kind", "manifestRevisionAtComplete",
+      "postPublicationProjectMapWitnessSha256", "publicationId", "version", "witnessChecksumSha256",
+    ]);
+    expect(() => createMigrationActivationReport({
+      ...baseInput(), restart: { status: "satisfied", reason: "no-pid-file" },
+    } as unknown as CreateMigrationActivationReportInput)).toThrow(
+      expect.objectContaining({ name: "MigrationActivationReportError", reason: "invalid-input" }),
+    );
   });
 
   it.each([
@@ -137,10 +138,6 @@ describe("createMigrationActivationReport", () => {
     ["negative manifestRevisionAtComplete", baseInput({ manifestRevisionAtComplete: -1 })],
     ["fractional manifestRevisionAtComplete", baseInput({ manifestRevisionAtComplete: 1.5 })],
     ["invalid postPublicationProjectMapWitnessSha256", baseInput({ postPublicationProjectMapWitnessSha256: "" })],
-    ["non-record restart", baseInput({ restart: "satisfied" as unknown as CreateMigrationActivationReportInput["restart"] })],
-    ["restart with extra key", baseInput({ restart: { status: "satisfied", reason: "no-pid-file", detail: "x" } as unknown as CreateMigrationActivationReportInput["restart"] })],
-    ["unknown restart status", baseInput({ restart: { status: "ok", reason: "no-pid-file" } as unknown as CreateMigrationActivationReportInput["restart"] })],
-    ["unknown restart reason", baseInput({ restart: { status: "satisfied", reason: "fine" } as unknown as CreateMigrationActivationReportInput["restart"] })],
     ["non-ISO createdAt", baseInput({ createdAt: "2026-10-16" })],
     ["non-canonical ISO createdAt", baseInput({ createdAt: "2026-10-16T12:00:04Z" })],
   ])("rejects %s as invalid-input", (_name, input) => {

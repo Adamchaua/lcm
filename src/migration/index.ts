@@ -219,5 +219,4 @@ export type {
   MigrationActivationReportReason,
   MigrationActivationReportStoreDependencies,
   MigrationActivationReportUnresolvableReason,
-  MigrationActivationRestartVerdict,
 } from "./activation-report.js";
