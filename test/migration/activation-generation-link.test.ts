@@ -56,19 +56,24 @@ function homeWithoutLcmRoot(): string {
 
 const DIGEST_A = "a".repeat(64);
 const DIGEST_B = "b".repeat(64);
+const CHECKSUM_C = "c".repeat(64);
 const GENERATION = "generation-1";
 
-function linkInput(overrides: Partial<{ generationId: string; publicationId: string; identityDigest: string }> = {}) {
+type LinkInput = Omit<ActivationGenerationLink, "version">;
+
+function linkInput(overrides: Partial<LinkInput> = {}): LinkInput {
   return {
     generationId: GENERATION,
     publicationId: "pub-1",
     identityDigest: DIGEST_A,
+    epochManifestRevision: 5,
+    epochManifestChecksumSha256: CHECKSUM_C,
     ...overrides,
   };
 }
 
 function expectedLink(overrides: Partial<ActivationGenerationLink> = {}): ActivationGenerationLink {
-  return { version: 1, generationId: GENERATION, publicationId: "pub-1", identityDigest: DIGEST_A, ...overrides };
+  return { version: 1, ...linkInput(), ...overrides };
 }
 
 /** This module's own canonical wire form of a link, built independently of
@@ -79,6 +84,8 @@ function wireBytes(link: ActivationGenerationLink): string {
     generationId: link.generationId,
     publicationId: link.publicationId,
     identityDigest: link.identityDigest,
+    epochManifestRevision: link.epochManifestRevision,
+    epochManifestChecksumSha256: link.epochManifestChecksumSha256,
   }) + "\n";
 }
 
@@ -134,6 +141,23 @@ describe("recordActivationGenerationLink", () => {
     );
   });
 
+  it.each([
+    ["epochManifestRevision", { epochManifestRevision: 6 }],
+    ["epochManifestChecksumSha256", { epochManifestChecksumSha256: DIGEST_B }],
+  ] as const)("refuses with a typed conflict when a retry carries a different frozen %s (A8: the pair is read from the link, never re-derived)", (_name, overrides) => {
+    const homeDir = home();
+    recordActivationGenerationLink({ homeDir, ...linkInput() });
+    expect(() => recordActivationGenerationLink({ homeDir, ...linkInput(overrides) })).toThrow(
+      ActivationGenerationLinkConflictError,
+    );
+  });
+
+  it("accepts the genesis revision 0 as a frozen epoch manifest revision", () => {
+    const homeDir = home();
+    const result = recordActivationGenerationLink({ homeDir, ...linkInput({ epochManifestRevision: 0 }) });
+    expect(result.link.epochManifestRevision).toBe(0);
+  });
+
   it("keeps links for different generations side by side", () => {
     const homeDir = home();
     recordActivationGenerationLink({ homeDir, ...linkInput() });
@@ -161,6 +185,11 @@ describe("recordActivationGenerationLink", () => {
     ["invalid generationId", linkInput({ generationId: "-bad" })],
     ["invalid publicationId", linkInput({ publicationId: "bad/id" })],
     ["invalid identityDigest", linkInput({ identityDigest: "A".repeat(64) })],
+    ["missing epoch manifest pair", { generationId: GENERATION, publicationId: "pub-1", identityDigest: DIGEST_A }],
+    ["negative epochManifestRevision", linkInput({ epochManifestRevision: -1 })],
+    ["fractional epochManifestRevision", linkInput({ epochManifestRevision: 1.5 })],
+    ["string epochManifestRevision", linkInput({ epochManifestRevision: "5" as unknown as number })],
+    ["invalid epochManifestChecksumSha256", linkInput({ epochManifestChecksumSha256: "abc" })],
   ])("rejects %s before any I/O", (_name, input) => {
     const homeDir = home();
     expect(() => recordActivationGenerationLink(
@@ -300,7 +329,10 @@ describe("readActivationGenerationLink: three-valued", () => {
     ["missing trailing newline (non-canonical)", wireBytes(expectedLink()).slice(0, -1)],
     ["non-canonical key order / whitespace", JSON.stringify(expectedLink(), null, 2) + "\n"],
     ["extra key", canonicalJson({ ...expectedLink(), extra: 1 }) + "\n"],
-    ["missing key", canonicalJson({ version: 1, generationId: GENERATION, publicationId: "pub-1" }) + "\n"],
+    ["missing key", canonicalJson({ version: 1, generationId: GENERATION, publicationId: "pub-1", identityDigest: DIGEST_A }) + "\n"],
+    ["missing epoch manifest pair (pre-A8 shape)", canonicalJson({ version: 1, generationId: GENERATION, publicationId: "pub-1", identityDigest: DIGEST_A }) + "\n"],
+    ["negative epochManifestRevision", canonicalJson({ ...expectedLink(), epochManifestRevision: -1 }) + "\n"],
+    ["invalid epochManifestChecksumSha256 pattern", canonicalJson({ ...expectedLink(), epochManifestChecksumSha256: "zz" }) + "\n"],
     ["unsupported version", canonicalJson({ ...expectedLink(), version: 2 }) + "\n"],
     ["invalid generationId pattern", canonicalJson({ ...expectedLink(), generationId: "-bad" }) + "\n"],
     ["invalid publicationId pattern", canonicalJson({ ...expectedLink(), publicationId: "bad/id" }) + "\n"],

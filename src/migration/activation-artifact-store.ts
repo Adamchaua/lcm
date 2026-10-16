@@ -109,8 +109,15 @@ import { attributeNullableRead } from "./activation-absence.js";
  * writes a second, tiny immutable file next to the artifacts, named by the
  * generation id's SHA-256 (generation-<sha256hex(generationId)>.link,
  * never the raw id, so the name stays fixed-width and path-safe), carrying
- * {generationId, publicationId, identityDigest}. It is written in S11
- * immediately before publishActivationArtifact, under the exact same
+ * {generationId, publicationId, identityDigest, epochManifestRevision,
+ * epochManifestChecksumSha256}. The last two are the revision and checksum
+ * of the VERIFIED manifest the activation epoch is derived from, frozen
+ * here before prepare-activation advances the manifest (plan-v7 A8/S-2):
+ * a retry that re-derived them from the now-activating manifest would
+ * mint a different epochId and refuse itself, so retries read the pair
+ * from this link and never from the live manifest. The link is written in
+ * S4b, after coverage backfill and before any manifest effect, under the
+ * exact same
  * persistence discipline (requireAbsent durable write, byte-identical
  * reuse, typed conflict on different bytes, crash-twin recovery, directory
  * fsync). A re-entering driver -- and #627's read-only report -- resolve the
@@ -210,6 +217,11 @@ export type ActivationGenerationLink = Readonly<{
   /** The identity digest (store key) of the recovery-material record this
    * generation's activation publishes; see readActivationArtifact. */
   identityDigest: string;
+  /** Revision of the verified manifest the activation epoch derives from,
+   * frozen before prepare-activation advances it (plan-v7 A8). */
+  epochManifestRevision: number;
+  /** checksumSha256 of that same verified manifest. */
+  epochManifestChecksumSha256: string;
 }>;
 
 export type ActivationGenerationLinkRecordResult = Readonly<{
@@ -1198,7 +1210,14 @@ function validateGenerationId(generationId: unknown): string {
   return generationId;
 }
 
-const LINK_INPUT_KEYS = ["generationId", "identityDigest", "publicationId"] as const;
+const LINK_INPUT_KEYS = [
+  "epochManifestChecksumSha256",
+  "epochManifestRevision",
+  "generationId",
+  "identityDigest",
+  "publicationId",
+] as const;
+const LINK_RECORD_KEYS = [...LINK_INPUT_KEYS, "version"] as const;
 
 function validateActivationGenerationLink(input: unknown): ActivationGenerationLink {
   if (
@@ -1215,12 +1234,29 @@ function validateActivationGenerationLink(input: unknown): ActivationGenerationL
   if (typeof input.identityDigest !== "string" || !IDENTITY_DIGEST_PATTERN.test(input.identityDigest)) {
     throw new ActivationArtifactValidationError("activation generation link identity digest is invalid");
   }
+  if (!isManifestRevision(input.epochManifestRevision)) {
+    throw new ActivationArtifactValidationError("activation generation link epoch manifest revision is invalid");
+  }
+  if (
+    typeof input.epochManifestChecksumSha256 !== "string"
+    || !IDENTITY_DIGEST_PATTERN.test(input.epochManifestChecksumSha256)
+  ) {
+    throw new ActivationArtifactValidationError("activation generation link epoch manifest checksum is invalid");
+  }
   return {
     version: ACTIVATION_GENERATION_LINK_VERSION,
     generationId,
     publicationId: input.publicationId,
     identityDigest: input.identityDigest,
+    epochManifestRevision: input.epochManifestRevision,
+    epochManifestChecksumSha256: input.epochManifestChecksumSha256,
   };
+}
+
+/** Same bound protocol.ts applies to a manifest revision: a safe,
+ * non-negative integer (genesis is revision 0). */
+function isManifestRevision(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function linkWireContent(link: ActivationGenerationLink): string {
@@ -1229,6 +1265,8 @@ function linkWireContent(link: ActivationGenerationLink): string {
     generationId: link.generationId,
     publicationId: link.publicationId,
     identityDigest: link.identityDigest,
+    epochManifestRevision: link.epochManifestRevision,
+    epochManifestChecksumSha256: link.epochManifestChecksumSha256,
   }) + "\n";
 }
 
@@ -1247,7 +1285,7 @@ function parseActivationGenerationLink(content: string): ActivationGenerationLin
   }
   if (
     !isRecord(value)
-    || !exactKeys(value, ["generationId", "identityDigest", "publicationId", "version"])
+    || !exactKeys(value, LINK_RECORD_KEYS)
     || value.version !== ACTIVATION_GENERATION_LINK_VERSION
     || typeof value.generationId !== "string"
     || !GENERATION_ID_PATTERN.test(value.generationId)
@@ -1255,6 +1293,9 @@ function parseActivationGenerationLink(content: string): ActivationGenerationLin
     || !PUBLICATION_ID_PATTERN.test(value.publicationId)
     || typeof value.identityDigest !== "string"
     || !IDENTITY_DIGEST_PATTERN.test(value.identityDigest)
+    || !isManifestRevision(value.epochManifestRevision)
+    || typeof value.epochManifestChecksumSha256 !== "string"
+    || !IDENTITY_DIGEST_PATTERN.test(value.epochManifestChecksumSha256)
   ) {
     return undefined;
   }
@@ -1263,6 +1304,8 @@ function parseActivationGenerationLink(content: string): ActivationGenerationLin
     generationId: value.generationId,
     publicationId: value.publicationId,
     identityDigest: value.identityDigest,
+    epochManifestRevision: value.epochManifestRevision,
+    epochManifestChecksumSha256: value.epochManifestChecksumSha256,
   };
   return linkWireContent(link) === content ? link : undefined;
 }
@@ -1285,10 +1328,18 @@ function linkSubject(generationId: string): ReconcileSubject {
  * dependency seam as publishActivationArtifact (see Part A and Part C of
  * the module doc comment). Different stored bytes for the same generation
  * raise ActivationGenerationLinkConflictError, never an overwrite. Call it
- * in S11 immediately before publishActivationArtifact.
+ * in S4b, after coverage backfill and before any manifest effect; the
+ * epoch manifest pair must come from the verified manifest.
  */
 export function recordActivationGenerationLink(
-  input: Readonly<{ homeDir?: string; generationId: string; publicationId: string; identityDigest: string }>,
+  input: Readonly<{
+    homeDir?: string;
+    generationId: string;
+    publicationId: string;
+    identityDigest: string;
+    epochManifestRevision: number;
+    epochManifestChecksumSha256: string;
+  }>,
   dependencies: ActivationArtifactPublishDependencies = {},
 ): ActivationGenerationLinkRecordResult {
   const link = validateActivationGenerationLink(input);
