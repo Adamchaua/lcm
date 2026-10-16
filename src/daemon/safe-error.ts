@@ -676,6 +676,17 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         forcedPath[index] = 1;
         continue;
       }
+      if (
+        exactFileScheme &&
+        foundFilePath &&
+        char === "/" &&
+        isPathWord(chars[index + 1]) &&
+        (chars[index - 1] === "&" || (chars[index - 1] === "?" && chars[index - 2] === "&"))
+      ) {
+        // An ampersand after the path starts a fresh root, not URL authority.
+        forcedPath[index] = 1;
+        continue;
+      }
       if (char === "/" && !quotedPathEnded) authority[index] = 1;
       if (
         exactFileScheme &&

@@ -4059,6 +4059,18 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it.each([
+    ["ampersand then query", "file://h/a&?/Users/A/secret.db", "file://h<path>&?<path>"],
+    ["query parameter then ampersand", "file://h/a?q=1&/Users/alice/secret.db", "file://h<path>?q=1&<path>"],
+    ["surrounding text", "see file://h/a&?/Users/A/secret.db end", "see file://h<path>&?<path> end"],
+  ] as const)("redacts a root after an unbracketed file URL path ampersand on the first pass: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");

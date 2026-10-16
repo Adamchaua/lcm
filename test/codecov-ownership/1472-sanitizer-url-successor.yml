@@ -1,0 +1,7 @@
+references: ["#1472"]
+rationale: >-
+  #1472 makes sanitizeError redact a POSIX root that follows an unbracketed
+  file URL path through an ampersand on the first pass; safe-error.ts keeps its
+  established owner.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]
