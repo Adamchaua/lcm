@@ -171,3 +171,18 @@ export {
   deriveActivationPublicationId,
 } from "./activation-publication-id.js";
 
+export {
+  MigrationTargetHealthError,
+  checkMigrationTargetHealth,
+} from "./target-health.js";
+export type {
+  MigrationTargetHealthDependencies,
+  MigrationTargetHealthErrorReason,
+  MigrationTargetHealthInput,
+  MigrationTargetHealthResult,
+  MigrationTargetHealthRuntime,
+  MigrationTargetHealthStatus,
+  MigrationTargetUnhealthyReason,
+  MigrationTargetUnresolvableReason,
+} from "./target-health.js";
+
