@@ -1140,11 +1140,15 @@ describe("passive-event replication pass", () => {
         machineId: "machine-uuid",
         acquireDrainLease: vi.fn().mockResolvedValue({ fencingToken }),
         renewDrainLease: vi.fn().mockResolvedValue({ fencingToken }),
-        claimEvents: vi.fn().mockResolvedValue(options.claims ?? []),
+        // The supplied claims are handed out once: completeApplied is a bare
+        // mock, so a row returned again would be applied again until the
+        // claim budget ran out.
+        claimEvents: vi.fn().mockResolvedValueOnce(options.claims ?? []).mockResolvedValue([]),
         completeApplied: vi.fn(),
         insertEvents: vi.fn().mockResolvedValue([remoteEvent("pending")]),
         readEvents: vi.fn().mockResolvedValue([remoteEvent("applied")]),
         releaseDrainLease: vi.fn().mockResolvedValue(undefined),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([]),
       };
       const harness = modules({
         resolveProjectIdentity: vi.fn(() => state.current ?? { remoteProjectId: null }),
@@ -1284,6 +1288,31 @@ describe("passive-event replication pass", () => {
       await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ applied: 1 });
       expect(fixture.remote.completeApplied).toHaveBeenCalledTimes(1);
       expect(fixture.resolveExistingProjectIdentity).toHaveBeenCalledTimes(5);
+      expectReportedOnce(fixture, onError);
+      await pass.close();
+    });
+
+    it("keeps claiming the old project's successors after the project is relinked between fetches (#1530)", async () => {
+      const home = publicationHome();
+      // Checks: lease, upload, renew, claim fetch, first apply; the relink
+      // lands at the renewal admitted before the second fetch.
+      const first = { eventId: "event-1", eventVersion: 1, machineId: "machine-uuid" };
+      const second = { eventId: "event-2", eventVersion: 1, machineId: "machine-uuid" };
+      const fixture = relinkHarness(5, REBOUND, { row: true });
+      fixture.remote.claimEvents.mockReset();
+      fixture.remote.claimEvents
+        .mockResolvedValueOnce([first])
+        .mockResolvedValueOnce([second])
+        .mockResolvedValue([]);
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ applied: 2 });
+      expect(fixture.remote.claimEvents).toHaveBeenCalledTimes(3);
+      expect(fixture.remote.completeApplied).toHaveBeenCalledTimes(2);
+      // The relinked project's foreign copies stay untouched and no further
+      // local row is uploaded once the binding has moved.
+      expect(fixture.remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+      expect(fixture.local.claimDeliveries).toHaveBeenCalledTimes(1);
       expectReportedOnce(fixture, onError);
       await pass.close();
     });

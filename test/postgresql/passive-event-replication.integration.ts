@@ -108,6 +108,7 @@ function worker(
   local: LocalHookOutboxRepository,
   remote: PostgreSqlPassiveEventRepository,
   processId: string,
+  batchSize = 2,
 ): PassiveEventReplicationWorker {
   return new PassiveEventReplicationWorker({
     local,
@@ -128,7 +129,7 @@ function worker(
     random: () => 0.5,
   }, {
     processId,
-    batchSize: 2,
+    batchSize,
     staleClaimMs: 50,
     leaseTtlMs: 1_000,
     retryBaseMs: 1,
@@ -347,6 +348,92 @@ describe("PostgreSQL 18 passive-event replication", () => {
         }
       } finally {
         await Promise.allSettled([firstFactory.close(), secondFactory.close()]);
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("applies a machine's whole ready backlog in a single pass (#1530)", async () => {
+    await withPostgreSqlTestDatabase("passive-single-pass", async (database) => {
+      await grantPassiveEventRuntimePrivileges(database);
+      const projectId = await createProject(database, "Passive single pass project");
+      const machineId = await createMachine(database, "Passive single pass machine");
+      await database.migrator.query({
+        text: `CREATE TABLE public.passive_event_effects(
+                 effect_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                 event_id uuid NOT NULL UNIQUE,
+                 machine_id uuid NOT NULL
+               );
+               REVOKE ALL ON public.passive_event_effects FROM PUBLIC;
+               GRANT INSERT, SELECT ON public.passive_event_effects
+               TO lcm_test_runtime;
+               GRANT USAGE ON SEQUENCE public.passive_event_effects_effect_id_seq
+               TO lcm_test_runtime`,
+      }, { domain: "passive-events", operation: "createSinglePassEffects" });
+      const directory = mkdtempSync(join(tmpdir(), "lcm-passive-single-pass-"));
+      const factory = new SQLiteLocalHookOutboxFactory();
+      try {
+        const path = join(directory, "events.db");
+        const local = await factory.open(path);
+        await insertLocalEvents(local, "pass", 4);
+        clearCapturedMachineIdentity(path);
+        const remote = new PostgreSqlPassiveEventRepository(
+          database.runtime,
+          projectId,
+          machineId,
+        );
+        // The real prune deletes applied inbox rows, so the status that each
+        // row had when it was pruned is the only proof of the applied state.
+        const prunedStatuses: string[] = [];
+        const prune = remote.pruneApplied.bind(remote);
+        remote.pruneApplied = async (keys, signal) => {
+          const records = await remote.readEvents(
+            keys.map((key) => ({ machineId: key.machineId, eventId: key.eventId })),
+            signal,
+          );
+          prunedStatuses.push(...records.map((record) => record.status));
+          return prune(keys, signal);
+        };
+
+        // One run only: a driver that repeats runs would hide the defect.
+        const result = await worker(local, remote, "replication-single", 10).runOnce();
+
+        expect(result).toMatchObject({
+          uploaded: 4,
+          applied: 4,
+          acknowledged: 4,
+          pruned: 4,
+        });
+        expect(prunedStatuses).toEqual(["applied", "applied", "applied", "applied"]);
+        const rows = await local.getUnprocessed(500);
+        expect(rows).toHaveLength(4);
+        expect(rows.every((row) =>
+          row.delivery_state === "acknowledged" && row.remote_pruned_at !== null))
+          .toBe(true);
+        const effects = await database.migrator.query<{ data: string }>({
+          text: `SELECT inbox.payload->>'data' AS data
+                 FROM public.passive_event_effects AS effect
+                 JOIN (
+                   SELECT event_id, payload
+                   FROM jsonb_to_recordset($1::pg_catalog.jsonb)
+                     AS input(event_id uuid, payload jsonb)
+                 ) AS inbox ON inbox.event_id = effect.event_id
+                 ORDER BY effect.effect_id`,
+          values: [JSON.stringify(rows.map((row) => ({
+            event_id: row.event_uuid,
+            payload: { data: row.data },
+          })))],
+        }, { domain: "passive-events", operation: "verifySinglePassOrder" });
+        expect(effects.rows.map((row) => row.data))
+          .toEqual(Array.from({ length: 4 }, (_, index) => `pass-${String(index)}`));
+        const inbox = await database.migrator.query<{ remaining: string }>({
+          text: `SELECT count(*)::pg_catalog.text AS remaining
+                 FROM lcm.passive_event_inbox WHERE project_id = $1`,
+          values: [projectId],
+        }, { domain: "passive-events", operation: "verifySinglePassInbox" });
+        expect(inbox.rows[0].remaining).toBe("0");
+      } finally {
+        await Promise.allSettled([factory.close()]);
         rmSync(directory, { recursive: true, force: true });
       }
     });
