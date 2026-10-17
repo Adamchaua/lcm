@@ -215,11 +215,27 @@ event-delivery worker for the local outbox, distinct from the daemon's selected
 3. inserts envelopes idempotently into the existing
    `lcm.passive_event_inbox`;
 4. applies remotely claimed events and their `applied` transition in one short
-   PostgreSQL transaction;
+   PostgreSQL transaction, and keeps claiming for as long as its own applies
+   and quarantines make the next events of a machine claimable, so a backlog
+   drains in one pass up to the batch size (100) while later events still
+   wait for earlier ones;
 5. resolves uncertain commits by exact inbox readback;
 6. durably acknowledges the local row after remote `applied` proof; and
 7. prunes only the exact applied inbox row, recording local prune completion
    after deletion or missing-row proof.
+
+A claim fetch returns at most one event per machine, because an event is
+claimable only once every earlier event of its machine is applied or
+quarantined. The batch size is therefore a budget of claimed events shared by
+all fetches of one pass, not a number of events per fetch. A pass stops
+claiming earlier when a fetched batch produces no applied or quarantined
+outcome (a batch that only schedules retries or only fails without a counter),
+when the drain lease is lost, or when a publication admission is refused. A
+mixed batch with any applied or quarantined row continues. Other ready work,
+such as another machine, a new arrival, or a retry timer, may be claimed by a
+later fetch of the same pass but is not guaranteed; it waits for the next sweep
+once the pass stops making progress. "Up to the batch size" thus means ready
+work the pass actually settles, not a guarantee about peers.
 
 Per-machine ordering is preserved within a project binding; a project relink
 is the exception (see below). Independent machines can progress
@@ -269,9 +285,10 @@ from the selected `ProjectStorage` route.
 
 Every project replicates in admitted phases rather than inside one admission
 held across the whole pass. The drain-lease acquisition runs under its own
-admission before the upload, then the upload runs under one admission, the
-claim fetch under the next, each renew-and-apply under its own, and reconcile
-and prune each under their own, using the same publication check that
+admission before the upload, then the upload runs under one admission, each
+claim fetch under its own (every fetch after the first preceded by its own
+lease renewal), each renew-and-apply under its own, and reconcile and prune
+each under their own, using the same publication check that
 promotion uses. Only the cleanup lease release runs outside admission. The
 consumer lock is released between phases so hook appends can proceed instead
 of waiting behind a whole sweep. A daemon keeps its startup backend for its
@@ -304,10 +321,12 @@ change. If the project was relinked or unbound in the meantime, the pass
 reports one error and uploads no further rows to the previous project. It
 keeps working on what that project already holds (claims, reconcile and prune)
 for the rest of the pass, so rows it uploaded there are not abandoned
-mid-pass. Rows the pass did not upload stay pending locally and upload to the
-new binding on the next sweep. A pass run without a publication admission
-checks the binding too, but without the admission's lock, so that check is
-best effort.
+mid-pass; that includes the further claims of events the old project already
+holds, while new local uploads and the withdrawal of copies from other
+projects stay withheld. Rows the pass did not upload stay pending locally and
+upload to the new binding on the next sweep. A pass run without a publication
+admission checks the binding too, but without the admission's lock, so that
+check is best effort.
 
 #### After a project relink
 
