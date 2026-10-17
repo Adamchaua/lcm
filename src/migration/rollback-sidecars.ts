@@ -390,7 +390,9 @@ type PassiveEventReadbackRow = Readonly<{
  * The two sets are accounted for separately. The live local outbox legitimately holds appends made after the
  * cutoff that the archive never saw. The events table's own state model (hooks/events-db.ts) marks a row as
  * delivered through remote_inbox_id (set when the remote inbox accepted it) and acknowledged_at (set on the
- * remote acknowledgement); a row with neither is still a local append awaiting replication, whether it is
+ * remote acknowledgement). The schema's CHECK constraints tie the two (acknowledged_at is set exactly when
+ * delivery_state is 'acknowledged', and that state requires a remote_inbox_id), so remote_inbox_id alone decides
+ * and acknowledged_at needs no read of its own. A row without one is still a local append awaiting replication, whether it is
  * pending, retrying, claimed or quarantined. Such a row absent from the archive is preserved untouched and
  * counted. A row absent from the archive that claims either marker contradicts the archive (a delivered event
  * PostgreSQL does not hold) and refuses.
@@ -443,11 +445,11 @@ export function verifyPassiveEventsAgainstArchive(
     }
   }
   const others = (eventsDb.prepare(
-    "SELECT event_uuid, remote_inbox_id, acknowledged_at FROM events",
-  ).all() as Array<{ event_uuid: string; remote_inbox_id: string | null; acknowledged_at: string | null }>)
+    "SELECT event_uuid, remote_inbox_id FROM events",
+  ).all() as Array<{ event_uuid: string; remote_inbox_id: string | null }>)
     .filter((stored) => !archivedEventIds.has(stored.event_uuid));
   for (const stored of others) {
-    if (stored.remote_inbox_id !== null || stored.acknowledged_at !== null) {
+    if (stored.remote_inbox_id !== null) {
       throw new RollbackSidecarError(
         "verification-failed",
         `events table holds delivered event ${stored.event_uuid} that the archive does not contain`,

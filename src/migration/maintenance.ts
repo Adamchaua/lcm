@@ -260,13 +260,15 @@ export function inspectImmutableSqliteSnapshot(
 }
 
 /**
- * True only for a valid manifest at phase rolled-back with no pending effect. A generation with no manifest
- * at all is not manifest-backed (false); a manifest that is present but cannot be read or validated refuses.
+ * True only for a valid manifest at phase rolled-back. rolled-back is a terminal phase, and the manifest
+ * validation refuses a terminal phase with a pending effect (protocol.ts), so a valid rolled-back manifest has
+ * none. A generation with no manifest at all is not manifest-backed (false); a manifest that is present but
+ * cannot be read or validated refuses.
  */
 function rolledBackWithoutPendingEffect(homeDir: string, generationId: string): boolean {
   try {
     const manifest = new MigrationManifestStore({ homeDir }).read(generationId);
-    return manifest.phase === "rolled-back" && manifest.pendingEffect === null;
+    return manifest.phase === "rolled-back";
   } catch (error) {
     if (error instanceof MigrationProtocolError && error.message === "migration manifest head is absent") return false;
     throw new BackendPublicationJournalError(
