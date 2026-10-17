@@ -944,3 +944,106 @@ of the process that runs verification is raised accordingly (for example with
 memory, verification stops and no report is written; it never trims its
 evidence to fit. Verification restarts from the beginning, and a lease left
 behind by the stopped process expires after `leaseTtlMs`.
+
+## Migration activation
+
+Activation is the cutover itself: it switches the daemon's storage selection
+from the verified SQLite generation to its PostgreSQL destination. It runs on
+one verified, activation-eligible generation while backend publication is
+held for migration maintenance, and it is the only step in this journal that
+changes what the daemon will read and write after its next restart.
+
+### What activation checks before it changes anything
+
+Every precondition is re-read live at the start of the run, never trusted
+from an earlier pass:
+
+- the manifest is `verified` (or `activating` from an interrupted earlier
+  run) and its verification report is the one the manifest names, parses,
+  and is activation-eligible;
+- a maintenance journal is held for this generation, every writer on the
+  roster is quiescent, and the fenced lease for the project is free or
+  already this generation's;
+- the stored data on this machine belongs to exactly one project, the one
+  being migrated. Activation of a machine with data for several projects
+  refuses with `uncovered-projects`; multi-project cutover is out of scope;
+- the destination identity, the project-map binding, the transfer-ledger copy
+  binding and the destination census all match the verification report, and
+  the PostgreSQL target passes the authenticated health check.
+
+A failed precondition is a **refusal**. A refusal begins no effect and leaves
+nothing to recover: fix the named condition and run again. Refusals name the
+step (`S0` through `S8`) and a closed reason such as `maintenance-not-held`,
+`lease-conflict`, `census-drift`, `project-map-drift` or `target-unhealthy`.
+Unresolvable readings (an unreadable journal, an ambiguous lease) are refusals
+too, distinct from a definite "no".
+
+### What activation writes, in order
+
+Once the checks pass, activation records durable evidence before it touches
+the live selection, in a fixed order so that any crash leaves a state the next
+run can classify:
+
+1. `prepare-activation` on the manifest (`verified` becomes `activating`);
+2. `publish-activation` begins;
+3. the sealed publication artifact, then the generation -> publication link,
+   then the activation epoch, attempt and witness, then the witness binding;
+4. the maintenance selection, then the selection binding;
+5. the backend publication itself (project map and configuration), under the
+   fenced lease;
+6. the activation report, then `publish-activation` completes and the manifest
+   is `active`.
+
+The activation report is a pure function of durable state and lives at
+`<home>/.lcm/migration-activation-reports/<sha256(generationId)>/<reportSha256>`.
+It never contains the restart verdict; that is returned on the outcome.
+
+### Interruptions and recovery
+
+A failure after step 1 is an **interruption**, not a refusal: an effect has
+begun. The outcome names the step (`S9` through `S16`), a closed cause, and
+three facts an operator can act on: whether an effect began, whether the
+publication is known to have been applied (`yes`, `no` or `unknown`), and
+whether an activation report is known to be stored. `unknown` is reported
+honestly when the journal or report store cannot be read; it is never
+collapsed into a guess.
+
+Recovery is to run activation again. The run resumes from the durable
+evidence it finds (the manifest, the link and artifact, the stored attempt,
+the journals, the stored report) and rolls forward; it never re-derives an
+attempt that a selection already carries, and it reuses an artifact or a
+report byte-identically when the bytes still authenticate. Nothing is
+reversed automatically. If the published target turns out unhealthy after
+publication, the outcome is `post-publication-unhealthy` with the restart
+verdict; the selection stands, and the next run completes once the target is
+healthy again. Reversal is a separate, explicit rollback.
+
+### The lease and the unavailable window
+
+Activation holds the project's fenced publication lease from the first check
+until publication completes, renewing it after the census and before the
+selection and the publication. The lease time to live is 15 minutes; a
+stretch that outlives it is not silently continued. An expired lease is taken
+over on the next run, which mints a new attempt if no selection exists yet
+and otherwise continues the recorded one, reporting the advanced fencing
+token on the outcome.
+
+### The daemon restart
+
+Publication changes the selection the daemon reads at startup. A daemon that
+was running before activation keeps its old backend until it restarts, so the
+outcome carries a restart verdict: satisfied when no daemon is running or the
+live daemon already reports the new backend, unsatisfied when a live daemon
+still reports the old one, and unresolvable when the pid file is malformed,
+unreadable, or a daemon answers on the port without a pid file. Restart the
+daemon before relying on the new backend.
+
+### Preview
+
+`previewMigrationActivation` reads the manifest, the verification report, the
+journals, the link, the artifact and the restart verdict and reports each as
+ok, refuse or unresolvable. It takes no lock, opens no PostgreSQL connection
+and writes nothing, so it cannot evaluate quiescence, coverage, the
+single-project rule, the lease, target health or the census, and it does not
+predict the outcome of a run; those checks happen only inside the run itself.
+
