@@ -296,21 +296,43 @@ export class PassiveEventReplicationWorker {
     const mutable = { ...summary, leaseAcquired: true };
     try {
       await admit(() => this.uploadLocal(mutable, signal));
-      const renewed = await admit(() => this.renewLease(lease.fencingToken, signal));
-      if (!renewed) return mutable;
-      const claims = await admit(() => this.dependencies.remote.claimEvents({
-        claimOwner: `${this.options.processId}:${lease.fencingToken.toString()}`,
-        limit: this.options.batchSize,
-        staleClaimMs: this.options.staleClaimMs,
-        signal,
-      }));
-      for (const claim of claims) {
-        const kept = await admit(async () => {
-          if (!await this.renewLease(lease.fencingToken, signal)) return false;
-          await this.applyClaim(claim, lease.fencingToken, mutable, signal);
-          return true;
-        });
-        if (!kept) break;
+      // The existing renewal below serves the first claim fetch.
+      if (!await admit(() => this.renewLease(lease.fencingToken, signal))) return mutable;
+      // A fetch returns at most one row per machine, because the claim query
+      // withholds a row until every earlier row of its machine is terminal.
+      // Applying a head therefore makes its successor claimable only after
+      // the fetch has run, so the pass keeps claiming while its own applies
+      // settle rows (#1530). The claimed-row budget is shared by every fetch
+      // of the pass and never refunded, which bounds the fetch count by the
+      // batch size. A fetch whose claims settle nothing ends the loop: no
+      // successor can have become claimable from this pass's own work.
+      let budget = this.options.batchSize;
+      while (budget > 0) {
+        const claims = await admit(() => this.dependencies.remote.claimEvents({
+          claimOwner: `${this.options.processId}:${lease.fencingToken.toString()}`,
+          limit: budget,
+          staleClaimMs: this.options.staleClaimMs,
+          signal,
+        }));
+        if (claims.length === 0) break;
+        budget -= claims.length;
+        // Taken here, not before uploadLocal: uploads and reconciliation also
+        // move the quarantined counter and are not claim progress.
+        const settledBefore = mutable.applied + mutable.quarantined;
+        let kept = true;
+        for (const claim of claims) {
+          kept = await admit(async () => {
+            if (!await this.renewLease(lease.fencingToken, signal)) return false;
+            await this.applyClaim(claim, lease.fencingToken, mutable, signal);
+            return true;
+          });
+          if (!kept) break;
+        }
+        if (!kept || budget <= 0) break;
+        if (mutable.applied + mutable.quarantined === settledBefore) break;
+        // The claim fetch itself is not fenced, so every further fetch needs
+        // its own renewal. A lost lease stops claiming but still reconciles.
+        if (!await admit(() => this.renewLease(lease.fencingToken, signal))) break;
       }
       await admit(() => this.reconcileLocal(mutable, signal));
       await admit(() => this.pruneAcknowledged(mutable, signal));

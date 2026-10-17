@@ -1140,11 +1140,15 @@ describe("passive-event replication pass", () => {
         machineId: "machine-uuid",
         acquireDrainLease: vi.fn().mockResolvedValue({ fencingToken }),
         renewDrainLease: vi.fn().mockResolvedValue({ fencingToken }),
-        claimEvents: vi.fn().mockResolvedValue(options.claims ?? []),
+        // The supplied claims are handed out once: completeApplied is a bare
+        // mock, so a row returned again would be applied again until the
+        // claim budget ran out.
+        claimEvents: vi.fn().mockResolvedValueOnce(options.claims ?? []).mockResolvedValue([]),
         completeApplied: vi.fn(),
         insertEvents: vi.fn().mockResolvedValue([remoteEvent("pending")]),
         readEvents: vi.fn().mockResolvedValue([remoteEvent("applied")]),
         releaseDrainLease: vi.fn().mockResolvedValue(undefined),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([]),
       };
       const harness = modules({
         resolveProjectIdentity: vi.fn(() => state.current ?? { remoteProjectId: null }),
@@ -1744,6 +1748,75 @@ describe("passive-event replication pass", () => {
       expect(fixture.remote.releaseFromOtherProjects).not.toHaveBeenCalled();
       expect(fixture.local.requeueReplicated).not.toHaveBeenCalled();
       expect(onError).toHaveBeenCalledWith(expect.any(ReplicationBindingChangedError));
+      await pass.close();
+    });
+
+    /**
+     * Two events of one machine already sit in the previous project's inbox.
+     * The claim fake hands out only the earliest non-terminal row and nothing
+     * while that row is unfinished, and completeApplied runs the effect and
+     * terminalizes the row, so the successor is claimable only after its
+     * predecessor has been applied (#1530).
+     */
+    function successorInbox(goodChecks: number) {
+      const fixture = guardedRecovery(goodChecks);
+      const rows = [
+        { eventId: "event-1", state: "pending" },
+        { eventId: "event-2", state: "pending" },
+      ];
+      fixture.remote.claimEvents.mockReset();
+      fixture.remote.claimEvents.mockImplementation(async () => {
+        const head = rows.find(row => row.state !== "applied");
+        if (head === undefined || head.state !== "pending") return [];
+        head.state = "claimed";
+        return [{ eventId: head.eventId, eventVersion: 1, machineId: "machine-uuid" }];
+      });
+      fixture.remote.completeApplied.mockReset();
+      fixture.remote.completeApplied.mockImplementation(async (
+        input: { claim: { eventId: string } },
+        effect: (executor: unknown, claim: unknown) => Promise<void>,
+      ) => {
+        await effect({}, input.claim);
+        rows.find(row => row.eventId === input.claim.eventId)!.state = "applied";
+      });
+      return fixture;
+    }
+
+    it("keeps claiming the old project's successors after the project is relinked between fetches (#1530)", async () => {
+      const home = publicationHome();
+      // Admissions: 1 lease, 2 upload, 3 renew, 4 first fetch, 5 first
+      // apply, 6 renew before the second fetch. The relink is first seen
+      // by the sixth binding read, which latches, so the proxy stops reading
+      // exactly there and the second fetch, second apply and everything
+      // after run with the binding already moved.
+      const fixture = successorInbox(5);
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ applied: 2 });
+      expect(fixture.resolveExistingProjectIdentity).toHaveBeenCalledTimes(6);
+      expect(fixture.remote.claimEvents).toHaveBeenCalledTimes(3);
+      expect(fixture.remote.completeApplied).toHaveBeenCalledTimes(2);
+      // No new local row goes to the old project, and the copies this
+      // machine holds in other projects are not withdrawn or requeued, even
+      // though reconcile reaches its recovery for the absent replicated row.
+      expect(fixture.local.claimDeliveries).toHaveBeenCalledTimes(1);
+      expect(fixture.remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+      expect(fixture.local.requeueReplicated).not.toHaveBeenCalled();
+      expectReportedOnce(fixture, onError);
+      await pass.close();
+    });
+
+    it("reaches the recovery of the absent replicated row when the binding does not move", async () => {
+      const home = publicationHome();
+      const fixture = successorInbox(Number.MAX_SAFE_INTEGER);
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ applied: 2 });
+      expect(fixture.remote.claimEvents).toHaveBeenCalledTimes(3);
+      expect(fixture.remote.completeApplied).toHaveBeenCalledTimes(2);
+      expect(fixture.remote.releaseFromOtherProjects).toHaveBeenCalledTimes(1);
+      expect(fixture.local.requeueReplicated).toHaveBeenCalledWith("event-1", 41n);
+      expect(onError).not.toHaveBeenCalled();
       await pass.close();
     });
   });
