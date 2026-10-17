@@ -711,6 +711,12 @@ export interface RollbackFencedSession {
    * is present and released; it never releases it itself (seam section 19).
    */
   markCoordinatorAcquired(): void;
+  /**
+   * Closes the owned resources only and leaves the PostgreSQL lease held. Called instead of release() once the
+   * maintenance selection has been attempted: until the coordinator's publication completes, a released lease
+   * would admit guarded writers while a selection toward sqlite is pending.
+   */
+  closeKeepingLease(): Promise<void>;
   release(): Promise<void>;
 }
 
@@ -1813,6 +1819,8 @@ async function runPostPrepareSequence(
   const remoteProjectId = assertCoveredProjectIsSoleRemoteBinding(deps, input, token);
 
   const heldChecksum = requireMaintenanceChecksum(input.homeDir);
+  // From the attempt on, nothing may release the lease (F1): the selection may be durable even if the call throws.
+  sessionsHoldingLease.add(session);
   const prepared = await deps.coordinator.prepareMaintenanceSelection({
     expectedChecksumSha256: heldChecksum,
     generationId: input.generationId,
@@ -1909,6 +1917,9 @@ async function resolveContinuationAuthority(
   return { status: "resolved", authority, authoritativeContext, artifact: priorAuthorityArtifact };
 }
 
+/** Sessions whose window reached the maintenance selection: their lease outlives any failure. */
+const sessionsHoldingLease = new WeakSet<RollbackFencedSession>();
+
 /**
  * Runs the body with the fenced session and releases it afterwards. A
  * release that fails after a failed body never masks the original failure.
@@ -1918,7 +1929,8 @@ async function withFencedSession<T>(session: RollbackFencedSession, body: () => 
   try {
     result = await body();
   } catch (error) {
-    await session.release().catch(() => undefined);
+    // Plan-v3.2 F1: once the maintenance selection was attempted, a failure must not release the lease.
+    await (sessionsHoldingLease.has(session) ? session.closeKeepingLease() : session.release()).catch(() => undefined);
     throw error;
   }
   await session.release();
@@ -2373,6 +2385,24 @@ async function recoverPendingPublishRollback(
       };
     };
 
+    /**
+     * Runs a recovery step under a fresh fenced session on the rollback's lease tuple. The selection was already
+     * attempted by an earlier process, so no failure here releases the lease.
+     */
+    const withRecoverySession = async <T,>(body: (session: RollbackFencedSession) => Promise<T>): Promise<T> => {
+      const session = await deps.openFencedSession({
+        homeDir: input.homeDir, manifest: current, lockToken: token,
+        scratchParent: input.scratchParent, signal: input.signal,
+      });
+      sessionsHoldingLease.add(session);
+      return withFencedSession(session, () => body(session));
+    };
+
+    /**
+     * Whether a rollback selection binding is recorded. Three-valued in effect (F5): an unresolvable binding store
+     * establishes nothing -- neither that a selection completed nor that it did not -- so it refuses here, before
+     * any report or manifest mutation, rather than reading as "no binding" and abandoning the effect.
+     */
     const hasRollbackSelectionBinding = (): boolean => {
       const resolution = deps.resolveWitnessBindings({ homeDir: input.homeDir, generationId: input.generationId });
       if (resolution.state === "unresolvable") {
@@ -2438,14 +2468,21 @@ async function recoverPendingPublishRollback(
           );
         }
         const phase = storedPhase();
-        if (maintenance.phase === "selection-prepared") {
-          await deps.coordinator.completeMaintenanceSelection({
-            expectedChecksumSha256: maintenance.checksumSha256,
-            generationId: input.generationId,
-            terminalEvidenceSha256,
-          }, token);
-        }
-        return finishRollbackPublication(phase, current);
+        // F1: the lease may have expired or been lost since the process that prepared the selection died, so a
+        // fresh fenced session on the same tuple is opened (it takes over our own expired lease and refuses a
+        // lease held by anyone else). A prepared selection is revalidated against it before it is completed;
+        // a completed one is final.
+        return withRecoverySession(async (session) => {
+          if (maintenance.phase === "selection-prepared") {
+            await revalidatePreparedSelection(input, deps, current, session, phase);
+            await deps.coordinator.completeMaintenanceSelection({
+              expectedChecksumSha256: maintenance.checksumSha256,
+              generationId: input.generationId,
+              terminalEvidenceSha256,
+            }, token);
+          }
+          return finishRollbackPublication({ ...phase, session }, current);
+        });
       }
       // The only other phase a pending effect can meet is maintenance-aborted: no selection was ever prepared.
       return abandon("the maintenance was " + maintenance.phase);
@@ -2457,7 +2494,12 @@ async function recoverPendingPublishRollback(
           "this rollback's coordinator publication is in the live slot without the selection binding that must precede it",
         );
       }
-      return finishRollbackPublication(storedPhase(), current);
+      const phase = storedPhase();
+      // A completed or aborted journal needs no lease; any other state still has the remote fence to drive.
+      if (slot.journal.phase === "completed" || slot.journal.phase === "aborted") {
+        return finishRollbackPublication(phase, current);
+      }
+      return withRecoverySession((session) => finishRollbackPublication({ ...phase, session }, current));
     }
     if (hasRollbackSelectionBinding()) {
       throw new RollbackOrchestrationError(
@@ -2467,6 +2509,45 @@ async function recoverPendingPublishRollback(
     }
     return abandon("no journal of this rollback remains");
   });
+}
+
+/**
+ * F1. A prepared maintenance selection is completed only if a fresh fenced readback still reproduces the terminal
+ * evidence the pending effect carries: the same authority, the same mode and, through the rollback witness, the
+ * same delta and census the export and step 10 saw. A contradiction cannot abort a prepared selection (the
+ * coordinator has no such exit), so it is refused with a typed error and everything is left as it is.
+ */
+async function revalidatePreparedSelection(
+  input: Readonly<RunMigrationRollbackInput>,
+  deps: Readonly<ResolvedRollbackDependencies>,
+  current: MigrationManifest,
+  session: RollbackFencedSession,
+  phase: PublicationPhase,
+): Promise<void> {
+  const resolved = await resolveContinuationAuthority(input, deps);
+  if (resolved.status === "refused") {
+    throw new RollbackOrchestrationError("not-eligible", "the authority no longer resolves: " + resolved.reason);
+  }
+  const { authority, authoritativeContext } = resolved;
+  const observation = await session.captureReadback({
+    manifestDestinationWitnessSha256: current.destination.identitySha256,
+    canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
+    requireCensus: phase.mode === "post-write",
+  });
+  const decision = evaluateRollbackEligibility({ authority, authoritativeContext, observation });
+  if (decision.eligibility === "refused") throw new RollbackOrchestrationError("not-eligible", decision.reason);
+  const evidence = session.computeRollbackTerminalEvidenceSha256({
+    epoch: authoritativeContext?.epoch ?? null,
+    attempt: authoritativeContext?.attempt ?? null,
+    observation,
+    mode: decision.mode,
+  });
+  if (decision.mode !== phase.mode || evidence !== phase.terminalEvidenceSha256) {
+    throw new RollbackOrchestrationError(
+      "drift",
+      "the destination no longer reproduces the pending publish-rollback's terminal evidence; the prepared selection is not completed",
+    );
+  }
 }
 
 /**

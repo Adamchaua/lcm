@@ -695,3 +695,55 @@ describe("RollbackSessionError", () => {
 const _typeCheck: (session: RollbackProductionSession) => RollbackFencedSession = (session) => session;
 void _typeCheck;
 
+
+describe("closeKeepingLease (F1)", () => {
+  it("closes the snapshots and the runtime and never touches the lease row", async () => {
+    const { guard, state, calls } = statefulGuard();
+    const h = harness({ guard });
+    const session = await open(h);
+    await session.openPortableSource();
+    const before = state.row;
+
+    await session.closeKeepingLease();
+
+    expect(h.snapshots[0]!.close).toHaveBeenCalledTimes(1);
+    expect(h.runtime.close).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual(["acquire"]);
+    expect(state.row).toBe(before);
+    expect(state.row?.releasedAt).toBeNull();
+  });
+
+  it("is a no-op once the session was released or closed, and release() afterwards does not release the lease", async () => {
+    const { guard, calls } = statefulGuard();
+    const h = harness({ guard });
+    const session = await open(h);
+    await session.closeKeepingLease();
+    await session.closeKeepingLease();
+    await session.release();
+    expect(h.runtime.close).toHaveBeenCalledTimes(1);
+    expect(calls).not.toContain("release");
+
+    const other = harness();
+    const released = await open(other);
+    await released.release();
+    await released.closeKeepingLease();
+    expect(other.runtime.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports the first close failure after attempting every close", async () => {
+    const h = harness();
+    const session = await open(h);
+    await session.openPortableSource();
+    h.snapshots[0]!.close.mockRejectedValue(new Error("snapshot close failed"));
+    h.runtime.close.mockRejectedValue(new Error("runtime close failed"));
+    await expect(session.closeKeepingLease()).rejects.toThrow("snapshot close failed");
+    expect(h.runtime.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a runtime close failure when the snapshots closed cleanly", async () => {
+    const h = harness();
+    const session = await open(h);
+    h.runtime.close.mockRejectedValue(new Error("runtime close failed"));
+    await expect(session.closeKeepingLease()).rejects.toThrow("runtime close failed");
+  });
+});

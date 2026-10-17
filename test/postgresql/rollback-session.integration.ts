@@ -32,6 +32,7 @@ import {
 import { createBackendPublicationCoordinator } from "../../src/storage/backend-publication-driver.js";
 import { composeBackendPublicationMaterial } from "../../src/storage/backend-publication-material.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { acquirePostgreSqlProjectMutationGuard } from "../../src/storage/postgresql/publication-guard.js";
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage/postgresql/publication-remote-guard.js";
 import { configPath } from "../../src/runtime-paths.js";
 import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
@@ -379,6 +380,12 @@ function expectRollbackPublished(homeDir: string, generationId: string): void {
   expect(readProjectMapFile(homeDir)[fixture.localProjectId]!.remoteProjectId).toBeUndefined();
 }
 
+function failCompleteSelection(coordinator: ReturnType<typeof createBackendPublicationCoordinator>): void {
+  coordinator.completeMaintenanceSelection = async () => {
+    throw new Error("simulated I/O failure in completeMaintenanceSelection");
+  };
+}
+
 function crashAfter(method: "prepare" | "resume") {
   return (coordinator: ReturnType<typeof createBackendPublicationCoordinator>): void => {
     const target = coordinator as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
@@ -595,6 +602,51 @@ describe("production rollback against PostgreSQL 18", { timeout: 240_000 }, () =
 
       expect(outcome.manifest.phase).toBe("rolled-back");
       expectRollbackPublished(homeDir, "gen-crash-prepare");
+      expect((await leaseRow(database))!.released).toBe(true);
+    });
+  });
+
+  it("F1: a failure after the selection was prepared keeps the lease, so guarded writers stay fenced out; a write that got past the fence refuses the retry", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-f1-drift", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-f1-drift");
+      await expect(runRollback({
+        homeDir, generationId: "gen-f1-drift", canonicalPath, database, wrapCoordinator: failCompleteSelection,
+      })).rejects.toMatchObject({ message: expect.stringContaining("simulated I/O failure in completeMaintenanceSelection") });
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+      // The lease is still held (not released), so the production mutation guard refuses a writer.
+      expect(await leaseRow(database)).toMatchObject({ released: false, live: true, owner_process_id: deriveRollbackPublicationId("gen-f1-drift") });
+      await expect(acquirePostgreSqlProjectMutationGuard(database.migrator, fixture.projectId, factoryContext))
+        .rejects.toThrow();
+
+      // A write that bypassed the guard (out of band) lands before the retry.
+      await insertConversation(database, "written-after-failure");
+      await expect(runRollback({ homeDir, generationId: "gen-f1-drift", canonicalPath, database }))
+        .rejects.toMatchObject({ reason: "drift" });
+
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+      expect(readConfigBackend(homeDir)).toBe("postgresql");
+      expect(new MigrationManifestStore({ homeDir }).read("gen-f1-drift").pendingEffect?.kind).toBe("publish-rollback");
+      expect(await leaseRow(database)).toMatchObject({ released: false });
+      const kept = await database.migrator.query<{ n: string }>({
+        text: "SELECT count(*)::text AS n FROM lcm.conversations WHERE project_id = $1 AND session_id = 'written-after-failure'",
+        values: [fixture.projectId],
+      }, factoryContext);
+      expect(kept.rows[0]!.n).toBe("1");
+    });
+  });
+
+  it("F1: the same failure with no intervening write completes on retry under a fresh session and releases the lease", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-f1-clean", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-f1-clean");
+      await expect(runRollback({
+        homeDir, generationId: "gen-f1-clean", canonicalPath, database, wrapCoordinator: failCompleteSelection,
+      })).rejects.toThrow("simulated I/O failure in completeMaintenanceSelection");
+      expect(await leaseRow(database)).toMatchObject({ released: false });
+
+      const outcome = await runRollback({ homeDir, generationId: "gen-f1-clean", canonicalPath, database });
+
+      expect(outcome.manifest.phase).toBe("rolled-back");
+      expectRollbackPublished(homeDir, "gen-f1-clean");
       expect((await leaseRow(database))!.released).toBe(true);
     });
   });

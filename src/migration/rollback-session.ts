@@ -382,6 +382,22 @@ class FencedRollbackSession implements RollbackProductionSession {
     }
   }
 
+  /**
+   * Closes the owned resources (snapshots, runtime) and leaves the lease exactly as it is: held until it expires
+   * or the same rollback takes it over. Used from the moment the maintenance selection was attempted, because a
+   * released lease admits guarded PostgreSQL writers while a selection is pending (plan-v3.2 A-01 / F1).
+   */
+  async closeKeepingLease(): Promise<void> {
+    if (this.released) return;
+    this.released = true;
+    const failures: unknown[] = [];
+    for (const snapshot of [...this.snapshots]) {
+      try { await this.closeSnapshot(snapshot); } catch (error) { failures.push(error); }
+    }
+    try { await this.runtime.close(); } catch (error) { failures.push(error); }
+    if (failures.length > 0) throw failures[0];
+  }
+
   async release(): Promise<void> {
     if (this.released) return;
     this.released = true;

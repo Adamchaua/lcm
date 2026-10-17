@@ -366,6 +366,7 @@ function fakeSession(input: Readonly<{
     async openPortableSource() {
       return { stream: await input.source(), ...exportEvidence };
     },
+    async closeKeepingLease(): Promise<void> {},
     async release(): Promise<void> {},
     computeRollbackTerminalEvidenceSha256(evidence): string {
       if (evidence.epoch === null || evidence.attempt === null) {
@@ -1688,6 +1689,164 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "completed", targetBackend: "sqlite" });
     });
 
+
+    // ---- F1 (plan-v3.2 A-01, P0): the lease outlives a failure after the selection was attempted, and recovery
+    // revalidates against a fresh fenced session before completing a prepared selection.
+    /** A session whose lease disposition is observable. */
+    const watched = async (base: () => Promise<RollbackFencedSession> = unchangedSession) => {
+      const session = await base();
+      const calls: string[] = [];
+      const release = session.release.bind(session);
+      const keep = session.closeKeepingLease.bind(session);
+      session.release = async () => { calls.push("release"); await release(); };
+      session.closeKeepingLease = async () => { calls.push("closeKeepingLease"); await keep(); };
+      return { session, calls };
+    };
+    const changedSession = (observation: Partial<{ postEpochDelta: ReturnType<typeof fixtureCanonicalDelta>; postEpochCensus: ReturnType<typeof fixtureCensusVector> | null }>) => async () => fakeSession({
+      observations: [{
+        manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+        destinationIdentity, postEpochDelta: baseline, postEpochCensus: census, ...observation,
+      }],
+      source: sqliteSourceStream,
+    });
+
+    it("F1: a failure in completeMaintenanceSelection keeps the lease and only closes owned resources", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      const { session, calls } = await watched();
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: async () => session,
+        coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection"),
+      }))).rejects.toThrow("simulated crash right before completeMaintenanceSelection");
+      expect(calls).toEqual(["closeKeepingLease"]);
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+    });
+
+    it("F1: a failure in prepareMaintenanceSelection itself also keeps the lease (the selection may be durable)", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      const { session, calls } = await watched();
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: async () => session,
+        coordinator: crashBefore(coordinatorFor(homeDir), "prepareMaintenanceSelection"),
+      }))).rejects.toThrow("simulated crash right before prepareMaintenanceSelection");
+      expect(calls).toEqual(["closeKeepingLease"]);
+    });
+
+    it("F1: a failure before the selection was attempted still releases the lease", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      const { session, calls } = await watched();
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: async () => session,
+        recordActivationWitness: () => { throw new Error("witness store unwritable"); },
+      }))).rejects.toThrow("witness store unwritable");
+      expect(calls).toEqual(["release"]);
+    });
+
+    it("F1: a failure during the coordinator's publication keeps the lease too", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      const { session, calls } = await watched();
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: async () => session,
+        coordinator: crashBefore(coordinatorFor(homeDir), "prepare"),
+      }))).rejects.toThrow("simulated crash right before prepare");
+      expect(calls).toEqual(["closeKeepingLease"]);
+    });
+
+    it("F1: retry of a prepared selection never completes a stale pre-write decision when the delta changed meanwhile", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      const before = new MigrationManifestStore({ homeDir }).read(GEN);
+      const maintenanceBefore = readBackendMaintenanceJournal(homeDir);
+      const coordinator = coordinatorFor(homeDir);
+      const complete = vi.spyOn(coordinator, "completeMaintenanceSelection");
+
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        coordinator, openFencedSession: changedSession({ postEpochDelta: fixtureCanonicalDelta("a16-written-meanwhile"), postEpochCensus: null }),
+      }))).rejects.toMatchObject({ reason: "drift", message: expect.stringContaining("terminal evidence") });
+
+      expect(complete).not.toHaveBeenCalled();
+      expect(readBackendMaintenanceJournal(homeDir)).toEqual(maintenanceBefore);
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+      const after = new MigrationManifestStore({ homeDir }).read(GEN);
+      expect(after.checksumSha256).toBe(before.checksumSha256);
+      expect(after.pendingEffect).toEqual(before.pendingEffect);
+    });
+
+    it("F1: a census-only change with an equal delta also refuses the prepared selection", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: changedSession({ postEpochCensus: fixtureCensusVector("a16-census-changed") }),
+      }))).rejects.toMatchObject({ reason: "drift" });
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+    });
+
+    it("F1: a prepared selection whose authority no longer resolves is refused, not completed", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        resolveWitnessBindings: () => fixtureBindingsUnresolvable("binding store unreadable"),
+      }))).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("no longer resolves") });
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+    });
+
+    it("F1: recovery of a prepared selection opens a fresh fenced session and a lease held by anyone else refuses", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      const before = new MigrationManifestStore({ homeDir }).read(GEN);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: async () => { throw new Error("lease-unavailable: held by another publication"); },
+      }))).rejects.toThrow("lease-unavailable");
+      expect(new MigrationManifestStore({ homeDir }).read(GEN).checksumSha256).toBe(before.checksumSha256);
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+    });
+
+    it("F1: recovery of a completed selection takes the coordinator's publication under a fresh session", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashAfter(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      const opened = vi.fn(unchangedSession);
+      const outcome = await runRollback(RUN(homeDir), depsFor(homeDir, { openFencedSession: opened }));
+      expect(opened).toHaveBeenCalledTimes(1);
+      expect(outcome.manifest.phase).toBe("rolled-back");
+    });
+
+    it("F1: a completed selection is final: a changed destination no longer matters", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashAfter(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      const outcome = await runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: changedSession({ postEpochDelta: fixtureCanonicalDelta("a16-after-final"), postEpochCensus: null }),
+      }));
+      expect(outcome.manifest.phase).toBe("rolled-back");
+    });
+
+    it("F1: an unactivated rollback's prepared selection is refused once the evidence no longer reads unactivated", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a16-unact-prep");
+      await expect(runRollback(RUN(homeDir, "gen-a16-unact-prep"), {
+        coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection"), ...absentDeps(), openFencedSession: unactivatedSession,
+      })).rejects.toThrow("simulated crash");
+      await expect(runRollback(RUN(homeDir, "gen-a16-unact-prep"), {
+        coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor("gen-a16-unact-prep")), openFencedSession: unactivatedSession,
+      })).rejects.toThrow();
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+    });
+
+
     it("row 5: finishes a completed selection from the stored rollback witness, with the authority's epoch, attempt and mode", async () => {
       const homeDir = tempHome();
       const scenario = prepareAuthoritative(homeDir);
@@ -1795,7 +1954,7 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-completed");
     });
 
-    it("row 6: resumes a coordinator publication that our own prepare left prepared, the journal archived, without a session", async () => {
+    it("row 6: resumes a coordinator publication that our own prepare left prepared, the journal archived, under a fresh session", async () => {
       const homeDir = tempHome();
       prepareAuthoritative(homeDir);
       await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashAfter(coordinatorFor(homeDir), "prepare") })))
@@ -1807,7 +1966,7 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
 
       const outcome = await runRollback(RUN(homeDir), depsFor(homeDir, { openFencedSession: opened }));
 
-      expect(opened).not.toHaveBeenCalled();
+      expect(opened).toHaveBeenCalledTimes(1);
       expect(outcome.manifest.phase).toBe("rolled-back");
       expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "completed", targetBackend: "sqlite" });
       expect(assertMigrationReplayAdmission({ homeDir, generationId: GEN, evidenceSha256: rollbackBinding(homeDir)!.witnessChecksumSha256 }))
