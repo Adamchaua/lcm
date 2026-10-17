@@ -160,6 +160,10 @@ function harness(options: Readonly<{
       status: "satisfied", reason: "quiescence-observed", detail: "held",
       quiescenceFence: { version: 1, kind: "lcm-activation-writer-quiescence-v1", payload: "{\"held\":true}", evidenceSha256: "a".repeat(64) },
     })),
+    checkRecoveryAdmission: vi.fn(async () => ({
+      status: "satisfied", detail: "recovery",
+      quiescenceFence: { kind: "lcm-rollback-recovery-admission-v1", payload: "{\"recovery\":true}" },
+    })),
     ...options.overrides,
   } as unknown as RollbackSessionDependencies & Record<string, ReturnType<typeof vi.fn>>;
   return { runtime, snapshots, source, stream, census, dependencies };
@@ -324,8 +328,8 @@ describe("openRollbackFencedSession: opening", () => {
   it("uses the real collaborators by default", () => {
     expect(Object.keys(DEFAULT_ROLLBACK_SESSION_DEPENDENCIES).sort()).toEqual([
       "assertReadOnlyGuard", "captureDestinationIdentity", "captureDestinationSchemaWitness", "checkQuiescence",
-      "createPortableSource", "createRuntime", "createStream", "readDomainCensus", "readFencedDestinationCensus",
-      "verifyRuntimeSchema",
+      "checkRecoveryAdmission", "createPortableSource", "createRuntime", "createStream", "readDomainCensus",
+      "readFencedDestinationCensus", "verifyRuntimeSchema",
     ]);
   });
 });
@@ -715,6 +719,47 @@ void _typeCheck;
 
 
 describe("closeKeepingLease (F1)", () => {
+  describe("a recovery open (F11)", () => {
+    const recoveryInput = { ...openInput, recovery: true as const };
+
+    it("asks the recovery admission, not the first-open quiescence, and seals its evidence", async () => {
+      const h = harness();
+      const session = await open(h, recoveryInput);
+      expect(h.dependencies.checkRecoveryAdmission).toHaveBeenCalledWith({
+        homeDir: "/home", lockToken, generationId: GENERATION_ID, publicationId: PUBLICATION_ID, machineId: MACHINE,
+      });
+      expect(h.dependencies.checkQuiescence).not.toHaveBeenCalled();
+      expect(session.quiescenceFenceEvidenceSha256).toMatch(/^[0-9a-f]{64}$/u);
+      await session.release();
+    });
+
+    it("keeps the lease and closes only the runtime when the admission is not satisfied", async () => {
+      const { guard, state, calls } = statefulGuard();
+      const h = harness({
+        guard,
+        overrides: {
+          checkRecoveryAdmission: vi.fn(async () => ({ status: "unsatisfied", detail: "not this rollback's journal", quiescenceFence: null })),
+        } as never,
+      });
+      await expect(open(h, recoveryInput)).rejects.toMatchObject({ reason: "quiescence-unsatisfied", message: "not this rollback's journal" });
+      expect(state.row?.releasedAt).toBeNull();
+      expect(calls).toEqual(["acquire"]);
+      expect(h.runtime.close).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the lease when the admission itself throws, and still reports that error if the close also fails", async () => {
+      const { guard, state, calls } = statefulGuard();
+      const h = harness({
+        guard,
+        overrides: { checkRecoveryAdmission: vi.fn(async () => { throw new Error("journal unreadable"); }) } as never,
+      });
+      h.runtime.close.mockRejectedValue(new Error("pool close failed"));
+      await expect(open(h, recoveryInput)).rejects.toThrow("journal unreadable");
+      expect(state.row?.releasedAt).toBeNull();
+      expect(calls).not.toContain("release");
+    });
+  });
+
   it("closes the snapshots and the runtime and never touches the lease row", async () => {
     const { guard, state, calls } = statefulGuard();
     const h = harness({ guard });

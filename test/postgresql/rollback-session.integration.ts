@@ -2,10 +2,11 @@
  * The production rollback against a real PostgreSQL 18 database: a real
  * lease on lcm.fenced_leases, real read-only snapshots, the real census and
  * export, and the REAL coordinator over the production driver and the
- * PostgreSQL remote guard. Quiescence (a local append-barrier concern with
- * its own tests) is the one collaborator satisfied by a stand-in; the
- * resolved context (the preserved-source snapshot evidence and machine
- * identity) is supplied, since those belong to the forward migration.
+ * PostgreSQL remote guard. The first-open quiescence (a local append-barrier
+ * concern with its own tests) is the one collaborator satisfied by a stand-in;
+ * every recovery open runs the REAL recovery admission over the real journals
+ * (#626 F11). The resolved context (the preserved-source snapshot evidence and
+ * machine identity) is supplied, since those belong to the forward migration.
  *
  * The cases drive runMigrationRollbackFromHome, the entry #627 will call, over
  * an installation whose activation was itself published through the real
@@ -144,7 +145,7 @@ function targetFor(database: PostgreSqlTestDatabase): RollbackSessionTarget {
   };
 }
 
-/** Everything real except the local append-barrier quiescence check. */
+/** Everything real except the first-open local append-barrier quiescence check (recovery admission is real). */
 const dependencies: RollbackSessionDependencies = {
   ...DEFAULT_ROLLBACK_SESSION_DEPENDENCIES,
   checkQuiescence: async () => ({
@@ -386,7 +387,7 @@ function failCompleteSelection(coordinator: ReturnType<typeof createBackendPubli
   };
 }
 
-function crashAfter(method: "prepare" | "resume") {
+function crashAfter(method: "prepare" | "resume" | "completeMaintenanceSelection") {
   return (coordinator: ReturnType<typeof createBackendPublicationCoordinator>): void => {
     const target = coordinator as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
     const real = target[method]!.bind(coordinator);
@@ -647,6 +648,27 @@ describe("production rollback against PostgreSQL 18", { timeout: 240_000 }, () =
 
       expect(outcome.manifest.phase).toBe("rolled-back");
       expectRollbackPublished(homeDir, "gen-f1-clean");
+      expect((await leaseRow(database))!.released).toBe(true);
+    });
+  });
+
+  it("F11: a completed selection that crashed before its binding is finished under a recovery open, and guarded writers stay fenced out meanwhile", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-f11-completed", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-f11-completed");
+      await expect(runRollback({
+        homeDir, generationId: "gen-f11-completed", canonicalPath, database, wrapCoordinator: crashAfter("completeMaintenanceSelection"),
+      })).rejects.toMatchObject({ message: expect.stringContaining("simulated crash right after completeMaintenanceSelection") });
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-completed");
+      // The guard that makes a completed selection final: while the unreleased lease row exists, every
+      // guarded PostgreSQL mutation refuses (publication-guard.ts acquirePostgreSqlProjectMutationGuard).
+      expect(await leaseRow(database)).toMatchObject({ released: false, live: true });
+      await expect(acquirePostgreSqlProjectMutationGuard(database.migrator, fixture.projectId, factoryContext))
+        .rejects.toMatchObject({ reason: "publication-unresolved" });
+
+      const outcome = await runRollback({ homeDir, generationId: "gen-f11-completed", canonicalPath, database });
+
+      expect(outcome.manifest.phase).toBe("rolled-back");
+      expectRollbackPublished(homeDir, "gen-f11-completed");
       expect((await leaseRow(database))!.released).toBe(true);
     });
   });

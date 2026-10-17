@@ -735,6 +735,12 @@ export type OpenRollbackFencedSession = (
     lockToken: BackendPublicationLockToken;
     scratchParent?: string;
     signal?: AbortSignal;
+    /**
+     * Set when the session is opened to recover a rollback whose maintenance selection was already attempted
+     * (#626 F11). Admission then accepts this rollback's own later journal phases instead of requiring a freshly
+     * held maintenance, and a failed open keeps the lease instead of releasing it.
+     */
+    recovery?: true;
   }>,
 ) => Promise<RollbackFencedSession>;
 
@@ -2394,7 +2400,7 @@ async function recoverPendingPublishRollback(
     const withRecoverySession = async <T,>(body: (session: RollbackFencedSession) => Promise<T>): Promise<T> => {
       const session = await deps.openFencedSession({
         homeDir: input.homeDir, manifest: current, lockToken: token,
-        scratchParent: input.scratchParent, signal: input.signal,
+        scratchParent: input.scratchParent, signal: input.signal, recovery: true,
       });
       sessionsHoldingLease.add(session);
       return withFencedSession(session, () => body(session));

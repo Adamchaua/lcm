@@ -1,5 +1,11 @@
 import { tmpdir } from "node:os";
-import { canonicalSha256, PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_RECORD_SCHEMA_SHA256 } from "../storage/portable-record.js";
+import { canonicalJson, canonicalSha256, PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_RECORD_SCHEMA_SHA256 } from "../storage/portable-record.js";
+import {
+  readBackendMaintenanceJournal,
+  readBackendPublicationJournal,
+  withBackendPublicationRetainedAppendAdmissionAsync,
+  type BackendPublicationLockToken,
+} from "../storage/backend-publication.js";
 import { createPortableRecordStream, type PortableRecordStream } from "../storage/portable-record-stream.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
@@ -131,6 +137,7 @@ export interface RollbackSessionDependencies {
   readDomainCensus: typeof readPostgreSqlPortableSourceDomainCensus;
   createStream: typeof createPortableRecordStream;
   checkQuiescence: typeof checkActivationWriterQuiescence;
+  checkRecoveryAdmission: typeof checkRollbackRecoveryAdmission;
 }
 
 export const DEFAULT_ROLLBACK_SESSION_DEPENDENCIES: RollbackSessionDependencies = {
@@ -144,6 +151,7 @@ export const DEFAULT_ROLLBACK_SESSION_DEPENDENCIES: RollbackSessionDependencies 
   readDomainCensus: readPostgreSqlPortableSourceDomainCensus,
   createStream: createPortableRecordStream,
   checkQuiescence: checkActivationWriterQuiescence,
+  checkRecoveryAdmission: checkRollbackRecoveryAdmission,
 };
 
 /** The session a rollback receives, plus the one hook the coordinator wiring (S4) needs. */
@@ -416,6 +424,9 @@ class FencedRollbackSession implements RollbackProductionSession {
  * Open the rollback's fenced session: lease, then quiescence under the
  * retained token. A failure after the lease was acquired releases it (best
  * effort; the original error is the one reported) and closes the runtime.
+ * A recovery open (input.recovery) admits this rollback's own later journal
+ * phases and, on failure, keeps the lease: its maintenance selection was
+ * already attempted, so the lease is what still bars guarded writers.
  */
 export async function openRollbackFencedSession(
   input: Parameters<OpenRollbackFencedSession>[0],
@@ -446,7 +457,12 @@ export async function openRollbackFencedSession(
       runtime, guard, tuple, fence, target, input.scratchParent ?? tmpdir(), input.signal, dependencies,
     );
     session = opened;
-    const quiescence = await dependencies.checkQuiescence({ homeDir: input.homeDir, lockToken: input.lockToken });
+    const quiescence = input.recovery === true
+      ? await dependencies.checkRecoveryAdmission({
+        homeDir: input.homeDir, lockToken: input.lockToken, generationId: input.manifest.generationId,
+        publicationId, machineId: target.machineId,
+      })
+      : await dependencies.checkQuiescence({ homeDir: input.homeDir, lockToken: input.lockToken });
     if (quiescence.status !== "satisfied") {
       throw new RollbackSessionError("quiescence-unsatisfied", quiescence.detail);
     }
@@ -457,7 +473,82 @@ export async function openRollbackFencedSession(
     return opened;
   } catch (error) {
     if (session === undefined) await runtime.close().catch(() => undefined);
+    else if (input.recovery === true) await session.closeKeepingLease().catch(() => undefined);
     else await session.release().catch(() => undefined);
     throw error;
   }
+}
+
+const RECOVERY_ADMISSION_KIND = "lcm-rollback-recovery-admission-v1";
+
+export type RollbackRecoveryAdmissionResult = Readonly<{
+  status: "satisfied" | "unsatisfied";
+  detail: string;
+  quiescenceFence: Readonly<{ kind: string; payload: string }> | null;
+}>;
+
+/**
+ * Admission of a recovery session (#626 F11). The first open of a rollback asserts quiescence under a freshly
+ * held maintenance. A recovery runs after this rollback attempted its maintenance selection, so the journal is
+ * in a later phase and checkActivationWriterQuiescence (maintenance-held only) can never be satisfied. This
+ * check accepts exactly the journals this rollback itself leaves behind, under the same retained local append
+ * barrier, and nothing else:
+ *
+ * - the maintenance journal of this generation and this rollback's publicationId, targeting sqlite, at
+ *   selection-prepared or selection-completed, whose roster is this machine alone; or
+ * - no maintenance journal (the coordinator archived it when it prepared the publication) and a non-terminal
+ *   publication journal with this rollback's publicationId.
+ *
+ * Every other journal, including a freshly held maintenance (which has the strict first-open path), is refused.
+ * The lease tuple (project, machine, publicationId, target, evidence) is matched by the lease acquisition that
+ * follows. The check proves no more about local writers than the retained barrier does; the guarded PostgreSQL
+ * writers are barred by the lease row itself (acquirePostgreSqlProjectMutationGuard refuses while an unreleased
+ * lease exists).
+ */
+export async function checkRollbackRecoveryAdmission(input: Readonly<{
+  homeDir: string;
+  lockToken: BackendPublicationLockToken;
+  generationId: string;
+  publicationId: string;
+  machineId: string;
+}>): Promise<RollbackRecoveryAdmissionResult> {
+  return withBackendPublicationRetainedAppendAdmissionAsync(input.homeDir, (): RollbackRecoveryAdmissionResult => {
+    const refuse = (detail: string): RollbackRecoveryAdmissionResult => ({ status: "unsatisfied", detail, quiescenceFence: null });
+    const admit = (journal: "maintenance" | "publication", phase: string, checksumSha256: string): RollbackRecoveryAdmissionResult => ({
+      status: "satisfied",
+      detail: "recovery of this rollback's own " + journal + " journal at " + phase,
+      quiescenceFence: {
+        kind: RECOVERY_ADMISSION_KIND,
+        payload: canonicalJson({
+          version: 1, journal, phase, checksumSha256, generationId: input.generationId,
+          publicationId: input.publicationId, machineId: input.machineId,
+        }),
+      },
+    });
+    const maintenance = readBackendMaintenanceJournal(input.homeDir);
+    if (maintenance !== null) {
+      if (
+        maintenance.generationId !== input.generationId
+        || maintenance.publicationId !== input.publicationId
+        || maintenance.targetBackend !== "sqlite"
+        || (maintenance.phase !== "selection-prepared" && maintenance.phase !== "selection-completed")
+      ) {
+        return refuse("the maintenance journal (phase " + maintenance.phase + ") is not this rollback's attempted selection");
+      }
+      if (maintenance.roster.length !== 1 || maintenance.roster[0]!.machineId !== input.machineId) {
+        return refuse("the maintenance roster is not this machine alone");
+      }
+      return admit("maintenance", maintenance.phase, maintenance.checksumSha256);
+    }
+    const publication = readBackendPublicationJournal(input.homeDir);
+    if (
+      publication === null
+      || publication.publicationId !== input.publicationId
+      || publication.phase === "completed"
+      || publication.phase === "aborted"
+    ) {
+      return refuse("no journal of this rollback's attempted selection or in-flight publication remains");
+    }
+    return admit("publication", publication.phase, publication.checksumSha256);
+  }, input.lockToken);
 }
