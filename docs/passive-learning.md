@@ -228,11 +228,14 @@ A claim fetch returns at most one event per machine, because an event is
 claimable only once every earlier event of its machine is applied or
 quarantined. The batch size is therefore a budget of claimed events shared by
 all fetches of one pass, not a number of events per fetch. A pass stops
-claiming earlier when a claim is scheduled for retry or fails without settling,
-when the drain lease is lost, or when a publication admission is refused.
-Events that become ready during the pass because of another machine, a new
-arrival, or a retry timer wait for the next sweep. "Up to the batch size" thus
-means ready work the pass actually settles, not a guarantee about peers.
+claiming earlier when a fetched batch produces no applied or quarantined
+outcome (a batch that only schedules retries or only fails without a counter),
+when the drain lease is lost, or when a publication admission is refused. A
+mixed batch with any applied or quarantined row continues. Other ready work,
+such as another machine, a new arrival, or a retry timer, may be claimed by a
+later fetch of the same pass but is not guaranteed; it waits for the next sweep
+once the pass stops making progress. "Up to the batch size" thus means ready
+work the pass actually settles, not a guarantee about peers.
 
 Per-machine ordering is preserved within a project binding; a project relink
 is the exception (see below). Independent machines can progress
@@ -320,10 +323,10 @@ keeps working on what that project already holds (claims, reconcile and prune)
 for the rest of the pass, so rows it uploaded there are not abandoned
 mid-pass; that includes the further claims of events the old project already
 holds, while new local uploads and the withdrawal of copies from other
-projects stay withheld. Rows the pass did not upload stay pending locally and upload to the
-new binding on the next sweep. A pass run without a publication admission
-checks the binding too, but without the admission's lock, so that check is
-best effort.
+projects stay withheld. Rows the pass did not upload stay pending locally and
+upload to the new binding on the next sweep. A pass run without a publication
+admission checks the binding too, but without the admission's lock, so that
+check is best effort.
 
 #### After a project relink
 
