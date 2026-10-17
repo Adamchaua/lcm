@@ -319,6 +319,7 @@ describe("activation evidence store: reader", () => {
     const { attempt } = recordAll(homeDir);
     rmSync(join(dir(homeDir), "attempt-" + attempt.attemptId + ".json"));
     expect(unresolvable(homeDir)).toContain("witness-");
+    expect(unresolvable(homeDir)).toContain("witness names an epoch or attempt that is not stored");
   });
 
   it("is unresolvable for a planted witness that its stored epoch and attempt do not mint", () => {

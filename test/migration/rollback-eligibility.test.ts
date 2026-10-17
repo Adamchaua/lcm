@@ -127,6 +127,15 @@ describe("resolveActivationAuthority: the unactivated truth table (plan-v3.1 A1)
     })).toContain("a binding exists without its evidence record");
   });
 
+  it("refuses an activation selection alone (no witness binding) when the evidence store is authoritatively absent", () => {
+    const { scenario } = published();
+    expect(refusal({
+      resolution: { state: "resolved", witnesses: [], selections: [scenario.selection] },
+      evidence: fixtureEvidenceAbsent,
+      operabilityFact: fixtureOperabilityAbsent,
+    })).toContain("a binding exists without its evidence record");
+  });
+
   // Row 5: a selection whose records disagree or are missing.
   it("refuses when the selected witness is missing from the evidence store", () => {
     const { scenario, ...inputs } = published();
@@ -331,6 +340,22 @@ describe("evaluateRollbackEligibility: authoritative branch", () => {
       destinationIdentity: fixtureDestinationIdentity("other-dest"), postEpochDelta: delta, postEpochCensus: census,
     });
     expect(decision).toEqual({
+      eligibility: "refused",
+      reason: "destination identity does not match the authoritative epoch",
+    });
+  });
+
+  it("refuses when only the sealed witness of the destination identity differs (the system identifier matches)", () => {
+    const identity = { ...fixtureDestinationIdentity("dest"), sealedWitnessSha256: "9".repeat(64) };
+    expect(evaluate({ destinationIdentity: identity, postEpochDelta: delta, postEpochCensus: census })).toEqual({
+      eligibility: "refused",
+      reason: "destination identity does not match the authoritative epoch",
+    });
+  });
+
+  it("refuses when only the system identifier of the destination identity differs (the sealed witness matches)", () => {
+    const identity = { ...fixtureDestinationIdentity("dest"), systemIdentifier: "another-cluster" };
+    expect(evaluate({ destinationIdentity: identity, postEpochDelta: delta, postEpochCensus: census })).toEqual({
       eligibility: "refused",
       reason: "destination identity does not match the authoritative epoch",
     });

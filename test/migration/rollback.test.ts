@@ -1225,6 +1225,44 @@ describe("runMigrationRollback", () => {
     });
   });
 
+  it("disagreement mutation (authority epoch or attempt, each alone): an authoritative artifact naming another epoch or another attempt than the fresh read -- refuses", async () => {
+    const fresh = fixtureActivationScenario();
+    for (const [label, epochId, attemptId] of [
+      ["epoch only", "another-epoch", fresh.selection.attemptId],
+      ["attempt only", fresh.selection.epochId, "another-attempt"],
+    ] as const) {
+      const homeDir = tempHome();
+      const store = new MigrationManifestStore({ homeDir });
+      manifestAtVerified(store, "gen-authority-" + label.replace(" ", "-"));
+      writeRollbackAuthorityArtifact(homeDir, {
+        version: 2,
+        generationId: "gen-authority-" + label.replace(" ", "-"),
+        operabilityFactState: "authoritatively-absent",
+        operabilityFactValueSha256: null,
+        authorityStatus: "authoritative",
+        epochId,
+        attemptId,
+        publication: PUBLICATION_SOURCE,
+      });
+      await expect(runRollback({
+        homeDir, generationId: "gen-authority-" + label.replace(" ", "-"), canonicalPath: join(homeDir, "live.sqlite"),
+        projectIdentity: identity, localProjectId: "local-1",
+        sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+      }, {
+        coordinator: coordinatorFor(homeDir),
+        ...authoritativeDeps(fresh),
+        recordSelectionBinding: () => undefined,
+        recordWitnessBinding: () => undefined,
+        resolveAuthoritativeContext: async () => { throw new Error("must not resolve authoritative context: refusal happens before this call"); },
+        openFencedSession: async () => { throw new Error("must not open a session: refusal happens before maintenance"); },
+      }), label).rejects.toMatchObject({
+        name: "RollbackOrchestrationError",
+        reason: "unexpected-state",
+        message: expect.stringContaining("freshly resolved authority disagrees with the durable rollback-authority artifact"),
+      });
+    }
+  });
+
   it("disagreement mutation (live side, authority): artifact records unactivated, a fresh Boundary A read resolves an authoritative selection -- refuses", async () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });
@@ -3386,16 +3424,26 @@ describe("runMigrationRollback: the publication source and the coordinator's pub
   });
 
   it("refuses a coordinator publication that did not complete as composed, and one that was aborted", async () => {
-    const homeDir = tempHome();
-    manifestAtVerified(new MigrationManifestStore({ homeDir }), GEN);
-    const coordinator = coordinatorFor(homeDir);
-    const realResume = coordinator.resume.bind(coordinator);
-    coordinator.resume = (async (...args: Parameters<typeof realResume>) => {
-      const journal = await realResume(...args);
-      return { ...journal, targetBackend: "postgresql" };
-    }) as typeof coordinator.resume;
-    await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator })))
-      .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("did not complete as composed") });
+    // Each field of the sealed journal is corrupted alone: every one must refuse by itself.
+    const corruptions: ReadonlyArray<(journal: any) => unknown> = [
+      (journal) => ({ ...journal, publicationId: "another-publication" }),
+      (journal) => ({ ...journal, sourceBackend: "sqlite" }),
+      (journal) => ({ ...journal, targetBackend: "postgresql" }),
+      (journal) => ({ ...journal, projects: [] }),
+      (journal) => ({ ...journal, projects: [{ ...journal.projects[0], localProjectId: "another-local-project" }] }),
+      (journal) => ({ ...journal, projects: [{ ...journal.projects[0], remoteProjectId: "another-remote-project" }] }),
+      (journal) => ({ ...journal, projects: [{ ...journal.projects[0], evidenceSha256: "0".repeat(64) }] }),
+      (journal) => ({ ...journal, recoveryReference: null }),
+    ];
+    for (const corrupt of corruptions) {
+      const home = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir: home }), GEN);
+      const coordinator = coordinatorFor(home);
+      const realResume = coordinator.resume.bind(coordinator);
+      coordinator.resume = (async (...args: Parameters<typeof realResume>) => corrupt(await realResume(...args))) as typeof coordinator.resume;
+      await expect(runRollback(RUN(home), depsFor(home, { coordinator })))
+        .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("did not complete as composed") });
+    }
 
     const abortedHome = tempHome();
     manifestAtVerified(new MigrationManifestStore({ homeDir: abortedHome }), GEN);
