@@ -91,7 +91,7 @@ function failure(error) {
   const field = typeof error?.surfacePreparedField === 'string' && /^[a-zA-Z.]{1,64}$/u.test(error.surfacePreparedField) ? `:${error.surfacePreparedField}` : '';
   const detail = preparedFailureContext ? `${preparedFailureContext}:${(symbolic ?? fallbackId).replace(/^surface[-\w]*:/u, '')}${field}`
     : `${symbolic ?? fallbackId}${frame ? `:${frame[1]}:${frame[2]}` : ''}`;
-  return { id: detail.slice(0, 80), digest: error?.surfaceEvidence?.stdoutErrorDigest ?? error?.surfaceEvidence?.stderrDigest ?? createHash('sha256').update(message).digest('hex') };
+  return { id: detail.slice(0, 110), digest: error?.surfaceEvidence?.stdoutErrorDigest ?? error?.surfaceEvidence?.stderrDigest ?? createHash('sha256').update(message).digest('hex') };
 }
 function send(message) {
   const json = JSON.stringify(message);
@@ -483,31 +483,70 @@ function ownedLifecycle() {
       assert.ok(JSON.stringify(after.authority) === JSON.stringify(before.authority), 'surface-isolation:authority-changed');
       assertRestartSnapshotUnchanged(after.logical, before.logical, process.getuid());
     },
-    // PostgreSQL only: replicate the pending outbox of remote-bound projects through the
-    // daemon's own startup pass (one extra restart), waiting on public sidecar state.
+    // PostgreSQL only. The daemon drains the outbox of remote-bound projects through its own
+    // startup pass, and one pass applies a single event per project and machine (issue #1530),
+    // so a backlog of N events takes N restarts. Restart until a full restart moves nothing
+    // (a fixed point), so the strict stop -> baseline -> start comparison that follows is exact.
+    // Only public state is read: sidecar delivery counters and the daemon's replication status.
     ...(backend === 'postgresql' ? { settleReplication: async function settleReplication() {
+      const MAX_ITERATIONS = 8;
+      const PASS_TIMEOUT_MS = 30000;
+      const QUIET_MS = 1500;
       const bound = row => Boolean(readProjectMapSnapshot()[row.projectId]?.remoteProjectId);
+      const counters = row => [row.deliveryPending, row.deliveryClaimed, row.deliveryRetry, row.deliveryReplicated,
+        row.deliveryAcknowledged, row.deliveryAwaitingRemotePrune, row.deliveryQuarantined];
       const open = row => row.deliveryPending + row.deliveryClaimed + row.deliveryRetry + row.deliveryReplicated + row.deliveryAwaitingRemotePrune;
-      const fixed = row => ({ projectId: row.projectId, captured: row.captured, deliveryQuarantined: row.deliveryQuarantined });
-      const before = await readPassiveSidecars();
-      if (!before.some(row => bound(row) && open(row) > 0)) return;
-      const previous = await this.stop();
-      await this.start(previous.port);
-      const deadline = Date.now() + 30000;
-      let after = await readPassiveSidecars();
-      while (after.some(row => bound(row) && open(row) > 0)) {
-        assert.ok(Date.now() < deadline, 'surface-isolation:replication-not-settled');
-        await new Promise(resolve => setTimeout(resolve, 250));
-        after = await readPassiveSidecars();
+      const vector = rows => JSON.stringify(rows.filter(bound).map(row => [row.projectId, counters(row)])
+        .sort((left, right) => left[0].localeCompare(right[0])));
+      // Counts only, no payloads: iteration, then project prefix and the seven counters (capped at 9)
+      // of each bound sidecar that still has an open delivery, in the order pending, claimed, retry,
+      // replicated, acknowledged, awaiting prune, quarantined.
+      const unsettled = (iteration, rows) => new Error('surface-isolation:replication-not-settled:i' + iteration + rows
+        .filter(row => bound(row) && open(row) > 0)
+        .map(row => '.' + row.projectId.slice(0, 4) + counters(row).map(count => Math.min(9, count)).join('')).join('').slice(0, 36));
+      const status = async () => {
+        const response = await request('POST', '/status', { cwd: projectPath });
+        const replication = response.body?.passiveEvents?.replication;
+        assert.ok(response.status === 200 && replication?.enabled === true, 'surface-isolation:replication-status');
+        return replication;
+      };
+      const statusKey = replication => [replication.passes, replication.projects, replication.uploaded, replication.applied,
+        replication.acknowledged, replication.pruned, replication.retried, replication.quarantined].join(',');
+      const initial = await readPassiveSidecars();
+      if (!initial.some(row => bound(row) && open(row) > 0)) return;
+      let current = initial;
+      let reachedFixedPoint = false;
+      for (let iteration = 1; iteration <= MAX_ITERATIONS && !reachedFixedPoint; iteration += 1) {
+        const previousVector = vector(current);
+        const previous = await this.stop();
+        await this.start(previous.port);
+        const deadline = Date.now() + PASS_TIMEOUT_MS;
+        let lastKey = null;
+        let lastChange = Date.now();
+        for (;;) {
+          const key = statusKey(await status());
+          if (key !== lastKey) { lastKey = key; lastChange = Date.now(); }
+          // passes >= 1: the startup pass has begun; unchanged counters for QUIET_MS: it has finished.
+          if (Number(key.split(',')[0]) >= 1 && Date.now() - lastChange >= QUIET_MS) break;
+          if (Date.now() >= deadline) throw unsettled(iteration, await readPassiveSidecars());
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+        current = await readPassiveSidecars();
+        reachedFixedPoint = vector(current) === previousVector;
       }
+      if (!reachedFixedPoint) throw unsettled(MAX_ITERATIONS, current);
+      // A claimed or retry row is still moving: the next pass would change it, so the strict
+      // comparison would not be exact.
+      if (current.some(row => bound(row) && (row.deliveryClaimed > 0 || row.deliveryRetry > 0))) throw unsettled(MAX_ITERATIONS, current);
       const byProject = rows => new Map(rows.map(row => [row.projectId, row]));
-      const prior = byProject(before);
-      for (const row of after) {
+      const prior = byProject(initial);
+      const fixed = row => ({ projectId: row.projectId, captured: row.captured, deliveryQuarantined: row.deliveryQuarantined });
+      for (const row of current) {
         const earlier = prior.get(row.projectId);
         assert.ok(earlier && JSON.stringify(fixed(row)) === JSON.stringify(fixed(earlier)), 'surface-isolation:replication-changed-identity');
         if (!bound(row)) assert.ok(JSON.stringify(row) === JSON.stringify(earlier), 'surface-isolation:replication-touched-unbound');
       }
-      await admin('replication.advanced');
+      if (vector(current) !== vector(initial)) await admin('replication.advanced');
     } } : {}),
   };
 }

@@ -78,7 +78,7 @@ function digestError(error: unknown): { id: string; digest: string } {
   return { id: "owned-administrator-failure", digest: createHash("sha256").update(error instanceof Error ? error.message : typeof error).digest("hex") };
 }
 function workerError(value: unknown): string {
-  requireThat(exact(value, ["id", "digest"]) && typeof value.id === "string" && /^[a-zA-Z0-9_.:-]{1,80}$/u.test(value.id)
+  requireThat(exact(value, ["id", "digest"]) && typeof value.id === "string" && /^[a-zA-Z0-9_.:-]{1,110}$/u.test(value.id)
     && typeof value.digest === "string" && /^[a-f0-9]{64}$/u.test(value.digest), "failure-details");
   return `${value.id}:${value.digest}`;
 }

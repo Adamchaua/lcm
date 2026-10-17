@@ -94,12 +94,19 @@ projects at startup and every five minutes; a SQLite-backed daemon never does
 (see [passive learning](passive-learning.md), "When the daemon runs it"). A
 restart therefore advances pending PostgreSQL deliveries to acknowledged and
 pruned, writes their remote inbox rows, and refreshes the machine-keyed
-passive-events lease row. The parity tests take the restart baseline after
-settling that replication: they restart once, wait up to 30 seconds on public
-sidecar state until no remote-bound project has an open delivery, and then
-require delivery state and database state to be unchanged across the next
-restart. Projects without a remote binding must stay exactly unchanged, and the
-PostgreSQL run fails unless at least one delivery was actually replicated.
+passive-events lease row. One pass applies a single event per project and
+machine, so a backlog of N events needs N passes
+([#1530](https://github.com/donadiosolutions/lcm/issues/1530)). The parity
+tests therefore settle the lane before they take a restart baseline: they
+restart the daemon, wait for its startup pass to finish using only the
+daemon's public replication status (at most 30 seconds), and repeat, at most
+eight times, until a full restart moves no remote-bound sidecar's delivery
+counters. Only then do they require delivery state and database state to be
+unchanged across the next restart. Projects without a remote binding must stay
+exactly unchanged, captured and quarantined counts must not move, a claimed or
+retrying delivery at the fixed point fails the run, and the PostgreSQL run
+fails unless at least one delivery was actually replicated. A failure reports
+the iteration and the delivery counters only, never payloads.
 
 Diagnostic reads report the selected backend's actual capabilities. Pool
 statistics may have different shapes, but failures remain sanitized and bounded.
