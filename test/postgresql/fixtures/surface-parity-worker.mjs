@@ -11,6 +11,7 @@ import { PrivateMutationLockContentionError, readPrivateMutationLockOwner, proce
 import { setTimeout as delay } from 'node:timers/promises';
 import { findUserSystemdPid } from '../../../dist/src/daemon/lifecycle.js';
 import { createDaemon } from '../../../dist/src/daemon/server.js';
+import { PASSIVE_EVENT_PROCESSOR_DEFAULTS } from '../../../dist/src/daemon/passive-event-processor.js';
 import { loadDaemonConfig, readDaemonConfigSnapshot, daemonConfigSnapshotWitnessEqual } from '../../../dist/src/daemon/config.js';
 import { withBackendPublicationConsumerLockAsync, withBackendPublicationReadRoot, assertBackendPublicationConfigReadAccess, withBackendPublicationConsumerLock, assertBackendPublicationConsumerAccess } from '../../../dist/src/storage/backend-publication.js';
 import { withNativeObserverLease } from '../../surface-parity/native-observer.mjs';
@@ -484,14 +485,25 @@ function ownedLifecycle() {
       assertRestartSnapshotUnchanged(after.logical, before.logical, process.getuid());
     },
     // PostgreSQL only. The daemon drains the outbox of remote-bound projects through its own
-    // startup pass, and one pass applies a single event per project and machine (issue #1530),
-    // so a backlog of N events takes N restarts. Restart until a full restart moves nothing
-    // (a fixed point), so the strict stop -> baseline -> start comparison that follows is exact.
-    // Only public state is read: sidecar delivery counters and the daemon's replication status.
+    // startup pass, and one pass may leave part of a backlog undelivered, so a backlog can take
+    // several restarts. Restart until a full restart moves nothing (a fixed point), so the strict
+    // stop -> baseline -> start comparison that follows is exact. Only public state is read:
+    // sidecar delivery counters and the daemon's replication status.
+    //
+    // A restart's startup pass has finished when the status counts every project the sweep
+    // replicates. The sweep (PassiveEventProcessor.runSweep) scans the first sweepMaxSidecars
+    // sidecars in file-name order from index 0, and replicateSidecars adds one to
+    // replication.projects, in the same synchronous block as the other counters, only after a
+    // project's replication returned. The replication returns after its last phase, lease
+    // release and outbox close, and returns null (nothing counted) for a sidecar that has no
+    // owner directory, no remote binding, no machine identity or unhealthy storage. The
+    // expected count is therefore the sidecars in the window that have an owner directory and
+    // a remote binding. The status carries no end-of-pass field, and passes only marks the
+    // start of the replication phase, so a quiet interval cannot tell a finished pass from a
+    // slow one.
     ...(backend === 'postgresql' ? { settleReplication: async function settleReplication() {
       const MAX_ITERATIONS = 8;
       const PASS_TIMEOUT_MS = 30000;
-      const QUIET_MS = 1500;
       // The remote-bound set cannot change while settling, so it is read once, below, with no daemon
       // running: the daemon takes the publication lock around each replication phase and this
       // synchronous reader does not wait for it.
@@ -514,8 +526,12 @@ function ownedLifecycle() {
         assert.ok(response.status === 200 && replication?.enabled === true, 'surface-isolation:replication-status');
         return replication;
       };
-      const statusKey = replication => [replication.passes, replication.projects, replication.uploaded, replication.applied,
-        replication.acknowledged, replication.pruned, replication.retried, replication.quarantined].join(',');
+      const incomplete = (iteration, replication, expected) => new Error('surface-isolation:replication-pass-incomplete:i' + iteration
+        + 'p' + replication.passes + 'n' + replication.projects + 'of' + expected);
+      // The sidecars the startup sweep replicates, from the rows read with the daemon stopped.
+      const sweptProjects = rows => [...rows].sort((left, right) => left.file.localeCompare(right.file))
+        .slice(0, PASSIVE_EVENT_PROCESSOR_DEFAULTS.sweepMaxSidecars)
+        .filter(row => bound(row) && typeof row.cwd === 'string' && row.cwd.length > 0).length;
       const initial = await readPassiveSidecars();
       if (!initial.some(row => open(row) > 0)) return;
       let stopped = await this.stop();
@@ -524,6 +540,9 @@ function ownedLifecycle() {
         await this.start(stopped.port);
         return;
       }
+      // A remote-bound sidecar outside the startup sweep's window or without an owner directory
+      // is never replicated by a restart, so the pass could not be proven complete.
+      assert.equal(initial.filter(bound).length, sweptProjects(initial), 'surface-isolation:replication-outside-sweep');
       let current = initial;
       let reachedFixedPoint = false;
       for (let iteration = 1; iteration <= MAX_ITERATIONS && !reachedFixedPoint; iteration += 1) {
@@ -532,14 +551,16 @@ function ownedLifecycle() {
         stopped = undefined;
         await this.start(previous.port);
         const deadline = Date.now() + PASS_TIMEOUT_MS;
-        let lastKey = null;
-        let lastChange = Date.now();
+        const expected = sweptProjects(current);
         for (;;) {
-          const key = statusKey(await status());
-          if (key !== lastKey) { lastKey = key; lastChange = Date.now(); }
-          // passes >= 1: the startup pass has begun; unchanged counters for QUIET_MS: it has finished.
-          if (Number(key.split(',')[0]) >= 1 && Date.now() - lastChange >= QUIET_MS) break;
-          if (Date.now() >= deadline) throw unsettled(iteration, await readPassiveSidecars());
+          const replication = await status();
+          // passes >= 1: promotion is done and replication has begun. Every project of the sweep
+          // counted: each replication, with its lease release and outbox close, has returned.
+          if (replication.passes >= 1 && replication.projects === expected) break;
+          // The sweep ran a project the sidecars did not predict: the expected count is not the
+          // completion signal for this state.
+          assert.ok(replication.projects <= expected, 'surface-isolation:replication-unexpected-project');
+          if (Date.now() >= deadline) throw incomplete(iteration, replication, expected);
           await new Promise(resolve => setTimeout(resolve, 250));
         }
         current = await readPassiveSidecars();
