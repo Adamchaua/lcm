@@ -441,6 +441,62 @@ async function readPassiveSidecars() {
   'surface-isolation:pending-owner-outside-fixture');
   return sidecars;
 }
+// The startup replication pass of a freshly started PostgreSQL daemon (settleReplication, enterFaults).
+// The sweep (PassiveEventReplicationPass via PassiveEventProcessor.runSweep) scans the first
+// sweepMaxSidecars sidecars in file-name order from index 0, and replicateSidecars adds one to
+// replication.projects, in the same synchronous block as the other counters, only after a
+// project's replication returned. The replication returns after its last phase, lease release
+// and outbox close. The expected count is the sidecars in the window that have an owner
+// directory and a remote binding.
+//
+// A sweep skips a project when its scan or one of the gates fails (for example another process
+// holds the publication lock), and tries it again at the next sweep. The status has no
+// end-of-pass field, so a count that stops changing before it reaches the expected one is taken
+// as a pass that skipped a project. A slow pass that is mistaken for a skipped one costs a
+// restart and never a false completion.
+const STARTUP_PASS_TIMEOUT_MS = 30000;
+const STARTUP_PASS_STALLED_MS = 3000;
+const FAULT_DAEMON_START_ATTEMPTS = 8;
+const sweptProjects = (rows, boundIds) => [...rows].sort((left, right) => left.file.localeCompare(right.file))
+  .slice(0, PASSIVE_EVENT_PROCESSOR_DEFAULTS.sweepMaxSidecars)
+  .filter(row => boundIds.has(row.projectId) && typeof row.cwd === 'string' && row.cwd.length > 0).length;
+function readBoundProjectIds() {
+  return new Set(Object.entries(readProjectMapSnapshot()).filter(([, entry]) => entry.remoteProjectId).map(([id]) => id));
+}
+async function readReplicationStatus() {
+  const response = await request('POST', '/status', { cwd: projectPath });
+  const replication = response.body?.passiveEvents?.replication;
+  assert.ok(response.status === 200 && replication?.enabled === true, 'surface-isolation:replication-status');
+  return replication;
+}
+function startupPassIncomplete(attempt, replication, expected) {
+  return new Error('surface-isolation:replication-pass-incomplete:i' + attempt
+    + 'p' + replication.passes + 'n' + replication.projects + 'of' + expected);
+}
+// Resolves { complete: true } once the running daemon's startup pass counted every expected
+// project, or { complete: false, error } when the count stopped short (a skipped project). Throws
+// when the pass never starts or the sweep reports a project the sidecars did not predict.
+async function awaitStartupPass(expected, attempt) {
+  const deadline = Date.now() + STARTUP_PASS_TIMEOUT_MS;
+  let lastKey = null;
+  let lastChange = Date.now();
+  for (;;) {
+    const replication = await readReplicationStatus();
+    // passes >= 1: promotion is done and replication has begun. Every project of the sweep
+    // counted: each replication, with its lease release and outbox close, has returned.
+    if (replication.passes >= 1 && replication.projects === expected) return { complete: true };
+    // The sweep ran a project the sidecars did not predict: the expected count is not the
+    // completion signal for this state.
+    assert.ok(replication.projects <= expected, 'surface-isolation:replication-unexpected-project');
+    if (Date.now() >= deadline) throw startupPassIncomplete(attempt, replication, expected);
+    const key = replication.passes + ',' + replication.projects;
+    if (key !== lastKey) { lastKey = key; lastChange = Date.now(); }
+    if (replication.passes >= 1 && Date.now() - lastChange >= STARTUP_PASS_STALLED_MS) {
+      return { complete: false, error: startupPassIncomplete(attempt, replication, expected) };
+    }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+}
 async function hasPendingPassiveWork() {
   const sidecars = await readPassiveSidecars();
   assert.ok(sidecars.every(row => !row.scanError && !row.scanSkipped), 'surface-isolation:sidecar-observation');
@@ -490,25 +546,11 @@ function ownedLifecycle() {
     // stop -> baseline -> start comparison that follows is exact. Only public state is read:
     // sidecar delivery counters and the daemon's replication status.
     //
-    // A restart's startup pass is complete when the status counts every project the sweep
-    // replicates. The sweep (PassiveEventReplicationPass via PassiveEventProcessor.runSweep)
-    // scans the first sweepMaxSidecars sidecars in file-name order from index 0, and
-    // replicateSidecars adds one to replication.projects, in the same synchronous block as the
-    // other counters, only after a project's replication returned. The replication returns
-    // after its last phase, lease release and outbox close. The expected count is the sidecars
-    // in the window that have an owner directory and a remote binding. Only a complete pass
-    // can prove a fixed point.
-    //
-    // A sweep skips a project without a trace when its scan or one of the gates fails, and tries
-    // it again at the next sweep. The status has no end-of-pass field, so a count that stops
-    // changing before it reaches the expected one is taken as a pass that skipped a project.
-    // That restart proves nothing, so the next restart is a new startup pass; the loop only
-    // fails when no restart completes within MAX_ITERATIONS. A slow pass that is mistaken for
-    // a skipped one costs a restart and never a false fixed point.
+    // A restart's startup pass is complete when awaitStartupPass says so; only a complete pass
+    // can prove a fixed point. A pass that skipped a project proves nothing, so the next restart
+    // is a new startup pass; the loop only fails when no restart completes within MAX_ITERATIONS.
     ...(backend === 'postgresql' ? { settleReplication: async function settleReplication() {
       const MAX_ITERATIONS = 12;
-      const PASS_TIMEOUT_MS = 30000;
-      const STALLED_MS = 3000;
       // The remote-bound set cannot change while settling, so it is read once, below, with no daemon
       // running: the daemon takes the publication lock around each replication phase and this
       // synchronous reader does not wait for it.
@@ -525,29 +567,17 @@ function ownedLifecycle() {
       const unsettled = (iteration, rows) => new Error('surface-isolation:replication-not-settled:i' + iteration + rows
         .filter(row => bound(row) && open(row) > 0)
         .map(row => '.' + row.projectId.slice(0, 4) + counters(row).map(count => Math.min(9, count)).join('')).join('').slice(0, 36));
-      const status = async () => {
-        const response = await request('POST', '/status', { cwd: projectPath });
-        const replication = response.body?.passiveEvents?.replication;
-        assert.ok(response.status === 200 && replication?.enabled === true, 'surface-isolation:replication-status');
-        return replication;
-      };
-      const incomplete = (iteration, replication, expected) => new Error('surface-isolation:replication-pass-incomplete:i' + iteration
-        + 'p' + replication.passes + 'n' + replication.projects + 'of' + expected);
-      // The sidecars the startup sweep replicates, from the rows read with the daemon stopped.
-      const sweptProjects = rows => [...rows].sort((left, right) => left.file.localeCompare(right.file))
-        .slice(0, PASSIVE_EVENT_PROCESSOR_DEFAULTS.sweepMaxSidecars)
-        .filter(row => bound(row) && typeof row.cwd === 'string' && row.cwd.length > 0).length;
       const initial = await readPassiveSidecars();
       if (!initial.some(row => open(row) > 0)) return;
       let stopped = await this.stop();
-      boundIds = new Set(Object.entries(readProjectMapSnapshot()).filter(([, entry]) => entry.remoteProjectId).map(([id]) => id));
+      boundIds = readBoundProjectIds();
       if (!initial.some(row => bound(row) && open(row) > 0)) {
         await this.start(stopped.port);
         return;
       }
       // A remote-bound sidecar outside the startup sweep's window or without an owner directory
       // is never replicated by a restart, so the pass could not be proven complete.
-      assert.equal(initial.filter(bound).length, sweptProjects(initial), 'surface-isolation:replication-outside-sweep');
+      assert.equal(initial.filter(bound).length, sweptProjects(initial, boundIds), 'surface-isolation:replication-outside-sweep');
       let current = initial;
       let reachedFixedPoint = false;
       let skipped = null;
@@ -556,28 +586,8 @@ function ownedLifecycle() {
         const previous = stopped ?? await this.stop();
         stopped = undefined;
         await this.start(previous.port);
-        const deadline = Date.now() + PASS_TIMEOUT_MS;
-        const expected = sweptProjects(current);
-        let complete = false;
-        let lastKey = null;
-        let lastChange = Date.now();
-        for (;;) {
-          const replication = await status();
-          // passes >= 1: promotion is done and replication has begun. Every project of the sweep
-          // counted: each replication, with its lease release and outbox close, has returned.
-          if (replication.passes >= 1 && replication.projects === expected) { complete = true; break; }
-          // The sweep ran a project the sidecars did not predict: the expected count is not the
-          // completion signal for this state.
-          assert.ok(replication.projects <= expected, 'surface-isolation:replication-unexpected-project');
-          if (Date.now() >= deadline) throw incomplete(iteration, replication, expected);
-          const key = replication.passes + ',' + replication.projects;
-          if (key !== lastKey) { lastKey = key; lastChange = Date.now(); }
-          if (replication.passes >= 1 && Date.now() - lastChange >= STALLED_MS) {
-            skipped = incomplete(iteration, replication, expected);
-            break;
-          }
-          await new Promise(resolve => setTimeout(resolve, 250));
-        }
+        const { complete, error } = await awaitStartupPass(sweptProjects(current, boundIds), iteration);
+        if (!complete) skipped = error;
         current = await readPassiveSidecars();
         // Only a complete pass that moved nothing is a fixed point.
         if (complete) skipped = null;
@@ -760,7 +770,28 @@ async function enterFaults() {
       setConfigValue({ configPath, path, value: String(value), json: true });
     }
   }
-  await startDirect();
+  if (backend !== 'postgresql') {
+    await startDirect();
+    return;
+  }
+  // The fault scenarios need a quiet daemon: its startup replication pass would otherwise overlap
+  // the "before" snapshot, the held-pool search and the recovery search, and a read that lands in
+  // a long sweep phase gets the retryable 503 of the bounded publication queue. The pass is
+  // complete when the status counts every project of the sweep (awaitStartupPass). A pass that
+  // skipped a project is not complete: restart this daemon, as the settle does, and fail when
+  // no start completes.
+  const boundIds = readBoundProjectIds();
+  const expected = sweptProjects(await readPassiveSidecars(), boundIds);
+  let incomplete;
+  for (let attempt = 1; attempt <= FAULT_DAEMON_START_ATTEMPTS; attempt += 1) {
+    await startDirect();
+    const outcome = await awaitStartupPass(expected, attempt);
+    if (outcome.complete) return;
+    incomplete = outcome.error;
+    await directDaemon.stop();
+    directDaemon = undefined;
+  }
+  throw incomplete;
 }
 async function cleanup() {
   stopping = true;
