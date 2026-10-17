@@ -1974,7 +1974,10 @@ function withPublicationAdmission<T>(homeDir: string, callback: (admission: Publ
     );
   }
   if (outcome.error instanceof PrivateMutationLockContentionError) {
-    throw new PrivateMutationLockContentionError(outcome.error.message, { cause: aggregate });
+    throw new PrivateMutationLockContentionError(outcome.error.message, {
+      cause: aggregate,
+      contendedLock: outcome.error.contendedLock,
+    });
   }
   throw aggregate;
 }

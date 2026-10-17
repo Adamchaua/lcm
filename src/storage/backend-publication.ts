@@ -1838,7 +1838,7 @@ function completeConsumerOperation<T>(
   if (outcome.error instanceof PrivateMutationLockContentionError) {
     throw new PrivateMutationLockContentionError(
       outcome.error.message,
-      { cause: aggregate },
+      { cause: aggregate, contendedLock: outcome.error.contendedLock },
     );
   }
   throw aggregate;
