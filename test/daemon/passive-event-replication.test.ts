@@ -1353,6 +1353,37 @@ describe("PassiveEventReplicationWorker", () => {
       expect(remote.insertEvents).toHaveBeenCalledTimes(1);
     });
 
+    it("retries rather than quarantines a row at the limit when the recovery query fails", async () => {
+      const failure = new Error("release unavailable");
+      const onError = vi.fn();
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([
+          pendingRow(1, { delivery_attempts: THRESHOLD }),
+        ]),
+      });
+      const remote = remoteRepository({
+        // The failed insert names this very row, as a quarantine-worthy error would.
+        insertEvents: insertThenSucceed(1),
+        readEvents: vi.fn().mockResolvedValue([]),
+        releaseFromOtherProjects: vi.fn().mockRejectedValue(failure),
+      });
+      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 1,
+        quarantined: 0,
+      });
+      expect(local.markDeliveryRetry).toHaveBeenCalledTimes(1);
+      expect(local.markDeliveryRetry).toHaveBeenCalledWith(
+        ID(1),
+        expect.any(String),
+        "release unavailable",
+        expect.any(String),
+      );
+      expect(local.markDeliveryQuarantined).not.toHaveBeenCalled();
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+      expect(onError.mock.calls.filter(([error]) => error === failure)).toHaveLength(1);
+    });
+
     it("acts on the first answer per row and reports a repeated one once", async () => {
       const onError = vi.fn();
       const local = localRepository({

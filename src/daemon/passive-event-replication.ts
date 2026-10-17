@@ -459,9 +459,9 @@ export class PassiveEventReplicationWorker {
    * the whole batch (#1511). Any failure that left rows out, with no returned
    * row differing from its local row, therefore asks the other projects about
    * the missing rows once and inserts the batch once more without the rows
-   * that cannot go. A differing row or a failed readback leaves every row to
-   * retry with backoff. Returns the batch and records to account for, or null
-   * when every row has been dealt with.
+   * that cannot go. A differing row, a failed readback or a failed recovery
+   * query leaves every row to retry with backoff. Returns the batch and
+   * records to account for, or null when every row has been dealt with.
    */
   private async settleFailedUpload(
     batch: readonly LocalHookEventRow[],
@@ -498,7 +498,7 @@ export class PassiveEventReplicationWorker {
       );
     } catch (releaseError) {
       await this.reportError(releaseError);
-      await this.recoverBatch(batch, owner, insertError, summary);
+      await this.recoverBatch(batch, owner, releaseError, summary);
       return null;
     }
     const asked = new Set(view.missing.map((event) => event.event_uuid));
