@@ -1,0 +1,10 @@
+references: ["#1521", "#1523"]
+rationale: >-
+  #1521 makes the backend publication composer validate the switched target
+  config with the stored-config validator before prepare(). #1523 gives the
+  retained-material reader a terminal-evidence check and a post-read journal
+  comparison through a new shared helper in the coordinator module. Both
+  files are existing storage-abstractions members; no ownership changes.
+pins:
+  - ["src/storage/backend-publication-material.ts", "unit-storage-abstractions"]
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]

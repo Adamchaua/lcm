@@ -1436,6 +1436,9 @@ describe("passive-event replication pass", () => {
         renewDrainLease: async () => ({ fencingToken: 1n }),
         releaseDrainLease: async () => undefined,
         insertEvents: async (inputs: ReadonlyArray<Omit<InboxRow, "inboxId" | "projectId" | "status">>) => {
+          // The real insert is one transaction: a row that fails rolls back
+          // every row inserted before it in the same batch.
+          const staged: InboxRow[] = [];
           const inserted = inputs.map(input => {
             const existing = find(input.machineId, input.eventId);
             if (existing !== undefined && existing.projectId !== projectId) {
@@ -1444,10 +1447,13 @@ describe("passive-event replication pass", () => {
             if (existing !== undefined) return existing;
             const row: InboxRow = { ...input, inboxId: nextInboxId, projectId, status: "pending" };
             nextInboxId += 1n;
-            rows.push(row);
-            insertions.push(`${projectId}:${input.machineSequence.toString()}`);
+            staged.push(row);
             return row;
           });
+          for (const row of staged) {
+            rows.push(row);
+            insertions.push(`${projectId}:${row.machineSequence.toString()}`);
+          }
           return inserted.map(record);
         },
         readEvents: async (keys: ReadonlyArray<{ machineId: string; eventId: string }>) =>
@@ -1507,12 +1513,17 @@ describe("passive-event replication pass", () => {
       const sidecar = join(directory, "events.db");
       const factory = new SQLiteLocalHookOutboxFactory();
       const inbox = sharedInbox(applying);
-      const state = { project: PROJECT_A };
+      const state = { project: PROJECT_A, checks: 0, movesAfter: Number.POSITIVE_INFINITY };
       const binding = () => ({ remoteProjectId: state.project });
+      // Counts the per-phase binding checks so a move can land at a chosen phase.
+      const existingBinding = () => {
+        state.checks += 1;
+        return state.checks > state.movesAfter ? { remoteProjectId: PROJECT_B } : binding();
+      };
       const harness = modules({
         readMachineIdentity: vi.fn().mockReturnValue({ ...REGISTERED_IDENTITY, machineId: MACHINE }),
         resolveProjectIdentity: vi.fn(binding),
-        resolveExistingProjectIdentity: vi.fn(binding),
+        resolveExistingProjectIdentity: vi.fn(existingBinding),
         createOutboxFactory: () => factory,
         createRepository: vi.fn((_runtime: unknown, projectId: string, machineId: string) =>
           inbox.repositoryFor(projectId, machineId)),
@@ -1558,6 +1569,24 @@ describe("passive-event replication pass", () => {
         onError,
         run: () => pass.run("/proj", undefined, sidecar),
         relink: (project: string) => { state.project = project; },
+        moveAfterChecks: (checks: number) => {
+          state.checks = 0;
+          state.movesAfter = checks;
+        },
+        forgetRemoteInboxIds: () => {
+          // The upload to the previous project committed, but the local
+          // record of it was lost: the rows are pending again.
+          const raw = new DatabaseSync(sidecar);
+          try {
+            raw.exec(
+              "UPDATE events SET delivery_state = 'pending', remote_inbox_id = NULL, "
+              + "delivery_owner = NULL, delivery_claimed_at = NULL, "
+              + "delivery_next_attempt_at = datetime('now', '-1 minute')",
+            );
+          } finally {
+            raw.close();
+          }
+        },
       };
     }
 
@@ -1628,6 +1657,53 @@ describe("passive-event replication pass", () => {
         .toEqual([PROJECT_A, PROJECT_B, PROJECT_B]);
       expect(BigInt(sequences[1])).toBeGreaterThan(BigInt(sequences[0]));
       expect(sequences[2]).toBe(sequences[0]);
+    });
+
+    describe("a pending row whose earlier upload landed in the previous project (#1511)", () => {
+      async function lostRecordScenario() {
+        const scenario = await relinkScenario(new Set([PROJECT_B]));
+        await scenario.insert("unrelated row");
+        await scenario.insert("row whose local record was lost");
+        await scenario.run();
+        expect(scenario.inbox.rows.map(row => row.projectId)).toEqual([PROJECT_A, PROJECT_A]);
+        // The first row's copy is gone everywhere; the second one's copy is
+        // still pending in the previous project. Both rows are pending locally.
+        scenario.inbox.rows.shift();
+        scenario.forgetRemoteInboxIds();
+        expect(scenario.states().map(row => row.state)).toEqual(["pending", "pending"]);
+        return scenario;
+      }
+
+      it("delivers it and the rest of its batch in the same pass", async () => {
+        const scenario = await lostRecordScenario();
+        scenario.relink(PROJECT_B);
+
+        await expect(scenario.run()).resolves.toMatchObject({
+          uploaded: 2,
+          applied: 2,
+          acknowledged: 2,
+          pruned: 2,
+        });
+        // Both rows went to the new project in their local order, and the
+        // previous project no longer holds a copy.
+        expect(scenario.inbox.insertions.slice(2).map(entry => entry.split(":")[0]))
+          .toEqual([PROJECT_B, PROJECT_B]);
+        expect(scenario.inbox.rows).toEqual([]);
+        expect(scenario.states().every(row => row.state === "acknowledged" && row.pruned)).toBe(true);
+        expect(scenario.onError).not.toHaveBeenCalled();
+      });
+
+      it("sends nothing and withdraws nothing once the binding moved before the upload", async () => {
+        const scenario = await lostRecordScenario();
+        const before = scenario.inbox.insertions.length;
+        // The lease phase still sees project A; the upload phase sees B.
+        scenario.moveAfterChecks(1);
+
+        await scenario.run();
+        expect(scenario.inbox.insertions.length).toBe(before);
+        expect(scenario.inbox.rows.map(row => row.projectId)).toEqual([PROJECT_A]);
+        expect(scenario.states().map(row => row.state)).toEqual(["pending", "pending"]);
+      });
     });
 
     function guardedRecovery(goodChecks: number) {

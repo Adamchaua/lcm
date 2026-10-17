@@ -1,7 +1,7 @@
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   captureBackendPublicationSourceMaterial,
   composeBackendPublicationMaterial,
@@ -9,6 +9,7 @@ import {
   type BackendPublicationProjectBinding,
 } from "../src/storage/backend-publication-material.js";
 import {
+  backendPublicationCanonicalSha256,
   backendPublicationDirectory,
   backendPublicationJournalPath,
   readAuthenticatedBackendPublicationMaterial,
@@ -19,9 +20,27 @@ import {
 import { createBackendPublicationCoordinator } from "../src/storage/backend-publication-driver.js";
 import { createInMemoryRemoteGuardProvider } from "./storage/backend-publication-guard-double.js";
 
+const materialReadHook = vi.hoisted(() => ({ armed: null as null | (() => void) }));
+
+vi.mock("../src/security-files.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../src/security-files.js")>();
+  return {
+    ...original,
+    readBoundedRegularFileWithStat: ((path: string, ...rest: unknown[]) => {
+      const hook = materialReadHook.armed;
+      if (hook !== null && path.endsWith(".material")) {
+        materialReadHook.armed = null;
+        hook();
+      }
+      return (original.readBoundedRegularFileWithStat as (...args: unknown[]) => unknown)(path, ...rest);
+    }) as typeof original.readBoundedRegularFileWithStat,
+  };
+});
+
 const roots: string[] = [];
 
 afterEach(() => {
+  materialReadHook.armed = null;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -651,6 +670,52 @@ describe("composeBackendPublicationMaterial: bindings change exactly the listed 
   });
 });
 
+describe("composeBackendPublicationMaterial target config validation (#1521)", () => {
+  it("refuses a postgresql target whose stored migrationRole is null, leaving live files untouched", () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite", postgresql: { migrationRole: null } } });
+    writeMap(home, sampleMap());
+    const configBefore = readFileSync(join(home, ".lcm", "config.json"));
+    const mapBefore = readFileSync(join(home, ".lcm", "map.json"));
+    let thrown: unknown;
+    try {
+      composeBackendPublicationMaterial({
+        homeDir: home,
+        targetBackend: "postgresql",
+        bindings: [binding()],
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toMatch(
+      /^backend publication target config is invalid for postgresql: .*migrationRole/su,
+    );
+    expect((thrown as Error).cause).toBeInstanceOf(Error);
+    expect(readFileSync(join(home, ".lcm", "config.json")).equals(configBefore)).toBe(true);
+    expect(readFileSync(join(home, ".lcm", "map.json")).equals(mapBefore)).toBe(true);
+  });
+
+  it("composes the same source once migrationRole is a valid string, keeping the exact serialized bytes", () => {
+    const home = makeHome();
+    const source = { storage: { backend: "sqlite", postgresql: { migrationRole: "lcm_migrator" } }, extra: "kept" };
+    writeConfig(home, source);
+    writeMap(home, sampleMap());
+    const result = composeBackendPublicationMaterial({
+      homeDir: home,
+      targetBackend: "postgresql",
+      bindings: [binding()],
+    });
+    expect(result.material.target.config.presence).toBe("present");
+    if (result.material.target.config.presence === "present") {
+      expect(Buffer.from(result.material.target.config.content).toString("utf-8")).toBe(
+        `${JSON.stringify({ ...source, storage: { ...source.storage, backend: "postgresql" } }, null, 2)}
+`,
+      );
+    }
+  });
+});
+
 describe("readRetainedBackendPublicationMaterial", () => {
   function preparedCoordinator(home: string) {
     return createBackendPublicationCoordinator({
@@ -658,6 +723,167 @@ describe("readRetainedBackendPublicationMaterial", () => {
       remoteGuard: { mode: "delegated", provider: createInMemoryRemoteGuardProvider() },
     });
   }
+
+  async function completedHome(publicationId: string): Promise<string> {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite" } });
+    writeMap(home, sampleMap());
+    const composed = composeBackendPublicationMaterial({
+      homeDir: home,
+      targetBackend: "postgresql",
+      bindings: [binding()],
+    });
+    const coordinator = preparedCoordinator(home);
+    await coordinator.prepare({
+      publicationId,
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      material: composed.material,
+      projects: composed.projects,
+    });
+    const completed = await coordinator.resume();
+    expect(completed.phase).toBe("completed");
+    return home;
+  }
+
+  function rewriteJournal(
+    home: string,
+    mutate: (journal: Record<string, unknown>) => Record<string, unknown>,
+  ): void {
+    const current = readBackendPublicationJournal(home);
+    if (current === null) throw new Error("test fixture has no journal");
+    const { checksumSha256: _checksum, ...payload } = current;
+    const next = mutate({ ...payload });
+    writeFileSync(
+      backendPublicationJournalPath(home),
+      JSON.stringify({ ...next, checksumSha256: backendPublicationCanonicalSha256(next) }) + "\n",
+      { mode: 0o600 },
+    );
+  }
+
+  function expectUnresolvable(home: string, pattern: RegExp): void {
+    const result = readRetainedBackendPublicationMaterial({ homeDir: home });
+    expect(result.status).toBe("unresolvable");
+    if (result.status === "unresolvable") expect(result.reason).toMatch(pattern);
+  }
+
+  it("is unresolvable when the journal is replaced in place while the material is read (#1523)", async () => {
+    const home = await completedHome("pub-race");
+    const directory = backendPublicationDirectory(home);
+    const before = statSync(directory);
+    let calls = 0;
+    materialReadHook.armed = () => {
+      calls += 1;
+      rewriteJournal(home, (journal) => ({ ...journal, updatedAt: "2999-01-01T00:00:00.000Z" }));
+    };
+    const result = readRetainedBackendPublicationMaterial({ homeDir: home });
+    expect(calls).toBe(1);
+    const after = statSync(directory);
+    expect([after.dev, after.ino, after.nlink]).toEqual([before.dev, before.ino, before.nlink]);
+    expect(result.status).toBe("unresolvable");
+    if (result.status === "unresolvable") {
+      expect(result.reason).toMatch(/journal changed while reading retained material/);
+    }
+  });
+
+  it("is unresolvable when the journal disappears while the material is read (#1523)", async () => {
+    const home = await completedHome("pub-vanish");
+    materialReadHook.armed = () => unlinkSync(backendPublicationJournalPath(home));
+    expectUnresolvable(home, /journal disappeared while reading retained material/);
+  });
+
+  it("is unresolvable when a completed journal retains an active remote fence (#1523)", async () => {
+    const home = await completedHome("pub-active-fence");
+    rewriteJournal(home, (journal) => ({
+      ...journal,
+      projects: [{
+        ...((journal.projects as Record<string, unknown>[])[0]),
+        fence: {
+          projectId: REMOTE_ID_A,
+          machineId: "machine",
+          publicationId: journal.publicationId,
+          targetBackend: journal.targetBackend,
+          evidenceSha256: EVIDENCE_A,
+          fencingToken: "1",
+          acquiredAt: "2026-08-06T12:00:00.000Z",
+          renewedAt: "2026-08-06T12:00:00.000Z",
+          expiresAt: "2999-08-06T12:00:00.000Z",
+          releasedAt: null,
+          databaseExpired: false,
+        },
+      }],
+    }));
+    expectUnresolvable(home, /active remote fence/);
+  });
+
+  it.each([
+    ["null published config hash", { publishedConfigSha256: null }],
+    ["null published project map hash", { publishedProjectMapSha256: null }],
+    ["differing published config hash", { publishedConfigSha256: "0".repeat(64) }],
+    ["differing published project map hash", { publishedProjectMapSha256: "0".repeat(64) }],
+  ])("is unresolvable when a completed journal has a %s (#1523)", async (_label, patch) => {
+    const home = await completedHome("pub-hash-witness");
+    rewriteJournal(home, (journal) => ({ ...journal, ...patch }));
+    expectUnresolvable(home, /lacks intended-state witnesses/);
+  });
+
+  it("is unresolvable when a completed journal has no recovery reference (#1523)", async () => {
+    const home = await completedHome("pub-no-reference");
+    rewriteJournal(home, (journal) => ({ ...journal, recoveryReference: null }));
+    expectUnresolvable(home, /no recovery reference/);
+  });
+
+  it("is unresolvable, not absent, for a completed publication under a non-private root", async () => {
+    const home = await completedHome("pub-open-root");
+    chmodSync(join(home, ".lcm"), 0o755);
+    expectUnresolvable(home, /./);
+    chmodSync(join(home, ".lcm"), 0o700);
+    expect(readRetainedBackendPublicationMaterial({ homeDir: home }).status).toBe("present");
+  });
+
+  it("stays authoritatively-absent for a prepared publication under a non-private root", async () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite" } });
+    writeMap(home, sampleMap());
+    const composed = composeBackendPublicationMaterial({
+      homeDir: home,
+      targetBackend: "postgresql",
+      bindings: [binding()],
+    });
+    await preparedCoordinator(home).prepare({
+      publicationId: "pub-prepared-open-root",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      material: composed.material,
+      projects: composed.projects,
+    });
+    chmodSync(join(home, ".lcm"), 0o755);
+    expect(readRetainedBackendPublicationMaterial({ homeDir: home }).status).toBe("authoritatively-absent");
+  });
+
+  it("stays authoritatively-absent for an aborted publication, even under a non-private root", async () => {
+    const home = makeHome();
+    writeConfig(home, { storage: { backend: "sqlite" } });
+    writeMap(home, sampleMap());
+    const composed = composeBackendPublicationMaterial({
+      homeDir: home,
+      targetBackend: "postgresql",
+      bindings: [binding()],
+    });
+    const coordinator = preparedCoordinator(home);
+    await coordinator.prepare({
+      publicationId: "pub-aborted",
+      sourceBackend: "sqlite",
+      targetBackend: "postgresql",
+      material: composed.material,
+      projects: composed.projects,
+    });
+    const aborted = await coordinator.abort();
+    expect(aborted.phase).toBe("aborted");
+    expect(readRetainedBackendPublicationMaterial({ homeDir: home }).status).toBe("authoritatively-absent");
+    chmodSync(join(home, ".lcm"), 0o755);
+    expect(readRetainedBackendPublicationMaterial({ homeDir: home }).status).toBe("authoritatively-absent");
+  });
 
   it("is authoritatively-absent when there is no journal at all", () => {
     const home = makeHome();

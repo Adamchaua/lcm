@@ -1,0 +1,12 @@
+references: ["#1511"]
+rationale: >-
+  #1511 recovers a pending local row whose earlier upload landed in the
+  previous remote project and was never recorded locally: when an upload batch
+  fails and the bound project lacks rows, the worker asks the repository to
+  withdraw or settle this machine's copies by event id and uploads the batch
+  once more without the rows that cannot go. The repository's release key
+  accepts a missing inbox id for such rows. Every changed file keeps its current
+  owner.
+pins:
+  - ["src/daemon/passive-event-replication.ts", "integration-postgresql-passive-events"]
+  - ["src/storage/postgresql/passive-event-repository.ts", "integration-postgresql-passive-events"]

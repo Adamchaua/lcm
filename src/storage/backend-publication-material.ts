@@ -1,12 +1,12 @@
 import { dirname } from "node:path";
+import { parseStoredConfig } from "../daemon/config.js";
 import { normalizeUuidV7 } from "../machine-identity.js";
 import { parseProjectMap, projectMapPath, type ProjectMap } from "../project-map.js";
 import { configPath } from "../runtime-paths.js";
 import type { StorageBackendName } from "./contracts.js";
 import {
   captureBackendPublicationFileWitness,
-  readAuthenticatedBackendPublicationMaterial,
-  readBackendPublicationJournalForConsumer,
+  readRetainedCompletedBackendPublicationEvidence,
   withBackendPublicationReadRoot,
   type BackendPublicationFileSnapshot,
   type BackendPublicationJournal,
@@ -233,6 +233,17 @@ function composeTargetConfigFile(
   };
   const serialized = `${JSON.stringify(targetParsed, null, 2)}
 `;
+  try {
+    // The config writer validates the stored config at phase
+    // config-publishing, after the project map is published. Run the same
+    // validator here so an unwritable target is refused before prepare().
+    parseStoredConfig(serialized);
+  } catch (error) {
+    throw new Error(
+      `backend publication target config is invalid for ${targetBackend}: ${String(error)}`,
+      { cause: error },
+    );
+  }
   return {
     sourceBackend,
     file: {
@@ -429,8 +440,14 @@ export type ReadRetainedBackendPublicationMaterialInput = Readonly<{
  *   `recoveryReference`; a missing or unauthenticatable file under that
  *   assertion is an inconsistent store, and concluding "absent" there
  *   would license a reversal with nothing to reverse to.
- * - the journal is `completed` and the material authenticates ->
- *   `present`, carrying BOTH the material and the journal. This function
+ * - the journal is `completed`, passes the terminal-evidence checks (a
+ *   recovery reference, no active remote fence, published hashes equal to
+ *   the intended hashes), its material authenticates, and a re-read of the
+ *   journal after the material read still has the same checksum ->
+ *   `present`, carrying BOTH the material and the journal. A journal that
+ *   changed or disappeared during the read is `unresolvable`. The reader
+ *   takes no lock, so `present` does not claim that the journal is still
+ *   live when the function returns. This function
  *   does not filter on `targetBackend`: that check belongs to the
  *   consumer (contract section 16), which has more information than this
  *   reader does about what it is eligible to roll back.
@@ -449,18 +466,10 @@ export type ReadRetainedBackendPublicationMaterialInput = Readonly<{
 export function readRetainedBackendPublicationMaterial(
   input: ReadRetainedBackendPublicationMaterialInput = {},
 ): RetainedBackendPublicationMaterialResult {
-  let journal: BackendPublicationJournal | null;
   try {
-    journal = readBackendPublicationJournalForConsumer(input.homeDir);
-  } catch (error) {
-    return { status: "unresolvable", reason: describeError(error) };
-  }
-  if (journal === null || journal.phase !== "completed") {
-    return { status: "authoritatively-absent" };
-  }
-  try {
-    const material = readAuthenticatedBackendPublicationMaterial(journal, input.homeDir);
-    return { status: "present", journal, material };
+    const evidence = readRetainedCompletedBackendPublicationEvidence(input.homeDir);
+    if (evidence === null) return { status: "authoritatively-absent" };
+    return { status: "present", journal: evidence.journal, material: evidence.material };
   } catch (error) {
     return { status: "unresolvable", reason: describeError(error) };
   }
