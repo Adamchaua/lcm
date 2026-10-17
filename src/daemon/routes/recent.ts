@@ -4,7 +4,7 @@ import type { RouteHandler } from "../server.js";
 import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
 import {
-  storageRouteFailureResponse,
+  storageReadFailureResponse,
   withProjectStorage,
 } from "./storage-lifecycle.js";
 
@@ -57,7 +57,7 @@ export function createRecentHandler(config: DaemonConfig, storageFactory?: Stora
       })) ?? [];
       sendJson(res, 200, { summaries: rows });
     } catch (error) {
-      const storageFailure = storageRouteFailureResponse(config.storage.backend, error, "recent", storageFactory);
+      const storageFailure = storageReadFailureResponse(config.storage.backend, error, "recent", storageFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;

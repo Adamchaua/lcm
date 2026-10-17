@@ -11,11 +11,13 @@ import {
   stagedPostgreSqlUnavailableResponse,
   storageIdentityRequiredResponse,
   storageRouteFailureResponse,
+  storageReadFailureResponse,
 } from "../../../src/daemon/routes/storage-lifecycle.js";
 import { loadDaemonConfig, type DaemonConfig } from "../../../src/daemon/config.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 import { StorageOperationError } from "../../../src/storage/errors.js";
+import { publicationWitnessContentionError } from "../../../src/storage/postgresql/factory.js";
 import type { ProjectStorage, StorageBackendFactory } from "../../../src/storage/index.js";
 import {
   BackendPublicationJournalError,
@@ -25,7 +27,11 @@ import {
 import { clearProjectMapCache } from "../../../src/project-map.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 import { isAbortError } from "../../../src/daemon/cancellation.js";
+import { createAbortError } from "../../../src/daemon/cancellation.js";
+import { PrivateMutationLockContentionError } from "../../../src/private-mutation-lock.js";
+import * as projectModule from "../../../src/daemon/project.js";
 import { projectIdentity } from "../../../src/daemon/project.js";
+import type { RoutePublicationAdmission } from "../../../src/daemon/server.js";
 import { closeLcmConnection, getPoolStats } from "../../../src/db/connection.js";
 import { SqliteStorageBackendFactory } from "../../../src/storage/sqlite/factory.js";
 
@@ -210,6 +216,67 @@ describe("route storage cleanup", () => {
       },
     });
     expect(storageRouteFailureResponse("sqlite", stagedError, "grep", staged)).toBeNull();
+  });
+
+  it("fails PostgreSQL read routes closed with sanitized 503 bodies", () => {
+    const canary = "/private/canary-4242 pid 4242";
+    const typed = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED", "postgresql", "p", "summaries", "recent",
+    );
+    const staged = makeStagedPostgreSqlStorageFactory();
+    const stagedError = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED", "postgresql", undefined, "factory", "grep",
+    );
+    const contention = new PrivateMutationLockContentionError(
+      `lock held at ${canary}`,
+      { cause: new Error(canary), contendedLock: { path: canary, owner: { pid: 4242 } } as never },
+    );
+
+    // Identity precedence, staged factory, and typed passthrough defer to the base classifier.
+    const identity = new StorageIdentityConfigurationError("binding required");
+    expect(storageReadFailureResponse("postgresql", identity, "search"))
+      .toEqual(storageRouteFailureResponse("postgresql", identity, "search"));
+    expect(storageReadFailureResponse("postgresql", identity, "search")?.status).toBe(409);
+    expect(storageReadFailureResponse("postgresql", stagedError, "grep", staged))
+      .toEqual(storageRouteFailureResponse("postgresql", stagedError, "grep", staged));
+    expect(storageReadFailureResponse("postgresql", stagedError, "grep", staged)?.status).toBe(503);
+    expect(storageReadFailureResponse("postgresql", typed, "recent"))
+      .toEqual({ status: 503, body: typed.toJSON() });
+
+    // Cancellation and SQLite keep the route's existing handling.
+    expect(storageReadFailureResponse("postgresql", createAbortError(), "search")).toBeNull();
+    expect(storageReadFailureResponse("sqlite", contention, "search")).toBeNull();
+    expect(storageReadFailureResponse("sqlite", new Error(canary), "search")).toBeNull();
+
+    // Publication-lock contention is a retryable identity failure without lock details.
+    const contended = storageReadFailureResponse("postgresql", contention, "describe");
+    expect(contended).toEqual({
+      status: 503,
+      body: new StorageOperationError(
+        "STORAGE_OPERATION_FAILED", "postgresql", undefined, "identity", "describe", { retryable: true },
+      ).toJSON(),
+    });
+    expect(contended?.body.retryable).toBe(true);
+
+    // Any other rejection becomes a non-retryable factory failure.
+    for (const failure of [new Error(canary), canary, undefined]) {
+      const failed = storageReadFailureResponse("postgresql", failure, "expand");
+      expect(failed).toEqual({
+        status: 503,
+        body: new StorageOperationError(
+          "STORAGE_OPERATION_FAILED", "postgresql", undefined, "factory", "expand",
+        ).toJSON(),
+      });
+      expect(failed?.body.retryable).toBe(false);
+    }
+
+    for (const response of [contended, storageReadFailureResponse("postgresql", new Error(canary), "expand")]) {
+      const serialized = JSON.stringify(response?.body);
+      expect(serialized).toContain("postgresql");
+      expect(serialized).not.toContain("canary");
+      expect(serialized).not.toContain("4242");
+      expect(serialized).not.toContain("/private");
+    }
   });
 
   it("recognizes only typed PostgreSQL identity admission failures", () => {
@@ -948,3 +1015,526 @@ describe("route storage cleanup", () => {
     expect(storageRouteFailureResponse("sqlite", error, "createFactory")).toBeNull();
   });
 });
+
+describe("PostgreSQL read prefix retry under bounded admission", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  type Events = string[];
+
+  /** Bounded read admission stand-in: a real consumer lock around the prefix. */
+  function readAdmission(home: string, events: Events) {
+    const tokens: unknown[] = [];
+    const admit = vi.fn(async <T>(
+      operation: (token: BackendPublicationLockToken) => Promise<T> | T,
+      _signal?: AbortSignal,
+    ): Promise<T> => withBackendPublicationConsumerLockAsync(home, async token => {
+      tokens.push(token);
+      events.push("admission-enter");
+      try {
+        return await operation(token);
+      } finally {
+        events.push("admission-release");
+      }
+    }));
+    return { admit, tokens, context: (signal: AbortSignal) => ({ signal, withReadAdmission: admit as RoutePublicationAdmission }) };
+  }
+
+  function contendIdentity(times: number) {
+    const original = projectModule.projectIdentity;
+    const identityTokens: unknown[] = [];
+    let remaining = times;
+    vi.spyOn(projectModule, "projectIdentity").mockImplementation(((...args: Parameters<typeof original>) => {
+      identityTokens.push(args[2]);
+      if (args[2] === undefined && remaining > 0) {
+        remaining -= 1;
+        throw new PrivateMutationLockContentionError("worktree reconciliation is busy");
+      }
+      return original(...args);
+    }) as typeof original);
+    return identityTokens;
+  }
+
+  it("keeps an uncontended read on the unadmitted path without a token", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const events: Events = [];
+      const admission = readAdmission(home, events);
+      const project = fakeProject(async () => undefined);
+      const openExisting = vi.fn(async (_identity: unknown, token?: unknown) => {
+        expect(token).toBeUndefined();
+        return project;
+      });
+      const factory = fakeFactory({ openExistingProject: openExisting as StorageBackendFactory["openExistingProject"] });
+      const controller = new AbortController();
+      await expect(withProjectStorage({
+        config, cwd, factory, context: admission.context(controller.signal), mode: "existing",
+      }, async (storage, signal, token) => {
+        expect(signal).toBe(controller.signal);
+        expect(token).toBeUndefined();
+        return storage.projectId;
+      })).resolves.toBe("project-id");
+      expect(admission.admit).not.toHaveBeenCalled();
+      expect(project.close).toHaveBeenCalledExactlyOnceWith(undefined);
+      expect(factory.close).not.toHaveBeenCalled();
+
+      openExisting.mockResolvedValueOnce(null as never);
+      await expect(withProjectStorage({
+        config, cwd, factory, context: admission.context(controller.signal), mode: "existing",
+      }, async () => "must not run")).resolves.toBeNull();
+      expect(admission.admit).not.toHaveBeenCalled();
+    });
+  });
+
+  it("retries identity contention once inside admission and runs the operation and close outside it", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const events: Events = [];
+      const admission = readAdmission(home, events);
+      const identityTokens = contendIdentity(1);
+      const project = fakeProject(async () => { events.push("project-close"); });
+      const openExisting = vi.fn(async (_identity: unknown, token?: unknown) => {
+        events.push("open");
+        expect(token).toBe(admission.tokens[0]);
+        return project;
+      });
+      const factory = fakeFactory({ openExistingProject: openExisting as StorageBackendFactory["openExistingProject"] });
+      const controller = new AbortController();
+      await expect(withProjectStorage({
+        config, cwd, factory, context: admission.context(controller.signal), mode: "existing",
+      }, async (_storage, _signal, token) => {
+        events.push("operation");
+        expect(token).toBeUndefined();
+        return "done";
+      })).resolves.toBe("done");
+      expect(admission.admit).toHaveBeenCalledExactlyOnceWith(expect.any(Function), controller.signal);
+      expect(identityTokens).toEqual([undefined, admission.tokens[0]]);
+      expect(events).toEqual(["admission-enter", "open", "admission-release", "operation", "project-close"]);
+      expect(project.close).toHaveBeenCalledExactlyOnceWith(undefined);
+    });
+  });
+
+  it("retries contention from owned-factory creation, reusing the factory and closing it once after release", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const events: Events = [];
+      const admission = readAdmission(home, events);
+      const project = fakeProject(async () => { events.push("project-close"); });
+      const factory = fakeFactory({
+        openExistingProject: async () => project,
+        close: vi.fn(async () => { events.push("factory-close"); }),
+      });
+      storageFactorySeam.create
+        .mockRejectedValueOnce(new PrivateMutationLockContentionError("busy"))
+        .mockResolvedValueOnce(factory);
+      await expect(withProjectStorage({
+        config, cwd, context: admission.context(new AbortController().signal), mode: "existing",
+      }, async () => { events.push("operation"); return "done"; })).resolves.toBe("done");
+      expect(storageFactorySeam.create).toHaveBeenCalledTimes(2);
+      expect(storageFactorySeam.create.mock.calls[0]?.[3]).toBeUndefined();
+      expect(storageFactorySeam.create.mock.calls[1]?.[3]).toBe(admission.tokens[0]);
+      expect(events).toEqual([
+        "admission-enter", "admission-release", "operation", "project-close", "factory-close",
+      ]);
+      expect(factory.close).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("reuses a factory created by the unadmitted attempt when identity contends", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const events: Events = [];
+      const admission = readAdmission(home, events);
+      contendIdentity(1);
+      const project = fakeProject(async () => undefined);
+      const factory = fakeFactory({
+        openExistingProject: async () => project,
+        close: vi.fn(async () => { events.push("factory-close"); }),
+      });
+      storageFactorySeam.create.mockResolvedValueOnce(factory);
+      await expect(withProjectStorage({
+        config, cwd, context: admission.context(new AbortController().signal), mode: "existing",
+      }, async () => "done")).resolves.toBe("done");
+      expect(storageFactorySeam.create).toHaveBeenCalledOnce();
+      expect(factory.close).toHaveBeenCalledOnce();
+      expect(events).toEqual(["admission-enter", "admission-release", "factory-close"]);
+    });
+  });
+
+  it.each([
+    ["the open's publication-witness contention", () => publicationWitnessContentionError(
+      undefined, "openExistingProject")],
+    ["typed contention from the open", () => new PrivateMutationLockContentionError("busy")],
+  ] as const)("retries %s once inside admission", async (_label, makeError) => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const events: Events = [];
+      const admission = readAdmission(home, events);
+      const project = fakeProject(async () => undefined);
+      const openExisting = vi.fn<StorageBackendFactory["openExistingProject"]>()
+        .mockRejectedValueOnce(makeError())
+        .mockImplementationOnce(async (_identity, token) => {
+          expect(token).toBe(admission.tokens[0]);
+          return project;
+        });
+      const factory = fakeFactory({ openExistingProject: openExisting });
+      await expect(withProjectStorage({
+        config, cwd, factory, context: admission.context(new AbortController().signal), mode: "existing",
+      }, async () => "done")).resolves.toBe("done");
+      expect(openExisting).toHaveBeenCalledTimes(2);
+      expect(openExisting.mock.calls[0]?.[1]).toBeUndefined();
+      expect(admission.admit).toHaveBeenCalledOnce();
+      expect(project.close).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("retries a contended create-mode open inside admission", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const admission = readAdmission(home, []);
+      const project = fakeProject(async () => undefined);
+      const openProject = vi.fn<StorageBackendFactory["openProject"]>()
+        .mockRejectedValueOnce(new PrivateMutationLockContentionError("busy"))
+        .mockResolvedValueOnce(project);
+      await expect(withProjectStorage({
+        config, cwd, factory: fakeFactory({ openProject }),
+        context: admission.context(new AbortController().signal), mode: "create",
+      }, async storage => storage.projectId)).resolves.toBe("project-id");
+      expect(openProject).toHaveBeenCalledTimes(2);
+      expect(openProject.mock.calls[1]?.[1]).toBe(admission.tokens[0]);
+    });
+  });
+
+  it("does not retry a factory construction failure, even with the initialization code", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const admission = readAdmission(home, []);
+      const error = new StorageOperationError(
+        "STORAGE_INITIALIZATION_FAILED", "postgresql", undefined, "factory", "createFactory");
+      storageFactorySeam.create.mockRejectedValueOnce(error);
+      await expect(withProjectStorage({
+        config, cwd, context: admission.context(new AbortController().signal), mode: "existing",
+      }, async () => "must not run")).rejects.toBe(error);
+      expect(storageFactorySeam.create).toHaveBeenCalledOnce();
+      expect(admission.admit).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each([
+    ["an abort", () => createAbortError(new Error("gone"))],
+    ["a journal error", () => new BackendPublicationJournalError("unexpected-state", "journal moved")],
+    ["a generic error", () => new Error("boom")],
+    ["a non-initialization storage error", () => new StorageOperationError(
+      "STORAGE_OPERATION_FAILED", "postgresql", undefined, "factory", "openExistingProject")],
+    ["an unmarked initialization failure such as a database outage", () => new StorageOperationError(
+      "STORAGE_INITIALIZATION_FAILED", "postgresql", undefined, "factory", "openExistingProject")],
+  ] as const)("does not retry %s from the open", async (_label, makeError) => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const admission = readAdmission(home, []);
+      const error = makeError();
+      const openExisting = vi.fn<StorageBackendFactory["openExistingProject"]>().mockRejectedValue(error);
+      const beforeClose = vi.fn(async () => undefined);
+      await expect(withProjectStorage({
+        config, cwd, factory: fakeFactory({ openExistingProject: openExisting }),
+        context: admission.context(new AbortController().signal), mode: "existing", beforeClose,
+      }, async () => "must not run")).rejects.toBe(error);
+      expect(openExisting).toHaveBeenCalledOnce();
+      expect(admission.admit).not.toHaveBeenCalled();
+      expect(beforeClose).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("does not retry an expected-identity mismatch", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const admission = readAdmission(home, []);
+      const live = projectIdentity(cwd, config.storage);
+      const openExisting = vi.fn<StorageBackendFactory["openExistingProject"]>();
+      await expect(withProjectStorage({
+        config, cwd, factory: fakeFactory({ openExistingProject: openExisting }),
+        context: admission.context(new AbortController().signal), mode: "existing",
+        expectedIdentity: { ...live, localProjectId: "other", id: "other" },
+      }, async () => "must not run")).rejects.toBeInstanceOf(BackendPublicationJournalError);
+      expect(openExisting).not.toHaveBeenCalled();
+      expect(admission.admit).not.toHaveBeenCalled();
+    });
+  });
+
+  it("makes exactly one admitted retry and returns its failure unchanged", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const admission = readAdmission(home, []);
+      const second = new StorageOperationError(
+        "STORAGE_INITIALIZATION_FAILED", "postgresql", undefined, "factory", "openExistingProject");
+      const openExisting = vi.fn<StorageBackendFactory["openExistingProject"]>()
+        .mockRejectedValueOnce(publicationWitnessContentionError(undefined, "openExistingProject"))
+        .mockRejectedValueOnce(second);
+      await expect(withProjectStorage({
+        config, cwd, factory: fakeFactory({ openExistingProject: openExisting }),
+        context: admission.context(new AbortController().signal), mode: "existing",
+      }, async () => "must not run")).rejects.toBe(second);
+      expect(openExisting).toHaveBeenCalledTimes(2);
+      expect(admission.admit).toHaveBeenCalledOnce();
+      expect(storageReadFailureResponse("postgresql", second, "search")).toEqual({
+        status: 503,
+        body: second.toJSON(),
+      });
+      expect(second.toJSON().retryable).toBeFalsy();
+    });
+  });
+
+  it("propagates an admission that expires before the retry runs, without a project to close", async () => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const expiry = new PrivateMutationLockContentionError("daemon publication work is in progress; retry the read");
+      const openExisting = vi.fn<StorageBackendFactory["openExistingProject"]>()
+        .mockRejectedValueOnce(new PrivateMutationLockContentionError("busy"));
+      const beforeClose = vi.fn(async () => undefined);
+      const withReadAdmission = vi.fn(async () => { throw expiry; });
+      await expect(withProjectStorage({
+        config, cwd, factory: fakeFactory({ openExistingProject: openExisting }),
+        context: { signal: new AbortController().signal, withReadAdmission: withReadAdmission as never },
+        mode: "existing", beforeClose,
+      }, async () => "must not run")).rejects.toBe(expiry);
+      expect(withReadAdmission).toHaveBeenCalledOnce();
+      expect(openExisting).toHaveBeenCalledOnce();
+      expect(beforeClose).toHaveBeenCalledOnce();
+      expect(storageReadFailureResponse("postgresql", expiry, "search")).toMatchObject({
+        status: 503,
+        body: { retryable: true },
+      });
+    });
+  });
+
+  it("closes the opened project once without the operation or beforeClose when admission rejects after the prefix", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const events: Events = [];
+      const rejection = new Error("post-callback admission check failed");
+      const project = fakeProject(async () => { events.push("project-close"); throw new Error("close failed"); });
+      const beforeClose = vi.fn(async () => { events.push("before-close"); });
+      const operation = vi.fn(async () => "must not run");
+      const factory = fakeFactory({
+        openExistingProject: vi.fn<StorageBackendFactory["openExistingProject"]>()
+          .mockRejectedValueOnce(new PrivateMutationLockContentionError("busy"))
+          .mockResolvedValueOnce(project),
+      });
+      const withReadAdmission = vi.fn(async (callback: (token: BackendPublicationLockToken) => Promise<unknown>) =>
+        withBackendPublicationConsumerLockAsync(home, async token => {
+          await callback(token);
+          events.push("admission-callback-returned");
+          throw rejection;
+        }));
+      await expect(withProjectStorage({
+        config, cwd, factory, context: { signal: new AbortController().signal, withReadAdmission: withReadAdmission as never },
+        mode: "existing", beforeClose,
+      }, operation)).rejects.toBe(rejection);
+      expect(events).toEqual(["admission-callback-returned", "project-close"]);
+      expect(project.close).toHaveBeenCalledOnce();
+      expect(beforeClose).not.toHaveBeenCalled();
+      expect(operation).not.toHaveBeenCalled();
+    });
+  });
+
+  it("rejects with an abort while the retry is queued and never opens or runs anything", async () => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const controller = new AbortController();
+      const project = fakeProject(async () => undefined);
+      const openExisting = vi.fn<StorageBackendFactory["openExistingProject"]>()
+        .mockRejectedValueOnce(new PrivateMutationLockContentionError("busy"))
+        .mockResolvedValue(project);
+      let queuedResolve!: () => void;
+      const queued = new Promise<void>(resolve => { queuedResolve = resolve; });
+      const withReadAdmission = vi.fn((_callback: unknown, signal: AbortSignal) =>
+        new Promise<never>((_resolve, reject) => {
+          queuedResolve();
+          signal.addEventListener("abort", () => reject(createAbortError(signal.reason)), { once: true });
+        }));
+      const operation = vi.fn(async () => "must not run");
+      const result = withProjectStorage({
+        config, cwd, factory: fakeFactory({ openExistingProject: openExisting }),
+        context: { signal: controller.signal, withReadAdmission: withReadAdmission as never }, mode: "existing",
+      }, operation);
+      await queued;
+      controller.abort();
+      await expect(result).rejects.toSatisfy(isAbortError);
+      expect(openExisting).toHaveBeenCalledOnce();
+      expect(operation).not.toHaveBeenCalled();
+      expect(project.close).not.toHaveBeenCalled();
+    });
+  });
+
+  it("stops at the admitted prefix when the request is aborted as the turn is granted", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const controller = new AbortController();
+      const events: Events = [];
+      const admission = readAdmission(home, events);
+      const openExisting = vi.fn<StorageBackendFactory["openExistingProject"]>()
+        .mockRejectedValueOnce(new PrivateMutationLockContentionError("busy"));
+      const withReadAdmission = vi.fn(async (callback: (token: BackendPublicationLockToken) => Promise<unknown>, signal: AbortSignal) => {
+        controller.abort();
+        return admission.admit(callback, signal);
+      });
+      await expect(withProjectStorage({
+        config, cwd, factory: fakeFactory({ openExistingProject: openExisting }),
+        context: { signal: controller.signal, withReadAdmission: withReadAdmission as never }, mode: "existing",
+      }, async () => "must not run")).rejects.toSatisfy(isAbortError);
+      expect(openExisting).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("closes a project opened by the retry when the request aborts during the operation", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const controller = new AbortController();
+      const admission = readAdmission(home, []);
+      const project = fakeProject(async () => undefined);
+      const factory = fakeFactory({
+        openExistingProject: vi.fn<StorageBackendFactory["openExistingProject"]>()
+          .mockRejectedValueOnce(new PrivateMutationLockContentionError("busy"))
+          .mockResolvedValueOnce(project),
+      });
+      let started!: () => void;
+      const operationStarted = new Promise<void>(resolve => { started = resolve; });
+      const result = withProjectStorage({
+        config, cwd, factory, context: admission.context(controller.signal), mode: "existing",
+      }, async (_storage, signal) => {
+        started();
+        await new Promise<void>(settle => signal.addEventListener("abort", () => settle(), { once: true }));
+        return "aborted";
+      });
+      await operationStarted;
+      controller.abort();
+      await expect(result).resolves.toBe("aborted");
+      expect(project.close).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("closes a project whose open finished after the request aborted", async () => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const controller = new AbortController();
+      const project = fakeProject(async () => undefined);
+      const operation = vi.fn(async () => "must not run");
+      const factory = fakeFactory({
+        openExistingProject: async () => {
+          controller.abort();
+          return project;
+        },
+      });
+      await expect(withProjectStorage({
+        config, cwd, factory,
+        context: { signal: controller.signal, withReadAdmission: vi.fn() as never }, mode: "existing",
+      }, operation)).rejects.toSatisfy(isAbortError);
+      await vi.waitFor(() => expect(project.close).toHaveBeenCalledOnce());
+      expect(operation).not.toHaveBeenCalled();
+    });
+  });
+
+  it("cancels in the post-listener abort window of the read path", async () => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const controller = new AbortController();
+      let addCalls = 0;
+      let activeListeners = 0;
+      const signal = {
+        get aborted(): boolean { return controller.signal.aborted; },
+        get reason(): unknown { return controller.signal.reason; },
+        addEventListener: (
+          type: string,
+          listener: EventListenerOrEventListenerObject | null,
+          options?: AddEventListenerOptions | boolean,
+        ): void => {
+          addCalls += 1;
+          activeListeners += 1;
+          controller.signal.addEventListener(type, listener, options);
+          if (addCalls === 2) controller.abort();
+        },
+        removeEventListener: (
+          type: string,
+          listener: EventListenerOrEventListenerObject | null,
+          options?: EventListenerOptions | boolean,
+        ): void => {
+          activeListeners -= 1;
+          controller.signal.removeEventListener(type, listener, options);
+        },
+        dispatchEvent: controller.signal.dispatchEvent.bind(controller.signal),
+      } as unknown as AbortSignal;
+      const project = fakeProject(async () => undefined);
+      const operation = vi.fn(async () => "must not run");
+      await expect(withProjectStorage({
+        config, cwd, factory: fakeFactory({ openExistingProject: async () => project }),
+        context: { signal, withReadAdmission: vi.fn() as never }, mode: "existing",
+      }, operation)).rejects.toSatisfy((error: unknown) =>
+        isAbortError(error) && error.message === "request cancelled");
+      expect(operation).not.toHaveBeenCalled();
+      expect(project.close).toHaveBeenCalledOnce();
+      expect(addCalls).toBe(2);
+      expect(activeListeners).toBe(0);
+    });
+  });
+
+  it("runs beforeClose before the close on the normal read path but not when setup never completed", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const events: Events = [];
+      const admission = readAdmission(home, events);
+      const project = fakeProject(async () => { events.push("project-close"); });
+      const factory = fakeFactory({ openExistingProject: async () => project });
+      await expect(withProjectStorage({
+        config, cwd, factory, context: admission.context(new AbortController().signal), mode: "existing",
+        beforeClose: async () => { events.push("before-close"); },
+      }, async () => "done")).resolves.toBe("done");
+      expect(events).toEqual(["before-close", "project-close"]);
+
+      // Identity contends on both attempts: setup never completes, so (as for a
+      // mutator whose identity throws) there is nothing to close and no beforeClose.
+      const beforeClose = vi.fn(async () => undefined);
+      const stillBusy = new PrivateMutationLockContentionError("worktree busy");
+      vi.spyOn(projectModule, "projectIdentity").mockImplementation((() => {
+        throw stillBusy;
+      }) as typeof projectModule.projectIdentity);
+      await expect(withProjectStorage({
+        config, cwd, factory, context: admission.context(new AbortController().signal),
+        mode: "existing", beforeClose,
+      }, async () => "must not run")).rejects.toBe(stillBusy);
+      expect(admission.admit).toHaveBeenCalledOnce();
+      expect(beforeClose).not.toHaveBeenCalled();
+    });
+  });
+
+  it("ignores the read admission for mutators and retained-token routes", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const events: Events = [];
+      const admission = readAdmission(home, events);
+      const project = fakeProject(async () => undefined);
+      const factory = fakeFactory({ openExistingProject: async () => project });
+      const mutatorBeforeClose = vi.fn(async () => undefined);
+      await expect(withProjectStorage({
+        config, cwd, factory, mode: "existing", beforeClose: mutatorBeforeClose,
+        context: {
+          signal: new AbortController().signal,
+          withReadAdmission: admission.admit as RoutePublicationAdmission,
+          withPublicationAdmission: async operation =>
+            withBackendPublicationConsumerLockAsync(home, token => operation(token)),
+        },
+      }, async (_storage, _signal, token) => token !== undefined)).resolves.toBe(true);
+      expect(admission.admit).not.toHaveBeenCalled();
+      expect(mutatorBeforeClose).toHaveBeenCalledOnce();
+
+      await withBackendPublicationConsumerLockAsync(home, async retained => {
+        await expect(withProjectStorage({
+          config, cwd, factory, mode: "existing",
+          context: {
+            signal: new AbortController().signal,
+            publicationLockToken: retained,
+            withReadAdmission: admission.admit as RoutePublicationAdmission,
+          },
+        }, async (_storage, _signal, token) => token === retained)).resolves.toBe(true);
+      });
+      expect(admission.admit).not.toHaveBeenCalled();
+    });
+  });
+
+  it("awaits beforeClose for a mutator-admitted run that opens nothing", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const beforeClose = vi.fn(async () => undefined);
+      await expect(withProjectStorage({
+        config, cwd, factory: fakeFactory({ openExistingProject: async () => null }), mode: "existing", beforeClose,
+        context: {
+          signal: new AbortController().signal,
+          withPublicationAdmission: async operation =>
+            withBackendPublicationConsumerLockAsync(home, token => operation(token)),
+        },
+      }, async () => "must not run")).resolves.toBeNull();
+      expect(beforeClose).toHaveBeenCalledOnce();
+    });
+  });
+});
+
