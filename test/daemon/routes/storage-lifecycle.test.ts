@@ -17,6 +17,7 @@ import { loadDaemonConfig, type DaemonConfig } from "../../../src/daemon/config.
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 import { StorageOperationError } from "../../../src/storage/errors.js";
+import { publicationWitnessContentionError } from "../../../src/storage/postgresql/factory.js";
 import type { ProjectStorage, StorageBackendFactory } from "../../../src/storage/index.js";
 import {
   BackendPublicationJournalError,
@@ -1158,8 +1159,8 @@ describe("PostgreSQL read prefix retry under bounded admission", () => {
   });
 
   it.each([
-    ["the open's laundered witness failure", () => new StorageOperationError(
-      "STORAGE_INITIALIZATION_FAILED", "postgresql", undefined, "factory", "openExistingProject")],
+    ["the open's publication-witness contention", () => publicationWitnessContentionError(
+      undefined, "openExistingProject")],
     ["typed contention from the open", () => new PrivateMutationLockContentionError("busy")],
   ] as const)("retries %s once inside admission", async (_label, makeError) => {
     await withTemporaryProject(async ({ home, cwd, config }) => {
@@ -1219,6 +1220,8 @@ describe("PostgreSQL read prefix retry under bounded admission", () => {
     ["a generic error", () => new Error("boom")],
     ["a non-initialization storage error", () => new StorageOperationError(
       "STORAGE_OPERATION_FAILED", "postgresql", undefined, "factory", "openExistingProject")],
+    ["an unmarked initialization failure such as a database outage", () => new StorageOperationError(
+      "STORAGE_INITIALIZATION_FAILED", "postgresql", undefined, "factory", "openExistingProject")],
   ] as const)("does not retry %s from the open", async (_label, makeError) => {
     await withTemporaryProject(async ({ home, cwd, config }) => {
       const admission = readAdmission(home, []);
@@ -1256,8 +1259,7 @@ describe("PostgreSQL read prefix retry under bounded admission", () => {
       const second = new StorageOperationError(
         "STORAGE_INITIALIZATION_FAILED", "postgresql", undefined, "factory", "openExistingProject");
       const openExisting = vi.fn<StorageBackendFactory["openExistingProject"]>()
-        .mockRejectedValueOnce(new StorageOperationError(
-          "STORAGE_INITIALIZATION_FAILED", "postgresql", undefined, "factory", "openExistingProject"))
+        .mockRejectedValueOnce(publicationWitnessContentionError(undefined, "openExistingProject"))
         .mockRejectedValueOnce(second);
       await expect(withProjectStorage({
         config, cwd, factory: fakeFactory({ openExistingProject: openExisting }),

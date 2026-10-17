@@ -4,8 +4,12 @@ rationale: >-
   (src/daemon/server.ts) gains the queue-wait-bounded admission it hands to
   PostgreSQL read routes, and the daemon route storage lifecycle
   (src/daemon/routes/storage-lifecycle.ts) retries a contended
-  identity/open prefix once inside it. No file is added, removed, moved, or
-  re-owned; both files stay in the components that already own them.
+  identity/open prefix once inside it. The PostgreSQL storage factory
+  (src/storage/postgresql/factory.ts) marks its publication-witness contention
+  errors so that only they, and not a database outage or timeout, trigger that
+  retry. No file is added, removed, moved, or re-owned; all three files stay in
+  the components that already own them.
 pins:
   - ["src/daemon/server.ts", "unit-daemon-core"]
   - ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"]
+  - ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"]

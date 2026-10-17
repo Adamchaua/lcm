@@ -22,6 +22,7 @@ import type {
   StorageIdentityContext,
 } from "../contracts.js";
 import { StorageOperationError } from "../errors.js";
+import { PrivateMutationLockContentionError } from "../../private-mutation-lock.js";
 import { composeAbortSignals } from "../../daemon/cancellation.js";
 import type {
   PostgreSqlConnectionSettings,
@@ -198,9 +199,34 @@ function requirePublicationWitness(
   operation: string,
 ): PublicationWitness {
   if (outcome.status !== "present") {
-    throw initializationError(projectId, operation);
+    throw outcome.status === "unresolvable"
+      && outcome.cause instanceof PrivateMutationLockContentionError
+      ? publicationWitnessContentionError(projectId, operation)
+      : initializationError(projectId, operation);
   }
   return outcome.witness;
+}
+
+const publicationWitnessContentionErrors = new WeakSet<StorageOperationError>();
+
+/**
+ * True for an initialization failure caused by publication-lock contention or
+ * a publication change during the unadmitted read, rather than by the database
+ * or the project identity. The mark is process-local and never serialized.
+ */
+export function isPublicationWitnessContention(error: unknown): boolean {
+  return error instanceof StorageOperationError
+    && publicationWitnessContentionErrors.has(error);
+}
+
+/** The unchanged public initialization error, marked as publication contention. */
+export function publicationWitnessContentionError(
+  projectId: string | undefined,
+  operation: string,
+): StorageOperationError {
+  const error = initializationError(projectId, operation);
+  publicationWitnessContentionErrors.add(error);
+  return error;
 }
 
 function initializationError(
@@ -239,7 +265,9 @@ function safeFactoryError(
         "factory",
         operation,
       )
-    : initializationError(projectId, operation);
+    : isPublicationWitnessContention(error)
+      ? publicationWitnessContentionError(projectId, operation)
+      : initializationError(projectId, operation);
 }
 
 function connectionSettings(
@@ -604,7 +632,7 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
           if (signal?.aborted) throw operationError(operation);
           if (backendPublicationCanonicalSha256(before)
               !== backendPublicationCanonicalSha256(after)) {
-            throw initializationError(identity.id, operation);
+            throw publicationWitnessContentionError(identity.id, operation);
           }
         } else {
           this.assertPublicationToken(publicationLockToken);

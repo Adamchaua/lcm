@@ -28,6 +28,7 @@ import {
 } from "../../storage/backend-publication.js";
 import { createAbortError, isAbortError } from "../cancellation.js";
 import { PrivateMutationLockContentionError } from "../../private-mutation-lock.js";
+import { isPublicationWitnessContention } from "../../storage/postgresql/factory.js";
 
 interface AsyncClosable {
   close(publicationLockToken?: BackendPublicationLockToken): Promise<void> | void;
@@ -130,14 +131,14 @@ export type ProjectStorageOperation<T> = (
 
 /**
  * A read prefix failure that the daemon's own publication work may have caused:
- * lock contention from factory creation, identity, or the open, or the open's
- * laundered publication-witness failure. Construction failures never qualify.
+ * publication-lock contention from factory creation, identity, or the open, or
+ * the open's initialization failure marked as publication-witness contention.
+ * Other initialization failures (database outage, timeout, identity mismatch)
+ * and construction failures never qualify.
  */
 function isContendedReadPrefixFailure(error: unknown, openStage: boolean): boolean {
   return error instanceof PrivateMutationLockContentionError
-    || (openStage
-      && error instanceof StorageOperationError
-      && error.code === "STORAGE_INITIALIZATION_FAILED");
+    || (openStage && isPublicationWitnessContention(error));
 }
 
 export function sameStorageIdentity(
