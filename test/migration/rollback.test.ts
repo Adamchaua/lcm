@@ -1270,6 +1270,61 @@ describe("runMigrationRollback", () => {
   // Plan-v3.2 A16a begins publish-rollback before the install, so this crash leaves a pending effect; the
   // A9 resume table resumes it in place: the readback reproduces the pending evidence, the generation is
   // rebuilt (the install is idempotent with readback) and the publication completes.
+  // F6: only a refusal before the install contradicts a pending effect. A14's re-check runs after the install, so
+  // a transient failure of it on the resume path must leave the effect pending and the maintenance held.
+  it("F6: a post-install refusal on the resume path leaves the effect pending and aborts nothing", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-f6");
+    const canonicalPath = join(homeDir, "live.sqlite");
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const baseline = fixtureCanonicalDelta("f6-baseline");
+    const coordinator = coordinatorFor(homeDir);
+    const realPrepare = coordinator.prepareMaintenanceSelection.bind(coordinator);
+    let calls = 0;
+    coordinator.prepareMaintenanceSelection = (async (...args: Parameters<typeof realPrepare>) => {
+      calls += 1;
+      if (calls === 1) throw new Error("simulated crash after install");
+      return realPrepare(...args);
+    }) as typeof coordinator.prepareMaintenanceSelection;
+    const abort = vi.spyOn(coordinator, "abortMaintenance");
+    const deps: RunMigrationRollbackDependencies = {
+      coordinator,
+      ...authoritativeDeps(fixtureActivationScenario({
+        destinationIdentity, censusVector: fixtureCensusVector("census-f6"), canonicalDeltaBaseline: baseline,
+      })),
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+          destinationIdentity, postEpochDelta: fixtureCanonicalDelta("f6-changed"), postEpochCensus: null,
+        }],
+        source: sqliteSourceStream,
+      }),
+    };
+    const run = {
+      homeDir, generationId: "gen-f6", canonicalPath,
+      projectIdentity: identity, localProjectId: "local-f6",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    };
+    await expect(runRollback(run, deps)).rejects.toThrow("simulated crash after install");
+    expect(existsSync(canonicalPath)).toBe(true);
+    const pending = new MigrationManifestStore({ homeDir }).read("gen-f6");
+    expect(pending.pendingEffect?.kind).toBe("publish-rollback");
+
+    await expect(runRollback(run, {
+      ...deps,
+      readProjectMap: () => { throw new Error("project map transiently unreadable"); },
+    })).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("project-map-unreadable") });
+
+    const after = new MigrationManifestStore({ homeDir }).read("gen-f6");
+    expect(after.checksumSha256).toBe(pending.checksumSha256);
+    expect(after.pendingEffect).toEqual(pending.pendingEffect);
+    expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+    expect(abort).not.toHaveBeenCalled();
+  });
+
   it("resumes in place after a crash between install and the maintenance-selection flip (post-write)", async () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });

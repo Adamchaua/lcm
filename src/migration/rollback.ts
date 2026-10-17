@@ -1596,6 +1596,8 @@ async function runPostPrepareSequence(
   decision: Exclude<RollbackEligibilityDecision, Readonly<{ eligibility: "refused" }>>,
   token: BackendPublicationLockToken,
   now: () => Date,
+  /** Set to true once the generation is installed: from then on a refusal is not a contradiction (F6). */
+  progress: { installed: boolean } = { installed: false },
 ): Promise<RunMigrationRollbackOutcome> {
   const mode = decision.mode;
 
@@ -1804,6 +1806,8 @@ async function runPostPrepareSequence(
       machineId: input.roster[0]!.machineId,
     });
   }
+  // Whatever the mode, from here the canonical database is the rollback's (install ran for post-write).
+  progress.installed = true;
 
   // A14: the project map may have changed since the pre-maintenance check.
   const remoteProjectId = assertCoveredProjectIsSoleRemoteBinding(deps, input, token);
@@ -2486,6 +2490,7 @@ async function resumeHeldPublication(
     return { status: "contradicted", reason: "the authority no longer resolves: " + resolved.reason };
   }
   const { authority, authoritativeContext } = resolved;
+  const progress = { installed: false };
   const session = await deps.openFencedSession({
     homeDir: input.homeDir, manifest: current, lockToken: token,
     scratchParent: input.scratchParent, signal: input.signal,
@@ -2501,12 +2506,19 @@ async function resumeHeldPublication(
         throw new RollbackOrchestrationError("not-eligible", decision.reason);
       }
       return runPostPrepareSequence(
-        input, deps, store, current, session, authority, authoritativeContext, artifact, decision, token, now,
+        input, deps, store, current, session, authority, authoritativeContext, artifact, decision, token, now, progress,
       );
     });
     return { status: "completed", outcome };
   } catch (error) {
-    if (error instanceof RollbackOrchestrationError && (error.reason === "not-eligible" || error.reason === "drift")) {
+    // Only a refusal before the install is a contradiction of the pending effect. After it the canonical
+    // database was replaced, so a refusal (a transient second binding, say) propagates and leaves the effect
+    // pending, exactly as on the fresh path (F6).
+    if (
+      !progress.installed
+      && error instanceof RollbackOrchestrationError
+      && (error.reason === "not-eligible" || error.reason === "drift")
+    ) {
       return { status: "contradicted", reason: error.message };
     }
     throw error;
