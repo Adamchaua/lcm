@@ -22,8 +22,14 @@ rationale: >-
   re-prepare, sealed-material comparison, release-tail and abort-family
   rows without a fence precheck); backend-publication.ts only exports its
   existing material serialization for that byte comparison and stays in
-  its own storage owner (unit-storage-abstractions).
+  its own storage owner (unit-storage-abstractions). Phase 3 adds the
+  orchestrator itself (src/migration/activate-generation.ts): the S0-S16
+  sequence under the append barrier, the closed refusal / interruption
+  vocabularies, the applied / reportStored classifiers, lease continuation,
+  crash-row re-entry, the non-predictive preview and the production
+  dependency builder with the single #626 wiring point.
 pins:
+  - ["src/migration/activate-generation.ts", "unit-migration-cutover"]
   - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
   - ["src/migration/copy-binding-reader.ts", "unit-migration-cutover"]
   - ["src/migration/project-map-witness.ts", "unit-migration-cutover"]

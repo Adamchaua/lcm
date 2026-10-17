@@ -26,6 +26,12 @@ import {
   migrationActivationReportReference,
   persistMigrationActivationReport,
   readMigrationActivationReport,
+  MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS,
+  MigrationActivationError,
+  createMigrationActivationDependencies,
+  previewMigrationActivation,
+  readMigrationManifestRevision,
+  runMigrationActivation,
 } from "../../src/migration/index.js";
 
 describe("migration package surface", () => {
@@ -62,5 +68,14 @@ describe("migration package surface", () => {
     expect(migrationActivationReportReference).toBeTypeOf("function");
     expect(persistMigrationActivationReport).toBeTypeOf("function");
     expect(readMigrationActivationReport).toBeTypeOf("function");
+  });
+
+  it("exports #625's activation orchestrator: entry point, preview, dependency builder and the #626 wiring point", () => {
+    expect(runMigrationActivation).toBeTypeOf("function");
+    expect(previewMigrationActivation).toBeTypeOf("function");
+    expect(createMigrationActivationDependencies).toBeTypeOf("function");
+    expect(readMigrationManifestRevision).toBeTypeOf("function");
+    expect(MigrationActivationError).toBeTypeOf("function");
+    expect(Object.isFrozen(MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS)).toBe(true);
   });
 });

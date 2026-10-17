@@ -255,3 +255,46 @@ export type {
   MigrationCopyBindingUnresolvableReason,
   ReadMigrationCopyBindingInput,
 } from "./copy-binding-reader.js";
+
+// --- #625: the activation orchestrator (G1) ----------------------------------
+//
+// plan-v7.1: one entry point that activates or recovers one verified
+// generation under the local append barrier, a non-predictive preview, and
+// the production dependency builder. The #626 evidence, binding-resolver and
+// census seams are typed structurally and wired at
+// MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS until that sibling merges.
+
+export {
+  MIGRATION_ACTIVATION_LEASE_TTL_MS,
+  MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS,
+  MigrationActivationError,
+  createMigrationActivationDependencies,
+  previewMigrationActivation,
+  readMigrationManifestRevision,
+  runMigrationActivation,
+} from "./activate-generation.js";
+export type {
+  MigrationActivationBindingSeam,
+  MigrationActivationCensusSeam,
+  MigrationActivationCoordinator,
+  MigrationActivationCrashPoint,
+  MigrationActivationDependencies,
+  MigrationActivationEvidenceRefusalReason,
+  MigrationActivationEvidenceResolution,
+  MigrationActivationEvidenceSeam,
+  MigrationActivationIdentity,
+  MigrationActivationInput,
+  MigrationActivationInterruptionCause,
+  MigrationActivationInterruptionStep,
+  MigrationActivationOrdinaryRuntime,
+  MigrationActivationOutcome,
+  MigrationActivationPreview,
+  MigrationActivationPreviewCheck,
+  MigrationActivationRefusalReason,
+  MigrationActivationRefusalStep,
+  MigrationActivationResumePoint,
+  MigrationActivationSnapshot,
+  MigrationActivationTransferRuntime,
+  MigrationActivationTriState,
+  MigrationWitnessBindingsResolution,
+} from "./activate-generation.js";
