@@ -88,12 +88,15 @@ extends PostgreSqlPassiveEventKey {
 }
 
 /**
- * One local row to recover after a project relink (#1509): the inbox id the
- * local outbox recorded plus the full envelope the local row would upload.
+ * One local row to recover after a project relink: the full envelope the
+ * local row would upload plus, for a row replicated to the previous project
+ * (#1509), the inbox id the local outbox recorded. A local row that never
+ * recorded where its upload landed (#1511) omits the inbox id; its copy is
+ * then identified by machine, event id, and envelope alone.
  */
 export interface PostgreSqlPassiveEventReleaseKey
 extends PostgreSqlPassiveEventInput {
-  readonly inboxId: bigint;
+  readonly inboxId?: bigint;
 }
 
 export interface PostgreSqlPassiveEventReleaseOptions {
@@ -997,9 +1000,9 @@ export class PostgreSqlPassiveEventRepository {
    * locked version, and deletes only copies that are safe to drop: undelivered
    * ones (pending, retry, or claimed with a stale claim) and applied ones.
    * Quarantined copies stay as remote evidence, live claims are left alone, and
-   * a copy whose inbox id or envelope differs from the requested row is
-   * reported and never deleted. Only rows of this repository's machine are
-   * ever touched.
+   * a copy whose envelope, or inbox id when the key carries one, differs from
+   * the requested row is reported and never deleted. Only rows of this
+   * repository's machine are ever touched.
    *
    * Deleting without the previous project's drain lease is safe only while
    * applying a passive event has no remote effect: a stale claimer's
@@ -1018,7 +1021,9 @@ export class PostgreSqlPassiveEventRepository {
       const expected = normalizedInput(key, this.projectId, this.machineId);
       return {
         expected,
-        inboxId: exactBigInt(key.inboxId, this.projectId, "inbox_id", 1n, expected.eventId),
+        inboxId: key.inboxId === undefined
+          ? undefined
+          : exactBigInt(key.inboxId, this.projectId, "inbox_id", 1n, expected.eventId),
       };
     });
     const distinct = new Set(requested.map(({ expected }) => expected.eventId));
@@ -1065,7 +1070,10 @@ export class PostgreSqlPassiveEventRepository {
           continue;
         }
         const record = passiveEventFromRow(row, this.projectId, rowProjectId);
-        if (record.inboxId !== inboxId || !sameEvent(expected, record)) {
+        if (
+          (inboxId !== undefined && record.inboxId !== inboxId)
+          || !sameEvent(expected, record)
+        ) {
           results.push({ eventId, outcome: "mismatch" });
           continue;
         }

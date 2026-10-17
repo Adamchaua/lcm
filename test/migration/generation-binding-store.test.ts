@@ -537,7 +537,10 @@ describe("recordMigrationSelectionBinding: code-less integrity failures are unre
     const homeDir = home();
     const directory = migrationGenerationBindingDirectory(homeDir, GENERATION_ID);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
-    writeFileSync(join(directory, "selection-activation.binding"), "irrelevant\n", { mode: 0o644 });
+    const storedPath = join(directory, "selection-activation.binding");
+    writeFileSync(storedPath, "irrelevant\n", { mode: 0o644 });
+    chmodSync(storedPath, 0o644); // the create mode is masked by the process umask
+    expect(statSync(storedPath).mode & 0o777).toBe(0o644);
     expect(() =>
       recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding: selectionBinding() }),
     ).toThrow(MigrationBindingUnresolvableError);
@@ -1170,11 +1173,10 @@ describe("recordMigrationWitnessBinding: code-less integrity failures are unreso
     const binding = witnessBinding();
     const directory = migrationGenerationBindingDirectory(homeDir, GENERATION_ID);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
-    writeFileSync(
-      join(directory, "witness-" + binding.witnessChecksumSha256 + ".binding"),
-      "irrelevant\n",
-      { mode: 0o644 },
-    );
+    const storedPath = join(directory, "witness-" + binding.witnessChecksumSha256 + ".binding");
+    writeFileSync(storedPath, "irrelevant\n", { mode: 0o644 });
+    chmodSync(storedPath, 0o644); // the create mode is masked by the process umask
+    expect(statSync(storedPath).mode & 0o777).toBe(0o644);
     expect(() =>
       recordMigrationWitnessBinding({ homeDir, generationId: GENERATION_ID, binding }),
     ).toThrow(MigrationBindingUnresolvableError);
