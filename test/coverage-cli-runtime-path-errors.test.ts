@@ -1670,7 +1670,12 @@ describe("runtime home rename failures", () => {
     },
     {
       label: "private mutation contention",
-      primaryError: new PrivateMutationLockContentionError("synthetic private mutation contention"),
+      primaryError: new PrivateMutationLockContentionError("synthetic private mutation contention", {
+        contendedLock: {
+          path: "/synthetic/.lcm.backend-publication.lock",
+          owner: { version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) },
+        },
+      }),
     },
   ])("preserves $label classification when callback cleanup also fails", ({ primaryError }) => {
     const paths = legacyHome();
@@ -1696,6 +1701,9 @@ describe("runtime home rename failures", () => {
     expect(failure).toBeInstanceOf(primaryError.constructor);
     expect(failure).not.toBe(primaryError);
     expect((failure as Error).message).toBe(primaryError.message);
+    if (primaryError instanceof PrivateMutationLockContentionError) {
+      expect((failure as PrivateMutationLockContentionError).contendedLock).toBe(primaryError.contendedLock);
+    }
     if (primaryError instanceof BackendPublicationJournalError) {
       expect((failure as BackendPublicationJournalError).reason).toBe(primaryError.reason);
     }
