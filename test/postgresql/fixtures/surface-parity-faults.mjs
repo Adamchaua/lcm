@@ -4,12 +4,9 @@ import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createStorageBackendFactory } from '../../../dist/src/storage/factory.js';
-import { createPostgreSqlStorageBackendFactoryWithHome } from '../../../dist/src/storage/postgresql/factory.js';
+import { createPostgreSqlStorageBackendFactoryWithHome, DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES } from '../../../dist/src/storage/postgresql/factory.js';
 import { PostgreSqlRuntime } from '../../../dist/src/storage/postgresql/runtime.js';
-import { verifyPostgreSqlRuntimeSchema } from '../../../dist/src/storage/postgresql/runtime-readiness.js';
-import { assertStorageBackendPublication, withStorageBackendConsumerLockAsync } from '../../../dist/src/storage/backend.js';
-import { readBackendPublicationJournal, captureBackendPublicationState } from '../../../dist/src/storage/backend-publication.js';
-import { normalizeProjectPath } from '../../../dist/src/project-map.js';
+import { assertStorageBackendPublication } from '../../../dist/src/storage/backend.js';
 import { createAbortError, throwIfAborted } from '../../../dist/src/daemon/cancellation.js';
 
 // Fixed assertion messages avoid embedding fixture paths, SQL or credentials in
@@ -60,18 +57,13 @@ export function createFaultHooks() {
       if (config.backend === 'postgresql') {
         publicationCheck({ backend: config.backend, homeDir }, publicationLockToken);
         return createPostgreSqlStorageBackendFactoryWithHome(config, homeDir, {
+          ...DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES,
           createRuntime(connectionSettings) {
             requireFault(runtime === undefined, 'one-selected-runtime');
             settings = connectionSettings;
             runtime = new PostgreSqlRuntime(connectionSettings);
             return runtime;
           },
-          verifyRuntimeSchema: verifyPostgreSqlRuntimeSchema,
-          withConsumerLock: withStorageBackendConsumerLockAsync,
-          assertPublication: assertStorageBackendPublication,
-          readJournal: readBackendPublicationJournal,
-          captureState: captureBackendPublicationState,
-          normalizePath: normalizeProjectPath,
         });
       }
       const factory = await createStorageBackendFactory(config, homeDir, publicationCheck, publicationLockToken);
