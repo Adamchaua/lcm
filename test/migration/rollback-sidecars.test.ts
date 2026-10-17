@@ -512,9 +512,9 @@ describe("verifyPassiveEventsAgainstArchive", () => {
     }
   });
 
-  it("goes red when the events table holds a row the archive does not account for", () => {
+  it("F2: preserves and separately counts a local pending row the archive does not hold", () => {
     const homeDir = tempHome();
-    const { path } = seedGeneration();
+    const { path, passiveEventRecords } = seedGeneration();
     const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
 
     const db = new DatabaseSync(path);
@@ -525,6 +525,80 @@ describe("verifyPassiveEventsAgainstArchive", () => {
         `INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook)
          VALUES ('018f7769-4c00-7f77-9b32-4a2f8f5cbeef', 1, '${formatLocalHookMachineSequence(999n)}', 'orphan', 'orphan.event', 'intent', '{}', 'Test')`,
       );
+      expect(verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, MACHINE_A_UUID))
+        .toEqual({ verifiedImported: passiveEventRecords.length, preservedPending: 1 });
+      // Untouched: still pending and unreplicated.
+      expect(eventsDb.prepare("SELECT delivery_state, remote_inbox_id FROM events WHERE event_uuid = ?").get("018f7769-4c00-7f77-9b32-4a2f8f5cbeef"))
+        .toEqual({ delivery_state: "pending", remote_inbox_id: null });
+    } finally {
+      db.close();
+      eventsDb.close();
+    }
+  });
+
+  it("F2: a local row absent from the archive that claims delivery (remote inbox id or acknowledgement) refuses", () => {
+    for (const delivered of [
+      "delivery_state = 'replicated', remote_inbox_id = 'inbox-1'",
+      "delivery_state = 'acknowledged', remote_inbox_id = 'inbox-1', acknowledged_at = '2026-01-03T00:00:00.000000Z'",
+    ]) {
+      const homeDir = tempHome();
+      const { path } = seedGeneration();
+      const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+      const db = new DatabaseSync(path);
+      const eventsDb = new DatabaseSync(outcome.eventsDbPath);
+      try {
+        const machineIds = readMachineIdByIdentityKey(db);
+        eventsDb.exec(
+          `INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook)
+           VALUES ('018f7769-4c00-7f77-9b32-4a2f8f5cbeef', 1, '${formatLocalHookMachineSequence(999n)}', 'orphan', 'orphan.event', 'intent', '{}', 'Test')`,
+        );
+        eventsDb.exec(`UPDATE events SET ${delivered} WHERE event_uuid = '018f7769-4c00-7f77-9b32-4a2f8f5cbeef'`);
+        expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, MACHINE_A_UUID))
+          .toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining("delivered event") }));
+      } finally {
+        db.close();
+        eventsDb.close();
+      }
+    }
+  });
+
+  it("F2: a whole materialization keeps a post-cutoff local append pending alongside the imported archive rows", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    expect(first.passiveEventsPreservedPending).toBe(0);
+    const appended = "018f7769-4c00-7f77-9b32-4a2f8f5cd00d";
+    const local = new DatabaseSync(first.eventsDbPath);
+    try {
+      local.exec(
+        `INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook)
+         VALUES ('${appended}', 1, '${formatLocalHookMachineSequence(1000n)}', 'post-cutoff', 'session.compacted', 'intent', '{}', 'PreCompact')`,
+      );
+    } finally {
+      local.close();
+    }
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    expect(outcome.passiveEventsPreservedPending).toBe(1);
+    const readback = new DatabaseSync(outcome.eventsDbPath, { readOnly: true });
+    try {
+      expect((readback.prepare("SELECT count(*) AS n FROM events").get() as { n: number }).n).toBe(passiveEventRecords.length + 1);
+      expect(readback.prepare("SELECT delivery_state, remote_inbox_id FROM events WHERE event_uuid = ?").get(appended))
+        .toEqual({ delivery_state: "pending", remote_inbox_id: null });
+    } finally {
+      readback.close();
+    }
+  });
+
+  it("goes red when a stored event the archive holds is missing", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    const db = new DatabaseSync(path);
+    const eventsDb = new DatabaseSync(outcome.eventsDbPath);
+    try {
+      const machineIds = readMachineIdByIdentityKey(db);
+      eventsDb.exec("DELETE FROM events WHERE rowid = (SELECT min(rowid) FROM events)");
       expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, MACHINE_A_UUID))
         .toThrow(expect.objectContaining({ reason: "verification-failed" }));
     } finally {

@@ -64,6 +64,14 @@
  * machine's identity). Other machines' rows are not lost: they stay in
  * PostgreSQL and in the preserved source.
  *
+ * THE LIVE LOCAL OUTBOX MAY HOLD MORE THAN THE ARCHIVE. Appends made after the
+ * cutoff are in the events table but not in the archive. Archived rows are
+ * imported and verified exactly; rows absent from the archive are preserved
+ * untouched when they are still local appends (no remote_inbox_id and no
+ * acknowledged_at, the events table's own delivery markers) and refuse when
+ * they claim delivery. The two sets are counted separately; see
+ * verifyPassiveEventsAgainstArchive.
+ *
  * THE MACHINE-WIDE SEQUENCE FILE is reconciled via
  * local-hook-event-sequence.ts's own `reconcileCheckpoint` (added in
  * its own commit specifically for this), never written directly -- see
@@ -148,6 +156,11 @@ export interface MaterializeRollbackSidecarsInput {
 export interface MaterializeRollbackSidecarsOutcome {
   readonly sessionInstructionsMaterialized: number;
   readonly passiveEventsMaterialized: number;
+  /**
+   * Rows already in the live local outbox that the archive does not hold and that are legitimately pending local
+   * appends (see {@link verifyPassiveEventsAgainstArchive}). They were left untouched and keep replicating later.
+   */
+  readonly passiveEventsPreservedPending: number;
   readonly eventsDbPath: string;
   /** The highest archived machine_sequence observed, or null when no passive events existed. reconcileCheckpoint was called with this value when non-null. */
   readonly reconciledUpTo: string | null;
@@ -365,12 +378,18 @@ type PassiveEventReadbackRow = Readonly<{
  * Independently verifies every archived passive event actually reached
  * the runtime events table intact: a fresh re-scan of the archive domain
  * (never the insertion loop's own variables) compared against a fresh
- * per-row SELECT, plus a whole-table row count so an orphaned or missing
- * row cannot hide behind a count that only tallies this call's own
- * inserts. Idempotent retries are compatible with this: ON CONFLICT DO
- * NOTHING means a retry's insert count under-reports already-materialized
+ * per-row SELECT. Idempotent retries are compatible with this: ON CONFLICT
+ * DO NOTHING means a retry's insert count under-reports already-materialized
  * rows, but every archived row must still be present with matching
  * content for this to pass, which is the invariant that actually matters.
+ *
+ * The two sets are accounted for separately. The live local outbox legitimately holds appends made after the
+ * cutoff that the archive never saw. The events table's own state model (hooks/events-db.ts) marks a row as
+ * delivered through remote_inbox_id (set when the remote inbox accepted it) and acknowledged_at (set on the
+ * remote acknowledgement); a row with neither is still a local append awaiting replication, whether it is
+ * pending, retrying, claimed or quarantined. Such a row absent from the archive is preserved untouched and
+ * counted. A row absent from the archive that claims either marker contradicts the archive (a delivered event
+ * PostgreSQL does not hold) and refuses.
  */
 /** @internal Exported for direct unit testing only; not part of the module's public surface. */
 export function verifyPassiveEventsAgainstArchive(
@@ -378,18 +397,20 @@ export function verifyPassiveEventsAgainstArchive(
   eventsDb: DatabaseSync,
   machineIds: ReadonlyMap<string, string | null>,
   localMachineId: string,
-): number {
+): Readonly<{ verifiedImported: number; preservedPending: number }> {
   const select = eventsDb.prepare(
     `SELECT event_version, machine_id, machine_sequence, session_id, seq, type, category, data,
             priority, source_hook, created_at, delivery_state, processed_at, quarantine_reason
      FROM events WHERE event_uuid = ?`,
   );
   let archiveCount = 0;
+  const archivedEventIds = new Set<string>();
   for (const row of readArchiveDomain(db, "passive-events")) {
     const v = row.value;
     const machineId = machineIds.get(v.machineIdentityKey);
     if (machineId !== localMachineId) continue;
     archiveCount++;
+    archivedEventIds.add(v.eventId);
     const sequence = requireInteger(v.machineSequence, "passive-events.machineSequence");
     const createdAt = requireTimestamp(v.createdAt, "passive-events.createdAt");
     const expected = dispositionColumns(v.disposition, createdAt);
@@ -417,14 +438,19 @@ export function verifyPassiveEventsAgainstArchive(
       );
     }
   }
-  const total = (eventsDb.prepare("SELECT count(*) AS n FROM events").get() as { n: number }).n;
-  if (total !== archiveCount) {
-    throw new RollbackSidecarError(
-      "verification-failed",
-      `events table holds ${total} rows but archive contains ${archiveCount} passive events for this machine`,
-    );
+  const others = (eventsDb.prepare(
+    "SELECT event_uuid, remote_inbox_id, acknowledged_at FROM events",
+  ).all() as Array<{ event_uuid: string; remote_inbox_id: string | null; acknowledged_at: string | null }>)
+    .filter((stored) => !archivedEventIds.has(stored.event_uuid));
+  for (const stored of others) {
+    if (stored.remote_inbox_id !== null || stored.acknowledged_at !== null) {
+      throw new RollbackSidecarError(
+        "verification-failed",
+        `events table holds delivered event ${stored.event_uuid} that the archive does not contain`,
+      );
+    }
   }
-  return archiveCount;
+  return { verifiedImported: archiveCount, preservedPending: others.length };
 }
 
 /**
@@ -442,6 +468,7 @@ export function materializeRollbackSidecars(
   const db = new DatabaseSync(input.databasePath);
   let sessionInstructionsMaterialized: number;
   let passiveEventsMaterialized = 0;
+  let passiveEventsPreservedPending = 0;
   let reconciledUpTo: string | null = null;
   const targetEventsDbPath = join(eventsDir(input.homeDir), `${input.localProjectId}.db`);
   try {
@@ -466,7 +493,7 @@ export function materializeRollbackSidecars(
       const machineIds = readMachineIdByIdentityKey(db);
       const result = materializePassiveEvents(db, eventsDb, machineIds, input.machineId);
       passiveEventsMaterialized = result.count;
-      verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, input.machineId);
+      passiveEventsPreservedPending = verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, input.machineId).preservedPending;
       if (result.highestSequence !== null) {
         const allocator = new LocalHookEventSequenceAllocator(eventSequenceDbPath(input.homeDir));
         try {
@@ -488,6 +515,7 @@ export function materializeRollbackSidecars(
   return {
     sessionInstructionsMaterialized,
     passiveEventsMaterialized,
+    passiveEventsPreservedPending,
     eventsDbPath: targetEventsDbPath,
     reconciledUpTo,
   };
