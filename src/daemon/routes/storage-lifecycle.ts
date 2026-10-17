@@ -8,7 +8,7 @@ import { createStorageBackendFactory } from "../../storage/index.js";
 import type { DaemonConfig } from "../config.js";
 import { projectIdentity } from "../project.js";
 import type { RouteExecutionContext } from "../server.js";
-import { StorageOperationError } from "../../storage/errors.js";
+import { StorageOperationError, normalizeStorageError } from "../../storage/errors.js";
 import {
   STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
   STORAGE_IDENTITY_REQUIRED_MACHINE_REASON,
@@ -26,7 +26,8 @@ import {
   BackendPublicationJournalError,
   type BackendPublicationLockToken,
 } from "../../storage/backend-publication.js";
-import { createAbortError } from "../cancellation.js";
+import { createAbortError, isAbortError } from "../cancellation.js";
+import { PrivateMutationLockContentionError } from "../../private-mutation-lock.js";
 
 interface AsyncClosable {
   close(publicationLockToken?: BackendPublicationLockToken): Promise<void> | void;
@@ -374,4 +375,39 @@ export function storageRouteFailureResponse(
   if (selectedBackend !== "postgresql" || !(error instanceof StorageOperationError)) return null;
   void operation;
   return { status: 503, body: error.toJSON() };
+}
+
+/**
+ * Classify a failure that rejected a read route's project-storage scope.
+ *
+ * On PostgreSQL every such failure is a sanitized 503 rather than an empty
+ * success body. Intentional cancellation and SQLite keep the route's existing
+ * non-fatal handling.
+ */
+export function storageReadFailureResponse(
+  selectedBackend: StorageBackendName,
+  error: unknown,
+  operation: string,
+  legacyStagedFactory?: StorageBackendFactory,
+): StorageRouteFailureResponse | null {
+  const classified = storageRouteFailureResponse(selectedBackend, error, operation, legacyStagedFactory);
+  if (classified) return classified;
+  if (isAbortError(error) || selectedBackend !== "postgresql") return null;
+  if (error instanceof PrivateMutationLockContentionError) {
+    return {
+      status: 503,
+      body: new StorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        "postgresql",
+        undefined,
+        "identity",
+        operation,
+        { retryable: true },
+      ).toJSON(),
+    };
+  }
+  return {
+    status: 503,
+    body: normalizeStorageError(error, { backend: "postgresql", domain: "factory", operation }).toJSON(),
+  };
 }

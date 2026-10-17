@@ -11,6 +11,7 @@ import {
   stagedPostgreSqlUnavailableResponse,
   storageIdentityRequiredResponse,
   storageRouteFailureResponse,
+  storageReadFailureResponse,
 } from "../../../src/daemon/routes/storage-lifecycle.js";
 import { loadDaemonConfig, type DaemonConfig } from "../../../src/daemon/config.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
@@ -25,6 +26,8 @@ import {
 import { clearProjectMapCache } from "../../../src/project-map.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 import { isAbortError } from "../../../src/daemon/cancellation.js";
+import { createAbortError } from "../../../src/daemon/cancellation.js";
+import { PrivateMutationLockContentionError } from "../../../src/private-mutation-lock.js";
 import { projectIdentity } from "../../../src/daemon/project.js";
 import { closeLcmConnection, getPoolStats } from "../../../src/db/connection.js";
 import { SqliteStorageBackendFactory } from "../../../src/storage/sqlite/factory.js";
@@ -210,6 +213,67 @@ describe("route storage cleanup", () => {
       },
     });
     expect(storageRouteFailureResponse("sqlite", stagedError, "grep", staged)).toBeNull();
+  });
+
+  it("fails PostgreSQL read routes closed with sanitized 503 bodies", () => {
+    const canary = "/private/canary-4242 pid 4242";
+    const typed = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED", "postgresql", "p", "summaries", "recent",
+    );
+    const staged = makeStagedPostgreSqlStorageFactory();
+    const stagedError = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED", "postgresql", undefined, "factory", "grep",
+    );
+    const contention = new PrivateMutationLockContentionError(
+      `lock held at ${canary}`,
+      { cause: new Error(canary), contendedLock: { path: canary, owner: { pid: 4242 } } as never },
+    );
+
+    // Identity precedence, staged factory, and typed passthrough defer to the base classifier.
+    const identity = new StorageIdentityConfigurationError("binding required");
+    expect(storageReadFailureResponse("postgresql", identity, "search"))
+      .toEqual(storageRouteFailureResponse("postgresql", identity, "search"));
+    expect(storageReadFailureResponse("postgresql", identity, "search")?.status).toBe(409);
+    expect(storageReadFailureResponse("postgresql", stagedError, "grep", staged))
+      .toEqual(storageRouteFailureResponse("postgresql", stagedError, "grep", staged));
+    expect(storageReadFailureResponse("postgresql", stagedError, "grep", staged)?.status).toBe(503);
+    expect(storageReadFailureResponse("postgresql", typed, "recent"))
+      .toEqual({ status: 503, body: typed.toJSON() });
+
+    // Cancellation and SQLite keep the route's existing handling.
+    expect(storageReadFailureResponse("postgresql", createAbortError(), "search")).toBeNull();
+    expect(storageReadFailureResponse("sqlite", contention, "search")).toBeNull();
+    expect(storageReadFailureResponse("sqlite", new Error(canary), "search")).toBeNull();
+
+    // Publication-lock contention is a retryable identity failure without lock details.
+    const contended = storageReadFailureResponse("postgresql", contention, "describe");
+    expect(contended).toEqual({
+      status: 503,
+      body: new StorageOperationError(
+        "STORAGE_OPERATION_FAILED", "postgresql", undefined, "identity", "describe", { retryable: true },
+      ).toJSON(),
+    });
+    expect(contended?.body.retryable).toBe(true);
+
+    // Any other rejection becomes a non-retryable factory failure.
+    for (const failure of [new Error(canary), canary, undefined]) {
+      const failed = storageReadFailureResponse("postgresql", failure, "expand");
+      expect(failed).toEqual({
+        status: 503,
+        body: new StorageOperationError(
+          "STORAGE_OPERATION_FAILED", "postgresql", undefined, "factory", "expand",
+        ).toJSON(),
+      });
+      expect(failed?.body.retryable).toBe(false);
+    }
+
+    for (const response of [contended, storageReadFailureResponse("postgresql", new Error(canary), "expand")]) {
+      const serialized = JSON.stringify(response?.body);
+      expect(serialized).toContain("postgresql");
+      expect(serialized).not.toContain("canary");
+      expect(serialized).not.toContain("4242");
+      expect(serialized).not.toContain("/private");
+    }
   });
 
   it("recognizes only typed PostgreSQL identity admission failures", () => {
