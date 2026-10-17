@@ -4286,6 +4286,174 @@ describe("sanitizeError", () => {
     expect(elapsed).toBeLessThan(1000);
   });
 
+  it.each([
+    ["fragment root", "file://h/a#/Users/x", "file://h<path>#<path>"],
+    ["fragment root with surrounding text", "see file:///a#/Users/x end", "see file://<path>#<path> end"],
+    [
+      "scheme inside a query root",
+      "file://h/a?q=/Users/_https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>?q=<path>",
+    ],
+    [
+      "scheme inside a backslash restart after a public URL",
+      "file://h/a?u=https://e.test/t&\\Users\\b?q=/Users/x",
+      "file://h<path>?u=https://e.test/t&<path>?q=<path>",
+    ],
+    [
+      "scheme inside a backslash restart",
+      "file://h/a?q=\\Users\\_https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>?q=<path>",
+    ],
+    [
+      "scheme inside a backslash restart after a fragment marker",
+      "file://h/a#q=\\Users\\_https://e.test/t?q=/Users/x",
+      "file://h<path>#q=<path>?q=<path>",
+    ],
+    [
+      "fragment root after a backslash restart scheme",
+      "file://h/a?q=\\Users\\_https://e.test/t#/Users/x",
+      "file://h<path>?q=<path>#<path>",
+    ],
+    [
+      "scheme inside a backslash restart after an equals run",
+      "file://h/a?q==\\Users\\_https://e.test/t?q=/Users/x",
+      "file://h<path>?q==<path>?q=<path>",
+    ],
+    [
+      "scheme inside a backslash restart after a public URL and an ampersand",
+      "file://h/a?u=https://e.test/t&\\Users\\_https://e.test/t?q=/Users/x",
+      "file://h<path>?u=https://e.test/t&<path>?q=<path>",
+    ],
+    [
+      "scheme inside a path joined by a backslash",
+      "file://h/a\\_https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>",
+    ],
+    [
+      "scheme inside the initial path",
+      "file://h/Users/_https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>",
+    ],
+    [
+      "fragment root after a scheme inside the initial path",
+      "file://h/Users/_https://e.test/t#/Users/x",
+      "file://h<path>#<path>",
+    ],
+    [
+      "scheme inside the initial path of an empty authority",
+      "file:///Users/_https://e.test/t?q=/Users/x",
+      "file://<path>?q=<path>",
+    ],
+    [
+      "scheme inside a drive-rooted query path",
+      "file://h/a?q=/C:/Users/_https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>?q=<path>",
+    ],
+    [
+      "scheme inside a bare drive-rooted query path",
+      "file://h/a?q=/C:/_https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>?q=<path>",
+    ],
+    [
+      "scheme inside a doubled-slash drive-rooted query path",
+      "file://h/a?q=//C:/Users/_https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>?q=<path>",
+    ],
+    [
+      "backslash after a path segment of an unbracketed public URL",
+      "file://h/a?u=https://e.test/t?k=\\public?x=/public2",
+      "file://h<path>?u=https://e.test/t?k=<path>?x=<path>",
+    ],
+    [
+      "backslash inside the path of an unbracketed public URL",
+      "file://h/a?u=https://e.test/t\\public?k=/public",
+      "file://h<path>?u=https://e.test/t<path>?k=<path>",
+    ],
+    [
+      "scheme inside a drive path with backslashes",
+      "file://h/a?q=/C:\\Users\\_https://e.test/t?q=/Users/x",
+      "file://h<path>?q=<path>?q=<path>",
+    ],
+  ] as const)("redacts a successor root after a fragment marker or a scheme inside a private span on the first pass: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "public URL after a question mark",
+      "file://h/a?_https://e.test/t?k=/public",
+      "file://h<path>?_https://e.test/t?k=/public",
+    ],
+    [
+      "public URL after an ampersand",
+      "file://h/a&u=https://e.test/t?k=/public",
+      "file://h<path>&u=https://e.test/t?k=/public",
+    ],
+    [
+      "public URL query fragment",
+      "file://h/a?u=https://e.test/t#/public",
+      "file://h<path>?u=https://e.test/t#/public",
+    ],
+    [
+      "public URL after a private query root",
+      "file://h/a?q=/Users/x&u=https://e.test/t?k=/public",
+      "file://h<path>?q=<path>&u=https://e.test/t?k=/public",
+    ],
+    [
+      "public URL after a backslash restart",
+      "file://h/a?q=\\Users\\b?u=https://e.test/t?k=/public",
+      "file://h<path>?q=<path>?u=https://e.test/t?k=/public",
+    ],
+    [
+      "public URL fragment after a private query root",
+      "file://h/a?q=/Users/x?u=https://e.test/t#/public",
+      "file://h<path>?q=<path>?u=https://e.test/t#/public",
+    ],
+    [
+      "bracketed public URL fragment",
+      "file://h/a?q=[https://e.test/t#/public]",
+      "file://h<path>?q=[https://e.test/t#/public]",
+    ],
+    ["bare slash after a fragment marker", "file://h/a#/", "file://h<path>#/"],
+    ["doubled slash after a fragment marker", "file://h/a#//", "file://h<path>#//"],
+  ] as const)("keeps the first-pass output of a public URL or bare delimiter after a private span: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("keeps main's two-pass behavior for a fragment root after a bracketed authority path", () => {
+    const first = sanitizeError("file://h[/Users/a]#/Users/x");
+
+    expect(first).toBe("file://h[<path>]#/Users/x");
+    expect(sanitizeError(first)).toBe("file://h[<path>]#<path>");
+    expect(sanitizeError(sanitizeError(first))).toBe("file://h[<path>]#<path>");
+  });
+
+  it("redacts long runs of fragment roots and scheme-bearing private spans in linear time", () => {
+    const input = [
+      "file://h/a",
+      "#/Users/x".repeat(2048),
+      "?q=/Users/_https://e.test/t".repeat(2048),
+      "?q=\\x_https://e.test/t".repeat(2048),
+    ].join("");
+    const started = performance.now();
+    const result = sanitizeError(input);
+    const elapsed = performance.now() - started;
+
+    expect(result).not.toContain("/Users/");
+    expect(result).not.toContain("\\x");
+    expect(sanitizeError(result)).toBe(result);
+    // Linear takes milliseconds; a rescan at every private start would take seconds.
+    expect(elapsed).toBeLessThan(1000);
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");
