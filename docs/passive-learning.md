@@ -338,14 +338,38 @@ nothing awaits the previous project the recovery costs no extra query, and a
 row that stays unresolved (a live claim or a mismatch) costs one query per
 pass.
 
+A row can also have reached the previous project without the local outbox
+recording it: the upload committed but the local record was lost, so the row is
+still pending locally with no remote inbox id. The previous project's copy then
+makes every upload of that row to the new project fail, and the failure takes
+the rest of its batch with it. When an upload fails and the new project lacks
+some of the rows, the same recovery runs for those rows right away, and the
+batch is uploaded once more without the rows that cannot go:
+
+- an undelivered copy is withdrawn and the row is uploaded to the new project
+  in the same pass;
+- an applied copy is deleted and the row is acknowledged;
+- a quarantined copy stays and the row is quarantined;
+- a copy another drainer is working on is left alone and the row is retried
+  later. Until that claim ends it can hold back the rows that follow it; and
+- a copy that differs from the row is never changed. One error naming the rows
+  is reported, and once the row has been attempted the configured number of
+  times it is quarantined locally.
+
+The other rows of that batch are uploaded in the same pass instead of waiting
+for the row that failed it. If the new upload fails again, or the recovery
+query itself fails, the remaining rows are retried with backoff as for any other
+failed upload. This costs one recovery transaction and at most one extra upload,
+and only when an upload batch fails this way.
+
 Withdrawing a copy does not wait for the previous project's drain lease. That
 is safe because applying a passive event has no remote effect and a drainer
 whose claim went stale fails its completion before it applies anything.
 
 Per-machine ordering holds while a project stays bound. After a relink a
-recovered older row is uploaded after rows that were still pending locally, so
-the new project can receive a newer event before an older one from the same
-machine.
+recovered older row, or a row held back by a copy another drainer is still
+working on, is uploaded after rows that were still pending locally, so the new
+project can receive a newer event before an older one from the same machine.
 
 The storage health check receives the daemon's shutdown signal, so stopping the
 daemon cancels a health check that is still waiting on a PostgreSQL connection

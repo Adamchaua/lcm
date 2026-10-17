@@ -985,5 +985,68 @@ describe("PostgreSqlPassiveEventRepository", () => {
         .rejects.toMatchObject(expectDataError("status_timestamps"));
       expect(deletions(execution)).toEqual([]);
     });
+
+    describe("for a row that never recorded its inbox id (#1511)", () => {
+      const withoutInboxId = (index: number, overrides: Record<string, unknown> = {}) => {
+        const { inboxId: _recorded, ...omitted } = key(index, overrides);
+        return omitted;
+      };
+
+      it("identifies the copy by machine, event id, and envelope alone", async () => {
+        const { repository: subject, execution } = releaseRepository([
+          located(0),
+          located(1, { status: "applied", applied_at: "2026-07-29T12:00:02.000Z" }),
+          located(2, {
+            status: "quarantined",
+            quarantined_at: "2026-07-29T12:00:03.000Z",
+            quarantine_reason: "poison",
+          }),
+          located(3, { status: "claimed", claimed_at: "2026-07-29T12:00:01.000Z", claimed_by: "w", claim_stale: false }),
+        ]);
+        await expect(subject.releaseFromOtherProjects(
+          [withoutInboxId(0), withoutInboxId(1), withoutInboxId(2), withoutInboxId(3), withoutInboxId(4)],
+          { staleClaimMs: 60_000 },
+        )).resolves.toEqual([
+          { eventId: ids[0], outcome: "released" },
+          { eventId: ids[1], outcome: "applied", inboxId: 101n },
+          { eventId: ids[2], outcome: "quarantined", inboxId: 102n, quarantineReason: "poison" },
+          { eventId: ids[3], outcome: "busy" },
+          { eventId: ids[4], outcome: "absent" },
+        ]);
+        // The deletes still name the observed copy, whatever id the caller had.
+        expect(deletions(execution).map(([config]) => config.values)).toEqual([
+          ["100", MACHINE_ID, ids[0], OTHER_PROJECT_ID, "pending"],
+          ["101", MACHINE_ID, ids[1], OTHER_PROJECT_ID, "applied"],
+        ]);
+      });
+
+      it("still reports a differing envelope and a bound copy without deleting", async () => {
+        const { repository: subject, execution } = releaseRepository([
+          located(0, { payload: { sessionId: "different" } }),
+          located(1, { project_id: PROJECT_ID }),
+        ]);
+        await expect(subject.releaseFromOtherProjects(
+          [withoutInboxId(0), withoutInboxId(1)],
+          { staleClaimMs: 1_000 },
+        )).resolves.toEqual([
+          { eventId: ids[0], outcome: "mismatch" },
+          { eventId: ids[1], outcome: "bound" },
+        ]);
+        expect(deletions(execution)).toEqual([]);
+      });
+
+      it("validates the rest of the key", async () => {
+        const { repository: subject, execution } = releaseRepository([]);
+        await expect(subject.releaseFromOtherProjects(
+          [withoutInboxId(0, { machineId: OTHER_MACHINE_ID })],
+          { staleClaimMs: 1_000 },
+        )).rejects.toMatchObject(expectDataError("machine_id"));
+        await expect(subject.releaseFromOtherProjects(
+          [withoutInboxId(0), withoutInboxId(1, { eventId: ids[0] })],
+          { staleClaimMs: 1_000 },
+        )).rejects.toMatchObject(expectDataError("duplicate_batch_event_id"));
+        expect(execution.query).not.toHaveBeenCalled();
+      });
+    });
   });
 });

@@ -1116,6 +1116,389 @@ describe("PassiveEventReplicationWorker", () => {
     });
   });
 
+  describe("a pending row whose earlier upload landed in another project (#1511)", () => {
+    const ID = (n: number) => `aaaaaaaa-0000-4000-8000-${String(n).padStart(12, "0")}`;
+    const THRESHOLD = PASSIVE_EVENT_REPLICATION_DEFAULTS.quarantineAfterAttempts;
+
+    function pendingRow(n: number, overrides: Partial<LocalHookEventRow> = {}): LocalHookEventRow {
+      return localRow({
+        event_id: n,
+        event_uuid: ID(n),
+        machine_sequence: String(n).padStart(19, "0"),
+        delivery_state: "claimed",
+        delivery_owner: "worker:local",
+        ...overrides,
+      });
+    }
+
+    function copy(n: number, overrides: Partial<PostgreSqlPassiveEventRecord> = {}) {
+      return remoteRecord({
+        inboxId: BigInt(100 + n),
+        eventId: ID(n),
+        machineSequence: BigInt(n),
+        ...overrides,
+      });
+    }
+
+    /** The first insert rolls back; the second one succeeds for whatever it is given. */
+    function insertThenSucceed(firstMissing: number) {
+      return vi.fn()
+        .mockRejectedValueOnce(
+          new PostgreSqlPassiveEventDataError(PROJECT_ID, "idempotency_readback", ID(firstMissing)),
+        )
+        .mockImplementation(async (inputs: ReadonlyArray<{ machineSequence: bigint }>) =>
+          inputs.map(input => copy(Number(input.machineSequence))));
+    }
+
+    const idsOf = (calls: ReadonlyArray<ReadonlyArray<unknown>>): string[] =>
+      calls.map(call => call[0] as string);
+
+    const insertedIds = (remote: { insertEvents: ReturnType<typeof vi.fn> }, call: number): string[] =>
+      remote.insertEvents.mock.calls[call][0].map((input: { eventId: string }) => input.eventId);
+
+    it("settles every outcome of one batch and uploads the rest in the same pass", async () => {
+      const rows = [
+        pendingRow(1),
+        pendingRow(2),
+        pendingRow(3),
+        pendingRow(4),
+        pendingRow(5),
+        pendingRow(6, { delivery_attempts: THRESHOLD }),
+        pendingRow(7),
+        pendingRow(8, { delivery_attempts: 1 }),
+        pendingRow(9, { delivery_attempts: THRESHOLD }),
+        pendingRow(10),
+      ];
+      const local = localRepository({ claimDeliveries: vi.fn().mockResolvedValue(rows) });
+      const onError = vi.fn();
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(2),
+        // Only row 1 is visible in the bound project.
+        readEvents: vi.fn().mockResolvedValue([copy(1)]),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(2), outcome: "absent" },
+          { eventId: ID(3), outcome: "released" },
+          { eventId: ID(4), outcome: "applied", inboxId: 104n },
+          { eventId: ID(5), outcome: "quarantined", inboxId: 105n, quarantineReason: "poison" },
+          { eventId: ID(6), outcome: "busy" },
+          { eventId: ID(7), outcome: "bound" },
+          { eventId: ID(8), outcome: "mismatch" },
+          { eventId: ID(9), outcome: "mismatch" },
+        ]),
+      });
+      const signal = new AbortController().signal;
+
+      await expect(worker(local, remote, { onError }).runOnce(signal)).resolves.toMatchObject({
+        uploaded: 3,
+        acknowledged: 1,
+        quarantined: 2,
+        retried: 4,
+      });
+
+      // Release is asked about exactly the rows the bound project lacks, with
+      // no recorded inbox id, and every remote call carries the pass signal.
+      expect(remote.releaseFromOtherProjects).toHaveBeenCalledTimes(1);
+      const [keys, options] = remote.releaseFromOtherProjects.mock.calls[0];
+      expect(keys.map((key: { eventId: string }) => key.eventId))
+        .toEqual([2, 3, 4, 5, 6, 7, 8, 9, 10].map(ID));
+      expect(keys.every((key: object) => !("inboxId" in key))).toBe(true);
+      expect(keys[0]).toEqual({
+        machineId: MACHINE_ID,
+        eventId: ID(2),
+        eventVersion: 1,
+        machineSequence: 2n,
+        eventType: "choice",
+        payload: {
+          sessionId: "session",
+          sessionSequence: 1,
+          category: "decision",
+          data: "SQLite",
+          priority: 1,
+          sourceHook: "PostToolUse",
+          previousEventId: null,
+          createdAt: "2026-07-29 12:00:00",
+        },
+      });
+      expect(options).toEqual({ staleClaimMs: 60_000, signal });
+      // The one extra insert holds the visible, withdrawn, and absent rows in
+      // their original order and nothing else.
+      expect(remote.insertEvents).toHaveBeenCalledTimes(2);
+      expect(insertedIds(remote, 1)).toEqual([1, 2, 3].map(ID));
+      expect(remote.insertEvents.mock.calls[0][1]).toBe(signal);
+      expect(remote.insertEvents.mock.calls[1][1]).toBe(signal);
+      expect(remote.readEvents).toHaveBeenCalledTimes(1);
+      expect(local.markReplicated.mock.calls).toEqual([
+        [ID(1), "worker:local", 101n],
+        [ID(2), "worker:local", 102n],
+        [ID(3), "worker:local", 103n],
+      ]);
+      expect(local.markAcknowledged.mock.calls).toEqual([[ID(4), 104n]]);
+      expect(local.markQuarantined.mock.calls).toEqual([[ID(5), 105n, "poison"]]);
+      // A live claim, a bound copy, a young mismatch, and a row nobody
+      // answered for stay queued; a mismatch at the boundary is quarantined.
+      expect(idsOf(local.markDeliveryRetry.mock.calls)).toEqual([6, 7, 8, 10].map(ID));
+      expect(local.markDeliveryQuarantined.mock.calls).toEqual([
+        [ID(9), "worker:local", "remote copy in another project differs from the local row"],
+      ]);
+      expect(onError).toHaveBeenCalledTimes(1);
+      const reported = onError.mock.calls[0][0] as Error;
+      expect(reported.message).toContain(ID(8));
+      expect(reported.message).toContain(ID(9));
+    });
+
+    it("inserts only the rows that remain visible when the others are settled", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(2),
+        readEvents: vi.fn().mockResolvedValue([copy(1)]),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(2), outcome: "busy" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 1,
+        retried: 1,
+      });
+      expect(insertedIds(remote, 1)).toEqual([ID(1)]);
+    });
+
+    it("does not insert again when no row remains to upload", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(1),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(1), outcome: "busy" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 1,
+      });
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+    });
+
+    it("inserts the whole batch again when the remote proves every row absent", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(1),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(1), outcome: "absent" },
+          { eventId: ID(2), outcome: "absent" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 2,
+        retried: 0,
+      });
+      expect(remote.insertEvents).toHaveBeenCalledTimes(2);
+      expect(insertedIds(remote, 1)).toEqual([ID(1), ID(2)]);
+    });
+
+    it.each([
+      ["a differing row in the bound project", [copy(1, { eventType: "different" })]],
+      ["a readback outage", new Error("readback unavailable")],
+    ])("asks nothing of other projects after %s", async (_label, readback) => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: vi.fn().mockRejectedValue(new Error("insert failed")),
+        readEvents: readback instanceof Error
+          ? vi.fn().mockRejectedValue(readback)
+          : vi.fn().mockResolvedValue(readback),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 2,
+      });
+      expect(remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+    });
+
+    it("asks nothing of other projects when the readback holds every row", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: vi.fn().mockRejectedValue(new Error("connection lost")),
+        readEvents: vi.fn().mockResolvedValue([copy(1), copy(2)]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({ uploaded: 2 });
+      expect(remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back to retrying the whole batch when the recovery query fails", async () => {
+      const failure = new Error("release unavailable");
+      const onError = vi.fn();
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(2),
+        readEvents: vi.fn().mockResolvedValue([copy(1)]),
+        releaseFromOtherProjects: vi.fn().mockRejectedValue(failure),
+      });
+      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 2,
+      });
+      expect(onError).toHaveBeenCalledWith(failure);
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+    });
+
+    it("acts on the first answer per row and reports a repeated one once", async () => {
+      const onError = vi.fn();
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(1),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(1), outcome: "released" },
+          { eventId: ID(1), outcome: "busy" },
+          { eventId: ID(1), outcome: "busy" },
+          { eventId: ID(99), outcome: "released" },
+          { eventId: ID(2), outcome: "busy" },
+        ]),
+      });
+      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({
+        uploaded: 1,
+        retried: 1,
+      });
+      expect(insertedIds(remote, 1)).toEqual([ID(1)]);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect((onError.mock.calls[0][0] as Error).message).toContain(ID(1));
+    });
+
+    it("recovers only the rows of the extra insert when it fails too", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2), pendingRow(3)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: vi.fn().mockRejectedValue(new Error("insert failed")),
+        readEvents: vi.fn()
+          .mockResolvedValueOnce([copy(1)])
+          .mockResolvedValueOnce([copy(1)]),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(2), outcome: "released" },
+          { eventId: ID(3), outcome: "busy" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 3,
+      });
+      expect(idsOf(local.markDeliveryRetry.mock.calls)).toEqual([3, 1, 2].map(ID));
+      // No second recovery and no third insert.
+      expect(remote.releaseFromOtherProjects).toHaveBeenCalledTimes(1);
+      expect(remote.insertEvents).toHaveBeenCalledTimes(2);
+      expect(remote.readEvents.mock.calls[1][0]).toEqual([
+        { machineId: MACHINE_ID, eventId: ID(1) },
+        { machineId: MACHINE_ID, eventId: ID(2) },
+      ]);
+    });
+
+    it("adopts the readback when the extra insert committed uncertainly", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: vi.fn().mockRejectedValue(new Error("insert failed")),
+        readEvents: vi.fn()
+          .mockResolvedValueOnce([copy(1)])
+          .mockResolvedValueOnce([copy(1), copy(2)]),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(2), outcome: "released" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 2,
+        retried: 0,
+      });
+      expect(local.markReplicated.mock.calls.map(call => call[0])).toEqual([ID(1), ID(2)]);
+    });
+
+    it("retries the rows of the extra insert when their readback fails", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: vi.fn().mockRejectedValue(new Error("insert failed")),
+        readEvents: vi.fn()
+          .mockResolvedValueOnce([copy(1)])
+          .mockRejectedValueOnce(new Error("readback unavailable")),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(2), outcome: "released" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 2,
+      });
+    });
+
+    it("does not count marks that raced and does not retry their rows", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([
+          pendingRow(1),
+          pendingRow(2),
+          pendingRow(3),
+          pendingRow(4, { delivery_attempts: THRESHOLD }),
+          pendingRow(5),
+          pendingRow(6, { delivery_attempts: 1 }),
+        ]),
+        markAcknowledged: vi.fn().mockResolvedValue(false),
+        markQuarantined: vi.fn().mockResolvedValue(false),
+        markDeliveryQuarantined: vi.fn().mockResolvedValue(false),
+        markDeliveryRetry: vi.fn().mockResolvedValue(false),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(1),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(1), outcome: "absent" },
+          { eventId: ID(2), outcome: "applied", inboxId: 102n },
+          { eventId: ID(3), outcome: "quarantined", inboxId: 103n, quarantineReason: "poison" },
+          { eventId: ID(4), outcome: "mismatch" },
+          { eventId: ID(5), outcome: "busy" },
+          { eventId: ID(6), outcome: "mismatch" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 1,
+        acknowledged: 0,
+        quarantined: 0,
+        retried: 0,
+      });
+      expect(insertedIds(remote, 1)).toEqual([ID(1)]);
+      expect(idsOf(local.markDeliveryRetry.mock.calls)).toEqual([5, 6].map(ID));
+    });
+
+    it("does not insert again after a local mark throws", async () => {
+      const failure = new Error("local store unavailable");
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+        markAcknowledged: vi.fn().mockRejectedValue(failure),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(1),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(1), outcome: "absent" },
+          { eventId: ID(2), outcome: "applied", inboxId: 102n },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).rejects.toBe(failure);
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+    });
+  });
+
+
 
   it.each([
     ["missing", null],
