@@ -1776,6 +1776,17 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       expect(calls).toEqual(["closeKeepingLease"]);
     });
 
+    it("F1: a lease close that fails after a failed body never masks the original failure", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      const session = await unchangedSession();
+      session.closeKeepingLease = async () => { throw new Error("the lease close failed too"); };
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: async () => session,
+        coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection"),
+      }))).rejects.toThrow("simulated crash right before completeMaintenanceSelection");
+    });
+
     it("F1: a failure before the selection was attempted still releases the lease", async () => {
       const homeDir = tempHome();
       prepareAuthoritative(homeDir);
@@ -1977,6 +1988,18 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
         openFencedSession: changedSession({ postEpochDelta: fixtureCanonicalDelta("a16-after-final"), postEpochCensus: null }),
       }));
       expect(outcome.manifest.phase).toBe("rolled-back");
+    });
+
+    it("F1: an unactivated rollback's prepared selection completes when the evidence still reads unactivated", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a16-unact-same");
+      const deps = (coordinator: ReturnType<typeof coordinatorFor>) => ({ coordinator, ...absentDeps(), openFencedSession: unactivatedSession });
+      await expect(runRollback(RUN(homeDir, "gen-a16-unact-same"), deps(crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection"))))
+        .rejects.toThrow("simulated crash");
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+      const outcome = await runRollback(RUN(homeDir, "gen-a16-unact-same"), deps(coordinatorFor(homeDir)));
+      expect(outcome.manifest.phase).toBe("rolled-back");
+      expect(outcome.report).toMatchObject({ eligibility: "unactivated", mode: "pre-write", epochId: null, attemptId: null });
     });
 
     it("F1: an unactivated rollback's prepared selection is refused once the evidence no longer reads unactivated", async () => {
