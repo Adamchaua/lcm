@@ -7,7 +7,7 @@ import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
 import { sanitizeError } from "../safe-error.js";
 import {
-  storageRouteFailureResponse,
+  storageReadFailureResponse,
   withProjectStorage,
 } from "./storage-lifecycle.js";
 
@@ -53,7 +53,7 @@ export function createExpandHandler(config: DaemonConfig, storageFactory?: Stora
       );
       sendJson(res, 200, result ?? { expanded: null, error: "project not found" });
     } catch (err) {
-      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "expand", storageFactory);
+      const storageFailure = storageReadFailureResponse(config.storage.backend, err, "expand", storageFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;

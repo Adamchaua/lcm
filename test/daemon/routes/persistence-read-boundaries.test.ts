@@ -89,6 +89,7 @@ import { createPoolStatsHandler } from "../../../src/daemon/routes/pool-stats.js
 import { createStatsHandler } from "../../../src/daemon/routes/stats.js";
 import { createSearchHandler } from "../../../src/daemon/routes/search.js";
 import { MachineIdentityFileError } from "../../../src/machine-identity.js";
+import { PrivateMutationLockContentionError } from "../../../src/private-mutation-lock.js";
 import { StorageIdentityConfigurationError } from "../../../src/storage/identity-context.js";
 
 const config = loadDaemonConfig("/tmp/lcm-persistence-routes");
@@ -159,6 +160,17 @@ function expectLast(status: number, payload: unknown): void {
 }
 
 describe("persistence read route boundaries", () => {
+  function lastResponse(): { status: number; payload: unknown } {
+    if (mocks.send.mock.calls.length > 0) {
+      const call = mocks.send.mock.calls.at(-1) as unknown as [unknown, number, unknown];
+      return { status: call[1], payload: call[2] };
+    }
+    return {
+      status: mocks.writeHead.mock.calls.at(-1)?.[0] as number,
+      payload: JSON.parse(String(mocks.end.mock.calls.at(-1)?.[0])),
+    };
+  }
+
   beforeEach(() => {
     for (const mock of Object.values(mocks)) {
       if (typeof mock === "function" && "mockClear" in mock) mock.mockClear();
@@ -1065,6 +1077,45 @@ describe("persistence read route boundaries", () => {
     await vi.waitFor(() => expect(mocks.projectClose).toHaveBeenCalled());
     release?.({ id: "node" });
     await pending;
+  });
+
+  it("fails PostgreSQL read routes closed when identity resolution hits publication-lock contention", async () => {
+    const contentionBody = new StorageOperationError(
+      "STORAGE_OPERATION_FAILED", "postgresql", undefined, "identity", "placeholder", { retryable: true },
+    ).toJSON();
+    const routes = [
+      ["search", createSearchHandler, { query: "q", cwd: "/ok" }, { episodic: [], promoted: [] }],
+      ["grep", createGrepHandler, { query: "q", cwd: "/ok" }, { matches: [] }],
+      ["recent", createRecentHandler, { cwd: "/ok" }, { summaries: [] }],
+      ["describe", createDescribeHandler, { nodeId: "n", cwd: "/ok" }, { node: null, error: "describe failed" }],
+      ["expand", createExpandHandler, { nodeId: "n", cwd: "/ok" }, { expanded: null, error: "expansion failed" }],
+    ] as const;
+    for (const [operation, createHandler, body, sqliteBody] of routes) {
+      const contention = () => new PrivateMutationLockContentionError("lock held by pid 4242 at /private/canary.lock");
+      for (const mock of [mocks.send, mocks.writeHead, mocks.end]) mock.mockClear();
+      mocks.projectIdentity.mockImplementationOnce(() => { throw contention(); });
+      await invoke(createHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())), body);
+      expect(lastResponse().status).toBe(503);
+      expect(lastResponse().payload).toEqual({ ...contentionBody, operation });
+      expect(JSON.stringify(lastResponse())).not.toMatch(/4242|canary/);
+
+      for (const mock of [mocks.send, mocks.writeHead, mocks.end]) mock.mockClear();
+      mocks.projectIdentity.mockImplementationOnce(() => { throw contention(); });
+      await invoke(createHandler(config, injectedFactory()), body);
+      expect(lastResponse().status).toBe(200);
+      expect(lastResponse().payload).toMatchObject(
+        "error" in sqliteBody ? { ...sqliteBody, error: expect.any(String) } : sqliteBody,
+      );
+    }
+  });
+
+  it("keeps per-layer best-effort search results on PostgreSQL for untyped promoted failures", async () => {
+    mocks.promotedSearch.mockRejectedValueOnce(new Error("promoted layer failed"));
+    await invoke(
+      createSearchHandler(postgresqlConfig(), postgresqlFactory(injectedFactory())),
+      { query: "q", cwd: "/ok" },
+    );
+    expectLast(200, { episodic: [], promoted: [] });
   });
 
   it.each([

@@ -492,6 +492,10 @@ project binding, or backend support are unavailable. The daemon starts one
 selected-backend factory and routes bounded repository batches through it. An
 unbound or invalid project returns sanitized `409` identity guidance; a
 selected-backend initialization or operation failure returns a sanitized `503`.
+On PostgreSQL, the read routes `/search`, `/grep`, `/recent`, `/describe`, and
+`/expand` likewise return a sanitized `503` when project storage fails,
+including publication-lock contention (marked retryable), instead of an empty
+or null `200`.
 The daemon cancels request-scoped work on client disconnect and drains active
 consumers before closing the factory during shutdown. No PostgreSQL failure
 opens a project SQLite database as a recovery path.

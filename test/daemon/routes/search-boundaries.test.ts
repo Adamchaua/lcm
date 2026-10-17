@@ -5,7 +5,7 @@ const mocks = vi.hoisted(() => ({
   sendJson: vi.fn(),
   validateCwd: vi.fn((cwd: string) => cwd),
   withProjectStorage: vi.fn(),
-  storageRouteFailureResponse: vi.fn(() => null),
+  storageReadFailureResponse: vi.fn(() => null),
   createRetrievalEngine: vi.fn(),
   grep: vi.fn(),
   searchPromoted: vi.fn(),
@@ -15,7 +15,7 @@ vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.sendJson }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({ validateCwd: mocks.validateCwd }));
 vi.mock("../../../src/daemon/routes/storage-lifecycle.js", () => ({
   withProjectStorage: mocks.withProjectStorage,
-  storageRouteFailureResponse: mocks.storageRouteFailureResponse,
+  storageReadFailureResponse: mocks.storageReadFailureResponse,
 }));
 vi.mock("../../../src/retrieval.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/retrieval.js")>(),
