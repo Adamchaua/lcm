@@ -62,6 +62,8 @@ let transport;
 let mcpClient;
 let mcpNeedsReadiness = false;
 let mcpReadinessAuthority;
+// True while the running baseline generation was started without an MCP child (settle restarts).
+let baselineWithoutMcp = false;
 let mcpErrorBytes = 0;
 let readFactory;
 let busy = false;
@@ -339,7 +341,7 @@ async function startDirect() {
   context.daemonInstanceId = directDaemon.daemonInstanceId;
   return routes;
 }
-async function startBaseline(reusePort) {
+async function startBaseline(reusePort, { mcp = true } = {}) {
   const port = reusePort ?? await availablePort();
   if (reusePort === undefined) selectPort(port);
   else assert.equal(loadDaemonConfig(configPath).daemon.port, reusePort, 'surface-isolation:configured-port');
@@ -376,6 +378,11 @@ async function startBaseline(reusePort) {
   assert.equal(health.pid, baseline.pid, 'surface-worker:baseline-process-replaced');
   context.daemonPid = baseline.pid;
   context.daemonInstanceId = health.daemonInstanceId;
+  baselineWithoutMcp = !mcp;
+  if (!mcp) {
+    assert.ok(!transport && !mcpClient, 'surface-isolation:mcp-before-daemon-only');
+    return [];
+  }
   transport = new StdioClientTransport({
     command: process.execPath, args: [bin, 'mcp'], cwd: projectPath,
     env: Object.fromEntries(Object.entries(process.env).filter(([key, value]) => value !== undefined && !['LCM_SURFACE_ADMIN_URL', 'LCM_SURFACE_MIGRATOR_URL'].includes(key))),
@@ -519,21 +526,32 @@ function ownedLifecycle() {
     },
     stop: async () => {
       const previous = { pid: baseline.pid, generation: context.daemonInstanceId, port: context.config.daemon.port };
-      const previousMcpPid = transport.pid;
-      assert.ok(Number.isSafeInteger(previousMcpPid) && previousMcpPid > 0, 'surface-isolation:mcp-owner');
-      await closeMcp();
-      assert.throws(() => process.kill(previousMcpPid, 0), error => error.code === 'ESRCH', 'surface-isolation:old-mcp-retained');
+      if (baselineWithoutMcp) assert.ok(!transport && !mcpClient, 'surface-isolation:mcp-owner');
+      else {
+        const previousMcpPid = transport.pid;
+        assert.ok(Number.isSafeInteger(previousMcpPid) && previousMcpPid > 0, 'surface-isolation:mcp-owner');
+        await closeMcp();
+        assert.throws(() => process.kill(previousMcpPid, 0), error => error.code === 'ESRCH', 'surface-isolation:old-mcp-retained');
+      }
       await readFactory?.close();
       readFactory = undefined;
       await stopBaseline();
       assert.throws(() => process.kill(previous.pid, 0), error => error.code === 'ESRCH', 'surface-isolation:old-daemon-retained');
       baseline = undefined;
+      baselineWithoutMcp = false;
       resetSnapshotReaders();
       assert.equal(childProcesses.size, 0, 'surface-isolation:owned-child-retained');
       return previous;
     },
     start: async port => {
       await startBaseline(port);
+      return { pid: baseline.pid, generation: context.daemonInstanceId, port: context.config.daemon.port };
+    },
+    // The daemon alone, for the settle's internal restarts: a freshly spawned MCP child takes the
+    // publication lock for its startup admission checks while the daemon's startup sweep runs, and
+    // the sweep skips a project whose phase meets that lock. The next stop() closes nothing else.
+    startDaemon: async port => {
+      await startBaseline(port, { mcp: false });
       return { pid: baseline.pid, generation: context.daemonInstanceId, port: context.config.daemon.port };
     },
     assertStateUnchanged: (after, before) => {
@@ -549,6 +567,14 @@ function ownedLifecycle() {
     // A restart's startup pass is complete when awaitStartupPass says so; only a complete pass
     // can prove a fixed point. A pass that skipped a project proves nothing, so the next restart
     // is a new startup pass; the loop only fails when no restart completes within MAX_ITERATIONS.
+    //
+    // The settle's restarts start the daemon alone. A spawned MCP child takes the publication lock
+    // for its startup admission checks in the first moments of the daemon's sweep, and a sweep
+    // phase that meets the lock skips its project until the next sweep, so with an MCP child
+    // every restart replays the same collision. The settle returns with that daemon-only
+    // generation running; the stop() that follows closes it, and the strict comparison's own
+    // restart (start(), with the MCP child) stays exact: it follows a complete pass that moved
+    // nothing, so it can only skip a project or complete, and either moves nothing.
     ...(backend === 'postgresql' ? { settleReplication: async function settleReplication() {
       const MAX_ITERATIONS = 12;
       // The remote-bound set cannot change while settling, so it is read once, below, with no daemon
@@ -585,7 +611,7 @@ function ownedLifecycle() {
         const previousVector = vector(current);
         const previous = stopped ?? await this.stop();
         stopped = undefined;
-        await this.start(previous.port);
+        await this.startDaemon(previous.port);
         const { complete, error } = await awaitStartupPass(sweptProjects(current, boundIds), iteration);
         if (!complete) skipped = error;
         current = await readPassiveSidecars();
