@@ -1080,8 +1080,7 @@ function removeIdenticalLoneScratch(
     if (!namePattern.test(entry)) continue;
     const candidate = join(directory, entry);
     if (
-      !isLoneScratchShape(candidate, expectedUid)
-      || readLoneScratchContent(candidate, directory, store, expectedUid, readWithStat) !== published
+      readLoneScratchContent(candidate, directory, store, expectedUid, readWithStat) !== published
     ) continue;
     try {
       unlinkSync(candidate);
@@ -1187,21 +1186,12 @@ function generationScopedUnresolvable(reason: string): GenerationScopedRead {
 }
 
 /**
- * Whether a directory entry is a single-link regular file owned by the
- * expected uid with the writer's mode: the only shape a lone writer scratch
- * file can legitimately have. Anything else is not debris of this store.
- */
-function isLoneScratchShape(path: string, expectedUid: number | undefined): boolean {
-  const stat = lstatSync(path, { bigint: true });
-  return stat.isFile()
-    && stat.nlink === 1n
-    && (expectedUid === undefined || Number(stat.uid) === expectedUid)
-    && (Number(stat.mode) & 0o777) === PRIVATE_FILE_MODE;
-}
-
-/**
  * A lone scratch file's content, or undefined when it cannot be read as a
- * bounded private regular file.
+ * bounded private regular file. The read itself enforces the only shape a
+ * lone writer scratch file can legitimately have -- a regular file with a
+ * single link, owned by the expected uid, with the writer's mode
+ * (requireSingleLink, expectedUid, allowedModes) -- so a separate shape
+ * check would be redundant with it (review r1 matrix A19-03 / A19-06).
  */
 function readLoneScratchContent(
   path: string,
@@ -1268,7 +1258,6 @@ function scanGenerationScopedDirectory(
     const published = files.find((file) => file.name === finalName);
     if (
       published === undefined
-      || !isLoneScratchShape(path, expectedUid)
       || readLoneScratchContent(path, directory, store, expectedUid, readWithStat) !== published.content
     ) {
       return generationScopedUnresolvable("scratch entry " + entry + " is not an authenticated writer scratch file");
