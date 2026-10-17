@@ -492,7 +492,11 @@ function ownedLifecycle() {
       const MAX_ITERATIONS = 8;
       const PASS_TIMEOUT_MS = 30000;
       const QUIET_MS = 1500;
-      const bound = row => Boolean(readProjectMapSnapshot()[row.projectId]?.remoteProjectId);
+      // The remote-bound set cannot change while settling, so it is read once, below, with no daemon
+      // running: the daemon takes the publication lock around each replication phase and this
+      // synchronous reader does not wait for it.
+      let boundIds;
+      const bound = row => boundIds.has(row.projectId);
       const counters = row => [row.deliveryPending, row.deliveryClaimed, row.deliveryRetry, row.deliveryReplicated,
         row.deliveryAcknowledged, row.deliveryAwaitingRemotePrune, row.deliveryQuarantined];
       const open = row => row.deliveryPending + row.deliveryClaimed + row.deliveryRetry + row.deliveryReplicated + row.deliveryAwaitingRemotePrune;
@@ -513,12 +517,19 @@ function ownedLifecycle() {
       const statusKey = replication => [replication.passes, replication.projects, replication.uploaded, replication.applied,
         replication.acknowledged, replication.pruned, replication.retried, replication.quarantined].join(',');
       const initial = await readPassiveSidecars();
-      if (!initial.some(row => bound(row) && open(row) > 0)) return;
+      if (!initial.some(row => open(row) > 0)) return;
+      let stopped = await this.stop();
+      boundIds = new Set(Object.entries(readProjectMapSnapshot()).filter(([, entry]) => entry.remoteProjectId).map(([id]) => id));
+      if (!initial.some(row => bound(row) && open(row) > 0)) {
+        await this.start(stopped.port);
+        return;
+      }
       let current = initial;
       let reachedFixedPoint = false;
       for (let iteration = 1; iteration <= MAX_ITERATIONS && !reachedFixedPoint; iteration += 1) {
         const previousVector = vector(current);
-        const previous = await this.stop();
+        const previous = stopped ?? await this.stop();
+        stopped = undefined;
         await this.start(previous.port);
         const deadline = Date.now() + PASS_TIMEOUT_MS;
         let lastKey = null;
