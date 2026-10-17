@@ -437,7 +437,13 @@ describe("openPortableSource", () => {
     const h = harness();
     const session = await open(h);
     const exported = await session.openPortableSource();
-    expect(exported.stream).toBe(h.stream);
+    // The stream delegates to the one createStream built (its close additionally closes the export snapshot).
+    h.stream.describe.mockReturnValue("manifest");
+    h.stream.readBatch = vi.fn(async () => "batch");
+    h.stream.verify = vi.fn(async () => "verified");
+    expect(exported.stream.describe()).toBe("manifest");
+    await expect(exported.stream.readBatch({} as never)).resolves.toBe("batch");
+    await expect(exported.stream.verify({} as never)).resolves.toBe("verified");
     expect(exported.canonicalDelta).toEqual(buildMigrationCanonicalDelta(h.census));
     expect(exported.censusVector).toEqual(buildMigrationCensusVector(h.census));
     const snapshot = await (h.runtime.openReadOnlySnapshot as ReturnType<typeof vi.fn>).mock.results[0]!.value;
@@ -449,6 +455,58 @@ describe("openPortableSource", () => {
     expect(h.snapshots[0]!.close).not.toHaveBeenCalled();
     await session.release();
     expect(h.snapshots[0]!.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("F4: closing the stream closes the export snapshot, so a one-connection pool can renew and read back after it", async () => {
+    let held = 0;
+    const h = harness();
+    h.runtime.openReadOnlySnapshot = vi.fn(async () => {
+      if (held >= 1) throw new Error("pool exhausted: the export snapshot still holds the only connection");
+      held += 1;
+      const snapshot = { close: vi.fn(async () => { held -= 1; }) };
+      h.snapshots.push(snapshot);
+      return snapshot as unknown as PostgreSqlSnapshotSession;
+    });
+    const session = await open(h);
+    const exported = await session.openPortableSource();
+    await exported.stream.close();
+    expect(held).toBe(0);
+    await session.renew();
+    await expect(session.captureReadback({ manifestDestinationWitnessSha256: "a".repeat(64), canonicalDeltaBaseline: fixtureCanonicalDelta("x") }))
+      .resolves.toBeDefined();
+    await session.release();
+  });
+
+  it("F4: the stream's close closes the snapshot once, whatever the stream's own close does, and release() does not close it again", async () => {
+    const h = harness();
+    const session = await open(h);
+    const exported = await session.openPortableSource();
+    await exported.stream.close();
+    await exported.stream.close();
+    expect(h.stream.close).toHaveBeenCalledTimes(1);
+    expect(h.snapshots[0]!.close).toHaveBeenCalledTimes(1);
+    await session.release();
+    expect(h.snapshots[0]!.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("F4: the snapshot is closed even when the stream's close fails, and the stream's failure is the one reported", async () => {
+    const h = harness();
+    h.stream.close.mockRejectedValue(new Error("stream close failed"));
+    const session = await open(h);
+    const exported = await session.openPortableSource();
+    h.snapshots[0]!.close.mockRejectedValue(new Error("snapshot close failed"));
+    await expect(exported.stream.close()).rejects.toThrow("stream close failed");
+    expect(h.snapshots[0]!.close).toHaveBeenCalledTimes(1);
+    await session.release();
+  });
+
+  it("F4: a failing snapshot close after a successful stream close is reported", async () => {
+    const h = harness();
+    const session = await open(h);
+    const exported = await session.openPortableSource();
+    h.snapshots[0]!.close.mockRejectedValue(new Error("snapshot close failed"));
+    await expect(exported.stream.close()).rejects.toThrow("snapshot close failed");
+    await session.release();
   });
 
   it("closes the source and the snapshot when the stream cannot be built", async () => {

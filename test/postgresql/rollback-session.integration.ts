@@ -209,9 +209,9 @@ function readConfigBackend(homeDir: string): string {
 }
 
 /** The sqlite-selecting config an installation holds before activation; its postgresql block survives every publication. */
-function writeSourceConfig(homeDir: string, backend: "sqlite" | "postgresql" = "sqlite"): void {
+function writeSourceConfig(homeDir: string, backend: "sqlite" | "postgresql" = "sqlite", poolMax?: number): void {
   writeFileSync(configPath(homeDir), `${JSON.stringify({
-    storage: { backend, postgresql: { migrationRole: "lcm_test_migrator" } },
+    storage: { backend, postgresql: { migrationRole: "lcm_test_migrator", ...(poolMax === undefined ? {} : { poolMax }) } },
   })}\n`, { mode: 0o600 });
 }
 
@@ -229,9 +229,9 @@ async function activate(
   database: PostgreSqlTestDatabase,
   homeDir: string,
   generationId: string,
-  options: { record?: boolean } = {},
+  options: { record?: boolean; poolMax?: number } = {},
 ): Promise<void> {
-  writeSourceConfig(homeDir);
+  writeSourceConfig(homeDir, "sqlite", options.poolMax);
   writeProjectMap(homeDir, unboundMap);
   const composed = composeBackendPublicationMaterial({
     homeDir, targetBackend: "postgresql",
@@ -278,7 +278,7 @@ async function activate(
 async function prepared(
   database: PostgreSqlTestDatabase,
   generationId: string,
-  options: { activated?: boolean; shape?: "unpublished" | "recordless" } = {},
+  options: { activated?: boolean; shape?: "unpublished" | "recordless"; poolMax?: number } = {},
 ) {
   await applyAllRuntimeGrants(database);
   await seedPortablePostgreSql(database.migrator);
@@ -296,7 +296,7 @@ async function prepared(
     }
   } else {
     manifestAtVerified(new MigrationManifestStore({ homeDir }), generationId);
-    await activate(database, homeDir, generationId);
+    await activate(database, homeDir, generationId, { poolMax: options.poolMax });
   }
   return { homeDir, canonicalPath: join(homeDir, "live.sqlite") };
 }
@@ -556,6 +556,18 @@ describe("production rollback against PostgreSQL 18", { timeout: 240_000 }, () =
       } finally {
         installed.close();
       }
+      expect((await leaseRow(database))!.released).toBe(true);
+    });
+  });
+
+  it("F4: a post-write rollback completes with poolMax=1, because the export snapshot is closed with its stream", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-pool-one", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-pool-one", { poolMax: 1 });
+      expect(JSON.parse(readFileSync(configPath(homeDir), "utf8")).storage.postgresql.poolMax).toBe(1);
+      await insertConversation(database, "raced-session-pool-one");
+      const outcome = await runRollback({ homeDir, generationId: "gen-pool-one", canonicalPath, database });
+      expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+      expectRollbackPublished(homeDir, "gen-pool-one");
       expect((await leaseRow(database))!.released).toBe(true);
     });
   });

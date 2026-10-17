@@ -1,6 +1,6 @@
 import { tmpdir } from "node:os";
 import { canonicalSha256, PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_RECORD_SCHEMA_SHA256 } from "../storage/portable-record.js";
-import { createPortableRecordStream } from "../storage/portable-record-stream.js";
+import { createPortableRecordStream, type PortableRecordStream } from "../storage/portable-record-stream.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
 import { createPostgreSqlPortableSource, readPostgreSqlPortableSourceDomainCensus } from "../storage/postgresql/portable-source.js";
@@ -291,8 +291,9 @@ class FencedRollbackSession implements RollbackProductionSession {
   }
 
   async openPortableSource(): Promise<RollbackExportSource> {
-    // The snapshot stays open for the whole export; release() closes it. The borrowed-session source
-    // never closes it itself.
+    // The snapshot stays open for the whole export and is closed with the returned stream (the borrowed-session
+    // source never closes it itself), so a one-connection pool is free again for the renewal and the fresh
+    // readback that follow the transfer (F4). release() closes it if the stream was never closed.
     const snapshot = await this.admittedSnapshot();
     try {
       const source = await this.dependencies.createPortableSource({
@@ -306,7 +307,7 @@ class FencedRollbackSession implements RollbackProductionSession {
       try {
         const census = PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => this.dependencies.readDomainCensus(source, domain));
         return {
-          stream: await this.dependencies.createStream(source),
+          stream: this.closingSnapshotWith(await this.dependencies.createStream(source), snapshot),
           canonicalDelta: buildMigrationCanonicalDelta(census),
           censusVector: buildMigrationCensusVector(census),
         };
@@ -318,6 +319,24 @@ class FencedRollbackSession implements RollbackProductionSession {
       await this.closeSnapshot(snapshot).catch(() => undefined);
       throw error;
     }
+  }
+
+  /** The stream, whose close also closes the export snapshot it reads (once, whatever the stream's own close does). */
+  private closingSnapshotWith(stream: PortableRecordStream, snapshot: PostgreSqlSnapshotSession): PortableRecordStream {
+    let closed = false;
+    return {
+      describe: () => stream.describe(),
+      readBatch: (input) => stream.readBatch(input),
+      verify: (checkpoint) => stream.verify(checkpoint),
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        let failure: unknown;
+        try { await stream.close(); } catch (error) { failure = error; }
+        try { await this.closeSnapshot(snapshot); } catch (error) { failure ??= error; }
+        if (failure !== undefined) throw failure;
+      },
+    };
   }
 
   computeRollbackTerminalEvidenceSha256(input: ComputeRollbackTerminalEvidenceInput): string {
