@@ -6,7 +6,7 @@ import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
 import { sanitizeError } from "../safe-error.js";
 import {
-  storageRouteFailureResponse,
+  storageReadFailureResponse,
   withProjectStorage,
 } from "./storage-lifecycle.js";
 
@@ -46,7 +46,7 @@ export function createDescribeHandler(config: DaemonConfig, storageFactory?: Sto
       );
       sendJson(res, 200, result ?? { node: null });
     } catch (err) {
-      const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "describe", storageFactory);
+      const storageFailure = storageReadFailureResponse(config.storage.backend, err, "describe", storageFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);
         return;

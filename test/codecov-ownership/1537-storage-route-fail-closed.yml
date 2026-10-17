@@ -1,0 +1,13 @@
+references: ["#1537"]
+rationale: >-
+  #1537 makes the five registered read routes (search, grep, recent,
+  describe, expand) answer a sanitized 503 on PostgreSQL when project storage
+  rejects, through a new storageReadFailureResponse helper in
+  storage-lifecycle; all six files keep their existing daemon-routes owner.
+pins:
+  - ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/search.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/grep.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/recent.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/describe.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/expand.ts", "unit-daemon-routes"]

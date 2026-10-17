@@ -35,9 +35,11 @@ import {
   capturePublicationWitnessOutcome,
   DEFAULT_POSTGRESQL_FACTORY_DEPENDENCIES,
   FactorySignalExecutor,
+  isPublicationWitnessContention,
   type PostgreSqlFactoryDependencies,
 } from "../../src/storage/postgresql/factory.js";
 import { createPostgreSqlStorageBackendFactory } from "../../src/storage/postgresql.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import type {
   PostgreSqlQueryOptions,
   PostgreSqlRuntimeHealth,
@@ -1012,6 +1014,123 @@ describe("PostgreSQL storage backend factory", () => {
     await expect(
       capturePublicationWitnessOutcome(lockDependencies, "/home/operator"),
     ).resolves.toEqual({ status: "unresolvable", cause: lockCanary });
+  });
+
+  describe("publication witness contention marking", () => {
+    const initializationFailure = {
+      code: "STORAGE_INITIALIZATION_FAILED",
+      backend: "postgresql",
+      domain: "factory",
+      retryable: false,
+      message: "postgresql storage initialization failed for project " + PROJECT_ID,
+    };
+
+    async function openWith(
+      configure: (
+        ctx: ReturnType<typeof harness>,
+        captures: { count: number },
+      ) => void,
+    ): Promise<unknown> {
+      const ctx = harness();
+      const captures = { count: 0 };
+      configure(ctx, captures);
+      const factory = await createPostgreSqlStorageBackendFactoryForTesting(
+        config,
+        "/home/operator",
+        ctx.dependencies,
+      );
+      try {
+        return await factory.openExistingProject(identity)
+          .then(() => undefined, (caught: unknown) => caught);
+      } finally {
+        await factory.close();
+      }
+    }
+
+    function failClassificationLockOn(
+      ctx: ReturnType<typeof harness>,
+      captures: { count: number },
+      failingCall: number,
+      failure: unknown,
+    ): void {
+      const original = ctx.dependencies.withClassificationLock;
+      ctx.dependencies.withClassificationLock = async (home, callback) => {
+        captures.count += 1;
+        if (captures.count === failingCall) throw failure;
+        return original(home, callback);
+      };
+    }
+
+    it.each([
+      ["before", 1],
+      ["after", 2],
+    ] as const)("marks contention on the %s witness capture and keeps the public error", async (_when, call) => {
+      const error = await openWith((ctx, captures) => failClassificationLockOn(
+        ctx, captures, call, new PrivateMutationLockContentionError("busy canary")));
+      expect(error).toBeInstanceOf(StorageOperationError);
+      expect(isPublicationWitnessContention(error)).toBe(true);
+      expect(error).toMatchObject(initializationFailure);
+      expect(JSON.stringify(error)).not.toContain("busy canary");
+      const plain = new StorageOperationError(
+        "STORAGE_INITIALIZATION_FAILED", "postgresql", PROJECT_ID, "factory", "openExistingProject");
+      expect(Object.keys(error as object)).toEqual(Object.keys(plain));
+      expect((error as StorageOperationError).toJSON()).toEqual(plain.toJSON());
+    });
+
+    it("marks a publication change between the two witness captures", async () => {
+      const error = await openWith((ctx) => {
+        let calls = 0;
+        ctx.dependencies.captureState = () => {
+          calls += 1;
+          return calls === 1 ? state : { ...state, config: { ...state.config, byteLength: 1 } };
+        };
+      });
+      expect(isPublicationWitnessContention(error)).toBe(true);
+      expect(error).toMatchObject(initializationFailure);
+    });
+
+    it.each([
+      ["a database failure", (ctx: ReturnType<typeof harness>) => {
+        ctx.runtime.query = async () => { throw new Error("connection refused canary"); };
+      }],
+      ["a malformed remote identity", (ctx: ReturnType<typeof harness>) => {
+        ctx.runtime.project = { ...remoteProject, projectId: "0195d250-0000-7000-8000-0000000000ff" };
+      }],
+      ["an unresolvable witness without contention", (ctx: ReturnType<typeof harness>, captures: { count: number }) => {
+        failClassificationLockOn(ctx, captures, 1, new Error("journal canary"));
+      }],
+      ["an unresolvable witness on the after capture", (ctx: ReturnType<typeof harness>, captures: { count: number }) => {
+        failClassificationLockOn(ctx, captures, 2, new Error("journal canary"));
+      }],
+      ["an absent journal", (ctx: ReturnType<typeof harness>) => {
+        ctx.dependencies.readJournal = () => null;
+      }],
+      ["a journal that is not completed PostgreSQL", (ctx: ReturnType<typeof harness>) => {
+        ctx.dependencies.readJournal = () => ({ ...journal, phase: "prepared" }) as BackendPublicationJournal;
+      }],
+    ] as const)("does not mark %s", async (_label, configure) => {
+      const error = await openWith(configure);
+      expect(error).toBeInstanceOf(StorageOperationError);
+      expect(error).toMatchObject({ code: "STORAGE_INITIALIZATION_FAILED" });
+      expect(isPublicationWitnessContention(error)).toBe(false);
+    });
+
+    it("does not mark a rejected caller identity or a plain lookalike", async () => {
+      const ctx = harness();
+      const factory = await createPostgreSqlStorageBackendFactoryForTesting(
+        config,
+        "/home/operator",
+        ctx.dependencies,
+      );
+      const error = await factory
+        .openExistingProject({ ...identity, id: "not-a-uuid" })
+        .then(() => undefined, (caught: unknown) => caught);
+      expect(error).toBeInstanceOf(StorageOperationError);
+      expect(isPublicationWitnessContention(error)).toBe(false);
+      expect(isPublicationWitnessContention(new Error("x"))).toBe(false);
+      expect(isPublicationWitnessContention(undefined)).toBe(false);
+      await factory.close();
+    });
   });
 
   it("reports sanitized runtime health while open", async () => {

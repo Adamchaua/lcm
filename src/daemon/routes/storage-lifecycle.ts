@@ -7,8 +7,8 @@ import type {
 import { createStorageBackendFactory } from "../../storage/index.js";
 import type { DaemonConfig } from "../config.js";
 import { projectIdentity } from "../project.js";
-import type { RouteExecutionContext } from "../server.js";
-import { StorageOperationError } from "../../storage/errors.js";
+import type { RouteExecutionContext, RoutePublicationAdmission } from "../server.js";
+import { StorageOperationError, normalizeStorageError } from "../../storage/errors.js";
 import {
   STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
   STORAGE_IDENTITY_REQUIRED_MACHINE_REASON,
@@ -26,7 +26,9 @@ import {
   BackendPublicationJournalError,
   type BackendPublicationLockToken,
 } from "../../storage/backend-publication.js";
-import { createAbortError } from "../cancellation.js";
+import { createAbortError, isAbortError } from "../cancellation.js";
+import { PrivateMutationLockContentionError } from "../../private-mutation-lock.js";
+import { isPublicationWitnessContention } from "../../storage/postgresql/factory.js";
 
 interface AsyncClosable {
   close(publicationLockToken?: BackendPublicationLockToken): Promise<void> | void;
@@ -127,6 +129,18 @@ export type ProjectStorageOperation<T> = (
   publicationLockToken?: BackendPublicationLockToken,
 ) => Promise<T> | T;
 
+/**
+ * A read prefix failure that the daemon's own publication work may have caused:
+ * publication-lock contention from factory creation, identity, or the open, or
+ * the open's initialization failure marked as publication-witness contention.
+ * Other initialization failures (database outage, timeout, identity mismatch)
+ * and construction failures never qualify.
+ */
+function isContendedReadPrefixFailure(error: unknown, openStage: boolean): boolean {
+  return error instanceof PrivateMutationLockContentionError
+    || (openStage && isPublicationWitnessContention(error));
+}
+
 export function sameStorageIdentity(
   expected: StorageIdentityContext & { readonly localProjectId: string },
   actual: StorageIdentityContext & { readonly localProjectId: string },
@@ -192,23 +206,28 @@ export async function withProjectStorage<T>(
   request: ProjectStorageRequest,
   operation: ProjectStorageOperation<T>,
 ): Promise<T | null> {
-  const signal = request.context?.signal ?? new AbortController().signal;
+  const context = request.context;
+  const signal = context?.signal ?? new AbortController().signal;
   throwIfRouteAborted(signal);
   let activeFactory = request.factory;
   let ownedFactory: StorageBackendFactory | undefined;
 
   const state = { openPending: false };
+  const createOwnedFactory = async (
+    publicationLockToken?: BackendPublicationLockToken,
+  ): Promise<StorageBackendFactory> => {
+    activeFactory = await createStorageBackendFactory(
+      request.config.storage,
+      undefined,
+      undefined,
+      publicationLockToken,
+    );
+    ownedFactory = activeFactory;
+    return activeFactory;
+  };
   const run = async (publicationLockToken?: BackendPublicationLockToken): Promise<T | null> => {
     throwIfRouteAborted(signal);
-    if (activeFactory === undefined) {
-      activeFactory = await createStorageBackendFactory(
-        request.config.storage,
-        undefined,
-        undefined,
-        publicationLockToken,
-      );
-      ownedFactory = activeFactory;
-    }
+    const factory = activeFactory ?? await createOwnedFactory(publicationLockToken);
 
     const identity = projectIdentity(
       request.cwd,
@@ -239,8 +258,8 @@ export async function withProjectStorage<T>(
       state.openPending = true;
       try {
         project = request.mode === "existing"
-          ? await openExistingProject(activeFactory, identity, publicationLockToken, signal) ?? undefined
-          : await activeFactory.openProject(identity, publicationLockToken, signal);
+          ? await openExistingProject(factory, identity, publicationLockToken, signal) ?? undefined
+          : await factory.openProject(identity, publicationLockToken, signal);
       } finally {
         state.openPending = false;
       }
@@ -260,9 +279,88 @@ export async function withProjectStorage<T>(
     }
   };
 
-  const privateExecution = request.context?.withPublicationAdmission !== undefined
-    ? request.context.withPublicationAdmission(run, signal)
-    : run(request.context?.publicationLockToken);
+  /**
+   * PostgreSQL read path: the prefix first runs unadmitted, as every read does.
+   * If the daemon's own publication work made it contend, the same prefix is
+   * retried once inside a bounded admission. The operation and the close run
+   * outside admission without a token.
+   */
+  const runRead = async (withReadAdmission: RoutePublicationAdmission): Promise<T | null> => {
+    let project: ProjectStorage | undefined;
+    let projectClose: Promise<void> | undefined;
+    let setupComplete = false;
+    let openStage = false;
+    const closeProject = (runBeforeClose = true): Promise<void> => {
+      projectClose ??= (async () => {
+        if (runBeforeClose) await request.beforeClose?.();
+        await settleClose(project);
+      })();
+      return projectClose;
+    };
+    const onAbort = (): void => {
+      void closeProject();
+    };
+    const openPrefix = async (publicationLockToken?: BackendPublicationLockToken): Promise<void> => {
+      openStage = false;
+      throwIfRouteAborted(signal);
+      const factory = activeFactory ?? await createOwnedFactory(publicationLockToken);
+      const identity = projectIdentity(request.cwd, request.config.storage, publicationLockToken);
+      setupComplete = true;
+      if (request.expectedIdentity !== undefined
+          && !sameStorageIdentity(request.expectedIdentity, identity)) {
+        throw new BackendPublicationJournalError(
+          "unexpected-state",
+          "project storage identity changed during publication admission",
+        );
+      }
+      openStage = true;
+      state.openPending = true;
+      try {
+        project = request.mode === "existing"
+          ? await openExistingProject(factory, identity, publicationLockToken, signal) ?? undefined
+          : await factory.openProject(identity, publicationLockToken, signal);
+      } finally {
+        state.openPending = false;
+      }
+    };
+
+    try {
+      try {
+        await openPrefix();
+      } catch (error) {
+        if (!isContendedReadPrefixFailure(error, openStage)) throw error;
+        try {
+          await withReadAdmission(openPrefix, signal);
+        } catch (admissionError) {
+          // The admission may reject after the prefix returned a project.
+          if (project !== undefined) await closeProject(false);
+          throw admissionError;
+        }
+      }
+      throwIfRouteAborted(signal);
+      if (project === undefined) return null;
+
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        throw createRouteAbortError();
+      }
+      return await operation(project, signal);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      if (setupComplete) await closeProject();
+    }
+  };
+
+  const withReadAdmission = context?.withPublicationAdmission === undefined
+    && context?.publicationLockToken === undefined
+    ? context?.withReadAdmission
+    : undefined;
+  const privateExecution = context?.withPublicationAdmission !== undefined
+    ? context.withPublicationAdmission(run, signal)
+    : withReadAdmission !== undefined
+      ? runRead(withReadAdmission)
+      : run(context?.publicationLockToken);
   // Attach observers immediately so a prompt public cancellation never leaves
   // a late open rejection unobserved.
   const observedExecution = privateExecution.then(
@@ -374,4 +472,39 @@ export function storageRouteFailureResponse(
   if (selectedBackend !== "postgresql" || !(error instanceof StorageOperationError)) return null;
   void operation;
   return { status: 503, body: error.toJSON() };
+}
+
+/**
+ * Classify a failure that rejected a read route's project-storage scope.
+ *
+ * On PostgreSQL every such failure is a sanitized 503 rather than an empty
+ * success body. Intentional cancellation and SQLite keep the route's existing
+ * non-fatal handling.
+ */
+export function storageReadFailureResponse(
+  selectedBackend: StorageBackendName,
+  error: unknown,
+  operation: string,
+  legacyStagedFactory?: StorageBackendFactory,
+): StorageRouteFailureResponse | null {
+  const classified = storageRouteFailureResponse(selectedBackend, error, operation, legacyStagedFactory);
+  if (classified) return classified;
+  if (isAbortError(error) || selectedBackend !== "postgresql") return null;
+  if (error instanceof PrivateMutationLockContentionError) {
+    return {
+      status: 503,
+      body: new StorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        "postgresql",
+        undefined,
+        "identity",
+        operation,
+        { retryable: true },
+      ).toJSON(),
+    };
+  }
+  return {
+    status: 503,
+    body: normalizeStorageError(error, { backend: "postgresql", domain: "factory", operation }).toJSON(),
+  };
 }

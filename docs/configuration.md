@@ -492,6 +492,17 @@ project binding, or backend support are unavailable. The daemon starts one
 selected-backend factory and routes bounded repository batches through it. An
 unbound or invalid project returns sanitized `409` identity guidance; a
 selected-backend initialization or operation failure returns a sanitized `503`.
+On PostgreSQL, the read routes `/search`, `/grep`, `/recent`, `/describe`, and
+`/expand` likewise return a sanitized `503` when project storage fails,
+including publication-lock contention (marked retryable), instead of an empty
+or null `200`.
+When such a read first meets the daemon's own publication work, for example a
+replication sweep phase, it waits up to one second for a turn in the daemon's
+publication queue and retries once. If the retry fails, the read returns the
+sanitized `503`; contention with publication work and an expired wait are
+marked retryable, while a genuine storage failure keeps `retryable: false`.
+The one-second limit only bounds waiting in the queue: a lock held by another process
+fails immediately once the turn is granted.
 The daemon cancels request-scoped work on client disconnect and drains active
 consumers before closing the factory during shutdown. No PostgreSQL failure
 opens a project SQLite database as a recovery path.
