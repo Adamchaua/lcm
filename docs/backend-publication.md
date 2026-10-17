@@ -548,7 +548,12 @@ guard by hand. Four exports in `src/storage` cover that.
   to 24 hours), and it validates all three when it is created.
 - `composeBackendPublicationMaterial` (`backend-publication-material.ts`)
   reads the live `config.json` and `map.json` and returns
-  `{ sourceBackend, targetBackend, material, projects }`.
+  `{ sourceBackend, targetBackend, material, projects }`. It runs the
+  stored-config validator on the composed target config and refuses with
+  `backend publication target config is invalid for <target>` before
+  anything is prepared, so a source config that the target backend would
+  reject (for example a null `storage.postgresql.migrationRole` composed for
+  PostgreSQL) never reaches the project map.
 - `readRetainedBackendPublicationMaterial` returns the retained recovery
   material of the last completed publication.
 
@@ -659,10 +664,16 @@ archives it, and the reader never looks in `history/`, so after a new
 `readRetainedBackendPublicationMaterial` answers `present` (with the journal
 and the authenticated material), `authoritatively-absent` (the publication
 directory is confirmed absent, or the journal is not at `completed`), or
-`unresolvable` with a reason. A publication directory that exists without a
-readable journal, and a completed journal whose material file is missing or
-fails authentication, are `unresolvable`; neither is treated as "nothing to
-reverse".
+`unresolvable` with a reason. `present` requires a completed journal that
+passes the same terminal-evidence checks as consumer access (a recovery
+reference, no active remote fence, published hashes equal to the intended
+hashes), material that authenticates, and the same journal checksum when the
+journal is re-read after the material read. The reader takes no lock, so
+`present` does not promise that the journal is still the live one when the
+call returns. A publication directory that exists without a readable
+journal, a completed journal that fails those checks or whose material file
+is missing or fails authentication, and a journal that changes while it is
+read are `unresolvable`; none of them is treated as "nothing to reverse".
 
 ### What the driver leaves to the coordinator
 

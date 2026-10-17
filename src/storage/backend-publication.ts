@@ -1553,11 +1553,11 @@ function readPublicationJournalForAccess(
   return journal;
 }
 
-function assertTerminalPublicationEvidence(
+function authenticateTerminalPublicationEvidence(
   journal: BackendPublicationJournal,
   directoryHandle: BackendPublicationDirectoryHandle,
   homeDir?: string,
-): void {
+): BackendPublicationRecoveryMaterial | null {
   if (journal.phase !== "completed" && journal.phase !== "aborted") {
     return fail("unresolved-publication", "backend publication is unresolved; recover it before consuming local state");
   }
@@ -1569,8 +1569,9 @@ function assertTerminalPublicationEvidence(
       return fail("malformed-journal", "terminal backend publication retains an active remote fence");
     }
   }
+  let material: BackendPublicationRecoveryMaterial | null = null;
   try {
-    authenticateMaterial(homeDir, journal, directoryHandle);
+    material = authenticateMaterial(homeDir, journal, directoryHandle).material;
   } catch (error) {
     // Aborted publications remove their recovery material after the journal
     // reaches its terminal state. The journal checksum and state witnesses
@@ -1589,6 +1590,15 @@ function assertTerminalPublicationEvidence(
   ) {
     return fail("malformed-journal", "completed backend publication lacks intended-state witnesses");
   }
+  return material;
+}
+
+function assertTerminalPublicationEvidence(
+  journal: BackendPublicationJournal,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  homeDir?: string,
+): void {
+  authenticateTerminalPublicationEvidence(journal, directoryHandle, homeDir);
 }
 
 function withConsumerPublicationJournal<T>(
@@ -3601,6 +3611,51 @@ export function readAuthenticatedBackendPublicationMaterial(
     publicationHandle?.close();
     rootHandle?.close();
   }
+}
+
+/**
+ * Read the live journal and, only when it is `completed`, the retained
+ * recovery material, validated as terminal consumer evidence: a recovery
+ * reference, no active remote fence, material that authenticates, and
+ * published hashes equal to the intended hashes. Returns `null` when the
+ * publication directory is confirmed absent or the journal is not
+ * `completed` (including `aborted`).
+ *
+ * The journal, the terminal checks and the material read share one
+ * publication directory handle, and the material is authenticated once with
+ * the strict directory checks. Afterwards the journal is re-read through the
+ * same handle: a different checksum fails with `unexpected-state` and a
+ * missing journal with `publication-evidence-missing`. This is an
+ * observation, not a snapshot; the journal can still change after the
+ * re-read. The function takes no publication lock, so a caller that already
+ * holds the consumer lock may call it.
+ */
+export function readRetainedCompletedBackendPublicationEvidence(
+  homeDir?: string,
+): Readonly<{ journal: BackendPublicationJournal; material: BackendPublicationRecoveryMaterial }> | null {
+  return withPublicationJournalForConsumer(homeDir, (journal, handle) => {
+    if (journal === null || journal.phase !== "completed") return null;
+    const rootHandle = openOptionalRootDirectory(homeDir);
+    try {
+      const material = authenticateTerminalPublicationEvidence(journal, handle!, homeDir)!;
+      const current = readJournalFromDirectory(homeDir, handle);
+      if (current === null) {
+        return fail(
+          "publication-evidence-missing",
+          "backend publication journal disappeared while reading retained material",
+        );
+      }
+      if (current.checksumSha256 !== journal.checksumSha256) {
+        return fail(
+          "unexpected-state",
+          "backend publication journal changed while reading retained material",
+        );
+      }
+      return { journal, material };
+    } finally {
+      rootHandle?.close();
+    }
+  });
 }
 
 function prospectiveJournal(
