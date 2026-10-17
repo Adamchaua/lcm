@@ -11,6 +11,9 @@ import type {
 import {
   PostgreSqlBackendPublicationGuard,
 } from "../../src/storage/postgresql/publication-guard.js";
+import {
+  createPostgreSqlBackendPublicationRemoteGuard,
+} from "../../src/storage/postgresql/publication-remote-guard.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import {
   assertHarnessReady,
@@ -230,6 +233,50 @@ describe("PostgreSQL publication guard post-wait database time", () => {
         holder.release();
         await Promise.allSettled([holder.completion, contender]);
       }
+    });
+  });
+});
+
+describe("PostgreSQL publication remote guard provider", () => {
+  it("adopts a lease the consumer acquired and renewed, then releases it", async () => {
+    await withPostgreSqlTestDatabase("publication-remote-guard", async (database) => {
+      const fixture = await publicationFixture(database, "remote-guard");
+      // The fixture's one-second lease is meant for expiry tests; renew it so
+      // adoption cannot race its own expiry.
+      const renewed = await fixture.guard.renew({ ...fixture.mutation, ttlMs: 60_000 });
+      const provider = createPostgreSqlBackendPublicationRemoteGuard({
+        guard: fixture.guard,
+        machineId: fixture.mutation.machineId,
+        ttlMs: 60_000,
+      });
+      const context = {
+        homeDir: undefined,
+        journal: {
+          publicationId: fixture.mutation.publicationId,
+          targetBackend: fixture.mutation.targetBackend,
+        },
+        project: {
+          localProjectId: "c".repeat(64),
+          remoteProjectId: fixture.mutation.projectId,
+          evidenceSha256: EVIDENCE,
+          fence: null,
+        },
+      } as never;
+      const token = renewed.fencingToken.toString();
+
+      await expect(provider.readRemoteGuard(context, "acquire")).resolves.toMatchObject({
+        fencingToken: token,
+        releasedAt: null,
+        databaseExpired: false,
+      });
+      const adopted = await provider.acquireRemoteGuard(context);
+      expect(adopted.fencingToken).toBe(token);
+      expect(adopted.releasedAt).toBeNull();
+
+      await provider.releaseRemoteGuard({ ...context, fence: adopted });
+      const released = await provider.readRemoteGuard(context, "release");
+      expect(released?.fencingToken).toBe(token);
+      expect(released?.releasedAt).not.toBeNull();
     });
   });
 });

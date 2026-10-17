@@ -254,8 +254,11 @@ Bootstrap migration attempts have their own existing bounds. Worktree
 reconciliation lock acquisition uses a five-second monotonic retry window and
 polls at most every 50 milliseconds; wall-clock corrections do not extend or
 shorten that window. Ordinary command I/O plus an in-flight attempt can extend
-total command time. Missing, foreign, malformed, stale, or unhealthy
-publication evidence still fails closed and exits with status 1. Before the
+total command time. The retry authenticates the publication lock owner
+recorded when the contention occurred, so a managed daemon that releases the
+lock before it can be read again still qualifies. A contention reported for
+any other lock, and an absent daemon identity, or foreign, malformed, stale,
+or unhealthy publication evidence, still fails closed and exits with status 1. Before the
 retry deadline's expiry is recognized, a refusal reports the current typed
 contention; after recognized expiry, the first contention for the current
 lock-acquisition callback is preserved only if that callback admitted at least

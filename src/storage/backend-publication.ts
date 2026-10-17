@@ -1838,7 +1838,7 @@ function completeConsumerOperation<T>(
   if (outcome.error instanceof PrivateMutationLockContentionError) {
     throw new PrivateMutationLockContentionError(
       outcome.error.message,
-      { cause: aggregate },
+      { cause: aggregate, contendedLock: outcome.error.contendedLock },
     );
   }
   throw aggregate;
@@ -3546,6 +3546,60 @@ function authenticateMaterial(
     };
   } finally {
     assertBackendPublicationMaterialDirectory(homeDir, directoryHandle, allowMutableDirectoryNlink);
+  }
+}
+
+/**
+ * Read and authenticate the sealed recovery material for a publication
+ * journal that already carries a recovery reference, opening and closing
+ * its own root and publication directory handles for one lock-free read.
+ *
+ * This is the ONLY authenticator for the on-disk material format. It exists
+ * so that external readers (#1433's retained-material reader, built for
+ * rollback eligibility) never reimplement path derivation, byte-cap, mode,
+ * or digest checks in a second place that would have to agree with this one.
+ * A second encoding of "what a valid material file looks like" is exactly
+ * the defect #1433 exists to close, one level down.
+ *
+ * Unlike the in-flight {@link BackendPublicationCoordinator} call sites that
+ * reach {@link authenticateMaterial} while a live journal is still being
+ * driven forward, this export REFUSES a journal whose {@link
+ * BackendPublicationJournal.recoveryReference} is `null`. Internally,
+ * {@link authenticateMaterial} tolerates a `null` reference by synthesizing
+ * one with an empty seal digest and a zero byte length, and its digest
+ * comparison is written as `reference.sealSha256 !== "" && ...`, so a
+ * synthesized reference silently skips the checksum comparison entirely.
+ * That tolerance is correct for its own caller (a publication still in the
+ * `preparing` phase, before a reference has ever been sealed) and would be
+ * wrong evidence for this one: a caller reading a journal from outside the
+ * coordinator has no other reason to expect an unauthenticated read to
+ * "succeed" silently. Refuse before calling through, rather than change
+ * {@link authenticateMaterial}'s behavior for its existing callers.
+ */
+export function readAuthenticatedBackendPublicationMaterial(
+  journal: BackendPublicationJournal,
+  homeDir?: string,
+): BackendPublicationRecoveryMaterial {
+  if (journal.recoveryReference === null) {
+    return fail(
+      "publication-evidence-missing",
+      "backend publication journal has no recovery reference to authenticate",
+    );
+  }
+  const rootHandle = openOptionalRootDirectory(homeDir);
+  let publicationHandle: BackendPublicationDirectoryHandle | undefined;
+  try {
+    publicationHandle = openOptionalPublicationDirectory(homeDir);
+    if (publicationHandle === undefined) {
+      return fail(
+        "publication-evidence-missing",
+        "backend publication directory is missing",
+      );
+    }
+    return authenticateMaterial(homeDir, journal, publicationHandle, true).material;
+  } finally {
+    publicationHandle?.close();
+    rootHandle?.close();
   }
 }
 

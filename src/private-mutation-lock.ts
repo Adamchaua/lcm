@@ -24,7 +24,23 @@ export type PrivateMutationLockOwner = {
   readonly createdAtMs?: number;
 };
 
-export class PrivateMutationLockContentionError extends Error {}
+export type PrivateMutationLockContention = Readonly<{
+  path: string;
+  owner: PrivateMutationLockOwner;
+}>;
+
+export class PrivateMutationLockContentionError extends Error {
+  /** The live owner read from the contended main lock, when this error reports one. */
+  readonly contendedLock?: PrivateMutationLockContention;
+
+  constructor(
+    message?: string,
+    options?: ErrorOptions & { contendedLock?: PrivateMutationLockContention },
+  ) {
+    super(message, options);
+    if (options?.contendedLock !== undefined) this.contendedLock = options.contendedLock;
+  }
+}
 
 export type PrivateMutationLockObserver = (
   event: string,
@@ -400,6 +416,7 @@ function acquireMutationLock(
       const reason = state === "live" ? `owned by live PID ${existing.owner.pid}` : "owner state is ambiguous";
       throw new PrivateMutationLockContentionError(
         `${label} mutation is already in progress (${reason}); retry after the active operation completes`,
+        state === "live" ? { contendedLock: { path: lockPath, owner: existing.owner } } : undefined,
       );
     }
     const reclaimPath = `${lockPath}.reclaim-${existing.owner.nonce}`;

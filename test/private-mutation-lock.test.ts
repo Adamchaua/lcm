@@ -596,6 +596,53 @@ describe("private mutation lock release recovery", () => {
 });
 
 describe("private mutation lock reclamation boundaries", () => {
+  it("carries the live owner and path on main-lock contention only", () => {
+    const live = makeLock();
+    let thrown: unknown;
+    withPrivateMutationLock(live.lockPath, "outer", () => {
+      try {
+        withPrivateMutationLock(live.lockPath, "inner", () => undefined);
+      } catch (error) {
+        thrown = error;
+      }
+    });
+    expect(thrown).toBeInstanceOf(PrivateMutationLockContentionError);
+    const contended = (thrown as PrivateMutationLockContentionError).contendedLock;
+    expect(contended?.path).toBe(live.lockPath);
+    expect(contended?.owner).toMatchObject({
+      version: 1,
+      pid: process.pid,
+      processStartTime: currentProcessStartTime(),
+    });
+
+    const ambiguous = makeLock();
+    writeFileSync(ambiguous.lockPath, ownerContent("6".repeat(32), { processStartTime: null }), { mode: 0o600 });
+    let ambiguousError: unknown;
+    try {
+      withPrivateMutationLock(ambiguous.lockPath, "ambiguous", () => undefined);
+    } catch (error) {
+      ambiguousError = error;
+    }
+    expect(ambiguousError).toBeInstanceOf(PrivateMutationLockContentionError);
+    expect((ambiguousError as PrivateMutationLockContentionError).contendedLock).toBeUndefined();
+
+    const claimed = makeLock();
+    writeFileSync(claimed.lockPath, ownerContent("7".repeat(32)), { mode: 0o600 });
+    const claim = `${claimed.lockPath}.reclaim-${"7".repeat(32)}`;
+    mkdirSync(claim);
+    writeFileSync(join(claim, "owner.json"), ownerContent("8".repeat(32), {
+      processStartTime: currentProcessStartTime(),
+    }), { mode: 0o600 });
+    let claimError: unknown;
+    try {
+      withPrivateMutationLock(claimed.lockPath, "claimed", () => undefined);
+    } catch (error) {
+      claimError = error;
+    }
+    expect(claimError).toBeInstanceOf(PrivateMutationLockContentionError);
+    expect((claimError as PrivateMutationLockContentionError).contendedLock).toBeUndefined();
+  });
+
   it("distinguishes a missing, live, and ambiguous reclaim claim", () => {
     const missing = makeLock();
     writeFileSync(missing.lockPath, ownerContent("1".repeat(32)), { mode: 0o600 });
