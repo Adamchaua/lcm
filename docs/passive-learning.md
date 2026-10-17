@@ -356,11 +356,15 @@ batch is uploaded once more without the rows that cannot go:
   is reported, and once the row has been attempted the configured number of
   times it is quarantined locally.
 
-The other rows of that batch are uploaded in the same pass instead of waiting
-for the row that failed it. If the new upload fails again, or the recovery
-query itself fails, the remaining rows are retried with backoff as for any other
-failed upload. This costs one recovery transaction and at most one extra upload,
-and only when an upload batch fails this way.
+The other rows of that batch are normally uploaded in the same pass instead of
+waiting for the row that failed it. If the new upload fails again, or the
+recovery query itself fails, the remaining rows are retried with backoff as for
+any other failed upload. This also happens when a different event from the same
+machine already holds the row's machine sequence number in the previous
+project: nothing is withdrawn, the extra upload fails, and the batch is retried
+with backoff as before. LCM never deletes that other event. This costs one
+recovery transaction and at most one extra upload, and only when an upload batch
+fails this way.
 
 Withdrawing a copy does not wait for the previous project's drain lease. That
 is safe because applying a passive event has no remote effect and a drainer
