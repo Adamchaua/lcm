@@ -2067,8 +2067,13 @@ function resolveRollbackPublicationSource(
   const sourceMap = decodeProjectMapFile(material.source.projectMap);
   const entry = sourceMap?.[input.localProjectId];
   // decodeProjectMapFile yields null -- hence an undefined entry -- unless the project map file is present and
-  // decodes, so the entry check alone also covers an absent or undecodable source map.
-  if (entry === undefined || material.source.config.presence !== "present") {
+  // decodes, so the entry check already covers an absent or undecodable source map at run time. The presence
+  // check is kept only because it narrows the recovery file's type for the digest below (tsc fails without it).
+  if (
+    entry === undefined
+    || material.source.config.presence !== "present"
+    || material.source.projectMap.presence !== "present"
+  ) {
     throw new RollbackOrchestrationError(
       "not-eligible",
       "retained-publication-source-unusable: the pre-activation config or project map cannot be read for the covered project",
