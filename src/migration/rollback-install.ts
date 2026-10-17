@@ -56,6 +56,7 @@ import {
   getExistingLcmConnection,
   invalidateLcmConnection,
 } from "../db/connection.js";
+import { syncPrivateDirectory } from "../security-files.js";
 import { rollbackGenerationPath } from "./rollback-generation.js";
 
 export type RollbackInstallErrorReason =
@@ -94,6 +95,11 @@ export interface InstallRollbackGenerationInput {
   readonly canonicalPath: string;
   /** BuildRollbackGenerationOutcome's databasePath when state is "verified". */
   readonly verifiedDatabasePath: string;
+  /**
+   * Flushes a directory so a rename's directory entries are durable. Defaults to syncPrivateDirectory
+   * (src/security-files.ts). Injectable so a test can fail it.
+   */
+  readonly syncDirectory?: (path: string) => void;
 }
 
 const COPY_CHUNK = 1024 * 1024;
@@ -189,6 +195,16 @@ export function checkCanonicalLiveExists(canonicalPath: string): boolean {
   }
 }
 
+/** Flushes the source and destination directories of a rename; a failure of either propagates. */
+function syncRenamedDirectories(sync: (path: string) => void, fromDir: string, toDir: string): void {
+  try {
+    sync(fromDir);
+    if (toDir !== fromDir) sync(toDir);
+  } catch (error) {
+    throw new RollbackInstallError("unsafe-storage", "a directory could not be flushed after a rename", { cause: error });
+  }
+}
+
 /**
  * Moves the live canonical database aside (if one exists) and installs
  * the verified generation in its place. Idempotent across a crash: if the
@@ -199,6 +215,7 @@ export function installRollbackGeneration(
   input: InstallRollbackGenerationInput,
 ): RollbackInstallOutcome {
   const canonicalPath = resolve(input.canonicalPath);
+  const syncDirectory = input.syncDirectory ?? ((path: string) => syncPrivateDirectory(path));
   try {
     releasePooledCanonicalConnection(canonicalPath);
   } catch (error) {
@@ -214,6 +231,8 @@ export function installRollbackGeneration(
     const before = witnessFile(canonicalPath);
     const preemptedPath = join(rollbackGenerationPath(input.homeDir, input.generationId), "preempted-canonical.sqlite");
     renameSync(canonicalPath, preemptedPath);
+    // Both directories changed (the entry left one and entered the other): flush them before anything else.
+    syncRenamedDirectories(syncDirectory, dirname(canonicalPath), dirname(preemptedPath));
     const after = witnessFile(preemptedPath);
     if (before.sha256 !== after.sha256 || before.size !== after.size) {
       throw new RollbackInstallError("move-aside-content-changed", "canonical database bytes changed across the move-aside rename");
@@ -223,5 +242,7 @@ export function installRollbackGeneration(
   }
 
   renameSync(input.verifiedDatabasePath, canonicalPath);
+  // The selection must not become durable before the installed database's directory entries are (A-03 / F3).
+  syncRenamedDirectories(syncDirectory, dirname(input.verifiedDatabasePath), dirname(canonicalPath));
   return { canonicalPath, preempted };
 }

@@ -140,6 +140,69 @@ describe("installRollbackGeneration", () => {
     expect(preempted.before.size).toBe(preempted.after.size);
   });
 
+  it("F3: flushes both directories after the move-aside and again after the install, before returning", () => {
+    const homeDir = tempHome();
+    const canonicalPath = liveCanonicalDatabase(homeDir, "live-for-sync");
+    const generationDir = makeGenerationDir(homeDir, "gen-install-sync");
+    const verifiedPath = verifiedGenerationDatabase(generationDir, "verified-for-sync");
+    const canonicalDir = join(homeDir, ".lcm", "projects", "proj-1");
+    const events: string[] = [];
+    const renamesBefore = renameSpy.mock.calls.length;
+    installRollbackGeneration({
+      homeDir, generationId: "gen-install-sync", canonicalPath, verifiedDatabasePath: verifiedPath,
+      syncDirectory: (path) => {
+        const renames = renameSpy.mock.calls.length - renamesBefore;
+        events.push(`after-rename-${renames}:${path === canonicalDir ? "canonical" : path === generationDir ? "generation" : path}`);
+      },
+    });
+    expect(events).toEqual([
+      "after-rename-1:canonical", "after-rename-1:generation",
+      "after-rename-2:generation", "after-rename-2:canonical",
+    ]);
+  });
+
+  it("F3: a failing directory flush after the move-aside refuses before the install rename", () => {
+    const homeDir = tempHome();
+    const canonicalPath = liveCanonicalDatabase(homeDir, "live-sync-fails");
+    const generationDir = makeGenerationDir(homeDir, "gen-install-sync-fail-1");
+    const verifiedPath = verifiedGenerationDatabase(generationDir, "verified-sync-fails");
+    const renamesBefore = renameSpy.mock.calls.length;
+    expect(() => installRollbackGeneration({
+      homeDir, generationId: "gen-install-sync-fail-1", canonicalPath, verifiedDatabasePath: verifiedPath,
+      syncDirectory: () => { throw new Error("EIO: directory sync failed"); },
+    })).toThrow(expect.objectContaining({ reason: "unsafe-storage", message: expect.stringContaining("flushed") }));
+    expect(renameSpy.mock.calls.length - renamesBefore).toBe(1);
+  });
+
+  it("F3: a failing directory flush after the install rename refuses (the install does not return)", () => {
+    const homeDir = tempHome();
+    const canonicalPath = liveCanonicalDatabase(homeDir, "live-sync-fails-late");
+    const generationDir = makeGenerationDir(homeDir, "gen-install-sync-fail-2");
+    const verifiedPath = verifiedGenerationDatabase(generationDir, "verified-sync-fails-late");
+    let syncs = 0;
+    expect(() => installRollbackGeneration({
+      homeDir, generationId: "gen-install-sync-fail-2", canonicalPath, verifiedDatabasePath: verifiedPath,
+      syncDirectory: () => { syncs += 1; if (syncs === 3) throw new Error("EIO: second flush failed"); },
+    })).toThrow(expect.objectContaining({ reason: "unsafe-storage" }));
+    expect(syncs).toBe(3);
+  });
+
+  it("F3: the second directory of a flush pair is not flushed twice when both entries share a directory", () => {
+    const homeDir = tempHome();
+    const dir = join(homeDir, ".lcm", "projects", "proj-same");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const canonicalPath = join(dir, "db.sqlite");
+    const verifiedPath = verifiedGenerationDatabase(dir, "same-dir");
+    const flushed: string[] = [];
+    // verified lives beside the canonical path here, so a single directory changes.
+    realRenameSync(verifiedPath, join(dir, "staged.sqlite"));
+    installRollbackGeneration({
+      homeDir, generationId: "gen-install-same-dir", canonicalPath, verifiedDatabasePath: join(dir, "staged.sqlite"),
+      syncDirectory: (path) => { flushed.push(path); },
+    });
+    expect(flushed).toEqual([dir]);
+  });
+
   it("installs directly with no preemption when nothing is live at the canonical path yet", async () => {
     const homeDir = tempHome();
     const canonicalPath = join(homeDir, ".lcm", "projects", "proj-2", "db.sqlite");

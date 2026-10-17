@@ -501,6 +501,40 @@ describe("runMigrationRollback", () => {
     expect(existsSync(canonicalPath)).toBe(false);
   });
 
+  it("F3: a failing directory flush after the install leaves the maintenance held and no selection prepared", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-sync-fail");
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const coordinator = coordinatorFor(homeDir);
+    const prepare = vi.spyOn(coordinator, "prepareMaintenanceSelection");
+
+    await expect(runRollback({
+      homeDir, generationId: "gen-sync-fail", canonicalPath: join(homeDir, "live.sqlite"),
+      projectIdentity: identity, localProjectId: "local-post",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, {
+      coordinator,
+      ...authoritativeDeps(fixtureActivationScenario({
+        destinationIdentity, censusVector: fixtureCensusVector("census"), canonicalDeltaBaseline: fixtureCanonicalDelta("baseline"),
+      })),
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      syncDirectory: () => { throw new Error("EIO: directory sync failed"); },
+      openFencedSession: async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+          destinationIdentity, postEpochDelta: fixtureCanonicalDelta("changed"), postEpochCensus: null,
+        }],
+        source: sqliteSourceStream,
+      }),
+    })).rejects.toThrow("flushed");
+
+    expect(prepare).not.toHaveBeenCalled();
+    expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+    expect(new MigrationManifestStore({ homeDir }).read("gen-sync-fail").pendingEffect?.kind).toBe("publish-rollback");
+  });
+
   it("post-write: builds, installs, materializes, publishes, and reports, ending at phase rolled-back", async () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });

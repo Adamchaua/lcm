@@ -64,6 +64,7 @@ import {
   atomicWritePrivateFileDurable,
   ensurePrivateDirectory,
   openPrivateDirectoryIfExists,
+  syncPrivateDirectory,
   readBoundedRegularFileWithStat,
 } from "../security-files.js";
 import { parseDaemonConfig, resolveDaemonConfigEnv, type ResolvedStorageConfig } from "../daemon/config.js";
@@ -925,6 +926,8 @@ export interface RunMigrationRollbackDependencies {
   readonly composePublication?: typeof composeBackendPublicationMaterial;
   /** Records the rollback witness in the evidence store (A9 step 1). Defaults to recordMigrationActivationWitness. */
   readonly recordActivationWitness?: MigrationActivationWitnessRecorder;
+  /** Flushes a directory after the install's renames (F3). Defaults to installRollbackGeneration's own. */
+  readonly syncDirectory?: (path: string) => void;
 }
 
 type ResolvedRollbackDependencies = Required<RunMigrationRollbackDependencies>;
@@ -944,6 +947,7 @@ function withDefaultDependencies(
     readRetainedMaterial: deps.readRetainedMaterial ?? readRetainedBackendPublicationMaterial,
     composePublication: deps.composePublication ?? composeBackendPublicationMaterial,
     recordActivationWitness: deps.recordActivationWitness ?? recordMigrationActivationWitness,
+    syncDirectory: deps.syncDirectory ?? ((path: string) => syncPrivateDirectory(path)),
   };
 }
 
@@ -1787,6 +1791,7 @@ async function runPostPrepareSequence(
       generationId: built!.generationId,
       canonicalPath: input.canonicalPath,
       verifiedDatabasePath: built!.databasePath,
+      syncDirectory: deps.syncDirectory,
     });
     materializeRollbackSidecars({
       homeDir: input.homeDir,
