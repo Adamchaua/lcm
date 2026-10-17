@@ -124,4 +124,3 @@ describe("PostgreSQL rollback census drift (donadiosolutions/lcm#626 plan-v2 sec
     });
   });
 });
-

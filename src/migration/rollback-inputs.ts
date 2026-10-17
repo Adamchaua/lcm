@@ -333,4 +333,3 @@ export async function runMigrationRollbackFromHome(
     throw toMigrationRollbackError(error);
   }
 }
-

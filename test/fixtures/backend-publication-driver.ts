@@ -124,4 +124,3 @@ export function activationPublicationMaterial(): BackendPublicationRecoveryMater
 export function rollbackFixtureCoordinator(homeDir: string): BackendPublicationCoordinator {
   return new BackendPublicationCoordinator({ homeDir, driver: workingPublicationDriver(rollbackPublicationMaterial()) });
 }
-

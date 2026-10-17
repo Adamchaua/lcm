@@ -423,4 +423,3 @@ describe("resolveRollbackAuthoritativeContext", () => {
       .rejects.toMatchObject({ name: "MigrationActivationEvidenceRefusalError", reason: "evidence-unresolvable" });
   });
 });
-

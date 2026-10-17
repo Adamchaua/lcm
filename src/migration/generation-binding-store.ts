@@ -1451,4 +1451,3 @@ export function resolveMigrationWitnessBindings(
     selections: orderedByRevision(selections, (entry) => entry.kind),
   };
 }
-

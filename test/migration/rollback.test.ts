@@ -3472,4 +3472,3 @@ describe("readOwnPublicationSourceFromMaterial: the rollback's sealed pre-public
       .toThrow(expect.objectContaining({ reason: "unexpected-state", message: expect.stringContaining("sealed no source file") }));
   });
 });
-

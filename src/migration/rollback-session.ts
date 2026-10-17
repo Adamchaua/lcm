@@ -461,4 +461,3 @@ export async function openRollbackFencedSession(
     throw error;
   }
 }
-

@@ -245,4 +245,3 @@ export function fixtureActivationScenario(input: FixtureActivationScenarioInput 
     context: { epoch, attempt, witness } as RollbackAuthoritativeContext,
   };
 }
-

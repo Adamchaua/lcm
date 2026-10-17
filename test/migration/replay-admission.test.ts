@@ -212,4 +212,3 @@ describe("assertMigrationReplayAdmission routes from durable authority (A15)", (
     expect(() => replay(homeDir, HASH_B)).toThrow("migration manifest cannot be read");
   });
 });
-

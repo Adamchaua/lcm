@@ -372,4 +372,3 @@ export function evaluateRollbackEligibility(input: Readonly<{
   if (classification.mode === "pre-write") return { eligibility: "pre-write", mode: "pre-write" };
   return { eligibility: "post-write", mode: "post-write" };
 }
-

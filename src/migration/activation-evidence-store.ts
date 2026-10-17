@@ -410,4 +410,3 @@ export async function resolveRollbackAuthoritativeContext(
   if (witness === undefined || witness.epochId !== epoch.epochId || witness.attemptId !== attempt.attemptId) return null;
   return { epoch, attempt, witness };
 }
-

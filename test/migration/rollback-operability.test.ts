@@ -87,4 +87,3 @@ describe("readBackendPublicationOperabilityFact failure attribution", () => {
     expect(await readBackendPublicationOperabilityFact({ homeDir: tempHome() })).toMatchObject({ state: "present" });
   });
 });
-

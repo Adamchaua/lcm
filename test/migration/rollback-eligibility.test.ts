@@ -413,4 +413,3 @@ describe("classifyRollbackEligibilityMode (plan-v3.1 A3)", () => {
       .toThrow(TypeError);
   });
 });
-
