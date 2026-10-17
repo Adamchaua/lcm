@@ -1,0 +1,11 @@
+references: ["#1538", "#1537", "#1530", "#620"]
+rationale: >-
+  Bounded read admission for PostgreSQL daemon reads. The daemon core
+  (src/daemon/server.ts) gains the queue-wait-bounded admission it hands to
+  PostgreSQL read routes, and the daemon route storage lifecycle
+  (src/daemon/routes/storage-lifecycle.ts) retries a contended
+  identity/open prefix once inside it. No file is added, removed, moved, or
+  re-owned; both files stay in the components that already own them.
+pins:
+  - ["src/daemon/server.ts", "unit-daemon-core"]
+  - ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"]
