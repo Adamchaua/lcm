@@ -54,6 +54,7 @@ import {
   recordMigrationActivationWitness,
 } from "../../src/migration/activation-evidence-store.js";
 import {
+  MigrationBindingUnresolvableError,
   migrationGenerationBindingDirectory,
   recordMigrationSelectionBinding,
   recordMigrationWitnessBinding,
@@ -1857,6 +1858,44 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       const outcome = await runRollback(RUN(homeDir), depsFor(homeDir));
       expect(outcome.manifest.phase).toBe("verified");
       expect(outcome.report).toMatchObject({ kind: "abandonment", selectionBindingManifestRevision: null });
+    });
+
+    it("F5: an unresolvable binding store refuses the no-journal fallthrough and changes nothing", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashAfter(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      await establishCompletedPostgresqlPublication(homeDir);
+      const store = new MigrationManifestStore({ homeDir });
+      const before = store.read(GEN);
+      const reportsBefore = readRollbackReport(homeDir, GEN, deriveRollbackReportId({ generationId: GEN, effectId: before.pendingEffect!.effectId, kind: "abandonment" }));
+      const coordinator = coordinatorFor(homeDir);
+      const abort = vi.spyOn(coordinator, "abortMaintenance");
+
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        coordinator, resolveWitnessBindings: () => fixtureBindingsUnresolvable("binding directory unreadable"),
+      }))).rejects.toThrow(MigrationBindingUnresolvableError);
+
+      const after = store.read(GEN);
+      expect(after.checksumSha256).toBe(before.checksumSha256);
+      expect(after.pendingEffect).toEqual(before.pendingEffect);
+      expect(after.phase).toBe(before.phase);
+      expect(reportsBefore).toBeNull();
+      expect(readRollbackReport(homeDir, GEN, deriveRollbackReportId({ generationId: GEN, effectId: before.pendingEffect!.effectId, kind: "abandonment" }))).toBeNull();
+      expect(abort).not.toHaveBeenCalled();
+      expect(rollbackBinding(homeDir)).toBeUndefined();
+    });
+
+    it("F5: an unresolvable binding store also refuses a coordinator publication in the slot, without finishing it", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashAfter(coordinatorFor(homeDir), "prepare") })))
+        .rejects.toThrow("simulated crash");
+      const before = new MigrationManifestStore({ homeDir }).read(GEN);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        resolveWitnessBindings: () => fixtureBindingsUnresolvable("binding directory unreadable"),
+      }))).rejects.toThrow(MigrationBindingUnresolvableError);
+      expect(new MigrationManifestStore({ homeDir }).read(GEN).checksumSha256).toBe(before.checksumSha256);
     });
 
     it("abandons a pending effect whose maintenance was aborted, without aborting it again", async () => {

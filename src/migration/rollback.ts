@@ -122,6 +122,7 @@ import {
   readRetainedBackendPublicationMaterial,
 } from "../storage/backend-publication-material.js";
 import {
+  MigrationBindingUnresolvableError,
   recordMigrationSelectionBinding,
   recordMigrationWitnessBinding,
   resolveMigrationWitnessBindings,
@@ -2370,6 +2371,12 @@ async function recoverPendingPublishRollback(
 
     const hasRollbackSelectionBinding = (): boolean => {
       const resolution = deps.resolveWitnessBindings({ homeDir: input.homeDir, generationId: input.generationId });
+      if (resolution.state === "unresolvable") {
+        throw new MigrationBindingUnresolvableError(
+          "the selection bindings cannot be resolved, so whether this rollback's selection completed is unknown: "
+            + resolution.reason,
+        );
+      }
       return resolution.state === "resolved" && resolution.selections.some((selection) => selection.kind === "rollback");
     };
 
