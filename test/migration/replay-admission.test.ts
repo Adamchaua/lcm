@@ -103,8 +103,11 @@ function witness(backend: "sqlite" | "postgresql"): MigrationStorageWitness {
   return { version: 1, backend, identitySha256: (backend === "sqlite" ? "1" : "4").repeat(64), schemaSha256: "2".repeat(64), contentSha256: "3".repeat(64), capturedAt: AT };
 }
 
-/** A manifest driven to phase rolled-back (or, with `complete` false, left with the publish effect pending). */
-function manifestRolledBack(homeDir: string, complete = true): void {
+/**
+ * A manifest driven to phase rolled-back (or, with `complete` false, left with the publish effect pending; with
+ * `stopAt` "prepared", left at rolling-back between the two effects, with none pending).
+ */
+function manifestRolledBack(homeDir: string, complete = true, stopAt: "published" | "prepared" = "published"): void {
   const store = new MigrationManifestStore({ homeDir });
   let m = store.create(createMigrationManifest({
     generationId: GENERATION_ID, source: witness("sqlite"), destination: witness("postgresql"), parentGenerationId: null,
@@ -121,6 +124,7 @@ function manifestRolledBack(homeDir: string, complete = true): void {
   step("complete-copy");
   step("verify-generation", { report: { kind: "verification", reportId: "r2", reportSha256: HASH_B, createdAt: AT }, activationEligible: true });
   step("prepare-rollback");
+  if (stopAt === "prepared") return;
   step("publish-rollback", {
     report: { kind: "rollback", reportId: "r3", reportSha256: HASH_B, createdAt: AT }, rollbackMode: "pre-write",
   }, complete);
@@ -180,6 +184,21 @@ describe("assertMigrationReplayAdmission routes from durable authority (A15)", (
     await selectBackend(homeDir, "sqlite", HASH_B);
     await archiveMaintenanceJournal(homeDir);
     expect(() => replay(homeDir, HASH_B)).toThrow("does not match a terminal maintenance generation");
+  });
+
+  it("refuses a manifest that is not at rolled-back even though no effect is pending (rolling-back between its effects)", async () => {
+    const homeDir = home();
+    manifestRolledBack(homeDir, true, "prepared");
+    await selectBackend(homeDir, "sqlite", HASH_B);
+    await archiveMaintenanceJournal(homeDir);
+    expect(() => replay(homeDir, HASH_B)).toThrow("does not match a terminal maintenance generation");
+  });
+
+  it("decides from a selection-completed journal still in the live slot only for its own terminal evidence", async () => {
+    const homeDir = home();
+    await selectBackend(homeDir, "postgresql", HASH_A);
+    expect(replay(homeDir, HASH_A)).toEqual({ backend: "postgresql", disposition: "selected" });
+    expect(() => replay(homeDir, HASH_B)).toThrow("no authoritative terminal");
   });
 
   it("refuses while this generation's maintenance is live and non-terminal, whatever the durable record says", async () => {

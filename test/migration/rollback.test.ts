@@ -1067,6 +1067,7 @@ describe("runMigrationRollback", () => {
       }),
     });
 
+    expect(outcome).toMatchObject({ report: { kind: "abandonment" } });
     expect(outcome.manifest.phase).toBe("verified");
     expect(outcome.manifest.rollbackLineage.returnPhase).toBeNull();
     expect(outcome.manifest.pendingEffect).toBeNull();
@@ -1740,7 +1741,11 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       session.closeKeepingLease = async () => { calls.push("closeKeepingLease"); await keep(); };
       return { session, calls };
     };
-    const changedSession = (observation: Partial<{ postEpochDelta: ReturnType<typeof fixtureCanonicalDelta>; postEpochCensus: ReturnType<typeof fixtureCensusVector> | null }>) => async () => fakeSession({
+    const changedSession = (observation: Partial<{
+      postEpochDelta: ReturnType<typeof fixtureCanonicalDelta>;
+      postEpochCensus: ReturnType<typeof fixtureCensusVector> | null;
+      destinationIdentity: typeof destinationIdentity;
+    }>) => async () => fakeSession({
       observations: [{
         manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
         destinationIdentity, postEpochDelta: baseline, postEpochCensus: census, ...observation,
@@ -1825,6 +1830,108 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       }))).rejects.toMatchObject({ reason: "drift" });
       expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
     });
+
+    it("F1: a prepared selection is refused with the fresh refusal when the destination identity changed", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: changedSession({ destinationIdentity: fixtureDestinationIdentity("another-cluster") }),
+      }))).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("destination identity") });
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+    });
+
+    it("F1: a prepared selection is refused when the mode flipped, even if the session's evidence hash did not see it", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: async () => {
+          const session = await changedSession({ postEpochDelta: fixtureCanonicalDelta("a16-written-meanwhile"), postEpochCensus: null })();
+          const real = session.computeRollbackTerminalEvidenceSha256.bind(session);
+          // The evidence the original pre-write decision hashed, whatever the fresh readback says.
+          session.computeRollbackTerminalEvidenceSha256 = (evidence) => real({
+            ...evidence, mode: "pre-write", observation: { ...evidence.observation, postEpochDelta: baseline, postEpochCensus: census },
+          });
+          return session;
+        },
+      }))).rejects.toMatchObject({ reason: "drift" });
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+    });
+
+    it("F1: a prepared selection is refused when the evidence hash no longer reproduces although the mode is unchanged", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: async () => {
+          const session = await unchangedSession();
+          session.computeRollbackTerminalEvidenceSha256 = () => "f".repeat(64);
+          return session;
+        },
+      }))).rejects.toMatchObject({ reason: "drift" });
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+    });
+
+    it("F1: the recovery session keeps the lease when its own revalidation refuses", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      const { session, calls } = await watched(changedSession({ postEpochDelta: fixtureCanonicalDelta("a16-written-meanwhile"), postEpochCensus: null }));
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { openFencedSession: async () => session })))
+        .rejects.toMatchObject({ reason: "drift" });
+      expect(calls).toEqual(["closeKeepingLease"]);
+    });
+
+    describe("a prepared post-write selection", () => {
+      const written = fixtureCanonicalDelta("a16-written");
+      const postWriteSession = (delta = written) => async () => fakeSession({
+        observations: [{
+          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
+          destinationIdentity, postEpochDelta: delta, postEpochCensus: null,
+        }],
+        source: sqliteSourceStream,
+        exportEvidence: { canonicalDelta: written, censusVector: census },
+      });
+      const preparedPostWrite = async (homeDir: string) => {
+        prepareAuthoritative(homeDir);
+        await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+          openFencedSession: postWriteSession(),
+          coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection"),
+        }))).rejects.toThrow("simulated crash");
+        expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+      };
+
+      it("F1: recovery asks the fresh readback for the census and completes it", async () => {
+        const homeDir = tempHome();
+        await preparedPostWrite(homeDir);
+        const requests: Array<boolean | undefined> = [];
+        const outcome = await runRollback(RUN(homeDir), depsFor(homeDir, {
+          openFencedSession: async () => {
+            const session = await postWriteSession()();
+            const real = session.captureReadback.bind(session);
+            session.captureReadback = async (request) => { requests.push(request.requireCensus); return real(request); };
+            return session;
+          },
+        }));
+        expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+        expect(requests).toEqual([true]);
+      });
+
+      it("F1: recovery refuses when the destination was written again meanwhile (same mode, other evidence)", async () => {
+        const homeDir = tempHome();
+        await preparedPostWrite(homeDir);
+        await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+          openFencedSession: postWriteSession(fixtureCanonicalDelta("a16-written-again")),
+        }))).rejects.toMatchObject({ reason: "drift" });
+        expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
+      });
+    });
+
 
     it("F1: a prepared selection whose authority no longer resolves is refused, not completed", async () => {
       const homeDir = tempHome();
@@ -1917,6 +2024,33 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashAfter(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
         .rejects.toThrow("simulated crash");
       await expect(runRollback(RUN(homeDir), depsFor(homeDir, { resolveActivationEvidence: () => fixtureEvidenceAbsent })))
+        .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("no stored rollback witness") });
+    });
+
+    it("row 5: takes the mode from the stored rollback witness whose checksum the pending effect names, not another rollback witness", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashAfter(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      const stored = readMigrationActivationEvidence({ homeDir, generationId: GEN });
+      if (stored.state !== "resolved") throw new Error("expected the evidence store to resolve");
+      const real = stored.witnesses.find((witness) => witness.kind === "rollback")!;
+      const decoy = { ...real, checksumSha256: "d".repeat(64), rollbackMode: "post-write" as const };
+      const outcome = await runRollback(RUN(homeDir), depsFor(homeDir, {
+        resolveActivationEvidence: () => ({ ...stored, witnesses: [decoy, ...stored.witnesses] }),
+      }));
+      expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
+    });
+
+    it("row 5: a stored witness that carries the pending effect's checksum but is not a rollback witness is not its mode source", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashAfter(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
+        .rejects.toThrow("simulated crash");
+      const stored = readMigrationActivationEvidence({ homeDir, generationId: GEN });
+      if (stored.state !== "resolved") throw new Error("expected the evidence store to resolve");
+      const witnesses = stored.witnesses.map((witness) => (witness.kind === "rollback" ? { ...witness, kind: "activation" as const } : witness));
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { resolveActivationEvidence: () => ({ ...stored, witnesses }) })))
         .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("no stored rollback witness") });
     });
 
@@ -2239,6 +2373,41 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
           await expect(runRollback(RUN(homeDir), depsFor(homeDir)))
             .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("does not agree") });
         }
+      });
+
+      it("refuses a report whose effect id is not the rollback publish effect of a terminal evidence digest", async () => {
+        const homeDir = tempHome();
+        prepareAuthoritative(homeDir);
+        const scenario = scenarioFor(GEN);
+        const store = new MigrationManifestStore({ homeDir });
+        let m = store.read(GEN);
+        m = store.update(GEN, m.checksumSha256, (c) => beginMigrationEffect(c, {
+          kind: "prepare-rollback", effectId: "prepare-rollback", inputSha256: "7".repeat(64), startedAt: capturedAt,
+        }));
+        m = store.update(GEN, m.checksumSha256, (c) => completeMigrationEffect(c, { effectId: "prepare-rollback", completedAt: capturedAt }));
+        writeRollbackAuthorityArtifact(homeDir, {
+          version: 2, generationId: GEN, operabilityFactState: "authoritatively-absent", operabilityFactValueSha256: null,
+          authorityStatus: "authoritative", epochId: scenario.epoch.epochId, attemptId: scenario.attempt.attemptId,
+          publication: PUBLICATION_SOURCE,
+        });
+        // An effect id that is not "rollback-publish-" plus the terminal evidence digest.
+        const effectId = "rollback-publish-not-a-digest";
+        m = store.update(GEN, m.checksumSha256, (c) => beginMigrationEffect(c, {
+          kind: "publish-rollback", effectId, inputSha256: "7".repeat(64), startedAt: capturedAt,
+        }));
+        const report = writeRollbackReport(homeDir, {
+          version: 1, reportId: deriveRollbackReportId({ generationId: GEN, effectId, kind: "rollback" }),
+          generationId: GEN, effectId, kind: "rollback", eligibility: "post-write", mode: "post-write",
+          epochId: scenario.epoch.epochId, attemptId: scenario.attempt.attemptId,
+          sealedPublicationMaterialDigestSha256: null, reason: null, selectionBindingManifestRevision: m.revision,
+        });
+        store.update(GEN, m.checksumSha256, (c) => completeMigrationEffect(c, {
+          effectId, completedAt: capturedAt,
+          report: { kind: "rollback", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: capturedAt },
+          rollbackMode: "post-write",
+        }));
+        await expect(runRollback(RUN(homeDir), depsFor(homeDir)))
+          .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("does not agree with the rollback authority artifact") });
       });
 
       it("refuses a stored binding revision that the manifest history contradicts", async () => {
@@ -3428,6 +3597,7 @@ describe("runMigrationRollback: the publication source and the coordinator's pub
     const corruptions: ReadonlyArray<(journal: any) => unknown> = [
       (journal) => ({ ...journal, publicationId: "another-publication" }),
       (journal) => ({ ...journal, sourceBackend: "sqlite" }),
+      (journal) => ({ ...journal, phase: "prepared" }),
       (journal) => ({ ...journal, targetBackend: "postgresql" }),
       (journal) => ({ ...journal, projects: [] }),
       (journal) => ({ ...journal, projects: [{ ...journal.projects[0], localProjectId: "another-local-project" }] }),

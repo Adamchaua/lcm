@@ -224,6 +224,17 @@ describe("openRollbackFencedSession: opening", () => {
   });
 
   it("refuses when the expired lease cannot be read back for takeover", async () => {
+    const { guard: ambiguous, state: ambiguousState } = statefulGuard(fenceRow({ fencingToken: 2n }));
+    let acquires = 0;
+    ambiguous.acquire = async () => {
+      acquires += 1;
+      // The first acquire's commit outcome is ambiguous; a takeover attempted from there would have succeeded.
+      if (acquires === 1) throw guardError("readback-mismatch");
+      return (ambiguousState.row = fenceRow({ fencingToken: 3n }));
+    };
+    await expect(open(harness({ guard: ambiguous }))).rejects.toMatchObject({ reason: "lease-unavailable" });
+    expect(acquires).toBe(1);
+
     const { guard } = statefulGuard(fenceRow({ databaseExpired: true }));
     guard.read = async () => null;
     await expect(open(harness({ guard }))).rejects.toMatchObject({ reason: "lease-unavailable" });
@@ -340,6 +351,13 @@ describe("renew", () => {
     const session = await open(harness({ guard }));
     guard.read = async () => fenceRow({ publicationId: "taken-over-by-another" });
     await expect(session.renew()).rejects.toMatchObject({ reason: "lease-lost" });
+  });
+
+  it("throws when the renew itself is refused although the row still reads as held", async () => {
+    const { guard } = statefulGuard();
+    const session = await open(harness({ guard }));
+    guard.renew = async () => { throw guardError("fence-mismatch"); };
+    await expect(session.renew()).rejects.toMatchObject({ name: "RollbackSessionError", reason: "lease-lost" });
   });
 
   it("throws when the fence was released underneath the session", async () => {

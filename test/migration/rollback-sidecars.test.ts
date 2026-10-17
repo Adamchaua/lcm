@@ -488,6 +488,24 @@ describe("verifySessionInstructionsAgainstArchive", () => {
     }
   });
 
+  it("goes red when the project holds a session instruction row the archive does not account for (count check)", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const db = new DatabaseSync(path);
+    try {
+      db.prepare(
+        `INSERT INTO session_instruction_cache (project_id, scope_hash, client_name, session_id, worktree_path, cwd_path, content, content_hash, updated_at)
+         VALUES (?, ?, 'codex', 'orphan-session', '/tmp', '/tmp', 'orphan content', ?, '2026-01-01T00:00:00.000000Z')`,
+      ).run(LOCAL_PROJECT_ID, "e".repeat(64), "e".repeat(64));
+      // The reported count still equals the archive's, and every archived row matches: only the readback count sees it.
+      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized, MACHINE_A_UUID))
+        .toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining("holds") }));
+    } finally {
+      db.close();
+    }
+  });
+
   it("goes red when the archive holds more rows than were ever materialized, even if every materialized row still matches", () => {
     const homeDir = tempHome();
     const { path } = seedGeneration();

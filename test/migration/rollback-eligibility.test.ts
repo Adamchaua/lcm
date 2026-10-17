@@ -131,7 +131,8 @@ describe("resolveActivationAuthority: the unactivated truth table (plan-v3.1 A1)
     const { scenario } = published();
     expect(refusal({
       resolution: { state: "resolved", witnesses: [], selections: [scenario.selection] },
-      evidence: fixtureEvidenceAbsent,
+      // Empty record lists, so a mutant that skipped this refusal would answer witness-missing instead of crashing.
+      evidence: { ...fixtureEvidenceAbsent, epochs: [], attempts: [], witnesses: [] } as MigrationActivationEvidenceResolution,
       operabilityFact: fixtureOperabilityAbsent,
     })).toContain("a binding exists without its evidence record");
   });
