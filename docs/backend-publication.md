@@ -52,7 +52,10 @@ process birth, token, and health identity without replaying startup or taking
 the publication lock across a wait. The initially authenticated daemon identity
 is the sole source for the retry's version, backend, entrypoint, and runtime
 digest expectations; none of those fields can be omitted from a captured
-identity. A token rotation, PID or birth mismatch, changed
+identity. The window authenticates the lock owner recorded when the
+contention occurred, so a daemon that releases the lock before it can be read
+again still qualifies; a contention reported for a different lock does not. A
+token rotation, PID or birth mismatch, changed
 runtime/version/backend/entrypoint, missing or malformed owner,
 unknown publication home, health failure, timeout, cancellation, or any other
 non-contention error fails closed. Cancellation after contention rethrows the
@@ -790,6 +793,8 @@ fails closed. A bounded process-birth or authenticated-health probe that
 settles failed at or after the armed deadline preserves the original
 contention without another wait; the same failed evidence while time remains
 reports the later contention, and admission stays fail-closed in both cases.
+The owner recorded with the contention is authenticated by the same process
+birth and health checks, even when its lock file has since been released.
 
 If a valid lock owner removes its lock while another process is reading that
 owner record, LCM retries acquisition once only when a retained-parent check

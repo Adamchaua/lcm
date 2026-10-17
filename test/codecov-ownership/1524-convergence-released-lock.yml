@@ -1,0 +1,11 @@
+references: ["#1524"]
+rationale: >-
+  #1524 carries the live owner and path of a contended main lock on
+  PrivateMutationLockContentionError, propagates it through the two
+  contention rewrap sites, and lets publication convergence authenticate
+  that recorded owner; all four files keep their existing owners.
+pins:
+  - ["src/private-mutation-lock.ts", "unit-configuration-security"]
+  - ["src/runtime-paths.ts", "unit-configuration-security"]
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
+  - ["src/storage/publication-convergence.ts", "unit-storage-abstractions"]
