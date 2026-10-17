@@ -373,9 +373,7 @@ type PassiveEventReadbackRow = Readonly<{
   priority: number;
   source_hook: string;
   created_at: string;
-  delivery_state: string;
-  processed_at: string | null;
-  quarantine_reason: string | null;
+  disposition: "applied" | "pending" | "quarantined";
 }>;
 
 /**
@@ -386,6 +384,14 @@ type PassiveEventReadbackRow = Readonly<{
  * DO NOTHING means a retry's insert count under-reports already-materialized
  * rows, but every archived row must still be present with matching
  * content for this to pass, which is the invariant that actually matters.
+ *
+ * An archived event is matched by its canonical identity and content and by its portable disposition (applied,
+ * pending or quarantined), classified exactly as the portable encoders do (sqlite/portable-sidecars.ts and
+ * postgresql/portable-mapping.ts): applied when processed_at is set or delivery_state is 'acknowledged',
+ * quarantined when delivery_state is 'quarantined', else pending. The row a fresh insert writes and a row the
+ * replication worker has since acknowledged are both applied, so an existing acknowledged row keeps its
+ * remote_inbox_id and acknowledgement and is neither rewritten nor replayed; a row whose content or disposition
+ * differs from the archive still refuses.
  *
  * The two sets are accounted for separately. The live local outbox legitimately holds appends made after the
  * cutoff that the archive never saw. The events table's own state model (hooks/events-db.ts) marks a row as
@@ -406,7 +412,10 @@ export function verifyPassiveEventsAgainstArchive(
 ): Readonly<{ verifiedImported: number; preservedPending: number }> {
   const select = eventsDb.prepare(
     `SELECT event_version, machine_id, machine_sequence, session_id, seq, type, category, data,
-            priority, source_hook, created_at, delivery_state, processed_at, quarantine_reason
+            priority, source_hook, created_at,
+            CASE WHEN processed_at IS NOT NULL OR delivery_state = 'acknowledged' THEN 'applied'
+                 WHEN delivery_state = 'quarantined' THEN 'quarantined'
+                 ELSE 'pending' END AS disposition
      FROM events WHERE event_uuid = ?`,
   );
   let archiveCount = 0;
@@ -419,7 +428,6 @@ export function verifyPassiveEventsAgainstArchive(
     archivedEventIds.add(v.eventId);
     const sequence = requireInteger(v.machineSequence, "passive-events.machineSequence");
     const createdAt = requireTimestamp(v.createdAt, "passive-events.createdAt");
-    const expected = dispositionColumns(v.disposition, createdAt);
     const stored = select.get(v.eventId) as PassiveEventReadbackRow | undefined;
     if (
       !stored
@@ -434,9 +442,7 @@ export function verifyPassiveEventsAgainstArchive(
       || BigInt(stored.priority) !== requireInteger(v.priority, "passive-events.priority")
       || stored.source_hook !== v.sourceHook
       || stored.created_at !== createdAt
-      || stored.delivery_state !== expected.deliveryState
-      || stored.processed_at !== expected.processedAt
-      || stored.quarantine_reason !== expected.quarantineReason
+      || stored.disposition !== v.disposition
     ) {
       throw new RollbackSidecarError(
         "verification-failed",

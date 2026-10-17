@@ -33,6 +33,7 @@ import {
 import { createPortableRecord, type PortableRecord } from "../../src/storage/portable-record.js";
 import { buildRecords, postgresGeneration, MACHINE_A, MACHINE_B, MACHINE_A_UUID } from "../fixtures/portable-records.js";
 import { eventsDir, eventSequenceDbPath } from "../../src/db/events-path.js";
+import { EventsDb } from "../../src/hooks/events-db.js";
 import { LocalHookEventSequenceAllocator, formatLocalHookMachineSequence } from "../../src/storage/local-hook-event-sequence.js";
 import {
   materializeRollbackSidecars,
@@ -46,6 +47,15 @@ import {
 } from "../../src/migration/rollback-sidecars.js";
 
 const LOCAL_PROJECT_ID = "c".repeat(64);
+
+function readEventRow(eventsDbPath: string, eventId: string): Record<string, unknown> {
+  const db = new DatabaseSync(eventsDbPath, { readOnly: true });
+  try {
+    return { ...db.prepare("SELECT * FROM events WHERE event_uuid = ?").get(eventId) };
+  } finally {
+    db.close();
+  }
+}
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true }); });
@@ -627,6 +637,83 @@ describe("verifyPassiveEventsAgainstArchive", () => {
     } finally {
       readback.close();
     }
+  });
+
++  it("F12: an archived applied event the replication worker already acknowledged materializes, stays acknowledged and is not replayed, beside pending-only extras", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const applied = passiveEventRecords.find((record) => record.value.disposition === "applied")!;
+    const appended = "018f7769-4c00-7f77-9b32-4a2f8f5cd00d";
+    const events = new EventsDb(first.eventsDbPath);
+    try {
+      expect(events.markAcknowledged(applied.value.eventId, 1n)).toBe(true);
+    } finally {
+      events.close();
+    }
+    const local = new DatabaseSync(first.eventsDbPath);
+    try {
+      local.exec(
+        `INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook)
+         VALUES ('${appended}', 1, '${formatLocalHookMachineSequence(1000n)}', 'post-cutoff', 'session.compacted', 'intent', '{}', 'PreCompact')`,
+      );
+    } finally {
+      local.close();
+    }
+    const acknowledgedBefore = readEventRow(first.eventsDbPath, applied.value.eventId);
+    expect(acknowledgedBefore).toMatchObject({ delivery_state: "acknowledged", remote_inbox_id: "1" });
+
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    expect(outcome.passiveEventsMaterialized).toBe(0);
+    expect(outcome.passiveEventsPreservedPending).toBe(1);
+    // Neither rewritten nor replayed: the whole row, acknowledgement included, is exactly as the worker left it.
+    expect(readEventRow(outcome.eventsDbPath, applied.value.eventId)).toEqual(acknowledgedBefore);
+    expect(readEventRow(outcome.eventsDbPath, appended)).toMatchObject({ delivery_state: "pending", remote_inbox_id: null });
+  });
+
+  it("F12: an existing row whose disposition contradicts the archive refuses, in either direction", () => {
+    const contradictions: ReadonlyArray<readonly [string, string]> = [
+      ["applied", "processed_at = NULL, delivery_state = 'pending'"],
+      ["pending", "delivery_state = 'replicated', remote_inbox_id = 'inbox-1', processed_at = '2026-01-01T00:00:00.000000Z'"],
+      ["quarantined", "delivery_state = 'pending', quarantine_reason = NULL"],
+      ["pending", "delivery_state = 'quarantined', quarantine_reason = 'rejected'"],
+    ];
+    for (const [archived, localState] of contradictions) {
+      const homeDir = tempHome();
+      const { path, passiveEventRecords } = seedGeneration();
+      const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+      const target = passiveEventRecords.find((record) => record.value.disposition === archived)!;
+      const local = new DatabaseSync(first.eventsDbPath);
+      try {
+        local.exec(`UPDATE events SET ${localState} WHERE event_uuid = '${target.value.eventId}'`);
+      } finally {
+        local.close();
+      }
+      expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID }))
+        .toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining(target.value.eventId) }));
+    }
+  });
+
+  it("F12: an existing row whose payload differs from the archive still refuses even when its disposition matches", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const applied = passiveEventRecords.find((record) => record.value.disposition === "applied")!;
+    const events = new EventsDb(first.eventsDbPath);
+    try {
+      events.markAcknowledged(applied.value.eventId, 1n);
+    } finally {
+      events.close();
+    }
+    const local = new DatabaseSync(first.eventsDbPath);
+    try {
+      local.exec(`UPDATE events SET data = '{"other":true}' WHERE event_uuid = '${applied.value.eventId}'`);
+    } finally {
+      local.close();
+    }
+    expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID }))
+      .toThrow(expect.objectContaining({ reason: "verification-failed" }));
   });
 
   it("goes red when a stored event the archive holds is missing", () => {
