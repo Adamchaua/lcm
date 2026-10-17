@@ -418,13 +418,16 @@ effect boundary.
 Rollback decides what to unwind from durable evidence, so activation writes
 that evidence in a fixed order:
 
-1. The activation's backend publication (the PostgreSQL configuration and the
-   project map entry that binds the project to its PostgreSQL id) is made
-   durable.
-2. The activation records its epoch, attempt and witness, then its selection
-   binding. The selection binding is written **before** the coordinator
-   publication is prepared, because preparing archives the maintenance
-   journal that the binding is derived from.
+1. Before the activation prepares its maintenance selection, it records, in
+   this order, its epoch, its attempt, its witness, and the binding of that
+   witness.
+2. After the maintenance selection completes, and before the coordinator
+   prepares the backend publication (the PostgreSQL configuration and the
+   project map entry that binds the project to its PostgreSQL id), it records
+   the selection binding. The binding is written **before** the publication is
+   prepared because preparing archives the maintenance journal that the
+   binding is derived from.
+3. The coordinator then publishes the backend publication durably.
 
 A crash while the publication is in flight leaves an activation that has to
 be resumed or aborted before anything else; rollback refuses to start over
