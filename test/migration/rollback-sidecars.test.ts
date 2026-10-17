@@ -373,6 +373,28 @@ describe("materializeRollbackSidecars", () => {
     expect(() => materializeRollbackSidecars({ homeDir: okHome, databasePath: okPath, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID })).not.toThrow();
   });
 
+  it("F8: refuses a session instruction whose machine identity key has no machines record", () => {
+    const homeDir = tempHome();
+    const { path } = tempGenerationPath();
+    const db = new DatabaseSync(path);
+    try {
+      runLcmMigrations(db, { fts5Available: false });
+      initializePortableArchive(db);
+      writePortableArchiveRecord(db, createPortableRecord({
+        domain: "session-instructions", ordinal: 0,
+        value: {
+          machineIdentityKey: "ghost-machine", scopeHash: "d".repeat(64), clientName: "codex", sessionId: "s",
+          worktreePath: "/w", cwdPath: "/w", content: "x", contentHash: "e".repeat(64), updatedAt: "2026-01-02T00:00:00.000000Z",
+        },
+        context: { projectIdentity: { scope: "local", projectId: "a".repeat(64) } },
+      }));
+    } finally {
+      db.close();
+    }
+    expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID }))
+      .toThrow(expect.objectContaining({ reason: "invalid-input", message: expect.stringContaining("ghost-machine") }));
+  });
+
   it("wraps a real events-directory creation failure as unsafe-storage", () => {
     const homeDir = tempHome();
     const { path } = tempGenerationPath();

@@ -21,9 +21,13 @@ rationale: >-
   MigrationRollbackError and the coordinator wiring), and rollback.ts the
   coordinator step and the resume table; both are materially changed and
   stay in the same owner. No file is added, removed, moved or re-owned.
+  src/migration/index.ts (the rollback export surface) and
+  src/storage/postgresql/factory.ts (an export made visible to the rollback
+  session) are also materially changed and keep their existing owners.
 pins:
   - ["src/migration/activation-evidence-store.ts", "unit-migration-cutover"]
   - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]
+  - ["src/migration/index.ts", "unit-migration-cutover"]
   - ["src/migration/maintenance.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-eligibility.ts", "unit-migration-cutover"]
   - ["src/migration/rollback-generation.ts", "unit-migration-cutover"]
@@ -33,4 +37,5 @@ pins:
   - ["src/migration/rollback-sidecars.ts", "unit-migration-cutover"]
   - ["src/migration/rollback.ts", "unit-migration-cutover"]
   - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
+  - ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"]
   - ["src/storage/local-hook-event-sequence.ts", "unit-local-event-storage"]

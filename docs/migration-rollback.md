@@ -12,11 +12,14 @@ rollback builds on.
 Rollback has two outcomes, decided from evidence at the moment it runs, never
 chosen by the operator:
 
-- **Pre-write or unactivated rollback copies nothing.** If PostgreSQL has
-  no activation evidence and no completed publication (for example, the
+- **Pre-write or unactivated rollback copies nothing.** If the project is
+  bound to PostgreSQL and the configuration selects PostgreSQL, but PostgreSQL
+  has no activation evidence and no completed publication (for example, the
   configuration was switched to PostgreSQL by hand), or it was activated but
-  nothing was durably written to it since, the live SQLite database at the canonical path is already correct
-  and current. No rollback generation is built, nothing is installed, no
+  nothing was durably written to it since, the live SQLite database at the
+  canonical path is already correct and current. (An installation that is not
+  bound and selected is refused instead; see the refusal section below.)
+  No rollback generation is built, nothing is installed, no
   runtime sidecar is materialized, and the live database is not touched. The
   reversal is the maintenance-selection flip back to SQLite, nothing else.
   Reconstructing the database from the preserved snapshot in this case would

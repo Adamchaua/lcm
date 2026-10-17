@@ -15,7 +15,7 @@
  * applyPortableBatchInTransaction branches on PORTABLE_ARCHIVE_DOMAINS.
  * includes(domain) and calls writePortableRuntimeRecord for everything
  * NOT in that set). Those need no further work. This module handles only
- * the two archive-only domains plan-v2 names by name -- 
+ * the two archive-only domains plan-v2 names by name --
  * "session-instructions" and "passive-events" -- plus the machine-wide
  * sequence reconciliation passive-events requires. The other six
  * archive-only domains (machines, project, project-aliases, and the
@@ -205,6 +205,10 @@ function isLocalMachineRow(
   machineIdentityKey: string,
   machineId: string,
 ): boolean {
+  // An unknown key is an archive inconsistency, not another machine's row: refuse like passive events do.
+  if (!machineIds.has(machineIdentityKey)) {
+    throw new RollbackSidecarError("invalid-input", `session instruction references unknown machine identity key ${machineIdentityKey}`);
+  }
   return machineIds.get(machineIdentityKey) === machineId;
 }
 

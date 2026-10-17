@@ -3,9 +3,10 @@
 ---
 
 Add reversible migration rollback: reverse a completed PostgreSQL
-activation back to SQLite. When PostgreSQL has no activation
-evidence, or it was activated but never written to, rollback flips the active
-backend selection back to SQLite without copying any data. When
+activation back to SQLite. When the project is bound to PostgreSQL and
+selected, and PostgreSQL has no activation evidence or was activated but never
+written to, rollback flips the active backend selection back to SQLite
+without copying any data. When
 PostgreSQL has been written to since activation, rollback builds a
 fresh SQLite generation from a fenced PostgreSQL snapshot, verifies
 it independently before installing it, and preserves the prior live
