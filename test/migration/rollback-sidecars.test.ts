@@ -734,7 +734,10 @@ describe("verifyPassiveEventsAgainstArchive", () => {
       }
     }
 
-    async function materializeThenSweep(options: { nullProcessedAt: boolean }) {
+    /** The consumer's own processed_at (EventsDb.markProcessed stamps datetime('now'), never the event's createdAt). */
+    const CONSUMER_PROCESSED_AT = "2026-03-04 05:06:07";
+
+    async function materializeThenSweep(options: { processedAt: "null" | "consumer" }) {
       const homeDir = tempHome();
       mkdirSync(join(homeDir, ".lcm"), { mode: 0o700 });
       chmodSync(homeDir, 0o700);
@@ -749,13 +752,12 @@ describe("verifyPassiveEventsAgainstArchive", () => {
         const first = materializeRollbackSidecars(input);
         const freshlyApplied = readEventRow(first.eventsDbPath, eventId);
         expect(freshlyApplied.processed_at).toEqual(expect.any(String));
-        if (options.nullProcessedAt) {
-          const local = new DatabaseSync(first.eventsDbPath);
-          try {
-            local.prepare("UPDATE events SET processed_at = NULL WHERE event_uuid = ?").run(eventId);
-          } finally {
-            local.close();
-          }
+        const local = new DatabaseSync(first.eventsDbPath);
+        try {
+          local.prepare("UPDATE events SET processed_at = ? WHERE event_uuid = ?")
+            .run(options.processedAt === "null" ? null : CONSUMER_PROCESSED_AT, eventId);
+        } finally {
+          local.close();
         }
         // The replication worker's acknowledgement: delivery_state, remote_inbox_id and acknowledged_at, never processed_at.
         const worker = new EventsDb(first.eventsDbPath);
@@ -766,7 +768,7 @@ describe("verifyPassiveEventsAgainstArchive", () => {
         }
         const acknowledged = readEventRow(first.eventsDbPath, eventId);
         expect(acknowledged).toMatchObject({
-          delivery_state: "acknowledged", remote_inbox_id: "1", processed_at: options.nullProcessedAt ? null : freshlyApplied.processed_at,
+          delivery_state: "acknowledged", remote_inbox_id: "1", processed_at: options.processedAt === "null" ? null : CONSUMER_PROCESSED_AT,
         });
 
         const outcome = materializeRollbackSidecars(input);
@@ -796,18 +798,19 @@ describe("verifyPassiveEventsAgainstArchive", () => {
     }
 
     it("sets the processing marker exactly as a fresh applied insert encodes it, keeping the acknowledgement, so the real consumer selects and promotes nothing", async () => {
-      const result = await materializeThenSweep({ nullProcessedAt: true });
+      const result = await materializeThenSweep({ processedAt: "null" });
       expect({ promotion: result.promotion, promotedMemories: result.promoted, selected: result.selected })
         .toMatchObject({ promotion: { promoted: 0, errors: 0 }, promotedMemories: 0, selected: [] });
       // Identity, acknowledgement and remote inbox id are exactly as the worker left them; only processed_at was reconciled.
       expect(result.after).toEqual({ ...result.before, processed_at: result.freshlyApplied.processed_at });
     });
 
-    it("control: a row the consumer already processed is left untouched and is not selected or promoted either", async () => {
-      const result = await materializeThenSweep({ nullProcessedAt: false });
+    it("control: a row the consumer already processed keeps its own processed_at and is not selected or promoted either", async () => {
+      const result = await materializeThenSweep({ processedAt: "consumer" });
       expect({ promotion: result.promotion, promotedMemories: result.promoted, selected: result.selected })
         .toMatchObject({ promotion: { promoted: 0, errors: 0 }, promotedMemories: 0, selected: [] });
       expect(result.after).toEqual(result.before);
+      expect(result.after.processed_at).toBe(CONSUMER_PROCESSED_AT);
     });
   });
 
