@@ -91,6 +91,7 @@ import {
   readRollbackAuthorityArtifact,
   readBackendPublicationOperabilityFact,
   readOwnPublicationSourceFromMaterial,
+  rollbackGenerationBuildBase,
   type RunMigrationRollbackDependencies,
   type RollbackFencedSession,
   type MigrationSelectionBindingRecorder,
@@ -3201,6 +3202,62 @@ describe("runMigrationRollback: recovery guards on settled and pending manifests
     expect(outcome.manifest.phase).toBe("rolled-back");
     const builds = readdirSync(join(homeDir, ".lcm", "migration-rollback-generations")).filter((name) => name.startsWith(GEN + "-rb"));
     expect(builds.map((name) => name.slice(name.lastIndexOf("-") + 1)).sort()).toEqual(["1", "2"]);
+  });
+
+  /**
+   * PR #1556 thread 4307516136: a generation id may be the full 128 characters the stores allow, so the build id
+   * cannot append "-rb<revision>-<ordinal>" verbatim. The base is bounded deterministically, independent of the
+   * revision and ordinal, so retries after a crash still find the earlier attempts of the same base.
+   */
+  describe("bounded build ids for long generation ids", () => {
+    const LONG = "g".repeat(128);
+    const BUDGET = 128 - ("-rb".length + 16 + "-".length + 16);
+
+    it("keeps a base within the budget unchanged and bounds a longer one deterministically, distinctly and within the character set", () => {
+      expect(rollbackGenerationBuildBase("g".repeat(BUDGET))).toBe("g".repeat(BUDGET));
+      const bounded = rollbackGenerationBuildBase(LONG);
+      expect(bounded).toHaveLength(BUDGET);
+      expect(bounded).toBe(rollbackGenerationBuildBase(LONG));
+      expect(bounded).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/u);
+      // Two ids that share every leading character differ by digest.
+      expect(rollbackGenerationBuildBase("g".repeat(127) + "h")).not.toBe(bounded);
+      expect(rollbackGenerationBuildBase("g".repeat(BUDGET + 1))).not.toBe(bounded);
+      // The longest suffix the derivation reserves for still fits the limit.
+      expect((bounded + "-rb" + "9".repeat(16) + "-" + "9".repeat(16)).length).toBe(128);
+    });
+
+    it("builds, crashes at step 10 and retries into the next ordinal with a 128-character generation id, every build id within the limit", async () => {
+      const homeDir = tempHome();
+      manifestAtVerified(new MigrationManifestStore({ homeDir }), LONG);
+      const destinationIdentity = fixtureDestinationIdentity("d");
+      const baseline = fixtureCanonicalDelta("long-baseline");
+      const run = { ...RUN(homeDir), generationId: LONG };
+      const retryDeps = (renewCrash: boolean): RunMigrationRollbackDependencies => ({
+        coordinator: coordinatorFor(homeDir),
+        ...authoritativeDeps(fixtureActivationScenario({
+          generationId: LONG, destinationIdentity, censusVector: fixtureCensusVector("long-census"), canonicalDeltaBaseline: baseline,
+        })),
+        recordSelectionBinding: () => undefined,
+        recordWitnessBinding: () => undefined,
+        openFencedSession: async () => {
+          const session = fakeSession({
+            observations: [{
+              destinationIdentity, postEpochDelta: fixtureCanonicalDelta("long-changed"), postEpochCensus: null,
+            }],
+            source: sqliteSourceStream,
+          });
+          if (renewCrash) session.renew = async () => { throw new Error("simulated crash at step 10"); };
+          return session;
+        },
+      });
+      await expect(runRollback(run, retryDeps(true))).rejects.toThrow("simulated crash at step 10");
+      const outcome = await runRollback(run, retryDeps(false));
+      expect(outcome.manifest.phase).toBe("rolled-back");
+      const prefix = rollbackGenerationBuildBase(LONG) + "-rb";
+      const builds = readdirSync(join(homeDir, ".lcm", "migration-rollback-generations")).filter((name) => name.startsWith(prefix));
+      expect(builds.map((name) => name.slice(name.lastIndexOf("-") + 1)).sort()).toEqual(["1", "2"]);
+      for (const name of builds) expect(name.length).toBeLessThanOrEqual(128);
+    });
   });
 
   it("refuses to abandon a pending publish-rollback whose maintenance selection completed for another backend", async () => {

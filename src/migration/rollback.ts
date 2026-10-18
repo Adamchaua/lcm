@@ -1559,6 +1559,31 @@ function rollbackGenerationBuildRoot(homeDir: string): string {
 
 const ROLLBACK_GENERATION_BUILD_ATTEMPT_ORDINAL_PATTERN = /^[1-9][0-9]*$/u;
 const MAX_ROLLBACK_GENERATION_BUILD_ATTEMPT_ENTRIES = 100_000;
+/** The generation-id limit the manifest store and the rollback generation builder both enforce. */
+const MAX_GENERATION_ID_LENGTH = 128;
+/**
+ * The longest suffix a build id appends to its base: "-rb" + revision + "-" + ordinal, each a safe integer of at
+ * most 16 digits. Reserving it keeps the base form independent of the revision and ordinal actually in use, so
+ * the ordinal lookup's prefix and every attempt's id agree for a given base whatever its attempt number is.
+ */
+const ROLLBACK_GENERATION_BUILD_SUFFIX_RESERVE = "-rb".length + 16 + "-".length + 16;
+const ROLLBACK_GENERATION_BUILD_BASE_BUDGET = MAX_GENERATION_ID_LENGTH - ROLLBACK_GENERATION_BUILD_SUFFIX_RESERVE;
+const ROLLBACK_GENERATION_BUILD_BASE_DIGEST_LENGTH = 32;
+
+/**
+ * The base a post-write rollback's generation ids are derived from (`<base>-rb<revision>-<ordinal>`). A generation
+ * id may itself be the full 128 characters the stores allow, so appending the suffix verbatim could exceed the
+ * limit the builder enforces and fail every build. A base within the budget is used unchanged; a longer one is
+ * bounded deterministically to its leading characters plus a 128-bit digest of the whole id, which keeps distinct
+ * bases distinct, stays within the generation-id character set, and lets a retry after a crash find the earlier
+ * attempts of the same base.
+ */
+/** @internal Exported for direct unit testing only; not part of the module's public surface. */
+export function rollbackGenerationBuildBase(baseGenerationId: string): string {
+  if (baseGenerationId.length <= ROLLBACK_GENERATION_BUILD_BASE_BUDGET) return baseGenerationId;
+  const head = baseGenerationId.slice(0, ROLLBACK_GENERATION_BUILD_BASE_BUDGET - 1 - ROLLBACK_GENERATION_BUILD_BASE_DIGEST_LENGTH);
+  return head + "-" + sha256(baseGenerationId).slice(0, ROLLBACK_GENERATION_BUILD_BASE_DIGEST_LENGTH);
+}
 
 /**
  * donadiosolutions/lcm#626 (post-write build retry). Three-valued, like
@@ -1595,7 +1620,7 @@ function highestRollbackGenerationBuildAttempt(
     const handle = openPrivateDirectoryIfExists(root);
     if (handle === undefined) return 0;
     try {
-      const prefix = baseGenerationId + "-rb" + revision.toString(10) + "-";
+      const prefix = rollbackGenerationBuildBase(baseGenerationId) + "-rb" + revision.toString(10) + "-";
       const directory = opendirSync(root, { bufferSize: 1 });
       let highest = 0;
       try {
@@ -1743,7 +1768,7 @@ async function runPostPrepareSequence(
     ) + 1;
     const buildOutcome = await buildRollbackGeneration({
       homeDir: input.homeDir,
-      generationId: input.generationId + "-rb" + working.revision + "-" + buildAttemptOrdinal,
+      generationId: rollbackGenerationBuildBase(input.generationId) + "-rb" + working.revision + "-" + buildAttemptOrdinal,
       projectIdentity: input.projectIdentity,
       source,
       exportEvidence,
