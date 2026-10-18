@@ -84,6 +84,7 @@ import {
   BackendPublicationCoordinator,
   type BackendPublicationJournal,
   type BackendPublicationLockToken,
+  type BackendPublicationPhase,
   type BackendPublicationRecoveryFile,
   type BackendPublicationRecoveryMaterial,
   type BackendMaintenanceRosterEntry,
@@ -2145,14 +2146,14 @@ async function publishRollbackSelection(phase: PublicationPhase): Promise<string
       projects: composed.projects,
     }, token);
   }
-  if (journal.phase === "aborted") {
-    throw new RollbackOrchestrationError("unexpected-state", "the rollback's coordinator publication was aborted");
-  }
-  if (journal.phase !== "completed") {
+  if (journal.phase !== "completed" && journal.phase !== "aborted") {
     // The coordinator acquires the remote fence (adopting the session's lease) and releases it on completion;
     // from here the session verifies instead of releasing.
     phase.session?.markCoordinatorAcquired();
     journal = await deps.coordinator.resume(token);
+  }
+  if (journal.phase === "aborted") {
+    throw new RollbackOrchestrationError("unexpected-state", "the rollback's coordinator publication was aborted");
   }
   const project = expectedRollbackProject(phase);
   if (
@@ -2291,6 +2292,20 @@ async function recoverRolledBackAuthority(
 }
 
 /**
+ * The coordinator publication phases at which the rollback's remote fence is still the coordinator's to acquire,
+ * adopt or release on its forward path (backend-publication.ts #resumeUnlocked: every one of them advances
+ * through #releaseAll). A recovery that meets one of them opens a fenced session on the rollback's lease tuple,
+ * which the coordinator adopts (or supersedes, when the row it recorded was already released) and releases. At
+ * released the fence is durably released and the coordinator finalizes without another release, and on the abort
+ * path it releases whatever it recorded through its own provider: a session lease acquired there would be a fresh
+ * row that nothing ever releases, and guarded PostgreSQL writers refuse while any unreleased row exists (E1).
+ */
+const FENCE_DRIVING_PUBLICATION_PHASES: readonly BackendPublicationPhase[] = [
+  "preparing", "prepared", "acquiring", "guarded", "map-publishing", "map-published",
+  "config-publishing", "config-published", "releasing",
+];
+
+/**
  * Recovers a rollback whose publish-rollback effect was pending when the
  * process died (plan-v3.2 A9 as amended by A16a, and the owner's decisions
  * on S3c). The effect is begun before anything is installed or selected, so
@@ -2309,7 +2324,10 @@ async function recoverRolledBackAuthority(
  *  - the live slot holds this rollback's coordinator publication (our own
  *    prepare archived the maintenance journal): the binding was written
  *    before it, so the coordinator is resumed (or, completed, verified)
- *    and the report and the manifest completion follow;
+ *    and the report and the manifest completion follow. A fenced session
+ *    is opened only while the coordinator still drives the fence
+ *    (FENCE_DRIVING_PUBLICATION_PHASES); at released, on the abort path
+ *    and at the terminal phases it is resumed without acquiring a lease;
  *  - the slot holds nothing of this rollback and no rollback selection
  *    binding exists: no selection could have completed, so the effect is
  *    abandoned. With a binding the selection did complete and the journal
@@ -2474,11 +2492,22 @@ async function recoverPendingPublishRollback(
         );
       }
       const phase = storedPhase();
-      // A completed or aborted journal needs no lease; any other state still has the remote fence to drive.
-      if (slot.journal.phase === "completed" || slot.journal.phase === "aborted") {
-        return finishRollbackPublication(phase, current);
+      if (FENCE_DRIVING_PUBLICATION_PHASES.includes(slot.journal.phase)) {
+        return withRecoverySession((session) => finishRollbackPublication({ ...phase, session }, current));
       }
-      return withRecoverySession((session) => finishRollbackPublication({ ...phase, session }, current));
+      // Released: the coordinator recorded the authoritative post-release readback of every fence when it got
+      // here, and resuming it only finalizes. Settling over a journal that says otherwise would report
+      // rolled-back with a fence this rollback acquired still unreleased, so it refuses instead.
+      if (
+        slot.journal.phase === "released"
+        && slot.journal.projects.some((project) => project.fence === null || project.fence.releasedAt === null)
+      ) {
+        throw new RollbackOrchestrationError(
+          "unexpected-state",
+          "the rollback's coordinator publication is released but does not record a released fence for every project",
+        );
+      }
+      return finishRollbackPublication(phase, current);
     }
     if (hasRollbackSelectionBinding()) {
       throw new RollbackOrchestrationError(

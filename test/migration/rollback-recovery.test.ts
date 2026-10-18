@@ -6,17 +6,21 @@
  * checkActivationWriterQuiescence legitimately handles elsewhere.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   BackendPublicationCoordinator,
+  backendPublicationCanonicalSha256,
+  backendPublicationJournalPath,
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
   withBackendPublicationAppendBarrierAsync,
   type BackendPublicationLockToken,
+  type BackendPublicationPhase,
 } from "../../src/storage/backend-publication.js";
+import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage/postgresql/publication-remote-guard.js";
 import { PORTABLE_RECORD_DOMAIN_ORDER } from "../../src/storage/portable-record.js";
 import type { ActivationLeasePublicationGuard } from "../../src/migration/activation-lease.js";
 import { checkActivationWriterQuiescence } from "../../src/migration/activation-quiescence.js";
@@ -62,8 +66,9 @@ import {
 import { fixtureActivationScenario, fixtureDestinationIdentity } from "../fixtures/migration-activation-records.js";
 
 const GEN = "gen-recovery";
-const MACHINE = "018f0b5d-1234-4abc-8def-1234567890ab";
-const OTHER_MACHINE = "018f0b5d-1234-4abc-8def-1234567890ff";
+// UUIDv7: the production remote-guard provider (shared-lease tests below) normalizes the machine id as one.
+const MACHINE = "018f0b5d-1234-7abc-8def-1234567890ab";
+const OTHER_MACHINE = "018f0b5d-1234-7abc-8def-1234567890ff";
 const capturedAt = "2026-09-06T00:00:00.000Z";
 const PUBLICATION_ID = deriveRollbackPublicationId(GEN);
 
@@ -82,17 +87,21 @@ type LeaseRow = {
   fencingToken: bigint; acquiredAt: string; renewedAt: string; expiresAt: string; releasedAt: string | null; databaseExpired: boolean;
 };
 
-/** The lcm.fenced_leases row: acquire returns the live row of the same tuple, as the real guard does. */
+/**
+ * The lcm.fenced_leases row: acquire returns the live row of the same tuple and replaces a released one with a
+ * fresh fencing token, as the real guard does (publication-guard.ts acquire).
+ */
 function leaseStandIn() {
   const state: { row: LeaseRow | null } = { row: null };
   const calls: string[] = [];
+  let nextToken = 1n;
   const guard = {
     async acquire(input: Omit<LeaseRow, "fencingToken" | "acquiredAt" | "renewedAt" | "expiresAt" | "releasedAt" | "databaseExpired">) {
       calls.push("acquire");
       if (state.row !== null && state.row.releasedAt === null) return state.row;
       state.row = {
         projectId: input.projectId, machineId: input.machineId, publicationId: input.publicationId,
-        targetBackend: input.targetBackend, evidenceSha256: input.evidenceSha256, fencingToken: 1n,
+        targetBackend: input.targetBackend, evidenceSha256: input.evidenceSha256, fencingToken: nextToken++,
         acquiredAt: capturedAt, renewedAt: capturedAt, expiresAt: "2999-01-01T00:00:00.000Z", releasedAt: null, databaseExpired: false,
       };
       return state.row;
@@ -186,6 +195,31 @@ function setup() {
     };
     return real;
   };
+  /**
+   * The real coordinator over the in-memory publication driver and the PRODUCTION PostgreSQL remote-guard provider,
+   * both bound to the very lease row the session acquires: the coordinator adopts, takes over and releases the
+   * session's lease exactly as it does against PostgreSQL. crashAt throws once the journal is durably at that
+   * phase (or right after the remote release, before the journal records it).
+   */
+  const sharedLeaseCoordinator = (crashAt?: BackendPublicationPhase | "after-release"): BackendPublicationCoordinator => {
+    let armed = crashAt !== undefined;
+    return new BackendPublicationCoordinator({
+      homeDir,
+      driver: {
+        ...workingPublicationDriver(rollbackPublicationMaterial()),
+        ...createPostgreSqlBackendPublicationRemoteGuard({ guard: lease.guard as never, machineId: MACHINE, ttlMs: 15 * 60 * 1000 }),
+      },
+      observer: (event) => {
+        if (!armed) return;
+        const hit = crashAt === "after-release"
+          ? event === "after-release"
+          : event === "after-journal-write" && readBackendPublicationJournal(homeDir)?.phase === crashAt;
+        if (!hit) return;
+        armed = false;
+        throw new Error("crash at " + crashAt);
+      },
+    });
+  };
   const dependencies = (coordinatorUsed: BackendPublicationCoordinator, extra: Partial<RunMigrationRollbackDependencies> = {},
     sessionOverrides: Partial<RollbackSessionDependencies> = {}): RunMigrationRollbackDependencies => ({
     coordinator: coordinatorUsed,
@@ -204,7 +238,7 @@ function setup() {
     ...extra,
   });
   return {
-    homeDir, lease, input, store, opens, coordinator, dependencies, target, sessionDependencies,
+    homeDir, lease, input, store, opens, coordinator, sharedLeaseCoordinator, dependencies, target, sessionDependencies,
     setObserved(next: typeof census) { observed = next; },
     pending: () => store.read(GEN).pendingEffect,
   };
@@ -301,6 +335,98 @@ describe("recovery of a rollback through the real session opener and recovery ad
     const result = await withBackendPublicationAppendBarrierAsync(t.homeDir, (token) => checkActivationWriterQuiescence({ homeDir: t.homeDir, lockToken: token }));
     expect(result).toMatchObject({ status: "unsatisfied", reason: "maintenance-not-held" });
   });
+});
+
+/**
+ * #626 E1 (round-3 S3-1). The session and the coordinator drive ONE lease row. A recovery that meets the
+ * coordinator's journal at released -- the coordinator released the fence and durably said so, and resumes by
+ * finalizing without another release -- must not acquire a fence of its own: the real guard replaces a released
+ * row with a fresh token that nothing would ever release, and guarded PostgreSQL writers refuse while any
+ * unreleased row exists. Every earlier forward phase keeps its fence-driving recovery session (the coordinator
+ * adopts or supersedes it and releases it); released and the abort phases finish through the coordinator alone.
+ */
+describe("recovery across the coordinator's lease handoff (E1): one lease row shared by the session and the coordinator", () => {
+  const acquires = (t: ReturnType<typeof setup>) => t.lease.calls.filter((call) => call === "acquire").length;
+
+  it("finishes a publication crashed at released without acquiring another fence, and settles with the one lease released", async () => {
+    const t = setup();
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("released")))).rejects.toThrow("crash at released");
+    expect(readBackendPublicationJournal(t.homeDir)).toMatchObject({ phase: "released", publicationId: PUBLICATION_ID });
+    expect(t.pending()?.kind).toBe("publish-rollback");
+    expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: capturedAt });
+    const acquiredBefore = acquires(t);
+
+    const outcome = await runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator()));
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(readBackendPublicationJournal(t.homeDir)).toMatchObject({ phase: "completed", publicationId: PUBLICATION_ID });
+    // No recovery session was opened and no row was acquired: the released row of the first attempt is the only one.
+    expect(t.opens).toEqual([{ recovery: false }]);
+    expect(acquires(t)).toBe(acquiredBefore);
+    expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: capturedAt });
+
+    // Settled: a further call reports the same outcome with the lease still released.
+    const again = await runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator()));
+    expect(again.manifest.phase).toBe("rolled-back");
+    expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: capturedAt });
+  });
+
+  it.each([
+    ["prepared", 1n],
+    ["guarded", 1n],
+    ["config-published", 1n],
+    ["releasing", 1n],
+    // The remote release landed but the journal still says releasing: the released row is superseded by the
+    // recovery session's fresh token, which the coordinator's release phase then releases.
+    ["after-release", 2n],
+  ] as const)("finishes a publication crashed at %s under a recovery session whose fence the coordinator releases", async (crashAt, finalToken) => {
+    const t = setup();
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator(crashAt)))).rejects.toThrow("crash at " + crashAt);
+    expect(readBackendPublicationJournal(t.homeDir)?.phase).toBe(crashAt === "after-release" ? "releasing" : crashAt);
+
+    const outcome = await runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator()));
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(t.opens).toEqual([{ recovery: false }, { recovery: true }]);
+    expect(t.lease.state.row).toMatchObject({ fencingToken: finalToken, releasedAt: capturedAt });
+  });
+
+  it("resumes an abort of this rollback's publication through the coordinator alone, without a recovery session", async () => {
+    const t = setup();
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("guarded")))).rejects.toThrow("crash at guarded");
+    // Something else aborted the publication and died at abort-releasing, before the remote release.
+    await expect(t.sharedLeaseCoordinator("abort-releasing").abort()).rejects.toThrow("crash at abort-releasing");
+    expect(readBackendPublicationJournal(t.homeDir)?.phase).toBe("abort-releasing");
+    expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: null });
+    const acquiredBefore = acquires(t);
+
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator())))
+      .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("aborted") });
+
+    expect(readBackendPublicationJournal(t.homeDir)?.phase).toBe("aborted");
+    expect(t.opens).toEqual([{ recovery: false }]);
+    expect(acquires(t)).toBe(acquiredBefore);
+    expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: capturedAt });
+    expect(t.pending()?.kind).toBe("publish-rollback");
+  });
+
+  it("refuses a released journal that does not record a released fence, instead of settling over it", async () => {
+    const t = setup();
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("released")))).rejects.toThrow("crash at released");
+    const journalPath = backendPublicationJournalPath(t.homeDir);
+    const { checksumSha256: _checksum, ...body } = JSON.parse(readFileSync(journalPath, "utf8"));
+    body.projects[0].fence.releasedAt = null;
+    writeFileSync(journalPath, JSON.stringify({ ...body, checksumSha256: backendPublicationCanonicalSha256(body) }));
+    const before = t.store.read(GEN).checksumSha256;
+
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator())))
+      .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("released fence") });
+
+    expect(t.opens).toEqual([{ recovery: false }]);
+    expect(t.store.read(GEN).checksumSha256).toBe(before);
+    expect(readBackendPublicationJournal(t.homeDir)?.phase).toBe("released");
+  });
+
 });
 
 describe("checkRollbackRecoveryAdmission", () => {

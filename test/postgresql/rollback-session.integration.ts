@@ -185,12 +185,14 @@ async function editFirstMessage(database: PostgreSqlTestDatabase, content: strin
   }, factoryContext);
 }
 
-type LeaseRow = Readonly<{ operation: string; owner_machine_id: string; owner_process_id: string; released: boolean; live: boolean }>;
+type LeaseRow = Readonly<{
+  operation: string; owner_machine_id: string; owner_process_id: string; fencing_token: string; released: boolean; live: boolean;
+}>;
 
 async function leaseRow(database: PostgreSqlTestDatabase): Promise<LeaseRow | undefined> {
   const result = await database.migrator.query<LeaseRow>({
-    text: "SELECT operation, owner_machine_id::text AS owner_machine_id, owner_process_id, released_at IS NOT NULL AS released, "
-      + "expires_at > statement_timestamp() AS live FROM lcm.fenced_leases WHERE project_id = $1",
+    text: "SELECT operation, owner_machine_id::text AS owner_machine_id, owner_process_id, fencing_token::text AS fencing_token, "
+      + "released_at IS NOT NULL AS released, expires_at > statement_timestamp() AS live FROM lcm.fenced_leases WHERE project_id = $1",
     values: [fixture.projectId],
   }, factoryContext);
   return result.rows[0];
@@ -696,6 +698,39 @@ describe("production rollback against PostgreSQL 18", { timeout: 240_000 }, () =
       expect(outcome.manifest.phase).toBe("rolled-back");
       expectRollbackPublished(homeDir, "gen-crash-config");
       expect((await leaseRow(database))!.released).toBe(true);
+    });
+  });
+
+  it("E1: resumes a publication crashed at released without acquiring another lease; the one released row stays the only row", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-crash-released", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-crash-released");
+      await expect(runRollback({
+        homeDir, generationId: "gen-crash-released", canonicalPath, database,
+        observer: (event) => {
+          if (event === "after-journal-write" && readBackendPublicationJournal(homeDir)?.phase === "released") {
+            throw new Error("simulated crash right after the fence release was journalled");
+          }
+        },
+      })).rejects.toMatchObject({ message: expect.stringContaining("simulated crash right after the fence release was journalled") });
+      expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "released" });
+      expect(new MigrationManifestStore({ homeDir }).read("gen-crash-released").pendingEffect?.kind).toBe("publish-rollback");
+      // The coordinator released the real fence before the crash: the row is released and no longer bars guarded writers.
+      const releasedRow = (await leaseRow(database))!;
+      expect(releasedRow).toMatchObject({ released: true, owner_process_id: deriveRollbackPublicationId("gen-crash-released") });
+      await acquirePostgreSqlProjectMutationGuard(database.migrator, fixture.projectId, factoryContext);
+
+      const outcome = await runRollback({ homeDir, generationId: "gen-crash-released", canonicalPath, database });
+
+      expect(outcome.manifest.phase).toBe("rolled-back");
+      expectRollbackPublished(homeDir, "gen-crash-released");
+      // The retry acquired nothing: the released row keeps its fencing token, and guarded writers still pass.
+      const rows = await database.migrator.query<{ n: string }>({
+        text: "SELECT count(*)::text AS n FROM lcm.fenced_leases WHERE project_id = $1",
+        values: [fixture.projectId],
+      }, factoryContext);
+      expect(rows.rows[0]!.n).toBe("1");
+      expect(await leaseRow(database)).toMatchObject({ released: true, fencing_token: releasedRow.fencing_token });
+      await acquirePostgreSqlProjectMutationGuard(database.migrator, fixture.projectId, factoryContext);
     });
   });
 
