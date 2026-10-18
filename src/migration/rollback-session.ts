@@ -270,14 +270,6 @@ class FencedRollbackSession implements RollbackProductionSession {
       );
       // Refuses a destination outside the pinned schema contract, whose census would not be comparable.
       await this.dependencies.captureDestinationSchemaWitness(snapshot, this.signal);
-      const base = {
-        observedPortableRecordSchemaSha256: PORTABLE_RECORD_SCHEMA_SHA256,
-        destinationIdentity,
-        manifestDestinationWitnessSha256: input.manifestDestinationWitnessSha256,
-      };
-      if (input.canonicalDeltaBaseline === null) {
-        return { ...base, postEpochDelta: null, postEpochCensus: null };
-      }
       // ONE census scan: the delta and the vector both come from this result.
       const read = await this.dependencies.readFencedDestinationCensus(snapshot, {
         settings: this.target.settings,
@@ -289,7 +281,8 @@ class FencedRollbackSession implements RollbackProductionSession {
       const postEpochDelta = buildMigrationCanonicalDelta(read.census);
       const deltaEqual = !migrationCanonicalDeltaChanged(postEpochDelta, input.canonicalDeltaBaseline);
       return {
-        ...base,
+        observedPortableRecordSchemaSha256: PORTABLE_RECORD_SCHEMA_SHA256,
+        destinationIdentity,
         postEpochDelta,
         postEpochCensus: deltaEqual || input.requireCensus === true ? buildMigrationCensusVector(read.census) : null,
       };
@@ -348,17 +341,11 @@ class FencedRollbackSession implements RollbackProductionSession {
   }
 
   computeRollbackTerminalEvidenceSha256(input: ComputeRollbackTerminalEvidenceInput): string {
-    if (input.epoch === null || input.attempt === null) {
-      // Never activated: there is no epoch, hence no witness to mint.
-      return migrationWitnessSha256([
-        "lcm-rollback-unactivated-terminal-evidence-v1", input.mode, input.observation.destinationIdentity,
-      ]);
-    }
     return createMigrationActivationWitness({
       kind: "rollback",
       epoch: input.epoch,
       attempt: input.attempt,
-      postEpochDelta: input.observation.postEpochDelta!,
+      postEpochDelta: input.observation.postEpochDelta,
       postEpochCensus: input.observation.postEpochCensus,
       rollbackMode: input.mode,
     }).checksumSha256;

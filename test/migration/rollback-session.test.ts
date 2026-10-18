@@ -303,7 +303,7 @@ describe("openRollbackFencedSession: opening", () => {
   it("scratches under the OS temp directory when the caller names none", async () => {
     const h = harness();
     const session = await open(h, { homeDir: "/home", manifest, lockToken } as never);
-    await session.captureReadback({ manifestDestinationWitnessSha256: "a".repeat(64), canonicalDeltaBaseline: fixtureCanonicalDelta("b") });
+    await session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("b") });
     const call = (h.dependencies.readFencedDestinationCensus as unknown as ReturnType<typeof vi.fn>).mock.calls[0]!;
     expect(typeof (call[1] as { scratchParent: string }).scratchParent).toBe("string");
     expect((call[1] as { scratchParent: string }).scratchParent.length).toBeGreaterThan(0);
@@ -373,35 +373,17 @@ describe("renew", () => {
 });
 
 describe("captureReadback", () => {
-  const witnessSha = "a".repeat(64);
-
-  it("captures identity alone for an unactivated readback, scanning no census", async () => {
-    const h = harness();
-    const session = await open(h);
-    const observation = await session.captureReadback({ manifestDestinationWitnessSha256: witnessSha, canonicalDeltaBaseline: null });
-    expect(observation).toEqual({
-      observedPortableRecordSchemaSha256: PORTABLE_RECORD_SCHEMA_SHA256,
-      destinationIdentity: fixtureDestinationIdentity("dest"),
-      postEpochDelta: null,
-      postEpochCensus: null,
-      manifestDestinationWitnessSha256: witnessSha,
-    });
-    expect(h.dependencies.readFencedDestinationCensus).not.toHaveBeenCalled();
-    expect(h.snapshots).toHaveLength(1);
-    expect(h.snapshots[0]!.close).toHaveBeenCalledTimes(1);
-  });
-
   it("derives the delta and the census vector from ONE census scan, and captures the census only when the delta equals the baseline", async () => {
     const h = harness();
     const session = await open(h);
     const delta = buildMigrationCanonicalDelta(h.census);
-    const equal = await session.captureReadback({ manifestDestinationWitnessSha256: witnessSha, canonicalDeltaBaseline: delta });
+    const equal = await session.captureReadback({ canonicalDeltaBaseline: delta });
     expect(equal.postEpochDelta).toEqual(delta);
     expect(equal.postEpochCensus).toEqual(buildMigrationCensusVector(h.census));
     expect(h.dependencies.readFencedDestinationCensus).toHaveBeenCalledTimes(1);
 
     const changed = await session.captureReadback({
-      manifestDestinationWitnessSha256: witnessSha, canonicalDeltaBaseline: driftCanonicalDelta(delta, 0),
+      canonicalDeltaBaseline: driftCanonicalDelta(delta, 0),
     });
     expect(changed.postEpochDelta).toEqual(delta);
     expect(changed.postEpochCensus).toBeNull();
@@ -415,7 +397,7 @@ describe("captureReadback", () => {
     const session = await open(h);
     const delta = driftCanonicalDelta(buildMigrationCanonicalDelta(h.census), 2);
     const observation = await session.captureReadback({
-      manifestDestinationWitnessSha256: witnessSha, canonicalDeltaBaseline: delta, requireCensus: true,
+      canonicalDeltaBaseline: delta, requireCensus: true,
     });
     expect(observation.postEpochCensus).toEqual(buildMigrationCensusVector(h.census));
   });
@@ -423,7 +405,7 @@ describe("captureReadback", () => {
   it("admits each snapshot (read-only guard, schema) and reads the census inside it", async () => {
     const h = harness();
     const session = await open(h);
-    await session.captureReadback({ manifestDestinationWitnessSha256: witnessSha, canonicalDeltaBaseline: fixtureCanonicalDelta("x") });
+    await session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("x") });
     const snapshot = await (h.runtime.openReadOnlySnapshot as ReturnType<typeof vi.fn>).mock.results[0]!.value;
     expect(h.dependencies.assertReadOnlyGuard).toHaveBeenCalledWith(snapshot, undefined);
     expect(h.dependencies.verifyRuntimeSchema).toHaveBeenCalledWith(snapshot, { expectedOwner: "lcm_owner", signal: undefined });
@@ -439,7 +421,7 @@ describe("captureReadback", () => {
       overrides: { captureDestinationIdentity: vi.fn(async () => { throw new Error("identity read failed"); }) } as never,
     });
     const session = await open(h);
-    await expect(session.captureReadback({ manifestDestinationWitnessSha256: witnessSha, canonicalDeltaBaseline: null }))
+    await expect(session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("x") }))
       .rejects.toThrow("identity read failed");
     expect(h.snapshots[0]!.close).toHaveBeenCalledTimes(1);
   });
@@ -449,7 +431,7 @@ describe("captureReadback", () => {
       overrides: { captureDestinationSchemaWitness: vi.fn(async () => { throw new Error("schema outside contract"); }) } as never,
     });
     const session = await open(h);
-    await expect(session.captureReadback({ manifestDestinationWitnessSha256: witnessSha, canonicalDeltaBaseline: fixtureCanonicalDelta("x") }))
+    await expect(session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("x") }))
       .rejects.toThrow("schema outside contract");
   });
 });
@@ -494,7 +476,7 @@ describe("openPortableSource", () => {
     await exported.stream.close();
     expect(held).toBe(0);
     await session.renew();
-    await expect(session.captureReadback({ manifestDestinationWitnessSha256: "a".repeat(64), canonicalDeltaBaseline: fixtureCanonicalDelta("x") }))
+    await expect(session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("x") }))
       .resolves.toBeDefined();
     await session.release();
   });
@@ -574,8 +556,7 @@ describe("computeRollbackTerminalEvidenceSha256", () => {
     destinationIdentity: fixtureDestinationIdentity("dest"),
     postEpochDelta: fixtureCanonicalDelta("terminal-delta"),
     postEpochCensus: null,
-    manifestDestinationWitnessSha256: "a".repeat(64),
-  };
+      };
 
   it("is the rollback witness checksum of the epoch and attempt it unwinds", async () => {
     const session = await open(harness());
@@ -590,13 +571,6 @@ describe("computeRollbackTerminalEvidenceSha256", () => {
     })).toBe(expected);
   });
 
-  it("derives a deterministic unactivated digest from the mode and destination identity", async () => {
-    const session = await open(harness());
-    const digest = session.computeRollbackTerminalEvidenceSha256({ epoch: null, attempt: null, observation, mode: "pre-write" });
-    expect(digest).toBe(migrationWitnessSha256([
-      "lcm-rollback-unactivated-terminal-evidence-v1", "pre-write", fixtureDestinationIdentity("dest"),
-    ]));
-  });
 });
 
 describe("release", () => {

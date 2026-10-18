@@ -39,8 +39,8 @@
  * ORDER (plan-v3.2 A16a, which supersedes plan-v3.1 A9's): the rollback
  * witness and its binding, begin publish-rollback, install (post-write),
  * the maintenance selection, the rollback selection binding, the
- * coordinator's publication of the sqlite config and project map (an
- * unactivated rollback publishes nothing), the report, and the effect's
+ * coordinator's publication of the sqlite config and project map, the
+ * report, and the effect's
  * completion. The binding precedes the coordinator because its prepare()
  * archives the maintenance journal, after which replay admission routes
  * from bindings. Every crash row resumes by re-running the same call
@@ -131,6 +131,7 @@ import {
   evaluateRollbackEligibility,
   resolveActivationAuthority,
   type ActivationAuthority,
+  type AuthoritativeActivation,
   type MigrationSelectionBinding,
   type MigrationWitnessBinding,
   type ActivationEvidenceResolver,
@@ -327,7 +328,7 @@ export function deriveRollbackPrepareInputSha256(input: Readonly<{
   generationId: string;
   manifestRevision: number;
   manifestChecksumSha256: string;
-  epochId: string | null;
+  epochId: string;
   resourceType: string;
   resourceKey: string;
 }>): string {
@@ -424,12 +425,9 @@ export type RollbackAuthorityArtifactBody = Readonly<{
   operabilityFactState: "present" | "authoritatively-absent";
   /** Present only when operabilityFactState is "present". */
   operabilityFactValueSha256: string | null;
-  authorityStatus: "unactivated" | "authoritative";
-  /** Present only when authorityStatus is "authoritative". */
-  epochId: string | null;
-  attemptId: string | null;
-  /** Present exactly when authorityStatus is "authoritative": an unactivated rollback publishes nothing. */
-  publication: RollbackPublicationSource | null;
+  epochId: string;
+  attemptId: string;
+  publication: RollbackPublicationSource;
   checksumSha256: string;
 }>;
 
@@ -604,22 +602,18 @@ async function resolveRollbackOperabilityFact(
 function assertAuthorityAgreesWithArtifact(
   authority: Exclude<ActivationAuthority, Readonly<{ status: "refused"; reason: string }>>,
   artifact: RollbackAuthorityArtifactBody | null,
-): void {
-  if (artifact === null) return;
+): asserts authority is AuthoritativeActivation {
+  // A rollback in progress began from an authoritative activation (an unactivated generation is refused before
+  // anything is written), so an unactivated reading now contradicts it.
   if (authority.status === "unactivated") {
-    if (artifact.authorityStatus !== "unactivated") {
-      throw new RollbackOrchestrationError(
-        "unexpected-state",
-        "freshly resolved authority is unactivated but the durable rollback-authority "
-          + "artifact recorded an authoritative epoch/attempt",
-      );
-    }
-    return;
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "freshly resolved authority is unactivated but a rollback is in progress for an authoritative activation",
+    );
   }
-  // authority.status === "authoritative"
+  if (artifact === null) return;
   if (
-    artifact.authorityStatus !== "authoritative"
-    || authority.selection.epochId !== artifact.epochId
+    authority.selection.epochId !== artifact.epochId
     || authority.selection.attemptId !== artifact.attemptId
   ) {
     throw new RollbackOrchestrationError(
@@ -674,16 +668,13 @@ export interface RollbackFencedSession {
   renew(): Promise<void>;
   /**
    * One dedicated-snapshot readback (plan-v2 section 5 steps 4 and 10).
-   * canonicalDeltaBaseline: null is the unactivated case: only
-   * destinationIdentity is meaningful and no delta/census is captured.
-   * Otherwise the implementation captures the delta and, only if it is
+   * The implementation captures the delta and, only if it is
    * found equal to the baseline within this same snapshot, the census --
    * plan-v2 section 4's "the census when the delta is equal", read from
    * the identical transaction rather than a second one.
    */
   captureReadback(input: Readonly<{
-    manifestDestinationWitnessSha256: string;
-    canonicalDeltaBaseline: MigrationCanonicalDelta | null;
+    canonicalDeltaBaseline: MigrationCanonicalDelta;
     /**
      * Capture the census even when the delta differs from the baseline.
      * Step 10 of a post-write rollback sets this: it must reproduce the
@@ -762,9 +753,8 @@ export type RollbackReportBody = Readonly<{
   effectId: string;
   kind: "rollback" | "abandonment";
   /** Recorded separately from the protocol mode, per plan-v2 section 5's
-   * closing paragraph: "unactivated and proven pre-write are never
-   * conflated by a later reader." */
-  eligibility: "unactivated" | "pre-write" | "post-write" | null;
+   * closing paragraph. */
+  eligibility: "pre-write" | "post-write" | null;
   mode: "pre-write" | "post-write" | null;
   epochId: string | null;
   attemptId: string | null;
@@ -778,8 +768,7 @@ export type RollbackReportBody = Readonly<{
   reason: string | null;
   /**
    * The manifest revision the rollback selection binding was recorded at, persisted so terminal recovery
-   * rewrites the identical binding. Null for an unactivated rollback (it records no binding) and for an
-   * abandonment.
+   * rewrites the identical binding. Null for an abandonment.
    */
   selectionBindingManifestRevision: number | null;
   checksumSha256: string;
@@ -891,9 +880,9 @@ export type MigrationWitnessBindingRecorder = (
 // ---------------------------------------------------------------------------
 
 export type ComputeRollbackTerminalEvidenceInput = Readonly<{
-  /** The activation records the rollback unwinds; null for an unactivated rollback. */
-  epoch: MigrationActivationEpoch | null;
-  attempt: MigrationActivationAttempt | null;
+  /** The activation records the rollback unwinds. */
+  epoch: MigrationActivationEpoch;
+  attempt: MigrationActivationAttempt;
   observation: RollbackEligibilityObservation;
   mode: "pre-write" | "post-write";
 }>;
@@ -1157,22 +1146,23 @@ function publishManifest(
  *    branches (fresh start, resume a pending prepare-rollback, continue a
  *    completed prepare-rollback with no pending effect); steps 2-8 for
  *    every eligibility outcome; step 9/11's post-write generation
- *    build+install+materialize path; step 9/11's pre-write and
- *    unactivated selection-reversal path -- no build, no install, no
+ *    build+install+materialize path; step 9/11's pre-write
+ *    selection-reversal path -- no build, no install, no
  *    sidecar materialization, no generation directory, per plan-v2
- *    section 1's "Data movement: none" for both eligibilities and issue
+ *    section 1's "Data movement: none" for pre-write and issue
  *    #626's acceptance ("an exact selection reversal with no data
  *    copy") -- corrected in this continuation from a predecessor's
  *    blanket "not-implemented" refusal for every non-post-write mode,
  *    which this file's own module doc's Boundary section had wrongly
  *    reasoned required resolving the #622-preserved source generation's
  *    on-disk path; step 12's report persistence and effect completion
- *    for both the post-write and pre-write/unactivated paths.
+ *    for both the post-write and pre-write paths. A generation that never
+ *    activated is refused before any of these steps (nothing to unwind).
  *  - NOT implemented: nothing at step 9 or step 11 remains unimplemented
  *    for any eligibility. The maintenance-selection flip
  *    (prepareMaintenanceSelection / completeMaintenanceSelection) is
  *    unconditional across every eligibility, which is what makes
- *    pre-write and unactivated a real "selection reversal" rather than a
+ *    pre-write a real "selection reversal" rather than a
  *    no-op.
 *  - Best-effort, flagged as needing review rather than presented as
 *    settled: step 12's abandonment path's explicit backend-selection
@@ -1296,23 +1286,30 @@ export async function runMigrationRollback(
   if (authority.status === "refused") {
     throw new RollbackOrchestrationError("not-eligible", authority.reason);
   }
+  // A generation that was never activated has no activation records to unwind and PostgreSQL was never the
+  // published backend, so there is nothing to roll back from: the operator restores the configuration or runs
+  // lcm migration abort. Refused before the authority artifact, maintenance or the manifest are touched.
+  if (authority.status === "unactivated") {
+    throw new RollbackOrchestrationError(
+      "not-eligible",
+      "this generation never completed an activation (no activation selection is bound), so there is nothing to "
+        + "roll back from; restore the configuration to sqlite or run lcm migration abort",
+    );
+  }
   assertAuthorityAgreesWithArtifact(authority, priorAuthorityArtifact);
 
-  let authoritativeContext: RollbackAuthoritativeContext | null = null;
-  if (authority.status === "authoritative") {
-    authoritativeContext = await deps.resolveAuthoritativeContext({
-      homeDir: input.homeDir,
-      generationId: input.generationId,
-      epochId: authority.selection.epochId,
-      attemptId: authority.selection.attemptId,
-      witnessChecksumSha256: authority.selection.witnessChecksumSha256,
-    });
-    if (authoritativeContext === null) {
-      throw new RollbackOrchestrationError(
-        "unexpected-state",
-        "authoritative selection resolved but its epoch/attempt record could not be fetched",
-      );
-    }
+  const authoritativeContext = await deps.resolveAuthoritativeContext({
+    homeDir: input.homeDir,
+    generationId: input.generationId,
+    epochId: authority.selection.epochId,
+    attemptId: authority.selection.attemptId,
+    witnessChecksumSha256: authority.selection.witnessChecksumSha256,
+  });
+  if (authoritativeContext === null) {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "authoritative selection resolved but its epoch/attempt record could not be fetched",
+    );
   }
 
   // donadiosolutions/lcm#1432: persist the durable rollback-authority
@@ -1330,12 +1327,9 @@ export async function runMigrationRollback(
     generationId: input.generationId,
     operabilityFactState: operabilityFact.state,
     operabilityFactValueSha256: operabilityFact.state === "present" ? operabilityFact.valueSha256 : null,
-    authorityStatus: authority.status,
-    epochId: authority.status === "authoritative" ? authority.selection.epochId : null,
-    attemptId: authority.status === "authoritative" ? authority.selection.attemptId : null,
-    publication: authority.status === "authoritative"
-      ? resolveRollbackPublicationSource(deps, input, authority.selection)
-      : null,
+    epochId: authority.selection.epochId,
+    attemptId: authority.selection.attemptId,
+    publication: resolveRollbackPublicationSource(deps, input, authority.selection),
   });
 
   return withBackendPublicationAppendBarrierAsync(input.homeDir, async (token) => {
@@ -1390,15 +1384,13 @@ export async function runMigrationRollback(
     return withFencedSession(session, async () => {
       // Step 4: authoritative readback in the dedicated snapshot.
       const observation = await session.captureReadback({
-        manifestDestinationWitnessSha256: working.destination.identitySha256,
-        canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
+        canonicalDeltaBaseline: authoritativeContext.attempt.canonicalDeltaBaseline,
       });
 
       // Steps 5+6 combined: identity gate, schema-bound census
       // comparability, and classification, in that order -- exactly the
       // order evaluateRollbackEligibility already implements.
       const decision = evaluateRollbackEligibility({
-        authority,
         authoritativeContext,
         observation,
       });
@@ -1412,7 +1404,7 @@ export async function runMigrationRollback(
       }
 
      // Step 7: begin prepare-rollback with a deterministic inputSha256.
-     const epochIdForInput = authority.status === "authoritative" ? authority.selection.epochId : null;
+     const epochIdForInput = authority.selection.epochId;
       // donadiosolutions/lcm#1432, a third independent defect found while
       // building the resume tests this fix requires: on a "resume"
       // (classifyMigrationRecovery's retry-idempotent action, reached
@@ -1602,8 +1594,8 @@ async function runPostPrepareSequence(
   store: MigrationManifestStore,
   working: MigrationManifest,
   session: RollbackFencedSession,
-  authority: ActivationAuthority,
-  authoritativeContext: RollbackAuthoritativeContext | null,
+  authority: AuthoritativeActivation,
+  authoritativeContext: RollbackAuthoritativeContext,
   artifact: RollbackAuthorityArtifactBody,
   decision: Exclude<RollbackEligibilityDecision, Readonly<{ eligibility: "refused" }>>,
   token: BackendPublicationLockToken,
@@ -1615,8 +1607,8 @@ async function runPostPrepareSequence(
 
   // Step 9: build, verify -- post-write only. Corrected by this item's
   // continuation: plan-v2 section 1's eligibility table records "Data
-  // movement: none" for BOTH "unactivated" and "pre-write", because in
-  // neither eligibility was anything ever durably written past
+  // movement: none" for "pre-write", because
+  // nothing was ever durably written past
   // activation -- the live SQLite database at input.canonicalPath is
   // still the correct, current image. Building a reconstruction and
   // installing it over that live database would replace a correct
@@ -1691,12 +1683,10 @@ async function runPostPrepareSequence(
   // Step 10: revalidate under a NEW snapshot, never step 4's/9's own.
   await session.renew();
   const revalidated = await session.captureReadback({
-    manifestDestinationWitnessSha256: working.destination.identitySha256,
-    canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
+    canonicalDeltaBaseline: authoritativeContext.attempt.canonicalDeltaBaseline,
     requireCensus: mode === "post-write",
   });
   const revalidatedDecision = evaluateRollbackEligibility({
-    authority,
     authoritativeContext,
     observation: revalidated,
   });
@@ -1723,49 +1713,46 @@ async function runPostPrepareSequence(
     if (drift !== null) throw new RollbackOrchestrationError("drift", drift);
   }
 
-  const epochId = authority.status === "authoritative" ? authority.selection.epochId : null;
-  const attemptId = authority.status === "authoritative" ? authority.selection.attemptId : null;
+  const epochId = authority.selection.epochId;
+  const attemptId = authority.selection.attemptId;
   const terminalEvidenceSha256 = session.computeRollbackTerminalEvidenceSha256({
-    epoch: authoritativeContext?.epoch ?? null,
-    attempt: authoritativeContext?.attempt ?? null,
+    epoch: authoritativeContext.epoch,
+    attempt: authoritativeContext.attempt,
     observation: revalidated,
     mode: revalidatedDecision.mode,
   });
 
-  if (authority.status === "authoritative") {
-    // Plan-v3.1 A9 step 1: the rollback witness is minted here from the stored epoch and attempt and must be
-    // exactly the evidence the session sealed. It is recorded in the evidence store and bound before anything
-    // is selected, so a resume reads it back (its mode included) instead of re-minting it.
-    const witness = createMigrationActivationWitness({
-      kind: "rollback",
-      epoch: authoritativeContext!.epoch,
-      attempt: authoritativeContext!.attempt,
-      postEpochDelta: revalidated.postEpochDelta!,
-      postEpochCensus: revalidated.postEpochCensus,
-      rollbackMode: revalidatedDecision.mode,
+  // Plan-v3.1 A9 step 1: the rollback witness is minted here from the stored epoch and attempt and must be
+  // exactly the evidence the session sealed. It is recorded in the evidence store and bound before anything
+  // is selected, so a resume reads it back (its mode included) instead of re-minting it.
+  const witness = createMigrationActivationWitness({
+    kind: "rollback",
+    epoch: authoritativeContext.epoch,
+    attempt: authoritativeContext.attempt,
+    postEpochDelta: revalidated.postEpochDelta,
+    postEpochCensus: revalidated.postEpochCensus,
+    rollbackMode: revalidatedDecision.mode,
+  });
+  if (witness.checksumSha256 !== terminalEvidenceSha256) {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "the session's terminal evidence is not the rollback witness minted from the same records",
+    );
+  }
+  if (working.pendingEffect === null) {
+    deps.recordActivationWitness({ homeDir: input.homeDir, generationId: input.generationId, witness });
+    // Section 18: written BEFORE the selection is prepared.
+    deps.recordWitnessBinding({
+      homeDir: input.homeDir,
+      generationId: input.generationId,
+      binding: {
+        kind: "rollback",
+        epochId,
+        attemptId,
+        manifestRevision: working.revision,
+        witnessChecksumSha256: terminalEvidenceSha256,
+      },
     });
-    if (witness.checksumSha256 !== terminalEvidenceSha256) {
-      throw new RollbackOrchestrationError(
-        "unexpected-state",
-        "the session's terminal evidence is not the rollback witness minted from the same records",
-      );
-    }
-    if (working.pendingEffect === null) {
-      deps.recordActivationWitness({ homeDir: input.homeDir, generationId: input.generationId, witness });
-      // Section 18: written BEFORE the selection is prepared. "unactivated" authority carries no epoch or
-      // attempt to name, so it records no witness or binding.
-      deps.recordWitnessBinding({
-        homeDir: input.homeDir,
-        generationId: input.generationId,
-        binding: {
-          kind: "rollback",
-          epochId: epochId!,
-          attemptId: attemptId!,
-          manifestRevision: working.revision,
-          witnessChecksumSha256: terminalEvidenceSha256,
-        },
-      });
-    }
   }
 
   // Plan-v3.2 A16a order (supersedes plan-v3.1 A9's): the witness and its
@@ -1792,13 +1779,12 @@ async function runPostPrepareSequence(
 
   // Step 11: install precedes publication -- while PostgreSQL is still
   // the durably selected backend -- then flip maintenance selection to
-  // sqlite. Post-write only: pre-write and unactivated install nothing
-  // and materialize no sidecars, because the live database at
+  // sqlite. Post-write only: pre-write installs nothing
+  // and materializes no sidecars, because the live database at
   // input.canonicalPath already IS the correct generation and its
   // existing sidecars are untouched -- see step 9's comment above. The
   // maintenance selection flip immediately below is unconditional: it is
-  // the actual "selection reversal" issue #626 asks pre-write and
-  // unactivated to perform, for every eligibility.
+  // the actual "selection reversal" issue #626 asks pre-write to perform.
   if (mode === "post-write") {
     // Step 9 built a verified generation for exactly this mode.
     const installOutcome = installRollbackGeneration({
@@ -1841,7 +1827,6 @@ async function runPostPrepareSequence(
 
   return finishRollbackPublication({
     input, deps, store, token, now, artifact, remoteProjectId, epochId, attemptId, terminalEvidenceSha256,
-    eligibility: revalidatedDecision.eligibility,
     mode: revalidatedDecision.mode,
     session,
   }, working);
@@ -1878,8 +1863,8 @@ async function resolveContinuationAuthority(
   | { status: "refused"; reason: string }
   | {
     status: "resolved";
-    authority: Exclude<ActivationAuthority, Readonly<{ status: "refused"; reason: string }>>;
-    authoritativeContext: RollbackAuthoritativeContext | null;
+    authority: AuthoritativeActivation;
+    authoritativeContext: RollbackAuthoritativeContext;
     artifact: RollbackAuthorityArtifactBody;
   }
 >> {
@@ -1904,21 +1889,18 @@ async function resolveContinuationAuthority(
     );
   }
   assertAuthorityAgreesWithArtifact(authority, priorAuthorityArtifact);
-  let authoritativeContext: RollbackAuthoritativeContext | null = null;
-  if (authority.status === "authoritative") {
-    authoritativeContext = await deps.resolveAuthoritativeContext({
-      homeDir: input.homeDir,
-      generationId: input.generationId,
-      epochId: authority.selection.epochId,
-      attemptId: authority.selection.attemptId,
-      witnessChecksumSha256: authority.selection.witnessChecksumSha256,
-    });
-    if (authoritativeContext === null) {
-      throw new RollbackOrchestrationError(
-        "unexpected-state",
-        "authoritative selection resolved but its epoch/attempt record could not be fetched",
-      );
-    }
+  const authoritativeContext = await deps.resolveAuthoritativeContext({
+    homeDir: input.homeDir,
+    generationId: input.generationId,
+    epochId: authority.selection.epochId,
+    attemptId: authority.selection.attemptId,
+    witnessChecksumSha256: authority.selection.witnessChecksumSha256,
+  });
+  if (authoritativeContext === null) {
+    throw new RollbackOrchestrationError(
+      "unexpected-state",
+      "authoritative selection resolved but its epoch/attempt record could not be fetched",
+    );
   }
   return { status: "resolved", authority, authoritativeContext, artifact: priorAuthorityArtifact };
 }
@@ -1973,11 +1955,9 @@ async function continueAfterPrepareRollback(
     });
     return withFencedSession(session, async () => {
       const observation = await session.captureReadback({
-        manifestDestinationWitnessSha256: current.destination.identitySha256,
-        canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
+        canonicalDeltaBaseline: authoritativeContext.attempt.canonicalDeltaBaseline,
       });
       const decision = evaluateRollbackEligibility({
-        authority,
         authoritativeContext,
         observation,
       });
@@ -2008,10 +1988,9 @@ type PublicationPhase = Readonly<{
   artifact: RollbackAuthorityArtifactBody;
   /** The covered project's PostgreSQL id, from the project map checked under the token. */
   remoteProjectId: string;
-  epochId: string | null;
-  attemptId: string | null;
+  epochId: string;
+  attemptId: string;
   terminalEvidenceSha256: string;
-  eligibility: "unactivated" | "pre-write" | "post-write";
   mode: "pre-write" | "post-write";
   /** Null when no fenced session is open (a resume that starts after the selection). */
   session: RollbackFencedSession | null;
@@ -2204,22 +2183,19 @@ async function finishRollbackPublication(
   working: MigrationManifest,
 ): Promise<RunMigrationRollbackOutcome> {
   const { input, deps, store, now } = phase;
-  const authoritative = phase.artifact.authorityStatus === "authoritative";
   // Plan-v3.2 A16a: the binding is recorded before the coordinator's prepare(), which archives the maintenance
   // journal that replay admission would otherwise route from. It is rewritten idempotently on every resume.
-  if (authoritative) {
-    deps.recordSelectionBinding({
-      homeDir: input.homeDir,
-      generationId: input.generationId,
-      binding: rollbackSelectionBinding(input.generationId, {
-        epochId: phase.epochId!,
-        attemptId: phase.attemptId!,
-        manifestRevision: working.revision,
-        terminalEvidenceSha256: phase.terminalEvidenceSha256,
-      }),
-    });
-  }
-  const sealedDigest = authoritative ? await publishRollbackSelection(phase) : null;
+  deps.recordSelectionBinding({
+    homeDir: input.homeDir,
+    generationId: input.generationId,
+    binding: rollbackSelectionBinding(input.generationId, {
+      epochId: phase.epochId,
+      attemptId: phase.attemptId,
+      manifestRevision: working.revision,
+      terminalEvidenceSha256: phase.terminalEvidenceSha256,
+    }),
+  });
+  const sealedDigest = await publishRollbackSelection(phase);
 
   const effectId = working.pendingEffect!.effectId;
   const reportCreatedAt = now().toISOString();
@@ -2229,13 +2205,13 @@ async function finishRollbackPublication(
     generationId: input.generationId,
     effectId,
     kind: "rollback",
-    eligibility: phase.eligibility,
+    eligibility: phase.mode,
     mode: phase.mode,
     epochId: phase.epochId,
     attemptId: phase.attemptId,
     sealedPublicationMaterialDigestSha256: sealedDigest,
     reason: null,
-    selectionBindingManifestRevision: authoritative ? working.revision : null,
+    selectionBindingManifestRevision: working.revision,
   });
   const completed = publishManifest(store, input.generationId, working, completeMigrationEffect(working, {
     effectId,
@@ -2280,7 +2256,6 @@ async function recoverRolledBackAuthority(
       "generation " + input.generationId + " is rolled back but its rollback authority artifact is absent",
     );
   }
-  if (artifact.authorityStatus === "unactivated") return { manifest: current, report };
   const terminalEvidenceSha256 = ROLLBACK_PUBLISH_EFFECT_ID_PATTERN.exec(report.effectId)?.[1];
   if (
     terminalEvidenceSha256 === undefined
@@ -2305,8 +2280,8 @@ async function recoverRolledBackAuthority(
       homeDir: input.homeDir,
       generationId: input.generationId,
       binding: rollbackSelectionBinding(input.generationId, {
-        epochId: artifact.epochId!,
-        attemptId: artifact.attemptId!,
+        epochId: artifact.epochId,
+        attemptId: artifact.attemptId,
         manifestRevision: report.selectionBindingManifestRevision!,
         terminalEvidenceSha256,
       }),
@@ -2370,25 +2345,21 @@ async function recoverPendingPublishRollback(
     /** Everything the publication phase needs when no fenced session is open. */
     const storedPhase = (): PublicationPhase => {
       const remoteProjectId = assertCoveredProjectIsSoleRemoteBinding(deps, input, token);
-      let mode: "pre-write" | "post-write" = "pre-write";
-      if (artifact.authorityStatus === "authoritative") {
-        // The mode is the stored rollback witness's, never inferred; no witness refuses.
-        const evidence = deps.resolveActivationEvidence({ homeDir: input.homeDir, generationId: input.generationId });
-        const witness = evidence.state === "resolved"
-          ? evidence.witnesses.find((candidate) => candidate.kind === "rollback" && candidate.checksumSha256 === terminalEvidenceSha256)
-          : undefined;
-        if (witness === undefined) {
-          throw new RollbackOrchestrationError(
-            "unexpected-state",
-            "the pending publish-rollback has no stored rollback witness to take its mode from",
-          );
-        }
-        mode = witness.rollbackMode!;
+      // The mode is the stored rollback witness's, never inferred; no witness refuses.
+      const evidence = deps.resolveActivationEvidence({ homeDir: input.homeDir, generationId: input.generationId });
+      const witness = evidence.state === "resolved"
+        ? evidence.witnesses.find((candidate) => candidate.kind === "rollback" && candidate.checksumSha256 === terminalEvidenceSha256)
+        : undefined;
+      if (witness === undefined) {
+        throw new RollbackOrchestrationError(
+          "unexpected-state",
+          "the pending publish-rollback has no stored rollback witness to take its mode from",
+        );
       }
+      const mode = witness.rollbackMode!;
       return {
         input, deps, store, token, now, artifact, remoteProjectId,
         epochId: artifact.epochId, attemptId: artifact.attemptId, terminalEvidenceSha256,
-        eligibility: artifact.authorityStatus === "authoritative" ? mode : "unactivated",
         mode, session: null,
       };
     };
@@ -2496,7 +2467,7 @@ async function recoverPendingPublishRollback(
       return abandon("the maintenance was " + maintenance.phase);
     }
     if (slot.kind === "publication" && slot.journal.publicationId === publicationId) {
-      if (artifact.authorityStatus !== "authoritative" || !hasRollbackSelectionBinding()) {
+      if (!hasRollbackSelectionBinding()) {
         throw new RollbackOrchestrationError(
           "unexpected-state",
           "this rollback's coordinator publication is in the live slot without the selection binding that must precede it",
@@ -2536,17 +2507,16 @@ async function revalidatePreparedSelection(
   if (resolved.status === "refused") {
     throw new RollbackOrchestrationError("not-eligible", "the authority no longer resolves: " + resolved.reason);
   }
-  const { authority, authoritativeContext } = resolved;
+  const { authoritativeContext } = resolved;
   const observation = await session.captureReadback({
-    manifestDestinationWitnessSha256: current.destination.identitySha256,
-    canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
+    canonicalDeltaBaseline: authoritativeContext.attempt.canonicalDeltaBaseline,
     requireCensus: phase.mode === "post-write",
   });
-  const decision = evaluateRollbackEligibility({ authority, authoritativeContext, observation });
+  const decision = evaluateRollbackEligibility({ authoritativeContext, observation });
   if (decision.eligibility === "refused") throw new RollbackOrchestrationError("not-eligible", decision.reason);
   const evidence = session.computeRollbackTerminalEvidenceSha256({
-    epoch: authoritativeContext?.epoch ?? null,
-    attempt: authoritativeContext?.attempt ?? null,
+    epoch: authoritativeContext.epoch,
+    attempt: authoritativeContext.attempt,
     observation,
     mode: decision.mode,
   });
@@ -2587,10 +2557,9 @@ async function resumeHeldPublication(
   try {
     const outcome = await withFencedSession(session, async () => {
       const observation = await session.captureReadback({
-        manifestDestinationWitnessSha256: current.destination.identitySha256,
-        canonicalDeltaBaseline: authoritativeContext?.attempt.canonicalDeltaBaseline ?? null,
+        canonicalDeltaBaseline: authoritativeContext.attempt.canonicalDeltaBaseline,
       });
-      const decision = evaluateRollbackEligibility({ authority, authoritativeContext, observation });
+      const decision = evaluateRollbackEligibility({ authoritativeContext, observation });
       if (decision.eligibility === "refused") {
         throw new RollbackOrchestrationError("not-eligible", decision.reason);
       }

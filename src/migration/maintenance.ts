@@ -283,8 +283,8 @@ function rolledBackWithoutPendingEffect(homeDir: string, generationId: string): 
  * which backend it selects. Decided from durable authority in this order (plan-v3.2 A15): a live
  * non-terminal maintenance of the generation refuses; the generation's selection bindings decide (the
  * last by manifest revision: activation selects postgresql, rollback selects sqlite); with no selection
- * recorded, a migration manifest at rolled-back with no pending effect selects sqlite (the unactivated
- * rollback, whose only durable record is the manifest); the generation's own terminal maintenance
+ * recorded, a migration manifest at rolled-back with no pending effect selects sqlite (the manifest is the
+ * rollback's last durable record); the generation's own terminal maintenance
  * journal, if the coordinator has not yet archived it, decides as before; everything else refuses.
  * Unresolvable bindings and an unreadable manifest refuse. Between the coordinator's archival of the
  * maintenance journal and the manifest's completion, admission refuses until the resume completes.
@@ -325,8 +325,8 @@ export function assertMigrationReplayAdmission(input: Readonly<{
     }
     return { backend: last.kind === "activation" ? "postgresql" : "sqlite", disposition: "selected" };
   }
-  // 3. No selection was ever recorded: a rollback of an unactivated generation is authoritative only
-  // through its migration manifest, which the coordinator never archives.
+  // 3. No selection binding is readable: a rolled-back manifest is still the rollback's last durable record, which
+  // the coordinator never archives.
   if (rolledBackWithoutPendingEffect(input.homeDir, input.generationId)) {
     return { backend: "sqlite", disposition: "selected" };
   }

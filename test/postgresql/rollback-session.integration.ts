@@ -12,8 +12,9 @@
  * an installation whose activation was itself published through the real
  * coordinator (config.json and the project map are real files, the retained
  * activation publication is read back, the evidence and binding stores hold
- * the activation's records). They prove: pre-write, post-write and
- * unactivated rollbacks complete and publish sqlite; replay admission then
+ * the activation's records). They prove: pre-write and post-write
+ * rollbacks complete and publish sqlite, and a generation that never
+ * activated is refused before anything is written; replay admission then
  * routes to sqlite from the selection binding; the released activation lease
  * row is replaced while an unreleased one refuses; a crash after the
  * coordinator's prepare and after its config publish resume through
@@ -273,7 +274,7 @@ async function activate(
 /**
  * The seeded database, a verified manifest and, by default, a published activation. With activated false the
  * installation holds no activation evidence: by default its configuration selects PostgreSQL and its map binds
- * the project without any coordinator publication (the unactivated shape rollback accepts), "unpublished" leaves
+ * the project without any coordinator publication (a shape rollback refuses as never activated), "unpublished" leaves
  * the configuration on sqlite, and "recordless" is a complete coordinator publication whose epoch and binding
  * were never recorded.
  */
@@ -495,15 +496,18 @@ describe("production rollback against PostgreSQL 18", { timeout: 240_000 }, () =
     });
   });
 
-  it("rolls back an unactivated generation (configuration selects PostgreSQL, no coordinator publication): no coordinator publication, selection reversed", async () => {
+  it("refuses a never-activated generation (configuration selects PostgreSQL, no activation evidence) before any lease, maintenance or manifest change", async () => {
     await withPostgreSqlTestDatabase("rollback-session-unactivated", async (database) => {
       const { homeDir, canonicalPath } = await prepared(database, "gen-unactivated", { activated: false });
-      const outcome = await runRollback({ homeDir, generationId: "gen-unactivated", canonicalPath, database });
-      expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
-      expect(outcome.report).toMatchObject({ eligibility: "unactivated", epochId: null, sealedPublicationMaterialDigestSha256: null });
-      expect(readBackendMaintenanceJournal(homeDir)).toMatchObject({ phase: "selection-completed", targetBackend: "sqlite" });
-      expect(rollbackBinding(homeDir, "gen-unactivated")).toBeUndefined();
-      expect((await leaseRow(database))!.released).toBe(true);
+      await expect(runRollback({ homeDir, generationId: "gen-unactivated", canonicalPath, database }))
+        .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("never completed an activation") });
+      // Nothing was written: the configuration still selects PostgreSQL, no maintenance, lease or effect exists.
+      expect(readConfigBackend(homeDir)).toBe("postgresql");
+      expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+      expect(await leaseRow(database)).toBeUndefined();
+      const manifest = new MigrationManifestStore({ homeDir }).read("gen-unactivated");
+      expect(manifest.phase).toBe("verified");
+      expect(manifest.pendingEffect).toBeNull();
     });
   });
 

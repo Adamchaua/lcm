@@ -56,7 +56,7 @@ import {
  * mutated witness whose checksum was merely recomputed is refused. The
  * reader repeats every one of these checks.
  *
- * What rollback concludes from this store. Rollback's "unactivated" needs
+ * What rollback concludes from this store. Rollback's "unactivated" (which it refuses) needs
  * three independent observations to agree (rollback-eligibility.ts): this
  * store authoritatively absent (or holding an epoch with no selection), the
  * binding store free of any activation selection, and the operability fact

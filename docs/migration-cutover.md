@@ -433,9 +433,10 @@ A crash while the publication is in flight leaves an activation that has to
 be resumed or aborted before anything else; rollback refuses to start over
 it. A completed publication without a recorded selection binding means
 PostgreSQL is live, so rollback refuses (`published-but-unbound`) until the
-activation records its binding. Only an installation with no activation
-evidence and no completed publication is *unactivated*: the live SQLite
-database is still authoritative, so rollback only reverses the selection.
+activation records its binding. An installation with no activation
+evidence and no completed publication is *unactivated*: it has nothing to
+unwind, so rollback refuses it (restore the configuration to SQLite or run
+`lcm migration abort`).
 
 Replay admission (the check that routes a replayed append to SQLite or
 PostgreSQL after a cutover or a rollback) follows the durable authority in
@@ -443,8 +444,7 @@ this order: a live maintenance of the generation that has not finished
 refuses; the generation's selection bindings decide (the latest by manifest
 revision; an activation selects PostgreSQL, a rollback selects SQLite); with
 no selection recorded, a manifest at `rolled-back` with no pending effect
-selects SQLite (the unactivated rollback, whose only durable record is the
-manifest); the generation's own terminal maintenance journal decides while
+selects SQLite (the manifest is the rollback's last durable record); the generation's own terminal maintenance journal decides while
 the coordinator has not archived it; everything else refuses. Between the
 coordinator archiving the maintenance journal and the manifest settling,
 admission refuses until the resume completes.

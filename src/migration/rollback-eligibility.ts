@@ -164,6 +164,9 @@ export type ActivationAuthority =
   | Readonly<{ status: "authoritative"; selection: MigrationSelectionBinding }>
   | Readonly<{ status: "refused"; reason: string }>;
 
+/** The only authority a rollback acts on: an unactivated generation is refused before any rollback step. */
+export type AuthoritativeActivation = Extract<ActivationAuthority, Readonly<{ status: "authoritative" }>>;
+
 function refuse(reason: string): ActivationAuthority {
   return { status: "refused", reason };
 }
@@ -282,25 +285,13 @@ export type RollbackEligibilityObservation = Readonly<{
   observedPortableRecordSchemaSha256: string;
   /** Fresh destination identity read in the same dedicated snapshot. */
   destinationIdentity: MigrationDestinationIdentity;
-  /**
-   * Fresh canonical delta read in the same dedicated snapshot. Null only for
-   * the unactivated readback, which captures identity alone; an authoritative
-   * decision refuses without one.
-   */
-  postEpochDelta: MigrationCanonicalDelta | null;
+  /** Fresh canonical delta read in the same dedicated snapshot. */
+  postEpochDelta: MigrationCanonicalDelta;
   /** Fresh census, present only when the delta was found equal to the baseline. */
   postEpochCensus: MigrationCensusVector | null;
-  /**
-   * The manifest's own sealed destination witness (the five-field formula
-   * `readPostgreSqlPortableWitness` seals, per witness-schema-FROZEN-v2.md
-   * section 3). This is the only comparand available in the `unactivated`
-   * case, per plan-v2 section 5 step 5.
-   */
-  manifestDestinationWitnessSha256: string;
 }>;
 
 export type RollbackEligibilityDecision =
-  | Readonly<{ eligibility: "unactivated"; mode: "pre-write" }>
   | Readonly<{ eligibility: "pre-write"; mode: "pre-write" }>
   | Readonly<{ eligibility: "post-write"; mode: "post-write" }>
   | Readonly<{ eligibility: "refused"; reason: string }>;
@@ -311,39 +302,11 @@ function sameDestinationIdentity(left: MigrationDestinationIdentity, right: Migr
 }
 
 export function evaluateRollbackEligibility(input: Readonly<{
-  authority: ActivationAuthority;
-  /** Required exactly when `authority.status === "authoritative"`: the full records. */
-  authoritativeContext: RollbackAuthoritativeContext | null;
+  /** The full records of the authoritative activation being unwound. */
+  authoritativeContext: RollbackAuthoritativeContext;
   observation: RollbackEligibilityObservation;
 }>): RollbackEligibilityDecision {
-  const { authority, authoritativeContext, observation } = input;
-
-  if (authority.status === "refused") {
-    return { eligibility: "refused", reason: authority.reason };
-  }
-
-  if (authority.status === "unactivated") {
-    // No epoch to compare against; the only available comparand is the
-    // manifest's own sealed destination witness. Sufficient for
-    // "unactivated" and insufficient for any other eligibility, per
-    // plan-v2 section 5 step 5.
-    if (observation.manifestDestinationWitnessSha256 !== observation.destinationIdentity.sealedWitnessSha256) {
-      return { eligibility: "refused", reason: "destination identity does not match the manifest's sealed witness" };
-    }
-    return { eligibility: "unactivated", mode: "pre-write" };
-  }
-
-  // authority.status === "authoritative"
-  if (authoritativeContext === null) {
-    return {
-      eligibility: "refused",
-      reason: "authoritative attempt resolved but its epoch/attempt record was not supplied",
-    };
-  }
-
-  if (observation.postEpochDelta === null) {
-    return { eligibility: "refused", reason: "an authoritative rollback needs a canonical delta from its readback" };
-  }
+  const { authoritativeContext, observation } = input;
 
   // Identity gate first and separately, refusing before any durable change
   // and before the classifier is ever consulted.

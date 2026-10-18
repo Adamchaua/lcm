@@ -12,13 +12,10 @@ rollback builds on.
 Rollback has two outcomes, decided from evidence at the moment it runs, never
 chosen by the operator:
 
-- **Pre-write or unactivated rollback copies nothing.** If the project is
-  bound to PostgreSQL and the configuration selects PostgreSQL, but PostgreSQL
-  has no activation evidence and no completed publication (for example, the
-  configuration was switched to PostgreSQL by hand), or it was activated but
+- **Pre-write rollback copies nothing.** If PostgreSQL was activated (the
+  activation recorded its evidence and published the PostgreSQL selection) but
   nothing was durably written to it since, the live SQLite database at the
-  canonical path is already correct and current. (An installation that is not
-  bound and selected is refused instead; see the refusal section below.)
+  canonical path is already correct and current.
   No rollback generation is built, nothing is installed, no
   runtime sidecar is materialized, and the live database is not touched. The
   reversal is the maintenance-selection flip back to SQLite, nothing else.
@@ -53,7 +50,16 @@ the project map entry that the activation's publication writes. A generation
 that never activated has no such entry (the project map does not yet bind the
 project), and no durable local record holds the id before then. Rollback
 refuses with `project-unbound`, and the same applies when the configuration
-does not select PostgreSQL. Nothing was changed; leave the generation with:
+does not select PostgreSQL.
+
+The same holds when the configuration and the project map were switched to
+PostgreSQL by hand, without an activation: there is no activation evidence
+and no completed publication, so there is nothing to unwind, and flipping the
+maintenance selection alone would leave every consumer refusing the mismatch
+between the configuration and the selection. Rollback refuses with
+`not-eligible` ("never completed an activation") before it enters maintenance,
+takes a lease or touches the manifest. Nothing was changed; restore the
+configuration and the project map to SQLite, or leave the generation with:
 
 ```bash
 lcm migration abort
@@ -82,7 +88,7 @@ retained backend publication before it prepares its own, and persists the
 publication identity, the source backend, the project map entry and the
 digests of the source configuration and map. A rollback artifact written by an
 older version refuses distinctly. When the retained publication is absent or
-unreadable, rollback refuses for every case except an unactivated one.
+unreadable, rollback refuses.
 
 ## Recovery procedure after an interrupted rollback
 
@@ -157,6 +163,7 @@ to check.
 | "backend publication is unresolved; recover it before consuming local state" | An activation's publication is still in flight (a crash while it published). Rollback does not start over it. | Finish or abort the activation first. A rollback's own interrupted publication is not this refusal: re-running resumes it. |
 | `published-but-unbound` | PostgreSQL is live (its publication completed) but the activation never recorded its selection binding. | Let the activation record it, then retry. |
 | `project-unbound`, or "the configuration selects another" | The generation never activated. | Run `lcm migration abort`. |
+| "never completed an activation" (`not-eligible`) | No activation selection was ever bound, although the configuration selects PostgreSQL (for example, it was switched by hand). There is nothing to roll back from, and nothing was changed. | Restore the configuration and the project map to SQLite, or run `lcm migration abort`. |
 | `multiple-remote-projects`, `covered-project-mismatch` | The project map binds another project to PostgreSQL. | See "Only one project may be remotely bound". |
 | "actively held by a different publication generation" | The activation's fence on the PostgreSQL project is still held, so a rollback cannot take it over. | Wait for the holder to finish or its lease to expire; rollback does not break a live lease. |
 | Drift: the destination changed between the export and the final check, or the rollback mode changed | PostgreSQL was written to while rollback was building, so the generation it built no longer matches. | Nothing was installed or selected. Run the rollback again. |

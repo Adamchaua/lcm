@@ -323,7 +323,6 @@ function fakeSession(input: Readonly<{
   resourceType?: string;
   resourceKey?: string;
   observations: readonly Readonly<{
-    manifestDestinationWitnessSha256: string;
     destinationIdentity: ReturnType<typeof fixtureDestinationIdentity>;
     postEpochDelta: ReturnType<typeof fixtureCanonicalDelta>;
     postEpochCensus: ReturnType<typeof fixtureCensusVector> | null;
@@ -360,7 +359,6 @@ function fakeSession(input: Readonly<{
         destinationIdentity: observed.destinationIdentity,
         postEpochDelta: observed.postEpochDelta,
         postEpochCensus: census,
-        manifestDestinationWitnessSha256: observed.manifestDestinationWitnessSha256,
       };
     },
     async openPortableSource() {
@@ -379,6 +377,30 @@ function fakeSession(input: Readonly<{
         rollbackMode: evidence.mode,
       }).checksumSha256;
     },
+  };
+}
+
+/**
+ * An authoritative activation of generationId whose destination is unchanged since its epoch (pre-write): the
+ * stores' dependencies, a session observing the baseline and the authority artifact a rollback of it persists.
+ */
+function preWriteActivation(generationId: string) {
+  const destinationIdentity = fixtureDestinationIdentity("d");
+  const baseline = fixtureCanonicalDelta("baseline");
+  const census = fixtureCensusVector("census");
+  const scenario = fixtureActivationScenario({ generationId, destinationIdentity, censusVector: census, canonicalDeltaBaseline: baseline });
+  return {
+    scenario,
+    deps: authoritativeDeps(scenario),
+    session: async (): Promise<RollbackFencedSession> => fakeSession({
+      observations: [{ destinationIdentity, postEpochDelta: baseline, postEpochCensus: census }],
+      source: sqliteSourceStream,
+    }),
+    artifact: () => ({
+      version: 2 as const, generationId, operabilityFactState: "authoritatively-absent" as const,
+      operabilityFactValueSha256: null, epochId: scenario.selection.epochId, attemptId: scenario.selection.attemptId,
+      publication: PUBLICATION_SOURCE,
+    }),
   };
 }
 
@@ -445,62 +467,32 @@ describe("runMigrationRollback", () => {
     expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
   });
 
-  it("does not refuse on the identical setup when witness resolution instead reports authoritative absence (positive control), and completes as an unactivated selection reversal", async () => {
+it("refuses a generation that was never activated before any durable change (an absent binding store is the generation's own, not a read failure)", async () => {
     const homeDir = tempHome();
-    const store = new MigrationManifestStore({ homeDir });
-    manifestAtVerified(store, "gen-control");
-    const canonicalPath = join(homeDir, "live.sqlite");
-    const selectionBindings: unknown[] = [];
-    const witnessBindings: unknown[] = [];
+    manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-control");
 
-    const outcome = await runRollback({
-      homeDir, generationId: "gen-control", canonicalPath,
+    await expect(runRollback({
+      homeDir, generationId: "gen-control", canonicalPath: join(homeDir, "live.sqlite"),
       projectIdentity: identity, localProjectId: "local-1",
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
       ...absentDeps(),
-      recordSelectionBinding: (input) => { selectionBindings.push(input.binding); },
-      recordWitnessBinding: (input) => { witnessBindings.push(input.binding); },
-      openFencedSession: async () => {
-        const destinationIdentity = fixtureDestinationIdentity("d");
-        return fakeSession({
-          observations: [{
-            manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
-            destinationIdentity,
-            postEpochDelta: fixtureCanonicalDelta("delta"),
-            postEpochCensus: null,
-          }],
-          source: sqliteSourceStream,
-        });
-      },
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      openFencedSession: async () => { throw new Error("must not open a session for an unactivated generation"); },
+    })).rejects.toMatchObject({
+      name: "RollbackOrchestrationError",
+      reason: "not-eligible",
+      message: expect.stringContaining("never completed an activation"),
     });
-    // "unactivated" always yields mode "pre-write" (plan-v2 section 1: no
-    // epoch ever existed, so there is nothing to compare beyond the
-    // manifest's own sealed destination witness) -- so this positive
-    // control reaches a DIFFERENT, later outcome (success) than the
-    // unresolvable case above (refusal before maintenance), proving the
-    // two setups are not indistinguishable to the code under test.
-    expect(outcome.manifest.phase).toBe("rolled-back");
-    expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
-    expect(outcome.report).not.toBeNull();
-    expect(outcome.report!.mode).toBe("pre-write");
-    expect(outcome.report!.eligibility).toBe("unactivated");
 
-    // No selection was ever published, so there is no activation
-    // epoch/attempt to name: neither a witness nor a selection binding
-    // is written for "unactivated" (see rollback.ts's OPEN QUESTION
-    // comment on this exact point).
-    expect(selectionBindings).toHaveLength(0);
-    expect(witnessBindings).toHaveLength(0);
-
-    // Selection reversal, not reinstallation: the maintenance selection
-    // flips to sqlite, but nothing is installed at canonicalPath -- this
-    // rollback never touches the live database.
-    const maintenance = readBackendMaintenanceJournal(homeDir);
-    expect(maintenance?.phase).toBe("selection-completed");
-    expect(maintenance?.targetBackend).toBe("sqlite");
-    expect(existsSync(canonicalPath)).toBe(false);
+    // Unlike the unresolvable case above, this is the authority's own answer; either way nothing is written.
+    expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+    expect(readRollbackAuthorityArtifact(homeDir, "gen-control")).toBeNull();
+    const manifest = new MigrationManifestStore({ homeDir }).read("gen-control");
+    expect(manifest.phase).toBe("verified");
+    expect(manifest.pendingEffect).toBeNull();
   });
 
   it("F3: a failing directory flush after the install leaves the maintenance held and no selection prepared", async () => {
@@ -525,7 +517,6 @@ describe("runMigrationRollback", () => {
       syncDirectory: () => { throw new Error("EIO: directory sync failed"); },
       openFencedSession: async () => fakeSession({
         observations: [{
-          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
           destinationIdentity, postEpochDelta: fixtureCanonicalDelta("changed"), postEpochCensus: null,
         }],
         source: sqliteSourceStream,
@@ -560,7 +551,6 @@ describe("runMigrationRollback", () => {
       recordWitnessBinding: (input) => { witnessBindings.push(input.binding); },
       openFencedSession: async () => fakeSession({
         observations: [{
-          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
           destinationIdentity,
           // Deliberately different from the baseline -- classifyMigrationRollbackMode
           // returns "post-write" as soon as the deltas differ, on the delta axis
@@ -633,7 +623,6 @@ describe("runMigrationRollback", () => {
       recordWitnessBinding: () => undefined,
       openFencedSession: async () => fakeSession({
         observations: [{
-          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
           destinationIdentity,
           postEpochDelta: fixtureCanonicalDelta("changed"),
           postEpochCensus: null,
@@ -675,11 +664,9 @@ describe("runMigrationRollback", () => {
       openFencedSession: async () => fakeSession({
         observations: [
           {
-            manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
             destinationIdentity, postEpochDelta: baseline, postEpochCensus: census,
           },
           {
-            manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
             destinationIdentity, postEpochDelta: fixtureCanonicalDelta("race-write-landed"), postEpochCensus: null,
           },
         ],
@@ -704,7 +691,6 @@ describe("runMigrationRollback", () => {
     const baseline = fixtureCanonicalDelta("race-control-baseline");
     const census = fixtureCensusVector("race-control-census");
     const observation = {
-      manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
       destinationIdentity, postEpochDelta: baseline, postEpochCensus: census,
     };
 
@@ -779,7 +765,6 @@ describe("runMigrationRollback", () => {
       },
       openFencedSession: async () => fakeSession({
         observations: [{
-          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
           destinationIdentity, postEpochDelta: baselineBound, postEpochCensus: censusBound,
         }],
         source: sqliteSourceStream,
@@ -816,6 +801,7 @@ describe("runMigrationRollback", () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });
     manifestAtVerified(store, "gen-resume-2-7");
+    const activation = preWriteActivation("gen-resume-2-7");
     const canonicalPath = join(homeDir, "live.sqlite");
     const coordinator = coordinatorFor(homeDir);
 
@@ -833,50 +819,33 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
       now: new Date(capturedAt),
     });
-    writeRollbackAuthorityArtifact(homeDir, {
-      version: 2,
-      generationId: "gen-resume-2-7",
-      operabilityFactState: "authoritatively-absent",
-      operabilityFactValueSha256: null,
-      authorityStatus: "unactivated",
-      epochId: null,
-      attemptId: null,
-      publication: null,
-    });
+    writeRollbackAuthorityArtifact(homeDir, activation.artifact());
     expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
 
-    const destinationIdentity = fixtureDestinationIdentity("d");
     const outcome = await runRollback({
       homeDir, generationId: "gen-resume-2-7", canonicalPath,
       projectIdentity: identity, localProjectId: "local-1",
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator,
-      ...absentDeps(),
+      ...activation.deps,
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      openFencedSession: async () => fakeSession({
-        observations: [{
-          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
-          destinationIdentity,
-          postEpochDelta: fixtureCanonicalDelta("delta"),
-          postEpochCensus: null,
-        }],
-        source: sqliteSourceStream,
-      }),
+      openFencedSession: activation.session,
     });
 
     expect(outcome.manifest.phase).toBe("rolled-back");
     expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
     expect(outcome.report).not.toBeNull();
-    expect(outcome.report!.eligibility).toBe("unactivated");
-    expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-completed");
+    expect(outcome.report!.eligibility).toBe("pre-write");
+    expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "completed", targetBackend: "sqlite" });
   });
 
   it("resumes after a crash between step 7's begin and step 8's complete: prepare-rollback is pending (donadiosolutions/lcm#1432)", async () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });
     const verified = manifestAtVerified(store, "gen-resume-7-8");
+    const activation = preWriteActivation("gen-resume-7-8");
     const canonicalPath = join(homeDir, "live.sqlite");
     const coordinator = coordinatorFor(homeDir);
 
@@ -886,16 +855,7 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
       now: new Date(capturedAt),
     });
-    writeRollbackAuthorityArtifact(homeDir, {
-      version: 2,
-      generationId: "gen-resume-7-8",
-      operabilityFactState: "authoritatively-absent",
-      operabilityFactValueSha256: null,
-      authorityStatus: "unactivated",
-      epochId: null,
-      attemptId: null,
-      publication: null,
-    });
+    writeRollbackAuthorityArtifact(homeDir, activation.artifact());
     // Simulates the crash: step 7's begin durably succeeded (the SAME
     // deterministic prepareInputSha256 runMigrationRollback itself would
     // compute for this manifest state and fakeSession's default
@@ -904,7 +864,7 @@ describe("runMigrationRollback", () => {
     // pending, retry-idempotent prepare-rollback).
     const prepareInputSha256 = deriveRollbackPrepareInputSha256({
       generationId: "gen-resume-7-8", manifestRevision: verified.revision, manifestChecksumSha256: verified.checksumSha256,
-      epochId: null, resourceType: "sqlite-generation", resourceKey: "gen",
+      epochId: activation.scenario.selection.epochId, resourceType: "sqlite-generation", resourceKey: "gen",
     });
     const prepareEffectId = "rollback-prepare-" + prepareInputSha256;
     const withPending = store.update("gen-resume-7-8", verified.checksumSha256, (c) => beginMigrationEffect(c, {
@@ -913,25 +873,16 @@ describe("runMigrationRollback", () => {
     expect(withPending.pendingEffect?.kind).toBe("prepare-rollback");
     expect(withPending.phase).toBe("verified");
 
-    const destinationIdentity = fixtureDestinationIdentity("d");
     const outcome = await runRollback({
       homeDir, generationId: "gen-resume-7-8", canonicalPath,
       projectIdentity: identity, localProjectId: "local-1",
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator,
-      ...absentDeps(),
+      ...activation.deps,
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      openFencedSession: async () => fakeSession({
-        observations: [{
-          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
-          destinationIdentity,
-          postEpochDelta: fixtureCanonicalDelta("delta"),
-          postEpochCensus: null,
-        }],
-        source: sqliteSourceStream,
-      }),
+      openFencedSession: activation.session,
     });
 
     expect(outcome.manifest.phase).toBe("rolled-back");
@@ -942,22 +893,14 @@ describe("runMigrationRollback", () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });
     manifestAtVerified(store, "gen-resume-8-9");
+    const activation = preWriteActivation("gen-resume-8-9");
     const canonicalPath = join(homeDir, "live.sqlite");
-    const destinationIdentity = fixtureDestinationIdentity("d");
     const coordinator = coordinatorFor(homeDir);
 
     // The FIRST call runs for real through step 8 (prepare-rollback
     // durably completes) and then crashes for real at step 10's renew(),
     // inside runPostPrepareSequence -- no manual state reconstruction.
-    const crashingSession = fakeSession({
-      observations: [{
-        manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
-        destinationIdentity,
-        postEpochDelta: fixtureCanonicalDelta("delta"),
-        postEpochCensus: null,
-      }],
-      source: sqliteSourceStream,
-    });
+    const crashingSession = await activation.session();
     crashingSession.renew = async () => { throw new Error("simulated crash after step 8"); };
 
     await expect(runRollback({
@@ -966,7 +909,7 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator,
-      ...absentDeps(),
+      ...activation.deps,
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
       openFencedSession: async () => crashingSession,
@@ -990,30 +933,23 @@ describe("runMigrationRollback", () => {
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator,
-      ...absentDeps(),
+      ...activation.deps,
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      openFencedSession: async () => fakeSession({
-        observations: [{
-          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
-          destinationIdentity,
-          postEpochDelta: fixtureCanonicalDelta("delta"),
-          postEpochCensus: null,
-        }],
-        source: sqliteSourceStream,
-      }),
+      openFencedSession: activation.session,
     });
 
     expect(outcome.manifest.phase).toBe("rolled-back");
     expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
     expect(outcome.report).not.toBeNull();
-    expect(outcome.report!.eligibility).toBe("unactivated");
+    expect(outcome.report!.eligibility).toBe("pre-write");
   });
 
  it("abandons a pending publish-rollback effect back to the sealed returnPhase when the resumed readback contradicts its terminal evidence", async () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });
     const verified = manifestAtVerified(store, "gen-abandon");
+    const activation = preWriteActivation("gen-abandon");
     const coordinator = coordinatorFor(homeDir);
 
     const publicationId = deriveRollbackPublicationId("gen-abandon");
@@ -1024,7 +960,7 @@ describe("runMigrationRollback", () => {
     });
     const prepareInputSha256 = deriveRollbackPrepareInputSha256({
       generationId: "gen-abandon", manifestRevision: verified.revision, manifestChecksumSha256: verified.checksumSha256,
-      epochId: null, resourceType: "sqlite-generation", resourceKey: "gen",
+      epochId: activation.scenario.selection.epochId, resourceType: "sqlite-generation", resourceKey: "gen",
     });
     const prepareEffectId = "rollback-prepare-" + prepareInputSha256;
     let m = store.update("gen-abandon", verified.checksumSha256, (c) => beginMigrationEffect(c, {
@@ -1041,30 +977,20 @@ describe("runMigrationRollback", () => {
     expect(m.phase).toBe("rolling-back");
     expect(m.pendingEffect?.kind).toBe("publish-rollback");
     expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
-    writeRollbackAuthorityArtifact(homeDir, {
-      version: 2, generationId: "gen-abandon", operabilityFactState: "authoritatively-absent",
-      operabilityFactValueSha256: null, authorityStatus: "unactivated", epochId: null, attemptId: null, publication: null,
-    });
+    writeRollbackAuthorityArtifact(homeDir, activation.artifact());
 
     // The held maintenance resumes in place; the fresh readback's terminal evidence is not the pending
     // effect's ("a".repeat(64)), a contradiction, so the effect is abandoned and the maintenance aborted.
-    const destinationIdentity = fixtureDestinationIdentity("d");
     const outcome = await runRollback({
       homeDir, generationId: "gen-abandon", canonicalPath: join(homeDir, "live.sqlite"),
       projectIdentity: identity, localProjectId: "local-1",
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator,
-      ...absentDeps(),
+      ...activation.deps,
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      openFencedSession: async () => fakeSession({
-        observations: [{
-          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
-          destinationIdentity, postEpochDelta: fixtureCanonicalDelta("delta"), postEpochCensus: null,
-        }],
-        source: sqliteSourceStream,
-      }),
+      openFencedSession: activation.session,
     });
 
     expect(outcome).toMatchObject({ report: { kind: "abandonment" } });
@@ -1094,36 +1020,19 @@ describe("runMigrationRollback", () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });
     manifestAtVerified(store, "gen-agree");
+    const activation = preWriteActivation("gen-agree");
     const canonicalPath = join(homeDir, "live.sqlite");
-    writeRollbackAuthorityArtifact(homeDir, {
-      version: 2,
-      generationId: "gen-agree",
-      operabilityFactState: "authoritatively-absent",
-      operabilityFactValueSha256: null,
-      authorityStatus: "unactivated",
-      epochId: null,
-      attemptId: null,
-      publication: null,
-    });
-    const destinationIdentity = fixtureDestinationIdentity("d");
+    writeRollbackAuthorityArtifact(homeDir, activation.artifact());
     const outcome = await runRollback({
       homeDir, generationId: "gen-agree", canonicalPath,
       projectIdentity: identity, localProjectId: "local-1",
       sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
     }, {
       coordinator: coordinatorFor(homeDir),
-      ...absentDeps(),
+      ...activation.deps,
       recordSelectionBinding: () => undefined,
       recordWitnessBinding: () => undefined,
-      openFencedSession: async () => fakeSession({
-        observations: [{
-          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
-          destinationIdentity,
-          postEpochDelta: fixtureCanonicalDelta("delta"),
-          postEpochCensus: null,
-        }],
-        source: sqliteSourceStream,
-      }),
+      openFencedSession: activation.session,
     });
     expect(outcome.manifest.phase).toBe("rolled-back");
     expect(readRollbackAuthorityArtifact(homeDir, "gen-agree")).not.toBeNull();
@@ -1138,10 +1047,9 @@ describe("runMigrationRollback", () => {
       generationId: "gen-fact-artifact-wrong",
       operabilityFactState: "present",
       operabilityFactValueSha256: "e".repeat(64),
-      authorityStatus: "unactivated",
-      epochId: null,
-      attemptId: null,
-      publication: null,
+      epochId: "epoch-1",
+      attemptId: "attempt-1",
+      publication: PUBLICATION_SOURCE,
     });
     await expect(runRollback({
       homeDir, generationId: "gen-fact-artifact-wrong", canonicalPath: join(homeDir, "live.sqlite"),
@@ -1169,10 +1077,9 @@ describe("runMigrationRollback", () => {
       generationId: "gen-fact-live-wrong",
       operabilityFactState: "authoritatively-absent",
       operabilityFactValueSha256: null,
-      authorityStatus: "unactivated",
-      epochId: null,
-      attemptId: null,
-      publication: null,
+      epochId: "epoch-1",
+      attemptId: "attempt-1",
+      publication: PUBLICATION_SOURCE,
     });
     await establishCompletedPostgresqlPublication(homeDir);
     const live = await readBackendPublicationOperabilityFact({ homeDir });
@@ -1195,7 +1102,7 @@ describe("runMigrationRollback", () => {
     });
   });
 
-  it("disagreement mutation (artifact side, authority): artifact records an authoritative epoch/attempt, a fresh Boundary A read resolves unactivated -- refuses", async () => {
+  it("disagreement mutation (artifact side, authority): artifact records an authoritative epoch/attempt, a fresh Boundary A read resolves unactivated -- refuses as never activated", async () => {
     const homeDir = tempHome();
     const store = new MigrationManifestStore({ homeDir });
     manifestAtVerified(store, "gen-authority-artifact-wrong");
@@ -1204,9 +1111,8 @@ describe("runMigrationRollback", () => {
       generationId: "gen-authority-artifact-wrong",
       operabilityFactState: "authoritatively-absent",
       operabilityFactValueSha256: null,
-      authorityStatus: "authoritative",
-      epochId: "epoch-mismatch",
-      attemptId: "attempt-mismatch",
+      epochId: "epoch-1",
+      attemptId: "attempt-1",
       publication: PUBLICATION_SOURCE,
     });
     await expect(runRollback({
@@ -1221,8 +1127,8 @@ describe("runMigrationRollback", () => {
       openFencedSession: async () => { throw new Error("must not open a session: refusal happens before maintenance"); },
     })).rejects.toMatchObject({
       name: "RollbackOrchestrationError",
-      reason: "unexpected-state",
-      message: expect.stringContaining("freshly resolved authority is unactivated but the durable rollback-authority artifact"),
+      reason: "not-eligible",
+      message: expect.stringContaining("never completed an activation"),
     });
   });
 
@@ -1240,7 +1146,6 @@ describe("runMigrationRollback", () => {
         generationId: "gen-authority-" + label.replace(" ", "-"),
         operabilityFactState: "authoritatively-absent",
         operabilityFactValueSha256: null,
-        authorityStatus: "authoritative",
         epochId,
         attemptId,
         publication: PUBLICATION_SOURCE,
@@ -1263,38 +1168,6 @@ describe("runMigrationRollback", () => {
       });
     }
   });
-
-  it("disagreement mutation (live side, authority): artifact records unactivated, a fresh Boundary A read resolves an authoritative selection -- refuses", async () => {
-    const homeDir = tempHome();
-    const store = new MigrationManifestStore({ homeDir });
-    manifestAtVerified(store, "gen-authority-live-wrong");
-    writeRollbackAuthorityArtifact(homeDir, {
-      version: 2,
-      generationId: "gen-authority-live-wrong",
-      operabilityFactState: "authoritatively-absent",
-      operabilityFactValueSha256: null,
-      authorityStatus: "unactivated",
-      epochId: null,
-      attemptId: null,
-      publication: null,
-    });
-    await expect(runRollback({
-      homeDir, generationId: "gen-authority-live-wrong", canonicalPath: join(homeDir, "live.sqlite"),
-      projectIdentity: identity, localProjectId: "local-1",
-      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
-    }, {
-      coordinator: coordinatorFor(homeDir),
-      ...authoritativeDeps(fixtureActivationScenario()),
-      recordSelectionBinding: () => undefined,
-      recordWitnessBinding: () => undefined,
-      resolveAuthoritativeContext: async () => { throw new Error("must not resolve authoritative context: refusal happens before this call"); },
-      openFencedSession: async () => { throw new Error("must not open a session: refusal happens before maintenance"); },
-    })).rejects.toMatchObject({
-      name: "RollbackOrchestrationError",
-      reason: "unexpected-state",
-     message: expect.stringContaining("freshly resolved authority disagrees with the durable rollback-authority artifact"),
-   });
- });
 
   // plan-v2 section 7: interruption "between install and config" must
   // resume to exactly one authoritative selection. Config/project-map
@@ -1337,7 +1210,6 @@ describe("runMigrationRollback", () => {
       recordWitnessBinding: () => undefined,
       openFencedSession: async () => fakeSession({
         observations: [{
-          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
           destinationIdentity, postEpochDelta: fixtureCanonicalDelta("f6-changed"), postEpochCensus: null,
         }],
         source: sqliteSourceStream,
@@ -1390,7 +1262,6 @@ describe("runMigrationRollback", () => {
       recordWitnessBinding: () => undefined,
       openFencedSession: async () => fakeSession({
         observations: [{
-          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
           destinationIdentity,
           postEpochDelta: fixtureCanonicalDelta("install-config-changed"),
           postEpochCensus: null,
@@ -1487,7 +1358,6 @@ describe("runMigrationRollback", () => {
         recordWitnessBinding: () => undefined,
         openFencedSession: async () => fakeSession({
           observations: [{
-            manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
             destinationIdentity,
             postEpochDelta: fixtureCanonicalDelta("enum-refuse-changed"),
             postEpochCensus: null,
@@ -1532,7 +1402,6 @@ describe("runMigrationRollback", () => {
       recordWitnessBinding: () => undefined,
       openFencedSession: async () => fakeSession({
         observations: [{
-          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
           destinationIdentity,
           postEpochDelta: fixtureCanonicalDelta("enum-refuse-changed"),
           postEpochCensus: null,
@@ -1563,15 +1432,7 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
     });
     const unchangedSession = async () => fakeSession({
       observations: [{
-        manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
         destinationIdentity, postEpochDelta: baseline, postEpochCensus: census,
-      }],
-      source: sqliteSourceStream,
-    });
-    const unactivatedSession = async () => fakeSession({
-      observations: [{
-        manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
-        destinationIdentity, postEpochDelta: fixtureCanonicalDelta("delta"), postEpochCensus: null,
       }],
       source: sqliteSourceStream,
     });
@@ -1747,7 +1608,6 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       destinationIdentity: typeof destinationIdentity;
     }>) => async () => fakeSession({
       observations: [{
-        manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
         destinationIdentity, postEpochDelta: baseline, postEpochCensus: census, ...observation,
       }],
       source: sqliteSourceStream,
@@ -1902,7 +1762,6 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       const written = fixtureCanonicalDelta("a16-written");
       const postWriteSession = (delta = written) => async () => fakeSession({
         observations: [{
-          manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
           destinationIdentity, postEpochDelta: delta, postEpochCensus: null,
         }],
         source: sqliteSourceStream,
@@ -1990,27 +1849,13 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       expect(outcome.manifest.phase).toBe("rolled-back");
     });
 
-    it("F1: an unactivated rollback's prepared selection completes when the evidence still reads unactivated", async () => {
+it("F1: a prepared selection is refused, and left prepared, once the stores no longer show the authoritative activation", async () => {
       const homeDir = tempHome();
-      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a16-unact-same");
-      const deps = (coordinator: ReturnType<typeof coordinatorFor>) => ({ coordinator, ...absentDeps(), openFencedSession: unactivatedSession });
-      await expect(runRollback(RUN(homeDir, "gen-a16-unact-same"), deps(crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection"))))
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
         .rejects.toThrow("simulated crash");
-      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
-      const outcome = await runRollback(RUN(homeDir, "gen-a16-unact-same"), deps(coordinatorFor(homeDir)));
-      expect(outcome.manifest.phase).toBe("rolled-back");
-      expect(outcome.report).toMatchObject({ eligibility: "unactivated", mode: "pre-write", epochId: null, attemptId: null });
-    });
-
-    it("F1: an unactivated rollback's prepared selection is refused once the evidence no longer reads unactivated", async () => {
-      const homeDir = tempHome();
-      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a16-unact-prep");
-      await expect(runRollback(RUN(homeDir, "gen-a16-unact-prep"), {
-        coordinator: crashBefore(coordinatorFor(homeDir), "completeMaintenanceSelection"), ...absentDeps(), openFencedSession: unactivatedSession,
-      })).rejects.toThrow("simulated crash");
-      await expect(runRollback(RUN(homeDir, "gen-a16-unact-prep"), {
-        coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor("gen-a16-unact-prep")), openFencedSession: unactivatedSession,
-      })).rejects.toThrow();
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, { resolveWitnessBindings: () => fixtureBindingsAbsent })))
+        .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("unactivated but a rollback is in progress") });
       expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-prepared");
     });
 
@@ -2101,7 +1946,6 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
         const outcome = await runRollback(RUN(homeDir), depsFor(homeDir, {
           openFencedSession: async () => fakeSession({
             observations: [{
-              manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
               destinationIdentity: fixtureDestinationIdentity("swapped"), postEpochDelta: baseline, postEpochCensus: census,
             }],
             source: sqliteSourceStream,
@@ -2125,28 +1969,6 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
         expect(pendingPublish(homeDir)?.kind).toBe("publish-rollback");
         expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
       });
-    });
-
-    it("row 5: finishes an unactivated rollback from a pending effect: pre-write, no epoch or attempt, no binding, no publication", async () => {
-      const homeDir = tempHome();
-      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a16-unactivated");
-      const unactivatedDeps = (extra: Partial<RunMigrationRollbackDependencies>) => ({
-        coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: unactivatedSession, ...extra,
-      });
-      await expect(runRollback(RUN(homeDir, "gen-a16-unactivated"), unactivatedDeps({ coordinator: crashAfter(coordinatorFor(homeDir), "completeMaintenanceSelection") })))
-        .rejects.toThrow("simulated crash");
-      const recorded: unknown[] = [];
-      const outcome = await runRollback(RUN(homeDir, "gen-a16-unactivated"), unactivatedDeps({
-        recordSelectionBinding: (input) => { recorded.push(input.binding); },
-      }));
-      expect(outcome.manifest.phase).toBe("rolled-back");
-      expect(outcome.manifest.rollbackLineage.mode).toBe("pre-write");
-      expect(outcome.report).toMatchObject({
-        eligibility: "unactivated", mode: "pre-write", epochId: null, attemptId: null,
-        sealedPublicationMaterialDigestSha256: null, selectionBindingManifestRevision: null,
-      });
-      expect(recorded).toEqual([]);
-      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("selection-completed");
     });
 
     it("row 6: resumes a coordinator publication that our own prepare left prepared, the journal archived, under a fresh session", async () => {
@@ -2219,22 +2041,6 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       realUnlinkSync(join(migrationGenerationBindingDirectory(homeDir, GEN), "selection-rollback.binding"));
       await expect(runRollback(RUN(homeDir), depsFor(homeDir)))
         .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("without the selection binding that must precede it") });
-    });
-
-    it("refuses a coordinator publication of this rollback for an unactivated generation (it never publishes)", async () => {
-      const homeDir = tempHome();
-      manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a16-unact-slot");
-      await expect(runRollback(RUN(homeDir, "gen-a16-unact-slot"), {
-        coordinator: crashAfter(coordinatorFor(homeDir), "completeMaintenanceSelection"), ...absentDeps(), openFencedSession: unactivatedSession,
-      })).rejects.toThrow("simulated crash");
-      // A completed publication under this rollback's id appears in the slot, though an unactivated rollback publishes none.
-      const material = rollbackPublicationMaterial();
-      await new BackendPublicationCoordinator({ homeDir, driver: workingPublicationDriver(material) }).prepare({
-        publicationId: deriveRollbackPublicationId("gen-a16-unact-slot"), sourceBackend: "postgresql", targetBackend: "sqlite",
-        material, projects: [], now: new Date(capturedAt),
-      });
-      await expect(runRollback(RUN(homeDir, "gen-a16-unact-slot"), { coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: unactivatedSession }))
-        .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("without the selection binding") });
     });
 
     it("refuses a pending effect whose maintenance journal another publication archived after the selection binding was recorded", async () => {
@@ -2358,19 +2164,6 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
         expect(rollbackBinding(homeDir)).toEqual(attempted[0]!.binding);
       });
 
-      it("records nothing for an unactivated rollback", async () => {
-        const homeDir = tempHome();
-        manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-a16-unact-terminal");
-        const deps = { coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: unactivatedSession };
-        const done = await runRollback(RUN(homeDir, "gen-a16-unact-terminal"), deps);
-        const recorded: unknown[] = [];
-        const again = await runRollback(RUN(homeDir, "gen-a16-unact-terminal"), {
-          ...deps, recordSelectionBinding: (input) => { recorded.push(input); },
-        });
-        expect(again.manifest).toEqual(done.manifest);
-        expect(recorded).toEqual([]);
-      });
-
       it("refuses when the rollback report or the rollback authority artifact cannot be read", async () => {
         const noReport = tempHome();
         const first = await rolledBackWithoutBinding(noReport);
@@ -2410,7 +2203,7 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
         m = store.update(GEN, m.checksumSha256, (c) => completeMigrationEffect(c, { effectId: "prepare-rollback", completedAt: capturedAt }));
         writeRollbackAuthorityArtifact(homeDir, {
           version: 2, generationId: GEN, operabilityFactState: "authoritatively-absent", operabilityFactValueSha256: null,
-          authorityStatus: "authoritative", epochId: scenario.epoch.epochId, attemptId: scenario.attempt.attemptId,
+          epochId: scenario.epoch.epochId, attemptId: scenario.attempt.attemptId,
           publication: PUBLICATION_SOURCE,
         });
         // An effect id that is not "rollback-publish-" plus the terminal evidence digest.
@@ -2451,7 +2244,7 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
         step("prepare-rollback");
         writeRollbackAuthorityArtifact(homeDir, {
           version: 2, generationId: GEN, operabilityFactState: "authoritatively-absent", operabilityFactValueSha256: null,
-          authorityStatus: "authoritative", epochId: scenario.epoch.epochId, attemptId: scenario.attempt.attemptId,
+          epochId: scenario.epoch.epochId, attemptId: scenario.attempt.attemptId,
           publication: PUBLICATION_SOURCE,
         });
         const effectId = "rollback-publish-" + "7".repeat(64);
@@ -2493,7 +2286,6 @@ describe("runMigrationRollback against the real binding and evidence stores", ()
   };
   const unchangedSession = (): Promise<RollbackFencedSession> => Promise.resolve(fakeSession({
     observations: [{
-      manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
       destinationIdentity,
       postEpochDelta: fixtureCanonicalDelta("real-baseline"),
       postEpochCensus: fixtureCensusVector("real-census"),
@@ -2548,39 +2340,27 @@ describe("runMigrationRollback against the real binding and evidence stores", ()
     });
   });
 
-  it("rolls back a never-activated generation with every default in place, writing no binding", async () => {
+it("refuses a never-activated generation with every default in place, writing nothing", async () => {
     const homeDir = tempHome();
     manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-never");
-    const outcome = await runRollback(RUN(homeDir, "gen-never"), {
-      coordinator: coordinatorFor(homeDir),
-      openFencedSession: async () => fakeSession({
-        observations: [{
-          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
-          destinationIdentity, postEpochDelta: fixtureCanonicalDelta("delta"), postEpochCensus: null,
-        }],
-        source: sqliteSourceStream,
-      }),
-    });
-    expect(outcome.report!.eligibility).toBe("unactivated");
+    await expect(runRollback(RUN(homeDir, "gen-never"), {
+      coordinator: coordinatorFor(homeDir), openFencedSession: neverOpens,
+    })).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("never completed an activation") });
     expect(resolveMigrationWitnessBindings({ homeDir, generationId: "gen-never" }))
       .toEqual({ state: "authoritatively-absent" });
+    expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+    expect(readRollbackAuthorityArtifact(homeDir, "gen-never")).toBeNull();
   });
 
-  it("treats witnessed-but-unpublished as unactivated: an epoch and witness are stored, no selection, destination not operable", async () => {
+it("refuses witnessed-but-unpublished as never activated: an epoch and witness are stored, no selection, destination not operable", async () => {
     const homeDir = tempHome();
     manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-unpublished");
     recordActivation(homeDir, "gen-unpublished", false);
-    const outcome = await runRollback(RUN(homeDir, "gen-unpublished"), {
-      coordinator: coordinatorFor(homeDir),
-      openFencedSession: async () => fakeSession({
-        observations: [{
-          manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
-          destinationIdentity, postEpochDelta: fixtureCanonicalDelta("delta"), postEpochCensus: null,
-        }],
-        source: sqliteSourceStream,
-      }),
-    });
-    expect(outcome.report!.eligibility).toBe("unactivated");
+    await expect(runRollback(RUN(homeDir, "gen-unpublished"), {
+      coordinator: coordinatorFor(homeDir), openFencedSession: neverOpens,
+    })).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("never completed an activation") });
+    expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
+    expect(readRollbackAuthorityArtifact(homeDir, "gen-unpublished")).toBeNull();
   });
 
   it("refuses a witnessed-but-unpublished generation once the destination is operable (published but unbound)", async () => {
@@ -2703,11 +2483,10 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
   const scenarioFor = (generationId: string) => fixtureActivationScenario({
     generationId, destinationIdentity, censusVector: census, canonicalDeltaBaseline: baseline,
   });
-  const unchanged = { manifestDestinationWitnessSha256: witnessSha, destinationIdentity, postEpochDelta: baseline, postEpochCensus: census };
+  const unchanged = { destinationIdentity, postEpochDelta: baseline, postEpochCensus: census };
   const sessionOf = (...observations: Parameters<typeof fakeSession>[0]["observations"][number][]) => async () =>
     fakeSession({ observations, source: sqliteSourceStream });
   const unactivatedSession = sessionOf({
-    manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
     destinationIdentity, postEpochDelta: fixtureCanonicalDelta("delta"), postEpochCensus: null,
   });
 
@@ -2755,8 +2534,7 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
       expect(readRollbackAuthorityArtifact(homeDir, "gen-operable-bound")).toMatchObject({
         operabilityFactState: "present",
         operabilityFactValueSha256: live.state === "present" ? live.valueSha256 : null,
-        authorityStatus: "authoritative",
-      });
+        });
     });
 
     it("continues a prepared rollback from a present fact recorded in the artifact while maintenance holds the live slot", async () => {
@@ -2811,8 +2589,7 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
       await establishCompletedPostgresqlPublication(homeDir);
       const artifact = (valueSha256: string) => ({
         version: 2 as const, generationId: "gen-fact-agree", operabilityFactState: "present" as const,
-        operabilityFactValueSha256: valueSha256, authorityStatus: "authoritative" as const,
-        epochId: scenarioFor("gen-fact-agree").epoch.epochId, attemptId: scenarioFor("gen-fact-agree").attempt.attemptId,
+        operabilityFactValueSha256: valueSha256, epochId: scenarioFor("gen-fact-agree").epoch.epochId, attemptId: scenarioFor("gen-fact-agree").attempt.attemptId,
         publication: PUBLICATION_SOURCE,
       });
       const deps = {
@@ -2837,18 +2614,17 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
   });
 
   describe("the authority artifact and the report store", () => {
-    const body = (generationId: string, epochId: string | null) => ({
+    const body = (generationId: string, epochId: string) => ({
       version: 2 as const, generationId, operabilityFactState: "authoritatively-absent" as const,
-      operabilityFactValueSha256: null, authorityStatus: epochId === null ? "unactivated" as const : "authoritative" as const,
-      epochId, attemptId: epochId, publication: epochId === null ? null : PUBLICATION_SOURCE,
+      operabilityFactValueSha256: null, epochId, attemptId: epochId, publication: PUBLICATION_SOURCE,
     });
     const artifactPath = (homeDir: string, generationId: string) =>
       join(homeDir, ".lcm", "migration-rollback-authority", deriveRollbackAuthorityArtifactId(generationId) + ".json");
 
     it("reuses an identical artifact and refuses a different one under the same generation", () => {
       const homeDir = tempHome();
-      const first = writeRollbackAuthorityArtifact(homeDir, body("gen-artifact", null));
-      expect(writeRollbackAuthorityArtifact(homeDir, body("gen-artifact", null))).toEqual(first);
+      const first = writeRollbackAuthorityArtifact(homeDir, body("gen-artifact", "d".repeat(64)));
+      expect(writeRollbackAuthorityArtifact(homeDir, body("gen-artifact", "d".repeat(64)))).toEqual(first);
       expect(() => writeRollbackAuthorityArtifact(homeDir, body("gen-artifact", "e".repeat(64)))).toThrow();
     });
 
@@ -2860,10 +2636,10 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
 
     it("refuses an artifact whose checksum does not match its content", () => {
       const homeDir = tempHome();
-      writeRollbackAuthorityArtifact(homeDir, body("gen-artifact-sum", null));
+      writeRollbackAuthorityArtifact(homeDir, body("gen-artifact-sum", "d".repeat(64)));
       const path = artifactPath(homeDir, "gen-artifact-sum");
       chmodSync(path, 0o600);
-      writeFileSync(path, readFileSync(path, "utf8").replace("unactivated", "authoritative"), { mode: 0o400 });
+      writeFileSync(path, readFileSync(path, "utf8").replace("authoritatively-absent", "present"), { mode: 0o400 });
       chmodSync(path, 0o400);
       expect(() => readRollbackAuthorityArtifact(homeDir, "gen-artifact-sum")).toThrow(/checksum/);
     });
@@ -2918,7 +2694,9 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
         return result;
       });
       const outcome = await runRollback(RUN(homeDir, "gen-landed"), {
-        coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: unactivatedSession,
+        coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor("gen-landed")),
+        recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+        openFencedSession: sessionOf(unchanged),
       });
       expect(outcome.manifest.phase).toBe("rolled-back");
     });
@@ -2930,7 +2708,9 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
         throw new Error("simulated failure before the update landed");
       });
       await expect(runRollback(RUN(homeDir, "gen-not-landed"), {
-        coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: unactivatedSession,
+        coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor("gen-not-landed")),
+        recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+        openFencedSession: sessionOf(unchanged),
       })).rejects.toThrow("simulated failure before the update landed");
     });
   });
@@ -2948,16 +2728,18 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
     });
     writeRollbackAuthorityArtifact(homeDir, {
       version: 2, generationId: "gen-roster", operabilityFactState: "authoritatively-absent",
-      operabilityFactValueSha256: null, authorityStatus: "unactivated", epochId: null, attemptId: null,
-      publication: null,
+      operabilityFactValueSha256: null, epochId: scenarioFor("gen-roster").selection.epochId, attemptId: scenarioFor("gen-roster").selection.attemptId,
+      publication: PUBLICATION_SOURCE,
     });
     // Same machines in the opposite order, plus a repeated id so every comparison outcome is reached: not the held roster.
     await expect(runRollback(RUN(homeDir, "gen-roster", { roster: rosterOf(second, MACHINE_ID, MACHINE_ID) }), {
-      coordinator, ...absentDeps(), openFencedSession: neverOpens,
+      coordinator, ...authoritativeDeps(scenarioFor("gen-roster")), openFencedSession: neverOpens,
     })).rejects.toThrow();
     // The held roster in the opposite order is adopted.
     const outcome = await runRollback(RUN(homeDir, "gen-roster", { roster: rosterOf(second, MACHINE_ID) }), {
-      coordinator, ...absentDeps(), openFencedSession: unactivatedSession,
+      coordinator, ...authoritativeDeps(scenarioFor("gen-roster")),
+      recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+      openFencedSession: sessionOf(unchanged),
     });
     expect(outcome.manifest.phase).toBe("rolled-back");
   });
@@ -2970,7 +2752,7 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
       kind: "prepare-rollback", effectId: "rollback-prepare-other", inputSha256: "9".repeat(64), startedAt: capturedAt,
     }));
     await expect(runRollback(RUN(homeDir, "gen-wrong-pending"), {
-      coordinator: coordinatorFor(homeDir), ...absentDeps(), openFencedSession: unactivatedSession,
+      coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor("gen-wrong-pending")), openFencedSession: sessionOf(unchanged),
     })).rejects.toMatchObject({ reason: "unexpected-state" });
   });
 
@@ -3191,10 +2973,12 @@ describe("runMigrationRollback: only the covered project may be remotely bound (
   const bound = (suffix: string) => ({ canonical: "/p-" + suffix, aliases: [], remoteProjectId: remote(suffix) });
   const localOnly = { canonical: "/local-only", aliases: [] };
   const destinationIdentity = fixtureDestinationIdentity("d");
-  const unactivatedSession = async (): Promise<RollbackFencedSession> => fakeSession({
+  const a14Scenario = fixtureActivationScenario({
+    destinationIdentity, censusVector: fixtureCensusVector("a14"), canonicalDeltaBaseline: fixtureCanonicalDelta("a14"),
+  });
+  const unchangedSession = async (): Promise<RollbackFencedSession> => fakeSession({
     observations: [{
-      manifestDestinationWitnessSha256: destinationIdentity.sealedWitnessSha256,
-      destinationIdentity, postEpochDelta: fixtureCanonicalDelta("delta"), postEpochCensus: null,
+      destinationIdentity, postEpochDelta: fixtureCanonicalDelta("a14"), postEpochCensus: fixtureCensusVector("a14"),
     }],
     source: sqliteSourceStream,
   });
@@ -3203,8 +2987,11 @@ describe("runMigrationRollback: only the covered project may be remotely bound (
   };
   const deps = (homeDir: string, map: () => ReturnType<typeof coveredOnlyProjectMap>, open = neverOpens) => ({
     coordinator: coordinatorFor(homeDir),
-    ...absentDeps(),
+    ...authoritativeDeps(a14Scenario),
     readProjectMap: map,
+    readRetainedMaterial: () => retainedActivationPublication(),
+    composePublication: composeRollbackPublication,
+    recordActivationWitness: () => undefined,
     recordSelectionBinding: () => undefined,
     recordWitnessBinding: () => undefined,
     openFencedSession: open,
@@ -3234,8 +3021,9 @@ describe("runMigrationRollback: only the covered project may be remotely bound (
   it("is not blocked by a second, unbound (local-only) entry (positive control)", async () => {
     const homeDir = tempHome();
     manifestAtVerified(new MigrationManifestStore({ homeDir }), "gen-local-only");
-    const outcome = await runMigrationRollback(RUN(homeDir, "gen-local-only", { projectIdentity: { scope: "shared", projectId: remote("01") } }),
-      deps(homeDir, () => ({ "local-1": bound("01"), "other-hash": localOnly }), unactivatedSession));
+    const outcome = await runMigrationRollback(
+      RUN(homeDir, "gen-local-only", { projectIdentity: { scope: "shared", projectId: remote("01") }, localProjectId: FIXTURE_LOCAL_PROJECT_ID }),
+      deps(homeDir, () => ({ [FIXTURE_LOCAL_PROJECT_ID]: bound("01"), "other-hash": localOnly }), unchangedSession));
     expect(outcome.manifest.phase).toBe("rolled-back");
   });
 
@@ -3296,12 +3084,14 @@ describe("runMigrationRollback: only the covered project may be remotely bound (
     let reads = 0;
     const tokens: unknown[] = [];
     await expect(runMigrationRollback(
-      RUN(homeDir, "gen-recheck"),
+      RUN(homeDir, "gen-recheck", { localProjectId: FIXTURE_LOCAL_PROJECT_ID }),
       deps(homeDir, ((_home?: string, token?: unknown) => {
         reads += 1;
         tokens.push(token);
-        return reads === 1 ? { "local-1": bound("01") } : { "local-1": bound("01"), "other-hash": bound("02") };
-      }) as never, unactivatedSession),
+        return reads === 1
+          ? { [FIXTURE_LOCAL_PROJECT_ID]: bound("01") }
+          : { [FIXTURE_LOCAL_PROJECT_ID]: bound("01"), "other-hash": bound("02") };
+      }) as never, unchangedSession),
     )).rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("multiple-remote-projects") });
     expect(reads).toBe(2);
     expect(tokens[0]).toBeUndefined();
@@ -3325,10 +3115,10 @@ describe("runMigrationRollback: recovery guards on settled and pending manifests
     ...absentDeps(),
     openFencedSession: async () => { throw new Error("must not open a session"); },
   });
-  const writeUnactivatedArtifact = (homeDir: string): void => {
+  const writeAuthorityArtifact = (homeDir: string): void => {
     writeRollbackAuthorityArtifact(homeDir, {
       version: 2, generationId: GEN, operabilityFactState: "authoritatively-absent", operabilityFactValueSha256: null,
-      authorityStatus: "unactivated", epochId: null, attemptId: null, publication: null,
+      epochId: "epoch-1", attemptId: "attempt-1", publication: PUBLICATION_SOURCE,
     });
   };
   const begin = (store: MigrationManifestStore, manifest: MigrationManifest, kind: string): MigrationManifest =>
@@ -3376,7 +3166,7 @@ describe("runMigrationRollback: recovery guards on settled and pending manifests
     let m = manifestAtVerified(store, GEN);
     m = complete(store, begin(store, m, "prepare-rollback"), "prepare-rollback", {});
     begin(store, m, "publish-rollback");
-    writeUnactivatedArtifact(homeDir);
+    writeAuthorityArtifact(homeDir);
     expect(readBackendMaintenanceJournal(homeDir)).toBeNull();
     const outcome = await runRollback(RUN(homeDir), deps(homeDir));
     expect(outcome.manifest.phase).toBe("verified");
@@ -3398,7 +3188,6 @@ describe("runMigrationRollback: recovery guards on settled and pending manifests
       openFencedSession: async () => {
         const session = fakeSession({
           observations: [{
-            manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
             destinationIdentity, postEpochDelta: fixtureCanonicalDelta("ordinal-changed"), postEpochCensus: null,
           }],
           source: sqliteSourceStream,
@@ -3420,7 +3209,7 @@ describe("runMigrationRollback: recovery guards on settled and pending manifests
     let m = manifestAtVerified(store, GEN);
     m = complete(store, begin(store, m, "prepare-rollback"), "prepare-rollback", {});
     begin(store, m, "publish-rollback");
-    writeUnactivatedArtifact(homeDir);
+    writeAuthorityArtifact(homeDir);
     const coordinator = coordinatorFor(homeDir);
     const held = await coordinator.enterMaintenance({
       publicationId: deriveRollbackPublicationId(GEN), generationId: GEN, sourceSelectionSha256: "5".repeat(64),
@@ -3442,7 +3231,7 @@ describe("runMigrationRollback: recovery guards on settled and pending manifests
     let m = manifestAtVerified(store, GEN);
     m = complete(store, begin(store, m, "prepare-rollback"), "prepare-rollback", {});
     begin(store, m, "publish-rollback");
-    writeUnactivatedArtifact(homeDir);
+    writeAuthorityArtifact(homeDir);
     const coordinator = coordinatorFor(homeDir);
     const held = await coordinator.enterMaintenance({
       publicationId: deriveRollbackPublicationId(GEN), generationId: GEN, sourceSelectionSha256: "5".repeat(64),
@@ -3470,7 +3259,6 @@ describe("runMigrationRollback: the publication source and the coordinator's pub
   });
   const unchangedSession = async () => fakeSession({
     observations: [{
-      manifestDestinationWitnessSha256: storageWitness("postgresql", "4").identitySha256,
       destinationIdentity, postEpochDelta: baseline, postEpochCensus: census,
     }],
     source: sqliteSourceStream,
@@ -3583,7 +3371,7 @@ describe("runMigrationRollback: the publication source and the coordinator's pub
     manifestAtVerified(new MigrationManifestStore({ homeDir }), GEN);
     writeRollbackAuthorityArtifact(homeDir, {
       version: 1, generationId: GEN, operabilityFactState: "authoritatively-absent", operabilityFactValueSha256: null,
-      authorityStatus: "authoritative", epochId: scenario.epoch.epochId, attemptId: scenario.attempt.attemptId,
+      epochId: scenario.epoch.epochId, attemptId: scenario.attempt.attemptId,
     } as never);
     const before = readFileSync(join(homeDir, ".lcm", "migration-rollback-authority", deriveRollbackAuthorityArtifactId(GEN) + ".json"), "utf8");
     await expect(runRollback(RUN(homeDir), depsFor(homeDir, { openFencedSession: neverOpens })))

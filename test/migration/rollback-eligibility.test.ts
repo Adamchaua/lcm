@@ -278,38 +278,9 @@ function observation(overrides: Partial<RollbackEligibilityObservation> = {}): R
     destinationIdentity: identity,
     postEpochDelta: fixtureCanonicalDelta("delta"),
     postEpochCensus: null,
-    manifestDestinationWitnessSha256: identity.sealedWitnessSha256,
     ...overrides,
   };
 }
-
-describe("evaluateRollbackEligibility: unactivated branch", () => {
-  it("passes a refused authority through verbatim", () => {
-    const decision = evaluateRollbackEligibility({
-      authority: { status: "refused", reason: "activation authority is unresolvable" },
-      authoritativeContext: null,
-      observation: observation(),
-    });
-    expect(decision).toEqual({ eligibility: "refused", reason: "activation authority is unresolvable" });
-  });
-
-  it("returns unactivated pre-write when the destination identity matches the manifest's sealed witness", () => {
-    expect(evaluateRollbackEligibility({
-      authority: { status: "unactivated" }, authoritativeContext: null, observation: observation(),
-    })).toEqual({ eligibility: "unactivated", mode: "pre-write" });
-  });
-
-  it("refuses when the destination identity does not match the manifest's sealed witness", () => {
-    expect(evaluateRollbackEligibility({
-      authority: { status: "unactivated" },
-      authoritativeContext: null,
-      observation: observation({ manifestDestinationWitnessSha256: "0".repeat(64) }),
-    })).toEqual({
-      eligibility: "refused",
-      reason: "destination identity does not match the manifest's sealed witness",
-    });
-  });
-});
 
 describe("evaluateRollbackEligibility: authoritative branch", () => {
   const delta = fixtureCanonicalDelta("shared-delta");
@@ -319,21 +290,8 @@ describe("evaluateRollbackEligibility: authoritative branch", () => {
     censusVector: census,
     canonicalDeltaBaseline: delta,
   });
-  const authoritative = { status: "authoritative" as const, selection: scenario.selection };
   const evaluate = (overrides: Partial<RollbackEligibilityObservation>, context = scenario.context) =>
-    evaluateRollbackEligibility({ authority: authoritative, authoritativeContext: context, observation: observation(overrides) });
-
-  it("refuses when the authoritative context is missing", () => {
-    expect(evaluateRollbackEligibility({ authority: authoritative, authoritativeContext: null, observation: observation() }))
-      .toMatchObject({ eligibility: "refused" });
-  });
-
-  it("refuses an authoritative decision whose readback carries no delta", () => {
-    expect(evaluate({ postEpochDelta: null, postEpochCensus: null })).toEqual({
-      eligibility: "refused",
-      reason: "an authoritative rollback needs a canonical delta from its readback",
-    });
-  });
+    evaluateRollbackEligibility({ authoritativeContext: context, observation: observation(overrides) });
 
   it("refuses on identity mismatch before the classifier is consulted", () => {
     // The census equals the epoch's, so a classifier that ran would grant pre-write.
