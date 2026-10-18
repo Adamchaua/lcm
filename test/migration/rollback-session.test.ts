@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalSha256, PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_RECORD_SCHEMA_SHA256 } from "../../src/storage/portable-record.js";
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
 import type { BackendPublicationLockToken } from "../../src/storage/backend-publication.js";
@@ -18,6 +18,7 @@ import type { MigrationManifest } from "../../src/migration/protocol.js";
 import { deriveRollbackPublicationId, type RollbackFencedSession } from "../../src/migration/rollback.js";
 import {
   DEFAULT_ROLLBACK_SESSION_DEPENDENCIES,
+  ROLLBACK_LEASE_RENEWAL_INTERVAL_MS,
   ROLLBACK_LEASE_TTL_MS,
   RollbackSessionError,
   deriveRollbackProjectEvidenceSha256,
@@ -165,8 +166,10 @@ function harness(options: Readonly<{
   return { runtime, snapshots, source, stream, census, dependencies };
 }
 
-const open = (h: ReturnType<typeof harness>, input = openInput) =>
-  openRollbackFencedSession(input, target, h.dependencies);
+const open = (h: ReturnType<typeof harness>, input = openInput, sessionTarget: RollbackSessionTarget = target) =>
+  openRollbackFencedSession(input, sessionTarget, h.dependencies);
+/** A target whose pool can serve a renewal while a read holds a connection. */
+const pooledTarget: RollbackSessionTarget = { ...target, settings: { ...target.settings, poolMax: 2 } };
 
 describe("deriveRollbackProjectEvidenceSha256", () => {
   it("is the canonical digest of the rollback-project-evidence record", () => {
@@ -325,8 +328,10 @@ describe("openRollbackFencedSession: opening", () => {
     expect(Object.keys(DEFAULT_ROLLBACK_SESSION_DEPENDENCIES).sort()).toEqual([
       "assertReadOnlyGuard", "captureDestinationIdentity", "captureDestinationSchemaWitness", "checkQuiescence",
       "checkRecoveryAdmission", "createPortableSource", "createRuntime", "createStream", "readDomainCensus",
-      "readFencedDestinationCensus", "verifyRuntimeSchema",
+      "readFencedDestinationCensus", "renewalIntervalMs", "verifyRuntimeSchema",
     ]);
+    expect(DEFAULT_ROLLBACK_SESSION_DEPENDENCIES.renewalIntervalMs).toBe(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS);
+    expect(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS).toBe(ROLLBACK_LEASE_TTL_MS / 3);
   });
 });
 
@@ -405,10 +410,11 @@ describe("captureReadback", () => {
     const snapshot = await (h.runtime.openReadOnlySnapshot as ReturnType<typeof vi.fn>).mock.results[0]!.value;
     expect(h.dependencies.assertReadOnlyGuard).toHaveBeenCalledWith(snapshot, undefined);
     expect(h.dependencies.verifyRuntimeSchema).toHaveBeenCalledWith(snapshot, { expectedOwner: "lcm_owner", signal: undefined });
-    expect(h.dependencies.captureDestinationIdentity).toHaveBeenCalledWith(snapshot, REMOTE, undefined);
+    // The reads run under the renewal keeper's signal, which a failed renewal aborts.
+    expect(h.dependencies.captureDestinationIdentity).toHaveBeenCalledWith(snapshot, REMOTE, expect.any(AbortSignal));
     expect(h.dependencies.readFencedDestinationCensus).toHaveBeenCalledWith(snapshot, {
       settings: target.settings, expectedOwner: "lcm_owner", expectedIdentity: target.expectedIdentity,
-      scratchParent: "/scratch", signal: undefined,
+      scratchParent: "/scratch", signal: expect.any(AbortSignal),
     });
   });
 
@@ -449,7 +455,7 @@ describe("openPortableSource", () => {
     const snapshot = await (h.runtime.openReadOnlySnapshot as ReturnType<typeof vi.fn>).mock.results[0]!.value;
     expect(h.dependencies.createPortableSource).toHaveBeenCalledWith({
       settings: target.settings, expectedOwner: "lcm_owner", expectedIdentity: target.expectedIdentity,
-      scratchParent: "/scratch", signal: undefined, session: snapshot,
+      scratchParent: "/scratch", signal: expect.any(AbortSignal), session: snapshot,
     });
     // The export snapshot stays open for the export; release() closes it.
     expect(h.snapshots[0]!.close).not.toHaveBeenCalled();
@@ -543,6 +549,217 @@ describe("openPortableSource", () => {
     h.snapshots[0]!.close.mockRejectedValue(new Error("snapshot close failed"));
     await expect(pending).rejects.toThrow("not read-only");
     expect(h.snapshots[0]!.close).toHaveBeenCalled();
+  });
+});
+
+
+/**
+ * PR #1556 review (thread 4306938046): the census scan and the export can outlast ROLLBACK_LEASE_TTL_MS on a large
+ * destination, and the first renewal used to come only after both. The session now renews on a bounded interval
+ * while either read is in flight, from a timer every exit path clears; a renewal that fails aborts the read and is
+ * what the read reports, so nothing read after the fence was lost is ever consumed as fenced.
+ */
+describe("lease renewal during long fenced reads", () => {
+  afterEach(() => { vi.useRealTimers(); });
+  const openPooled = (h: ReturnType<typeof harness>, input = openInput) => open(h, input, pooledTarget);
+
+  /** A census read that stays in flight until the test resolves it, observing the signal it was given. */
+  function pendingCensus(h: ReturnType<typeof harness>) {
+    let resolve!: (value: unknown) => void;
+    let signal: AbortSignal | undefined;
+    const gate = new Promise((done) => { resolve = done; });
+    h.dependencies.readFencedDestinationCensus = vi.fn(async (_snapshot: unknown, options: { signal?: AbortSignal }) => {
+      signal = options.signal;
+      await gate;
+      return { census: h.census, dependencyEdges: new Map(), recordIdentities: new Map(), recordSha256s: new Map() };
+    }) as never;
+    return { finish: () => resolve(undefined), signal: () => signal };
+  }
+  const renews = (lease: ReturnType<typeof statefulGuard>) => lease.calls.filter((call) => call === "renew").length;
+
+  it("renews the lease repeatedly during a census scan longer than the TTL, then stops renewing once the scan is done", async () => {
+    vi.useFakeTimers();
+    const lease = statefulGuard();
+    const h = harness({ guard: lease.guard });
+    const session = await openPooled(h);
+    const census = pendingCensus(h);
+    const capture = session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("x") });
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_TTL_MS + ROLLBACK_LEASE_RENEWAL_INTERVAL_MS);
+    // Four intervals elapsed (the TTL is three of them, plus one): four renewals of the same token.
+    expect(renews(lease)).toBe(4);
+    expect(lease.state.row).toMatchObject({ fencingToken: 1n, renewedAt: "renewed", releasedAt: null });
+    expect(census.signal()?.aborted).toBe(false);
+
+    census.finish();
+    await expect(capture).resolves.toMatchObject({ postEpochDelta: buildMigrationCanonicalDelta(h.census) });
+    const after = renews(lease);
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_TTL_MS * 2);
+    expect(renews(lease)).toBe(after);
+    await session.release();
+  });
+
+  it("aborts the scan and reports lease-lost when a renewal fails mid-scan, even if the scan then completes", async () => {
+    vi.useFakeTimers();
+    const lease = statefulGuard();
+    const h = harness({ guard: lease.guard });
+    const session = await openPooled(h);
+    const census = pendingCensus(h);
+    const capture = session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("x") });
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS);
+    expect(census.signal()?.aborted).toBe(false);
+    // The fence is lost underneath the scan: the next renewal fails.
+    lease.state.row = { ...lease.state.row!, releasedAt: "released elsewhere" };
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS);
+    expect(census.signal()?.aborted).toBe(true);
+
+    census.finish();
+    await expect(capture).rejects.toMatchObject({ name: "RollbackSessionError", reason: "lease-lost" });
+    const after = renews(lease);
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_TTL_MS);
+    expect(renews(lease)).toBe(after);
+    await session.closeKeepingLease();
+  });
+
+  it("reports lease-lost over the scan's own failure when the renewal failed first", async () => {
+    vi.useFakeTimers();
+    const lease = statefulGuard();
+    const h = harness({ guard: lease.guard });
+    const session = await openPooled(h);
+    let reject!: (error: unknown) => void;
+    h.dependencies.readFencedDestinationCensus = vi.fn(() => new Promise((_resolve, fail) => { reject = fail; })) as never;
+    const capture = session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("x") });
+    lease.state.row = { ...lease.state.row!, releasedAt: "released elsewhere" };
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS);
+    reject(new Error("query aborted"));
+    await expect(capture).rejects.toMatchObject({ reason: "lease-lost" });
+    await session.closeKeepingLease();
+  });
+
+  it("renews across the export until the stream is closed, hands out no batch once a renewal failed, and reports the loss on close", async () => {
+    vi.useFakeTimers();
+    const lease = statefulGuard();
+    const h = harness({ guard: lease.guard });
+    h.stream.readBatch = vi.fn(async () => "batch");
+    const session = await openPooled(h);
+    const exported = await session.openPortableSource();
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS * 2);
+    expect(renews(lease)).toBe(2);
+    await expect(exported.stream.readBatch({} as never)).resolves.toBe("batch");
+
+    lease.state.row = { ...lease.state.row!, releasedAt: "released elsewhere" };
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS);
+    await expect(exported.stream.readBatch({} as never)).rejects.toMatchObject({ reason: "lease-lost" });
+    expect(h.stream.readBatch).toHaveBeenCalledTimes(1);
+    await expect(exported.stream.close()).rejects.toMatchObject({ reason: "lease-lost" });
+    // The snapshot was still closed with the stream, and the keeper is stopped.
+    expect(h.snapshots[0]!.close).toHaveBeenCalledTimes(1);
+    const after = renews(lease);
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_TTL_MS);
+    expect(renews(lease)).toBe(after);
+    await session.closeKeepingLease();
+  });
+
+  it("a batch read that outlived a renewal failure is refused, not returned", async () => {
+    vi.useFakeTimers();
+    const lease = statefulGuard();
+    const h = harness({ guard: lease.guard });
+    let resolveBatch!: (value: unknown) => void;
+    h.stream.readBatch = vi.fn(() => new Promise((done) => { resolveBatch = done; }));
+    const session = await openPooled(h);
+    const exported = await session.openPortableSource();
+    const batch = exported.stream.readBatch({} as never);
+    lease.state.row = { ...lease.state.row!, releasedAt: "released elsewhere" };
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS);
+    resolveBatch("late batch");
+    await expect(batch).rejects.toMatchObject({ reason: "lease-lost" });
+    await expect(exported.stream.close()).rejects.toMatchObject({ reason: "lease-lost" });
+    await session.closeKeepingLease();
+  });
+
+  it("the stream's close stops renewing even when the stream and snapshot closes fail, and the renewal failure takes precedence", async () => {
+    vi.useFakeTimers();
+    const lease = statefulGuard();
+    const h = harness({ guard: lease.guard });
+    h.stream.close.mockRejectedValue(new Error("stream close failed"));
+    const session = await openPooled(h);
+    const exported = await session.openPortableSource();
+    h.snapshots[0]!.close.mockRejectedValue(new Error("snapshot close failed"));
+    lease.state.row = { ...lease.state.row!, releasedAt: "released elsewhere" };
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS);
+    await expect(exported.stream.close()).rejects.toMatchObject({ reason: "lease-lost" });
+    await session.closeKeepingLease().catch(() => undefined);
+  });
+
+  it("release() and closeKeepingLease() stop a keeper of a stream that was never closed", async () => {
+    vi.useFakeTimers();
+    for (const close of ["release", "closeKeepingLease"] as const) {
+      const lease = statefulGuard();
+      const h = harness({ guard: lease.guard });
+      const session = await openPooled(h);
+      await session.openPortableSource();
+      await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS);
+      expect(renews(lease)).toBe(1);
+      await session[close]();
+      await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_TTL_MS);
+      expect(renews(lease)).toBe(1);
+    }
+  });
+
+  it("the session's own abort signal aborts a read in flight through the keeper's signal", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const h = harness();
+    const session = await openPooled(h, { ...openInput, signal: controller.signal });
+    const census = pendingCensus(h);
+    const capture = session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("x") });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(census.signal()?.aborted).toBe(false);
+    controller.abort(new Error("caller aborted"));
+    expect(census.signal()?.aborted).toBe(true);
+    census.finish();
+    await capture;
+    await session.release();
+  });
+
+  it("does not overlap renewals: a renewal still waiting (one-connection pool) is awaited at the end of the scan, not duplicated", async () => {
+    vi.useFakeTimers();
+    const lease = statefulGuard();
+    let releaseRenew!: () => void;
+    const slowRenew = new Promise<void>((done) => { releaseRenew = done; });
+    const renew = lease.guard.renew.bind(lease.guard);
+    lease.guard.renew = async (input) => { await slowRenew; return renew(input); };
+    const h = harness({ guard: lease.guard });
+    const session = await openPooled(h);
+    const census = pendingCensus(h);
+    const capture = session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("x") });
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS * 3);
+    census.finish();
+    let settled = false;
+    void capture.then(() => { settled = true; }, () => { settled = true; });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBe(false);
+    releaseRenew();
+    await expect(capture).resolves.toBeDefined();
+    expect(renews(lease)).toBe(1);
+    await session.release();
+  });
+
+  it("with a single-connection pool the only connection is the read's own, so no periodic renewal is attempted (the read must fit the TTL)", async () => {
+    vi.useFakeTimers();
+    const lease = statefulGuard();
+    const h = harness({ guard: lease.guard });
+    const session = await open(h);
+    const census = pendingCensus(h);
+    const capture = session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("x") });
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_TTL_MS * 2);
+    expect(renews(lease)).toBe(0);
+    census.finish();
+    await expect(capture).resolves.toBeDefined();
+    const exported = await session.openPortableSource();
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_TTL_MS * 2);
+    expect(renews(lease)).toBe(0);
+    await exported.stream.close();
+    await session.release();
   });
 });
 

@@ -213,7 +213,13 @@ Rollback holds the same PostgreSQL fence used by the forward migration for
 the full duration of its destination scan -- reading the current census and
 delta, and, on a post-write rollback, transferring every domain into the new
 SQLite generation. The fence is renewed across long scans rather than held in
-a single non-renewable lease, but it is held throughout. Size any expected
+a single non-renewable lease, but it is held throughout: while the census scan
+or the export is in flight the lease is renewed every five minutes (a third of
+its fifteen-minute lifetime), and a renewal that fails stops the scan rather
+than letting it finish unfenced. That renewal needs a PostgreSQL connection of
+its own beside the one the scan holds, so it runs only when `poolMax` is at
+least 2; with a single-connection pool each scan has to finish within the
+fifteen-minute lease. Size any expected
 outage window from the amount of data PostgreSQL holds, not from a fixed
 estimate: a larger destination means a longer window during which PostgreSQL
 writes from this project are fenced.

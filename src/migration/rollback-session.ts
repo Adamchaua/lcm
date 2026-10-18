@@ -92,6 +92,11 @@ import {
 
 /** How long one acquisition or renewal keeps the lease. Fixed, not caller-supplied. */
 export const ROLLBACK_LEASE_TTL_MS = 15 * 60 * 1000;
+/**
+ * How often a fenced read in flight (the census scan, the export) renews the lease: a third of the TTL, so a
+ * renewal may run late twice before the lease could lapse. A renewal that fails aborts the read fail-closed.
+ */
+export const ROLLBACK_LEASE_RENEWAL_INTERVAL_MS = ROLLBACK_LEASE_TTL_MS / 3;
 
 export type RollbackSessionErrorReason =
   | "lease-unavailable"
@@ -137,6 +142,8 @@ export interface RollbackSessionDependencies {
   createStream: typeof createPortableRecordStream;
   checkQuiescence: typeof checkActivationWriterQuiescence;
   checkRecoveryAdmission: typeof checkRollbackRecoveryAdmission;
+  /** Renewal cadence of a fenced read in flight; defaults to {@link ROLLBACK_LEASE_RENEWAL_INTERVAL_MS}. */
+  renewalIntervalMs?: number;
 }
 
 export const DEFAULT_ROLLBACK_SESSION_DEPENDENCIES: RollbackSessionDependencies = {
@@ -151,6 +158,7 @@ export const DEFAULT_ROLLBACK_SESSION_DEPENDENCIES: RollbackSessionDependencies 
   createStream: createPortableRecordStream,
   checkQuiescence: checkActivationWriterQuiescence,
   checkRecoveryAdmission: checkRollbackRecoveryAdmission,
+  renewalIntervalMs: ROLLBACK_LEASE_RENEWAL_INTERVAL_MS,
 };
 
 /** The session a rollback receives, plus the one hook the coordinator wiring (S4) needs. */
@@ -194,6 +202,19 @@ async function acquireRollbackLease(
   return took.fence;
 }
 
+/**
+ * Keeps the lease renewed while a long fenced read is in flight. Its signal aborts the read when a renewal
+ * fails (or when the session's own signal aborts); stop() reports that failure, so no read that outlived its
+ * fence is ever consumed as fenced.
+ */
+type LeaseRenewalKeeper = Readonly<{
+  signal: AbortSignal;
+  /** Throws the renewal failure, if one was recorded. */
+  assertFenced(): void;
+  /** Stops renewing, waits for a renewal in flight, then throws the renewal failure if one was recorded. */
+  stop(): Promise<void>;
+}>;
+
 class FencedRollbackSession implements RollbackProductionSession {
   readonly selectionAuthority: MigrationSelectionAuthority;
   /** Sealed once quiescence is observed, before the session is handed out. */
@@ -202,6 +223,8 @@ class FencedRollbackSession implements RollbackProductionSession {
   private coordinatorAcquired = false;
   private released = false;
   private readonly snapshots = new Set<PostgreSqlSnapshotSession>();
+  /** Renewal keepers of reads still in flight (an export whose stream was never closed); release stops them. */
+  private readonly keepers = new Set<LeaseRenewalKeeper>();
 
   constructor(
     private readonly runtime: RollbackSessionRuntime,
@@ -239,6 +262,72 @@ class FencedRollbackSession implements RollbackProductionSession {
     if (asserted.status !== "satisfied") throw new RollbackSessionError("lease-lost", asserted.detail);
   }
 
+  /**
+   * The census scan and the export can outlast the lease TTL on a large destination; the fence must be
+   * renewed across them, from a timer the read's own exit paths clear, with any renewal failure aborting the
+   * read rather than letting it finish unfenced. Renewals never overlap (a renewal still waiting on the pool,
+   * is awaited at stop, never duplicated). A renewal needs a pool connection of its own while the read holds
+   * one: with a single-connection pool it would only wait for the read to end (and time out under the pool's
+   * connection timeout, failing a read that is still fenced), so the keeper is inert there and such a
+   * destination must finish each read within the lease TTL, as documented.
+   */
+  private startRenewalKeeper(): LeaseRenewalKeeper {
+    const controller = new AbortController();
+    const external = this.signal;
+    const onExternalAbort = (): void => controller.abort(external?.reason);
+    if (external?.aborted) controller.abort(external.reason);
+    else external?.addEventListener("abort", onExternalAbort, { once: true });
+    if (this.target.settings.poolMax <= 1) {
+      return {
+        signal: controller.signal,
+        assertFenced: () => undefined,
+        stop: async () => { external?.removeEventListener("abort", onExternalAbort); },
+      };
+    }
+    let failure: unknown;
+    let pending: Promise<void> | null = null;
+    const timer = setInterval(() => {
+      if (pending !== null || failure !== undefined) return;
+      pending = this.renew().then(
+        () => { pending = null; },
+        (error: unknown) => {
+          pending = null;
+          failure = error;
+          clearInterval(timer);
+          controller.abort(error);
+        },
+      );
+    }, this.dependencies.renewalIntervalMs ?? ROLLBACK_LEASE_RENEWAL_INTERVAL_MS);
+    timer.unref?.();
+    const keeper: LeaseRenewalKeeper = {
+      signal: controller.signal,
+      assertFenced: () => { if (failure !== undefined) throw failure; },
+      stop: async () => {
+        this.keepers.delete(keeper);
+        clearInterval(timer);
+        external?.removeEventListener("abort", onExternalAbort);
+        if (pending !== null) await pending;
+        if (failure !== undefined) throw failure;
+      },
+    };
+    this.keepers.add(keeper);
+    return keeper;
+  }
+
+  /** Runs a fenced read under a renewal keeper; a renewal failure is what is reported, before any read error. */
+  private async withRenewal<T>(body: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const keeper = this.startRenewalKeeper();
+    let result: T;
+    try {
+      result = await body(keeper.signal);
+    } catch (error) {
+      await keeper.stop();
+      throw error;
+    }
+    await keeper.stop();
+    return result;
+  }
+
   private async admittedSnapshot(): Promise<PostgreSqlSnapshotSession> {
     const snapshot = await this.runtime.openReadOnlySnapshot({
       projectId: this.target.remoteProjectId, signal: this.signal,
@@ -262,52 +351,64 @@ class FencedRollbackSession implements RollbackProductionSession {
   }
 
   async captureReadback(input: Parameters<RollbackFencedSession["captureReadback"]>[0]): Promise<RollbackEligibilityObservation> {
-    const snapshot = await this.admittedSnapshot();
-    try {
-      const destinationIdentity = await this.dependencies.captureDestinationIdentity(
-        snapshot, this.target.remoteProjectId, this.signal,
-      );
-      // Refuses a destination outside the pinned schema contract, whose census would not be comparable.
-      await this.dependencies.captureDestinationSchemaWitness(snapshot, this.signal);
-      // ONE census scan: the delta and the vector both come from this result.
-      const read = await this.dependencies.readFencedDestinationCensus(snapshot, {
-        settings: this.target.settings,
-        expectedOwner: this.target.expectedOwner,
-        expectedIdentity: this.target.expectedIdentity,
-        scratchParent: this.scratchParent,
-        signal: this.signal,
-      });
-      const postEpochDelta = buildMigrationCanonicalDelta(read.census);
-      const deltaEqual = !migrationCanonicalDeltaChanged(postEpochDelta, input.canonicalDeltaBaseline);
-      return {
-        observedPortableRecordSchemaSha256: PORTABLE_RECORD_SCHEMA_SHA256,
-        destinationIdentity,
-        postEpochDelta,
-        postEpochCensus: deltaEqual || input.requireCensus === true ? buildMigrationCensusVector(read.census) : null,
-      };
-    } finally {
-      await this.closeSnapshot(snapshot);
-    }
+    // The census scan is renewed across its duration (a large destination can outlast the lease TTL).
+    return this.withRenewal(async (signal) => {
+      const snapshot = await this.admittedSnapshot();
+      try {
+        const destinationIdentity = await this.dependencies.captureDestinationIdentity(
+          snapshot, this.target.remoteProjectId, signal,
+        );
+        // Refuses a destination outside the pinned schema contract, whose census would not be comparable.
+        await this.dependencies.captureDestinationSchemaWitness(snapshot, signal);
+        // ONE census scan: the delta and the vector both come from this result.
+        const read = await this.dependencies.readFencedDestinationCensus(snapshot, {
+          settings: this.target.settings,
+          expectedOwner: this.target.expectedOwner,
+          expectedIdentity: this.target.expectedIdentity,
+          scratchParent: this.scratchParent,
+          signal,
+        });
+        const postEpochDelta = buildMigrationCanonicalDelta(read.census);
+        const deltaEqual = !migrationCanonicalDeltaChanged(postEpochDelta, input.canonicalDeltaBaseline);
+        return {
+          observedPortableRecordSchemaSha256: PORTABLE_RECORD_SCHEMA_SHA256,
+          destinationIdentity,
+          postEpochDelta,
+          postEpochCensus: deltaEqual || input.requireCensus === true ? buildMigrationCensusVector(read.census) : null,
+        };
+      } finally {
+        await this.closeSnapshot(snapshot);
+      }
+    });
   }
 
   async openPortableSource(): Promise<RollbackExportSource> {
     // The snapshot stays open for the whole export and is closed with the returned stream (the borrowed-session
     // source never closes it itself), so a one-connection pool is free again for the renewal and the fresh
     // readback that follow the transfer (F4). release() closes it if the stream was never closed.
-    const snapshot = await this.admittedSnapshot();
+    // The export is renewed across its duration too: the keeper runs until the stream is closed, every batch
+    // read refuses once a renewal failed, and the close reports that failure.
+    const keeper = this.startRenewalKeeper();
+    let snapshot: PostgreSqlSnapshotSession;
+    try {
+      snapshot = await this.admittedSnapshot();
+    } catch (error) {
+      await keeper.stop();
+      throw error;
+    }
     try {
       const source = await this.dependencies.createPortableSource({
         settings: this.target.settings,
         expectedOwner: this.target.expectedOwner,
         expectedIdentity: this.target.expectedIdentity,
         scratchParent: this.scratchParent,
-        signal: this.signal,
+        signal: keeper.signal,
         session: snapshot,
       });
       try {
         const census = PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => this.dependencies.readDomainCensus(source, domain));
         return {
-          stream: this.closingSnapshotWith(await this.dependencies.createStream(source), snapshot),
+          stream: this.closingSnapshotWith(await this.dependencies.createStream(source), snapshot, keeper),
           canonicalDelta: buildMigrationCanonicalDelta(census),
           censusVector: buildMigrationCensusVector(census),
         };
@@ -317,16 +418,29 @@ class FencedRollbackSession implements RollbackProductionSession {
       }
     } catch (error) {
       await this.closeSnapshot(snapshot).catch(() => undefined);
+      await keeper.stop();
       throw error;
     }
   }
 
-  /** The stream, whose close also closes the export snapshot it reads (once, whatever the stream's own close does). */
-  private closingSnapshotWith(stream: PortableRecordStream, snapshot: PostgreSqlSnapshotSession): PortableRecordStream {
+  /**
+   * The stream, whose close also closes the export snapshot it reads (once, whatever the stream's own close does)
+   * and stops the lease renewal that spanned the export; a batch is handed out only while the lease is renewed.
+   */
+  private closingSnapshotWith(
+    stream: PortableRecordStream,
+    snapshot: PostgreSqlSnapshotSession,
+    keeper: LeaseRenewalKeeper,
+  ): PortableRecordStream {
     let closed = false;
     return {
       describe: () => stream.describe(),
-      readBatch: (input) => stream.readBatch(input),
+      readBatch: async (input) => {
+        keeper.assertFenced();
+        const batch = await stream.readBatch(input);
+        keeper.assertFenced();
+        return batch;
+      },
       verify: (checkpoint) => stream.verify(checkpoint),
       close: async () => {
         if (closed) return;
@@ -334,6 +448,7 @@ class FencedRollbackSession implements RollbackProductionSession {
         let failure: unknown;
         try { await stream.close(); } catch (error) { failure = error; }
         try { await this.closeSnapshot(snapshot); } catch (error) { failure ??= error; }
+        try { await keeper.stop(); } catch (error) { failure = error; }
         if (failure !== undefined) throw failure;
       },
     };
@@ -385,6 +500,9 @@ class FencedRollbackSession implements RollbackProductionSession {
     if (this.released) return;
     this.released = true;
     const failures: unknown[] = [];
+    for (const keeper of [...this.keepers]) {
+      try { await keeper.stop(); } catch (error) { failures.push(error); }
+    }
     for (const snapshot of [...this.snapshots]) {
       try { await this.closeSnapshot(snapshot); } catch (error) { failures.push(error); }
     }
@@ -399,6 +517,7 @@ class FencedRollbackSession implements RollbackProductionSession {
     const attempt = async (step: () => Promise<void>): Promise<void> => {
       try { await step(); } catch (error) { failures.push(error); }
     };
+    for (const keeper of [...this.keepers]) await attempt(() => keeper.stop());
     for (const snapshot of [...this.snapshots]) await attempt(() => this.closeSnapshot(snapshot));
     await attempt(() => (this.coordinatorAcquired ? this.verifyReleased() : this.releaseLease()));
     await attempt(() => this.runtime.close());
