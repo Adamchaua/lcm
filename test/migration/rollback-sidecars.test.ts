@@ -818,6 +818,8 @@ describe("verifyPassiveEventsAgainstArchive", () => {
     const contradictions: ReadonlyArray<readonly [string, string]> = [
       ["applied", "processed_at = NULL, delivery_state = 'pending'"],
       ["pending", "delivery_state = 'replicated', remote_inbox_id = 'inbox-1', processed_at = '2026-01-01T00:00:00.000000Z'"],
+      // Acknowledged locally (applied remotely) with no processed_at, while the archive still holds it as pending.
+      ["pending", "delivery_state = 'acknowledged', remote_inbox_id = '1', acknowledged_at = '2026-01-03T00:00:00.000000Z', processed_at = NULL"],
       ["quarantined", "delivery_state = 'pending', quarantine_reason = NULL"],
       ["pending", "delivery_state = 'quarantined', quarantine_reason = 'rejected'"],
     ];
