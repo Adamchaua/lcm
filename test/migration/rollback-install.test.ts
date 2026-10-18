@@ -22,7 +22,6 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import {
-  getExistingLcmConnection,
   getLcmConnection,
   isLcmConnectionOpen,
   closeLcmConnection,

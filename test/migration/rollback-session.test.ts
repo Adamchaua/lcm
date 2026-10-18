@@ -13,10 +13,7 @@ import {
   type PostgreSqlBackendPublicationMutationInput,
 } from "../../src/storage/postgresql/publication-guard.js";
 import type { ActivationLeasePublicationGuard } from "../../src/migration/activation-lease.js";
-import {
-  createMigrationActivationWitness,
-  migrationWitnessSha256,
-} from "../../src/migration/activation-witness.js";
+import { createMigrationActivationWitness } from "../../src/migration/activation-witness.js";
 import type { MigrationManifest } from "../../src/migration/protocol.js";
 import { deriveRollbackPublicationId, type RollbackFencedSession } from "../../src/migration/rollback.js";
 import {
@@ -35,7 +32,6 @@ import {
   driftCanonicalDelta,
   fixtureActivationScenario,
   fixtureCanonicalDelta,
-  fixtureCensusVector,
   fixtureDestinationIdentity,
   fixtureSchemaWitness,
   fixtureSha,

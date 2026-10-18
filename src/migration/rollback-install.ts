@@ -46,7 +46,7 @@
  * crash safe to call again.
  */
 
-import { chmodSync, lstatSync, openSync, closeSync, readSync, renameSync, statSync } from "node:fs";
+import { chmodSync, lstatSync, openSync, closeSync, readSync, renameSync } from "node:fs";
 import { existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";

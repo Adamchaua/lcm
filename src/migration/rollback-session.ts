@@ -1,5 +1,5 @@
 import { tmpdir } from "node:os";
-import { canonicalJson, canonicalSha256, PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_RECORD_SCHEMA_SHA256 } from "../storage/portable-record.js";
+import { canonicalJson, PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_RECORD_SCHEMA_SHA256 } from "../storage/portable-record.js";
 import {
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
@@ -32,7 +32,6 @@ import {
   createMigrationActivationWitness,
   createMigrationQuiescenceFence,
   migrationCanonicalDeltaChanged,
-  migrationWitnessSha256,
   type MigrationSelectionAuthority,
 } from "./activation-witness.js";
 import { deriveRollbackProjectEvidenceSha256, deriveRollbackPublicationId } from "./rollback.js";
