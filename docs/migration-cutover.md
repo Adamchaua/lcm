@@ -443,8 +443,10 @@ PostgreSQL after a cutover or a rollback) follows the durable authority in
 this order: a live maintenance of the generation that has not finished
 refuses; the generation's selection bindings decide (the latest by manifest
 revision; an activation selects PostgreSQL, a rollback selects SQLite); with
-no selection recorded, a manifest at `rolled-back` with no pending effect
-selects SQLite (the manifest is the rollback's last durable record); the generation's own terminal maintenance journal decides while
+no selection recorded, a manifest at `rolled-back` is refused
+(`unexpected-state`): no supported path leaves a rolled-back generation
+without its selection binding, and re-running the rollback restores the
+binding from its stored report, after which the binding decides; the generation's own terminal maintenance journal decides while
 the coordinator has not archived it; everything else refuses. Between the
 coordinator archiving the maintenance journal and the manifest settling,
 admission refuses until the resume completes.
