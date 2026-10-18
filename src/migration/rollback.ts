@@ -58,7 +58,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { opendirSync } from "node:fs";
+import { lstatSync, opendirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   atomicWritePrivateFileDurable,
@@ -75,6 +75,7 @@ import type { PortableProjectIdentity } from "../storage/portable-record-stream.
 import {
   BackendPublicationJournalError,
   backendPublicationCanonicalSha256,
+  backendPublicationDirectory,
   captureBackendPublicationFileWitness,
   captureBackendPublicationState,
   readAuthenticatedBackendPublicationMaterial,
@@ -976,16 +977,17 @@ function decodeRecoveryFile(file: BackendPublicationRecoveryFile): string {
 }
 
 /**
- * E6. This rollback's own publication journal still at preparing with no recovery reference: prepare() wrote the
- * journal and died before (material absent) or after (material sealed) the seal, before the prepared checkpoint
- * recorded the reference. The authenticated material reader refuses such a journal by design, and nothing has been
- * published from it: the live configuration and project map are still the pre-rollback source. Recognized only for
- * the rollback's composition (postgresql to sqlite, exactly the covered project); any other unreferenced journal is
- * left to the authenticated reader's refusal.
+ * E6/E7. This rollback's own publication journal with no recovery reference: still at preparing (prepare() wrote
+ * the journal and died before or after the material seal, before the prepared checkpoint recorded the reference)
+ * or aborted straight from that state by the coordinator's missing-material exit. The authenticated material
+ * reader refuses such a journal by design, and nothing has been published or fenced from it: the live configuration
+ * and project map are still the pre-rollback source. Recognized only for the rollback's composition (postgresql to
+ * sqlite, exactly the covered project); any other unreferenced journal is left to the authenticated reader's
+ * refusal, and an aborted journal that had sealed its material is not this (it stays refused, #1555).
  */
-function isOwnUnsealedPreparingJournal(journal: BackendPublicationJournal, publicationId: string, localProjectId: string): boolean {
+function isOwnUnsealedJournal(journal: BackendPublicationJournal, publicationId: string, localProjectId: string): boolean {
   return journal.publicationId === publicationId
-    && journal.phase === "preparing"
+    && (journal.phase === "preparing" || journal.phase === "aborted")
     && journal.recoveryReference === null
     && journal.sourceBackend === "postgresql"
     && journal.targetBackend === "sqlite"
@@ -1002,16 +1004,26 @@ function isAbortedUnsealedJournal(journal: BackendPublicationJournal): boolean {
   return journal.phase === "aborted" && journal.recoveryReference === null;
 }
 
+/**
+ * E8. Whether the material of this rollback's publication is absent at the coordinator's deterministic path
+ * (authenticateMaterial requires exactly `<publicationId>.material` under the publication directory). Only an
+ * ENOENT at that path establishes absence; a present entry does not, and any other error propagates.
+ */
+function unsealedPublicationMaterialAbsent(homeDir: string, publicationId: string): boolean {
+  return lstatSync(join(backendPublicationDirectory(homeDir), publicationId + ".material"), { throwIfNoEntry: false }) === undefined;
+}
+
 /** The decoded pre-rollback source files of this rollback's own publication. */
 type OwnPublicationSourceFiles = Readonly<{ config: string; projectMap: string }>;
 
 /**
- * E6. The source files of this rollback's own publication still at preparing without a reference. The coordinator
- * observed the live configuration and project map when it wrote that journal (sourceState) and has mutated neither
- * since, so the live files are the source -- read privately (the ordinary readers refuse any in-flight publication)
- * and accepted only byte-for-byte as the journal witnessed them.
+ * E6/E7. The source files of this rollback's own unsealed publication (preparing, or aborted from preparing without
+ * a reference). The coordinator observed the live configuration and project map when it wrote that journal
+ * (sourceState, carried unchanged into the aborted transition) and has mutated neither since, so the live files are
+ * the source -- read privately (the ordinary readers refuse any in-flight or unreferenced publication) and accepted
+ * only byte-for-byte as the journal witnessed them.
  */
-function readUnsealedPreparingSource(homeDir: string, journal: BackendPublicationJournal): OwnPublicationSourceFiles {
+function readUnsealedPublicationSource(homeDir: string, journal: BackendPublicationJournal): OwnPublicationSourceFiles {
   const root = lcmHomeDir(homeDir);
   const read = (name: string, expected: BackendPublicationFileWitness, field: string): string => {
     const observed = captureBackendPublicationFileWitness(join(root, name), root);
@@ -1040,15 +1052,16 @@ function readUnsealedPreparingSource(homeDir: string, journal: BackendPublicatio
  * live slot (or it was aborted, which restored the files). Once the publication has begun the live files and the
  * consumer reads are the rollback's in-flight state -- the config selects sqlite, the project is unbound, and the
  * consumer read refuses an unresolved publication -- so every re-run reads its inputs from this sealed source.
- * A journal still at preparing without a reference (E6) has sealed nothing yet and published nothing: its source
- * is read from the live files, matched against the witnesses that journal recorded.
+ * A journal without a reference -- still at preparing, or aborted straight from it (E6/E7) -- has sealed nothing
+ * and published nothing: its source is read from the live files, matched against the witnesses it recorded.
  */
 function readOwnPublicationSourceFiles(homeDir: string, publicationId: string, localProjectId: string): OwnPublicationSourceFiles | null {
   // While maintenance holds the live slot no publication journal is readable, and none of this rollback's exists.
   if (readBackendMaintenanceJournal(homeDir) !== null) return null;
   const journal = readBackendPublicationJournal(homeDir);
-  if (journal === null || journal.publicationId !== publicationId || journal.phase === "aborted") return null;
-  if (isOwnUnsealedPreparingJournal(journal, publicationId, localProjectId)) return readUnsealedPreparingSource(homeDir, journal);
+  if (journal === null || journal.publicationId !== publicationId) return null;
+  if (isOwnUnsealedJournal(journal, publicationId, localProjectId)) return readUnsealedPublicationSource(homeDir, journal);
+  if (journal.phase === "aborted") return null;
   const material = readAuthenticatedBackendPublicationMaterial(journal, homeDir);
   return { config: decodeRecoveryFile(material.source.config), projectMap: decodeRecoveryFile(material.source.projectMap) };
 }
@@ -2223,26 +2236,27 @@ async function publishRollbackSelection(phase: PublicationPhase): Promise<string
     // journal recorded no fence and published nothing, so it is only the terminal journal prepare() archives.
     journal = isAbortedUnsealedJournal(slot.journal) ? null : slot.journal;
   }
-  if (journal !== null && journal.phase === "preparing" && journal.recoveryReference === null) {
-    // E6: prepare() died between the preparing checkpoint and the prepared one. With the material sealed, resume
-    // authenticates it, records the reference and drives the publication on. With the material absent, resume
-    // cannot authenticate (the coordinator reports the file missing); the coordinator's own exit for exactly that
-    // state is abort, which takes the unsealed journal straight to aborted (no restore, no fence), after which
-    // the publication is composed and prepared again below. Any other failure propagates as it is.
-    phase.session?.markCoordinatorAcquired();
-    try {
-      journal = await deps.coordinator.resume(token);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") throw error;
-      const aborted = await deps.coordinator.abort(token);
-      if (!isAbortedUnsealedJournal(aborted)) {
-        throw new RollbackOrchestrationError(
-          "unexpected-state",
-          "the rollback's unsealed coordinator publication did not abort as a missing-material publication",
-        );
-      }
-      journal = null;
+  if (
+    journal !== null && journal.phase === "preparing" && journal.recoveryReference === null
+    && unsealedPublicationMaterialAbsent(input.homeDir, publicationId)
+  ) {
+    // E6/E8: prepare() died after the preparing checkpoint and before sealing the material, so there is nothing
+    // the coordinator could authenticate (its forward path would only report the file missing). The coordinator's
+    // own exit for exactly this state is abort, which takes the unsealed journal straight to aborted (no restore,
+    // no fence), after which the publication is composed and prepared again below. Both facts are established
+    // positively before the abort: the slot readback above, taken under this barrier with no coordinator call since,
+    // is this rollback's own composition at preparing with no reference, and the material is absent at the
+    // coordinator's deterministic path. The abort's result is verified to be that unsealed aborted journal. A journal
+    // that did seal its material (or any failure inside resume, ENOENT included) never reaches this exit: resume runs
+    // below and its failure propagates with the effect pending and the lease held, so a later retry resumes forward.
+    const aborted = await deps.coordinator.abort(token);
+    if (!isAbortedUnsealedJournal(aborted)) {
+      throw new RollbackOrchestrationError(
+        "unexpected-state",
+        "the rollback's unsealed coordinator publication did not abort as a missing-material publication",
+      );
     }
+    journal = null;
   }
   if (journal === null) {
     // The caller completed this rollback's maintenance selection (or verified that it had); prepare() archives

@@ -6,13 +6,14 @@
  * checkActivationWriterQuiescence legitimately handles elsewhere.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BackendPublicationCoordinator,
   backendPublicationCanonicalSha256,
+  backendPublicationDirectory,
   backendPublicationJournalPath,
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
@@ -45,6 +46,7 @@ import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.
 import {
   deriveRollbackPublicationId,
   readOwnPublicationSourceFromMaterial,
+  readProjectMapForRollback,
   runMigrationRollback,
   type RunMigrationRollbackDependencies,
   type RunMigrationRollbackInput,
@@ -211,8 +213,10 @@ function setup() {
    */
   const sharedLeaseCoordinator = (
     crashAt?: BackendPublicationPhase | "after-release" | "before-material-seal" | "after-material-seal",
+    options: { failAfterPhaseWrite?: { phase: BackendPublicationPhase; failure: () => void } } = {},
   ): BackendPublicationCoordinator => {
     let armed = crashAt !== undefined;
+    let injected = false;
     return new BackendPublicationCoordinator({
       homeDir,
       driver: {
@@ -220,6 +224,13 @@ function setup() {
         ...createPostgreSqlBackendPublicationRemoteGuard({ guard: lease.guard as never, machineId: MACHINE, ttlMs: 15 * 60 * 1000 }),
       },
       observer: (event) => {
+        if (
+          options.failAfterPhaseWrite !== undefined && !injected && event === "after-journal-write"
+          && readBackendPublicationJournal(homeDir)?.phase === options.failAfterPhaseWrite.phase
+        ) {
+          injected = true;
+          options.failAfterPhaseWrite.failure();
+        }
         if (!armed) return;
         const hit = crashAt === "after-release" || crashAt === "before-material-seal" || crashAt === "after-material-seal"
           ? event === crashAt
@@ -520,9 +531,9 @@ describe("recovery of a publication crashed while preparing (E6): unsealed journ
 
     expect(outcome.manifest.phase).toBe("rolled-back");
     expect(t.opens).toEqual([{ recovery: false }, { recovery: true }]);
-    // Sealed material is authenticated and driven forward by resume alone; absent material fails that resume, takes
-    // the coordinator's preparing -> aborted exit once, and is composed, prepared and resumed again.
-    expect(counts).toEqual(crashAt === "after-material-seal" ? { abort: 0, resume: 1, prepare: 0 } : { abort: 1, resume: 2, prepare: 1 });
+    // Sealed material is authenticated and driven forward by resume alone; absent material (established before any
+    // coordinator call) takes the coordinator's preparing -> aborted exit once, then is composed, prepared and resumed.
+    expect(counts).toEqual(crashAt === "after-material-seal" ? { abort: 0, resume: 1, prepare: 0 } : { abort: 1, resume: 1, prepare: 1 });
     expectSettled(t);
   });
 
@@ -533,7 +544,8 @@ describe("recovery of a publication crashed while preparing (E6): unsealed journ
     expect(readBackendPublicationJournal(t.homeDir)).toMatchObject({ phase: "aborted", publicationId: PUBLICATION_ID, recoveryReference: null });
     expect(t.pending()?.kind).toBe("publish-rollback");
     expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: null });
-    expect(readOwnPublicationSourceFromMaterial(t.homeDir, PUBLICATION_ID, LOCAL)).toBeNull();
+    // E7: the aborted unsealed journal reads like the preparing one -- the live files it witnessed.
+    expectLiveSource(t);
 
     const { coordinator, counts } = counting(t.sharedLeaseCoordinator());
     const outcome = await runMigrationRollback(t.input, t.dependencies(coordinator));
@@ -588,9 +600,9 @@ describe("recovery of a publication crashed while preparing (E6): unsealed journ
     expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: null });
   });
 
-  it("a resume failure other than missing material propagates untouched, with nothing aborted and the lease kept", async () => {
+  it("a resume failure on a sealed journal propagates untouched, with nothing aborted and the lease kept", async () => {
     const t = setup();
-    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("before-material-seal")))).rejects.toThrow("crash at before-material-seal");
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("after-material-seal")))).rejects.toThrow("crash at after-material-seal");
     const { coordinator, counts } = counting(t.sharedLeaseCoordinator());
     coordinator.resume = async () => { throw new Error("EACCES-like failure reading the material"); };
 
@@ -618,6 +630,68 @@ describe("recovery of a publication crashed while preparing (E6): unsealed journ
     expect(counts.prepare).toBe(0);
     expect(t.pending()?.kind).toBe("publish-rollback");
     expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: null });
+  });
+
+  it("E7: a retry starting from the aborted unsealed journal, through the PRODUCTION readers, reaches admission and prepares again", async () => {
+    const t = setup();
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("before-material-seal")))).rejects.toThrow("crash at before-material-seal");
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("aborted")))).rejects.toThrow("crash at aborted");
+    expect(readBackendPublicationJournal(t.homeDir)).toMatchObject({ phase: "aborted", publicationId: PUBLICATION_ID, recoveryReference: null });
+    // The durable input resolver's reader and the orchestration's map reader both resolve the live source.
+    expectLiveSource(t);
+    const { coordinator, counts } = counting(t.sharedLeaseCoordinator());
+
+    // No fixture project-map port: the orchestration's sole-project check reads through the production readers.
+    const outcome = await runMigrationRollback(t.input, t.dependencies(coordinator, { readProjectMap: readProjectMapForRollback }));
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(t.opens).toEqual([{ recovery: false }, { recovery: true }, { recovery: true }]);
+    expect(counts).toEqual({ abort: 0, resume: 1, prepare: 1 });
+    expectSettled(t);
+  });
+
+  it("E8: a material file missing transiently after the prepared checkpoint propagates without any abort; restoring it lets a retry finish forward", async () => {
+    const t = setup();
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("after-material-seal")))).rejects.toThrow("crash at after-material-seal");
+    const materialPath = join(backendPublicationDirectory(t.homeDir), PUBLICATION_ID + ".material");
+    const hidden = materialPath + ".hidden";
+    // The retry authenticates the sealed material and records prepared; the file then vanishes (a real ENOENT at
+    // the coordinator's next material read, after forward progress), so this is not a missing-material journal.
+    const { coordinator, counts } = counting(t.sharedLeaseCoordinator(undefined, {
+      failAfterPhaseWrite: { phase: "prepared", failure: () => renameSync(materialPath, hidden) },
+    }));
+    await expect(runMigrationRollback(t.input, t.dependencies(coordinator))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(counts.abort).toBe(0);
+    const journal = readBackendPublicationJournal(t.homeDir)!;
+    expect(["prepared", "acquiring", "guarded"]).toContain(journal.phase);
+    expect(journal.recoveryReference).not.toBeNull();
+    expect(t.pending()?.kind).toBe("publish-rollback");
+    expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: null });
+
+    renameSync(hidden, materialPath);
+    const { coordinator: again, counts: later } = counting(t.sharedLeaseCoordinator());
+    const outcome = await runMigrationRollback(t.input, t.dependencies(again));
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(later).toEqual({ abort: 0, resume: 1, prepare: 0 });
+    expectSettled(t);
+  });
+
+  it("E8: an ENOENT raised right after the prepared checkpoint, with the material present, propagates without any abort and a retry finishes forward", async () => {
+    const t = setup();
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("after-material-seal")))).rejects.toThrow("crash at after-material-seal");
+    const { coordinator, counts } = counting(t.sharedLeaseCoordinator(undefined, {
+      failAfterPhaseWrite: { phase: "prepared", failure: () => { throw Object.assign(new Error("injected ENOENT after prepared"), { code: "ENOENT" }); } },
+    }));
+    await expect(runMigrationRollback(t.input, t.dependencies(coordinator))).rejects.toThrow("injected ENOENT after prepared");
+    expect(counts.abort).toBe(0);
+    expect(readBackendPublicationJournal(t.homeDir)).toMatchObject({ phase: "prepared", recoveryReference: expect.objectContaining({ sealSha256: expect.any(String) }) });
+    expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: null });
+
+    const outcome = await runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator()));
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expectSettled(t);
   });
 });
 
