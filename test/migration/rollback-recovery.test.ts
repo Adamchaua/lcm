@@ -427,6 +427,25 @@ describe("recovery across the coordinator's lease handoff (E1): one lease row sh
     expect(readBackendPublicationJournal(t.homeDir)?.phase).toBe("released");
   });
 
+  it("E4: refuses a journal under this rollback's id that is not its composition before resuming it", async () => {
+    const t = setup();
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("prepared")))).rejects.toThrow("crash at prepared");
+    const journalPath = backendPublicationJournalPath(t.homeDir);
+    const { checksumSha256: _checksum, ...body } = JSON.parse(readFileSync(journalPath, "utf8"));
+    // A forward-shaped (sqlite -> postgresql) publication planted under the rollback's publicationId.
+    body.sourceBackend = "sqlite";
+    body.targetBackend = "postgresql";
+    writeFileSync(journalPath, JSON.stringify({ ...body, checksumSha256: backendPublicationCanonicalSha256(body) }));
+    const before = t.store.read(GEN).checksumSha256;
+
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator())))
+      .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("not its composition") });
+
+    // Nothing was resumed or settled; the recovery session kept the lease.
+    expect(readBackendPublicationJournal(t.homeDir)).toMatchObject({ phase: "prepared", targetBackend: "postgresql" });
+    expect(t.store.read(GEN).checksumSha256).toBe(before);
+    expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: null });
+  });
 });
 
 describe("checkRollbackRecoveryAdmission", () => {

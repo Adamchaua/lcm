@@ -2116,6 +2116,20 @@ function assertComposedPublicationRestoresSource(
 }
 
 /**
+ * Whether a coordinator journal under the rollback's publicationId is the publication this rollback composed:
+ * postgresql back to the pre-activation backend, for exactly the covered project's pre-activation entry (E4).
+ */
+function journalIsRollbackComposition(phase: PublicationPhase, journal: BackendPublicationJournal): boolean {
+  const project = expectedRollbackProject(phase);
+  return journal.sourceBackend === "postgresql"
+    && journal.targetBackend === phase.artifact.publication!.sourceBackend
+    && journal.projects.length === 1
+    && journal.projects[0]!.localProjectId === project.localProjectId
+    && journal.projects[0]!.remoteProjectId === project.remoteProjectId
+    && journal.projects[0]!.evidenceSha256 === project.evidenceSha256;
+}
+
+/**
  * Drives the coordinator's publication of the sqlite config and project map
  * to completion and returns the sealed material digest. Never prepares a
  * second time: a journal for the rollback publicationId already in the live
@@ -2129,6 +2143,14 @@ async function publishRollbackSelection(phase: PublicationPhase): Promise<string
   if (slot.kind === "publication") {
     // Callers reach here with a publication in the slot only after establishing that it is this rollback's.
     journal = slot.journal;
+    // E4: the id alone admitted it; a journal that is not this rollback's composition is refused before anything
+    // is resumed (resuming would publish its map and config).
+    if (!journalIsRollbackComposition(phase, journal)) {
+      throw new RollbackOrchestrationError(
+        "unexpected-state",
+        "the publication in the live slot carries this rollback's id but is not its composition",
+      );
+    }
   } else {
     // The caller completed this rollback's maintenance selection (or verified that it had); prepare() archives
     // that terminal journal and refuses any other state of the slot.
@@ -2155,16 +2177,10 @@ async function publishRollbackSelection(phase: PublicationPhase): Promise<string
   if (journal.phase === "aborted") {
     throw new RollbackOrchestrationError("unexpected-state", "the rollback's coordinator publication was aborted");
   }
-  const project = expectedRollbackProject(phase);
   if (
     journal.phase !== "completed"
     || journal.publicationId !== publicationId
-    || journal.sourceBackend !== "postgresql"
-    || journal.targetBackend !== phase.artifact.publication!.sourceBackend
-    || journal.projects.length !== 1
-    || journal.projects[0]!.localProjectId !== project.localProjectId
-    || journal.projects[0]!.remoteProjectId !== project.remoteProjectId
-    || journal.projects[0]!.evidenceSha256 !== project.evidenceSha256
+    || !journalIsRollbackComposition(phase, journal)
     || journal.recoveryReference === null
   ) {
     throw new RollbackOrchestrationError(
