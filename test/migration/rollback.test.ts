@@ -3472,14 +3472,14 @@ describe("readOwnPublicationSourceFromMaterial: the rollback's sealed pre-public
   afterEach(() => { vi.unstubAllEnvs(); });
 
   it("is null when the slot holds no publication journal", () => {
-    expect(readOwnPublicationSourceFromMaterial(tempHome(), ID)).toBeNull();
+    expect(readOwnPublicationSourceFromMaterial(tempHome(), ID, FIXTURE_LOCAL_PROJECT_ID)).toBeNull();
   });
 
   it("reads the sealed source configuration and project map of its own in-flight publication", async () => {
     const homeDir = tempHome();
     await prepared(homeDir, ID);
     // The live files could say anything now; only the sealed material is read.
-    const source = readOwnPublicationSourceFromMaterial(homeDir, ID)!;
+    const source = readOwnPublicationSourceFromMaterial(homeDir, ID, FIXTURE_LOCAL_PROJECT_ID)!;
     expect(source.storage).toMatchObject({ backend: "postgresql", postgresql: { url: "postgresql://user:secret@example/db", caFile: expect.stringContaining("ca.pem") } });
     expect(source.projectMap[FIXTURE_LOCAL_PROJECT_ID]).toMatchObject({ remoteProjectId: FIXTURE_REMOTE_PROJECT_ID });
   });
@@ -3487,17 +3487,17 @@ describe("readOwnPublicationSourceFromMaterial: the rollback's sealed pre-public
   it("is null for another publication's journal, and once its own publication was aborted", async () => {
     const homeDir = tempHome();
     const coordinator = await prepared(homeDir, ID);
-    expect(readOwnPublicationSourceFromMaterial(homeDir, deriveRollbackPublicationId("another-generation"))).toBeNull();
+    expect(readOwnPublicationSourceFromMaterial(homeDir, deriveRollbackPublicationId("another-generation"), FIXTURE_LOCAL_PROJECT_ID)).toBeNull();
     await coordinator.recoverPending({ disposition: "abort" });
     expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "aborted" });
-    expect(readOwnPublicationSourceFromMaterial(homeDir, ID)).toBeNull();
+    expect(readOwnPublicationSourceFromMaterial(homeDir, ID, FIXTURE_LOCAL_PROJECT_ID)).toBeNull();
   });
 
   it("refuses a sealed publication whose source project map was absent", async () => {
     const homeDir = tempHome();
     const material = rollbackPublicationMaterial();
     await prepared(homeDir, ID, { ...material, source: { ...material.source, projectMap: { presence: "absent" } } });
-    expect(() => readOwnPublicationSourceFromMaterial(homeDir, ID))
+    expect(() => readOwnPublicationSourceFromMaterial(homeDir, ID, FIXTURE_LOCAL_PROJECT_ID))
       .toThrow(expect.objectContaining({ reason: "unexpected-state", message: expect.stringContaining("sealed no source file") }));
   });
 });

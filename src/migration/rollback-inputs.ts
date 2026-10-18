@@ -98,7 +98,7 @@ export interface ResolveRollbackContextDependencies {
    * Once the rollback's publication has begun, the live files and the consumer read are the rollback's
    * in-flight state, so a re-run resolves its inputs from the material that publication sealed.
    */
-  readOwnPublicationSource(homeDir: string, publicationId: string): OwnPublicationSource | null;
+  readOwnPublicationSource(homeDir: string, publicationId: string, localProjectId: string): OwnPublicationSource | null;
 }
 
 export const DEFAULT_RESOLVE_ROLLBACK_CONTEXT_DEPENDENCIES: ResolveRollbackContextDependencies = {
@@ -135,7 +135,7 @@ export async function resolveMigrationRollbackContext(
     evidenceSha256: artifact.sourceByteWitnessSha256,
   }];
 
-  const own = dependencies.readOwnPublicationSource(homeDir, deriveRollbackPublicationId(generationId));
+  const own = dependencies.readOwnPublicationSource(homeDir, deriveRollbackPublicationId(generationId), authority.physicalProjectId);
   const storage = own === null ? dependencies.readStorageConfig(homeDir) : own.storage;
   if (storage.backend !== "postgresql") {
     throw new RollbackInputResolutionError(

@@ -484,7 +484,9 @@ export type RollbackRecoveryAdmissionResult = Readonly<{
  * - the maintenance journal of this generation and this rollback's publicationId, targeting sqlite, at
  *   selection-prepared or selection-completed, whose roster is this machine alone; or
  * - no maintenance journal (the coordinator archived it when it prepared the publication) and a non-terminal
- *   publication journal with this rollback's publicationId.
+ *   publication journal with this rollback's publicationId, or one the coordinator's missing-material exit took
+ *   straight from preparing to aborted without ever sealing material (recoveryReference null): that publication
+ *   recorded no fence and published nothing, and the rollback prepares it again (E6).
  *
  * Every other journal, including a freshly held maintenance (which has the strict first-open path), is refused.
  * The lease tuple (project, machine, publicationId, target, evidence) is matched by the lease acquisition that
@@ -535,7 +537,7 @@ export async function checkRollbackRecoveryAdmission(input: Readonly<{
       publication === null
       || publication.publicationId !== input.publicationId
       || publication.phase === "completed"
-      || publication.phase === "aborted"
+      || (publication.phase === "aborted" && publication.recoveryReference !== null)
     ) {
       return refuse("no journal of this rollback's attempted selection or in-flight publication remains");
     }

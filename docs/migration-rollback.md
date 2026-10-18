@@ -112,7 +112,8 @@ incomplete generation is evidence of what the earlier attempt actually wrote,
 and quarantining it is safer than any hidden repair.
 
 The same holds after the selection flips. A crash after the maintenance
-selection, after the coordinator prepared the rollback's own publication,
+selection, while or after the coordinator prepared the rollback's own
+publication (including before it finished sealing that publication's material),
 after the configuration was published, or after the publication completed
 resumes from where it stopped when the same operation is run again: the
 rollback records its selection binding as soon as the selection completes,

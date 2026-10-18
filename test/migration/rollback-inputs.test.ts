@@ -137,7 +137,7 @@ describe("resolveMigrationRollbackContext", () => {
       readProjectMap: vi.fn(() => { throw new Error("live map must not be read"); }) as never,
     });
     const { input, target } = await resolveMigrationRollbackContext({ homeDir: HOME, generationId: GENERATION }, deps);
-    expect(deps.readOwnPublicationSource).toHaveBeenCalledWith(HOME, deriveRollbackPublicationId(GENERATION));
+    expect(deps.readOwnPublicationSource).toHaveBeenCalledWith(HOME, deriveRollbackPublicationId(GENERATION), LOCAL);
     expect(input.localProjectId).toBe(LOCAL);
     expect(target.remoteProjectId).toBe(REMOTE);
     expect(target.settings.url).toBe("postgresql://example/db");

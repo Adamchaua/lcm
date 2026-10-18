@@ -734,6 +734,35 @@ describe("production rollback against PostgreSQL 18", { timeout: 240_000 }, () =
     });
   });
 
+  it.each(["before-material-seal", "after-material-seal"] as const)("E6: finishes a publication crashed at %s (journal preparing, no recovery reference) under the original lease", async (crashAt) => {
+    const generationId = "gen-crash-" + crashAt;
+    await withPostgreSqlTestDatabase("rollback-session-crash-" + crashAt, async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, generationId);
+      await expect(runRollback({
+        homeDir, generationId, canonicalPath, database,
+        observer: (event) => { if (event === crashAt) throw new Error("simulated crash at " + crashAt); },
+      })).rejects.toMatchObject({ message: expect.stringContaining("simulated crash at " + crashAt) });
+      expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "preparing", recoveryReference: null });
+      expect(readConfigBackend(homeDir)).toBe("postgresql");
+      const held = (await leaseRow(database))!;
+      expect(held).toMatchObject({ released: false, live: true, owner_process_id: deriveRollbackPublicationId(generationId) });
+
+      const outcome = await runRollback({ homeDir, generationId, canonicalPath, database });
+
+      expect(outcome.manifest.phase).toBe("rolled-back");
+      expectRollbackPublished(homeDir, generationId);
+      const rows = await database.migrator.query<{ n: string }>({
+        text: "SELECT count(*)::text AS n FROM lcm.fenced_leases WHERE project_id = $1",
+        values: [fixture.projectId],
+      }, factoryContext);
+      expect(rows.rows[0]!.n).toBe("1");
+      expect(await leaseRow(database)).toMatchObject({ released: true, fencing_token: held.fencing_token });
+      expect(assertMigrationReplayAdmission({
+        homeDir, generationId, evidenceSha256: rollbackBinding(homeDir, generationId)!.witnessChecksumSha256,
+      })).toEqual({ backend: "sqlite", disposition: "selected" });
+    });
+  });
+
   it("refuses when the fence is lost mid-window, installing and selecting nothing", async () => {
     await withPostgreSqlTestDatabase("rollback-session-fence-loss", async (database) => {
       const { homeDir, canonicalPath } = await prepared(database, "gen-fence");
