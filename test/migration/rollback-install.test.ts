@@ -420,6 +420,9 @@ describe("installRollbackGeneration", () => {
       ["unreadable mode", (path: string) => chmodSync(path, 0o644), "could not be read"],
       ["malformed JSON", (path: string) => writeFileSync(path, "{", { mode: 0o600 }), "is malformed"],
       ["malformed shape", (path: string) => writeFileSync(path, JSON.stringify({ version: 1 }), { mode: 0o600 }), "is malformed"],
+      ["a null before-witness", (path: string) => writeFileSync(path, JSON.stringify({
+        ...JSON.parse(readFileSync(path, "utf8")), before: null,
+      }), { mode: 0o600 }), "is malformed"],
       ["another rollback's id", (path: string) => writeFileSync(path, JSON.stringify({
         ...JSON.parse(readFileSync(path, "utf8")), rollbackGenerationId: "gen-other",
       }), { mode: 0o600 }), "is malformed"],
