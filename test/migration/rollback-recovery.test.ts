@@ -417,4 +417,3 @@ describe("checkRollbackRecoveryAdmission", () => {
     expect(await check(tempHome())).toMatchObject({ status: "unsatisfied" });
   });
 });
-
