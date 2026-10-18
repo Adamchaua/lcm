@@ -60,8 +60,45 @@ describe("local Vitest worker budget", () => {
   );
 
   it.each(["true", "1"])("preserves PostgreSQL CI sizing when CI is %s", (CI) => {
-    const configuration = createPostgresqlVitestConfiguration({ CI });
+    const configuration = createPostgresqlVitestConfiguration({ CI }, () => 8);
 
-    expect(configuration.test.maxWorkers).toBe(4);
+    expect(configuration.test.maxWorkers).toBe(8);
+  });
+
+  describe("PostgreSQL census-cost measurement", () => {
+    const censusCostTest = "test/postgresql/migration-verification-census-cost.integration.ts";
+
+    it.each([{}, { LCM_TEST_POSTGRES_CENSUS_COST: "false" }, { LCM_TEST_POSTGRES_CENSUS_COST: "1" }])(
+      "excludes the measurement from the default integration run for %j",
+      (environment) => {
+        const configuration = createPostgresqlVitestConfiguration(environment);
+
+        expect(configuration.test.include).toEqual(["test/postgresql/**/*.integration.ts"]);
+        expect(configuration.test.exclude).toContain(censusCostTest);
+      },
+    );
+
+    it("includes only the measurement when the opt-in flag is set", () => {
+      const configuration = createPostgresqlVitestConfiguration({ LCM_TEST_POSTGRES_CENSUS_COST: "true" });
+
+      expect(configuration.test.include).toEqual([censusCostTest]);
+      expect(configuration.test.exclude).toEqual([]);
+    });
+
+    it("keeps the fork probe selection when both flags are set", () => {
+      const configuration = createPostgresqlVitestConfiguration({
+        LCM_TEST_POSTGRES_CENSUS_COST: "true",
+        LCM_TEST_POSTGRES_FORK_PROBE: "true",
+      });
+
+      expect(configuration.test.include).toEqual(["test/postgresql/fixtures/persistent-worker.integration.ts"]);
+      expect(configuration.test.exclude).toEqual([]);
+    });
+  });
+
+  it.each(["true", "1"])("keeps PostgreSQL CI sizing at one when CPU discovery is zero and CI is %s", (CI) => {
+    const configuration = createPostgresqlVitestConfiguration({ CI }, () => 0);
+
+    expect(configuration.test.maxWorkers).toBe(1);
   });
 });

@@ -38,7 +38,9 @@ import {
   PASSIVE_EVENT_PROCESSOR_DEFAULTS,
   PassiveEventProcessor,
   type BackgroundPublicationAdmission,
+  type PassiveEventBackgroundDiagnostics,
 } from "./passive-event-processor.js";
+import { createPassiveEventReplicationPass } from "./passive-event-replication-pass.js";
 import { createStatsHandler } from "./routes/stats.js";
 import { backendDiagnosticFailure } from "../storage/diagnostics.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
@@ -46,6 +48,7 @@ import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { createInvocationControlHandler } from "./routes/invocation-control.js";
 import { composeAbortSignals, throwIfAborted } from "./cancellation.js";
 import { createPublicationQueue } from "./publication-queue.js";
+import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import {
   createInvocationCoordinator,
   type InvocationCoordinator,
@@ -86,6 +89,11 @@ export type RoutePublicationAdmission = <T>(
 export type RouteExecutionContext = Readonly<{
   publicationLockToken?: BackendPublicationLockToken;
   withPublicationAdmission?: RoutePublicationAdmission;
+  /**
+   * Bounded FIFO turn on the daemon's own publication queue for a PostgreSQL
+   * read's identity/open prefix retry. Absent on SQLite and on every other route.
+   */
+  withReadAdmission?: RoutePublicationAdmission;
   signal?: AbortSignal;
   /** Narrow invocation-control seam used by invocation-aware compact routes. */
   invocationCoordinator?: InvocationCoordinator;
@@ -98,11 +106,13 @@ export type RouteHandler = (
 ) => Promise<void>;
 export type RouteAdmission = "read" | "mutating";
 type BuiltInRoutePublicationMode = "retained" | "operation-scoped";
+type BuiltInRouteResponseMode = "direct" | "buffered";
 type RequestLifecycleEvent = "received" | "cancelled" | "settled";
 type RegisteredRoute = Readonly<{
   handler: RouteHandler;
   admission: RouteAdmission;
   publicationMode: BuiltInRoutePublicationMode;
+  responseMode: BuiltInRouteResponseMode;
 }>;
 export type DaemonInstance = {
   address: () => AddressInfo;
@@ -156,6 +166,8 @@ export type DaemonOptions = {
   _withBackendPublicationConsumerLockAsync?: typeof withBackendPublicationConsumerLockAsync;
   /** @internal Test-only request lifecycle observer. */
   _onRequestLifecycle?: (event: RequestLifecycleEvent, signal: AbortSignal) => void;
+  /** @internal Queue-wait budget for a PostgreSQL read's admitted retry, in milliseconds. */
+  _readAdmissionWaitMs?: number;
   /** @internal Test-only observer for the closed built-in route registry. */
   _onBuiltInRouteRegistered?: (
     key: string,
@@ -167,6 +179,7 @@ export type DaemonOptions = {
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_REQUEST_CONFIG_BYTES = 4 * 1024 * 1024;
 const MAX_BUFFERED_RESPONSE_BYTES = MAX_BODY_BYTES;
+const READ_ADMISSION_WAIT_MS = 1000;
 
 export function claudeProjectDirName(cwd: string): string {
   const sanitized = cwd
@@ -230,6 +243,23 @@ function responseWriteAfterEndError(): Error & { code: string } {
   return Object.assign(new Error("write after end"), { code: "ERR_STREAM_WRITE_AFTER_END" });
 }
 
+const BUFFERED_RESPONSE_SIZE_LIMIT_CODE = "ERR_LCM_BUFFERED_RESPONSE_SIZE_LIMIT";
+
+function bufferedResponseSizeLimitError(): Error & { code: typeof BUFFERED_RESPONSE_SIZE_LIMIT_CODE; statusCode: 500 } {
+  return Object.assign(new Error("buffered response exceeds the response size limit"), {
+    code: BUFFERED_RESPONSE_SIZE_LIMIT_CODE,
+    statusCode: 500,
+  } as const);
+}
+
+/** Identify the server-owned bounded-response failure for route-level propagation. */
+export function isBufferedResponseSizeLimitError(
+  error: unknown,
+): error is Error & { code: typeof BUFFERED_RESPONSE_SIZE_LIMIT_CODE; statusCode: 500 } {
+  return error instanceof Error
+    && (error as { code?: unknown }).code === BUFFERED_RESPONSE_SIZE_LIMIT_CODE;
+}
+
 /**
  * Admitted handlers must not reach the client until their retained mutation
  * permit or lock-free read witness has passed post-handler revalidation. This
@@ -284,7 +314,7 @@ class BufferedServerResponse {
     if (this.ended) throw responseWriteAfterEndError();
     const bufferedChunk = typeof chunk === "string" ? Buffer.from(chunk, encoding) : Buffer.from(chunk);
     if (this.bodyBytes + bufferedChunk.byteLength > MAX_BUFFERED_RESPONSE_BYTES) {
-      throw Object.assign(new Error("buffered response exceeds the response size limit"), { statusCode: 500 });
+      throw bufferedResponseSizeLimitError();
     }
     this.chunks.push(bufferedChunk);
     this.bodyBytes += bufferedChunk.byteLength;
@@ -411,7 +441,7 @@ function assertDaemonRequestStorageAdmission(
   const requestConfig = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
   if (requestConfig.storage.backend !== startupConfig.storage.backend) {
     throw new BackendPublicationJournalError(
-      "unexpected-state",
+      "backend-mismatch",
       "daemon request backend differs from the authenticated startup backend",
     );
   }
@@ -580,6 +610,35 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }
   };
   const withBackgroundPublicationAdmission: BackgroundPublicationAdmission = publicationAdmission(shutdownController.signal);
+  /**
+   * One bounded turn on the publication queue for a PostgreSQL read's retry.
+   * The deadline only bounds queue waiting: it is disarmed on callback entry,
+   * and it never aborts the request signal, which would discard the 503.
+   */
+  const boundedReadAdmission = (requestSignal: AbortSignal): RoutePublicationAdmission => async operation => {
+    const deadline = new AbortController();
+    let deadlineFired = false;
+    const timer = setTimeout(() => {
+      deadlineFired = true;
+      deadline.abort();
+    }, options?._readAdmissionWaitMs ?? READ_ADMISSION_WAIT_MS);
+    const composed = composeAbortSignals([requestSignal, deadline.signal]);
+    try {
+      return await enqueuePublication(() => {
+        clearTimeout(timer);
+        throwIfAborted(requestSignal);
+        return withConsumerPublicationLockAsync(publicationHome, publicationLockToken => operation(publicationLockToken));
+      }, composed.signal);
+    } catch (error) {
+      if (deadlineFired && !requestSignal.aborted) {
+        throw new PrivateMutationLockContentionError("daemon publication work is in progress; retry the read");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      composed.cleanup();
+    }
+  };
   const withRequestPublicationAdmission = (
     retainedToken: BackendPublicationLockToken,
   ): RoutePublicationAdmission => async (operation, signal) => {
@@ -599,6 +658,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   };
   const invocationCoordinator = createInvocationCoordinator({
     daemonInstanceId: options?._daemonInstanceId,
+  });
+  // #1383: the daemon owns passive-event replication. The lease owner is the
+  // daemon instance id so fencing follows daemon lifetime and a restarted
+  // daemon cannot masquerade as its predecessor's lease holder.
+  const passiveEventReplication = createPassiveEventReplicationPass(config, {
+    processId: `lcm-daemon:${invocationCoordinator.daemonInstanceId}`,
+    withPublicationAdmission: withBackgroundPublicationAdmission,
+    publicationHome,
   });
   const createFactory = options?._createStorageBackendFactory ?? createStorageBackendFactory;
   let storageFactory: StorageBackendFactory;
@@ -644,9 +711,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     handler: RouteHandler,
     admission: RouteAdmission,
     publicationMode: BuiltInRoutePublicationMode = "retained",
+    responseMode: BuiltInRouteResponseMode = "direct",
   ): void => {
     const key = `${method} ${path}`;
-    routes.set(key, { handler, admission, publicationMode });
+    routes.set(key, { handler, admission, publicationMode, responseMode });
     options?._onBuiltInRouteRegistered?.(key, admission, publicationMode);
   };
 
@@ -666,6 +734,20 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }, idleTimeoutMs);
   }
 
+  /**
+   * #1384: report a halted background sweep on the health route. Read admission
+   * refuses every other route once the configured backend diverges from this
+   * daemon's frozen startup backend, so unauthenticated health is the only
+   * surface that still answers when the halt is most relevant. A healthy daemon
+   * keeps its existing response shape.
+   */
+  const passiveEventHaltReport = (): {
+    passiveEvents?: PassiveEventBackgroundDiagnostics;
+  } => {
+    const diagnostics = passiveEventProcessor.backgroundDiagnostics();
+    return diagnostics.halted ? { passiveEvents: diagnostics } : {};
+  };
+
   registerBuiltInRoute("GET", "/health", async (req, res) => {
     if (serverToken && req.headers.authorization === undefined) {
       sendJson(res, 200, {
@@ -675,6 +757,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         uptime: Math.floor((Date.now() - startTime) / 1000),
         pid: process.pid,
         ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
+        ...passiveEventHaltReport(),
       });
       return;
     }
@@ -688,6 +771,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       pid: process.pid,
       entrypoint: daemonEntrypoint,
       ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
+      ...passiveEventHaltReport(),
       ...(serverToken && req.headers.authorization !== undefined
         ? { daemonInstanceId: invocationCoordinator.daemonInstanceId }
         : {}),
@@ -759,7 +843,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     "mutating",
     "operation-scoped",
   );
-  registerBuiltInRoute("POST", "/prompt-search", createPromptSearchHandler(config, storageFactory), "read");
+  registerBuiltInRoute(
+    "POST",
+    "/prompt-search",
+    createPromptSearchHandler(config, storageFactory),
+    "mutating",
+    "operation-scoped",
+    "buffered",
+  );
   registerBuiltInRoute(
     "POST",
     "/session-complete",
@@ -773,6 +864,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     {
       storageFactory,
       withPublicationAdmission: withBackgroundPublicationAdmission,
+      replicatePassiveEvents: passiveEventReplication.run,
       signal: shutdownController.signal,
     },
   );
@@ -968,11 +1060,19 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           const withPublicationAdmission = publicationAdmission(requestSignal);
           await withPublicationAdmission(() => undefined);
           throwIfAborted(requestSignal);
-          await route.handler(req, res, body, {
+          if (route.responseMode === "buffered") {
+            bufferedResponse = new BufferedServerResponse(res);
+          }
+          await route.handler(req, (bufferedResponse ?? res) as ServerResponse, body, {
             withPublicationAdmission,
             signal: requestSignal,
             invocationCoordinator,
           });
+          if (bufferedResponse !== undefined) {
+            throwIfAborted(requestSignal);
+            bufferedResponse.flush();
+            bufferedResponse = undefined;
+          }
           return;
         }
         bufferedResponse = new BufferedServerResponse(res);
@@ -1002,6 +1102,9 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           await route.handler(req, bufferedResponse as unknown as ServerResponse, body, {
             signal: requestSignal,
             invocationCoordinator,
+            ...(config.storage.backend === "postgresql"
+              ? { withReadAdmission: boundedReadAdmission(requestSignal) }
+              : {}),
           });
           const finalWitness = assertDaemonReadStorageAdmission(
             config,
@@ -1101,7 +1204,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       registerBuiltInRoute(
         "POST",
         "/status",
-        createStatusHandler(config, startTime, actualPort, publicationHome, storageFactory),
+        createStatusHandler(
+          config,
+          startTime,
+          actualPort,
+          publicationHome,
+          storageFactory,
+          () => passiveEventProcessor.backgroundDiagnostics(),
+        ),
         "read",
       );
       passiveEventProcessor.start();
@@ -1118,6 +1228,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           await settleCleanup(() => activeIngestScan);
           await settleCleanup(() => projectMapWatcher.close());
           await settleCleanup(() => passiveEventProcessor.stopAndWait());
+          await settleCleanup(() => passiveEventReplication.close());
           await settleCleanup(() => { idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout); });
           if (proxyManager) {
             await settleCleanup(() => proxyManager.stop());
@@ -1132,7 +1243,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           const admission = existing?.admission === "mutating"
             ? "mutating"
             : requestedAdmission ?? inheritedAdmission;
-          routes.set(key, { handler, admission, publicationMode: "retained" });
+          routes.set(key, { handler, admission, publicationMode: "retained", responseMode: "direct" });
         },
         get idleTriggered() { return idleTriggered; },
       });
@@ -1160,6 +1271,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const processor = constructedProcessor;
       await settleCleanup(() => processor.stopAndWait());
     }
+    await settleCleanup(() => passiveEventReplication.close());
     await closeStorageFactoryForTerminalCleanup();
     throw error;
   }

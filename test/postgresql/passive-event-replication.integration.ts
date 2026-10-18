@@ -108,6 +108,7 @@ function worker(
   local: LocalHookOutboxRepository,
   remote: PostgreSqlPassiveEventRepository,
   processId: string,
+  batchSize = 2,
 ): PassiveEventReplicationWorker {
   return new PassiveEventReplicationWorker({
     local,
@@ -128,7 +129,7 @@ function worker(
     random: () => 0.5,
   }, {
     processId,
-    batchSize: 2,
+    batchSize,
     staleClaimMs: 50,
     leaseTtlMs: 1_000,
     retryBaseMs: 1,
@@ -352,6 +353,92 @@ describe("PostgreSQL 18 passive-event replication", () => {
     });
   });
 
+  it("applies a machine's whole ready backlog in a single pass (#1530)", async () => {
+    await withPostgreSqlTestDatabase("passive-single-pass", async (database) => {
+      await grantPassiveEventRuntimePrivileges(database);
+      const projectId = await createProject(database, "Passive single pass project");
+      const machineId = await createMachine(database, "Passive single pass machine");
+      await database.migrator.query({
+        text: `CREATE TABLE public.passive_event_effects(
+                 effect_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                 event_id uuid NOT NULL UNIQUE,
+                 machine_id uuid NOT NULL
+               );
+               REVOKE ALL ON public.passive_event_effects FROM PUBLIC;
+               GRANT INSERT, SELECT ON public.passive_event_effects
+               TO lcm_test_runtime;
+               GRANT USAGE ON SEQUENCE public.passive_event_effects_effect_id_seq
+               TO lcm_test_runtime`,
+      }, { domain: "passive-events", operation: "createSinglePassEffects" });
+      const directory = mkdtempSync(join(tmpdir(), "lcm-passive-single-pass-"));
+      const factory = new SQLiteLocalHookOutboxFactory();
+      try {
+        const path = join(directory, "events.db");
+        const local = await factory.open(path);
+        await insertLocalEvents(local, "pass", 4);
+        clearCapturedMachineIdentity(path);
+        const remote = new PostgreSqlPassiveEventRepository(
+          database.runtime,
+          projectId,
+          machineId,
+        );
+        // The real prune deletes applied inbox rows, so the status that each
+        // row had when it was pruned is the only proof of the applied state.
+        const prunedStatuses: string[] = [];
+        const prune = remote.pruneApplied.bind(remote);
+        remote.pruneApplied = async (keys, signal) => {
+          const records = await remote.readEvents(
+            keys.map((key) => ({ machineId: key.machineId, eventId: key.eventId })),
+            signal,
+          );
+          prunedStatuses.push(...records.map((record) => record.status));
+          return prune(keys, signal);
+        };
+
+        // One run only: a driver that repeats runs would hide the defect.
+        const result = await worker(local, remote, "replication-single", 10).runOnce();
+
+        expect(result).toMatchObject({
+          uploaded: 4,
+          applied: 4,
+          acknowledged: 4,
+          pruned: 4,
+        });
+        expect(prunedStatuses).toEqual(["applied", "applied", "applied", "applied"]);
+        const rows = await local.getUnprocessed(500);
+        expect(rows).toHaveLength(4);
+        expect(rows.every((row) =>
+          row.delivery_state === "acknowledged" && row.remote_pruned_at !== null))
+          .toBe(true);
+        const effects = await database.migrator.query<{ data: string }>({
+          text: `SELECT inbox.payload->>'data' AS data
+                 FROM public.passive_event_effects AS effect
+                 JOIN (
+                   SELECT event_id, payload
+                   FROM jsonb_to_recordset($1::pg_catalog.jsonb)
+                     AS input(event_id uuid, payload jsonb)
+                 ) AS inbox ON inbox.event_id = effect.event_id
+                 ORDER BY effect.effect_id`,
+          values: [JSON.stringify(rows.map((row) => ({
+            event_id: row.event_uuid,
+            payload: { data: row.data },
+          })))],
+        }, { domain: "passive-events", operation: "verifySinglePassOrder" });
+        expect(effects.rows.map((row) => row.data))
+          .toEqual(Array.from({ length: 4 }, (_, index) => `pass-${String(index)}`));
+        const inbox = await database.migrator.query<{ remaining: string }>({
+          text: `SELECT count(*)::pg_catalog.text AS remaining
+                 FROM lcm.passive_event_inbox WHERE project_id = $1`,
+          values: [projectId],
+        }, { domain: "passive-events", operation: "verifySinglePassInbox" });
+        expect(inbox.rows[0].remaining).toBe("0");
+      } finally {
+        await Promise.allSettled([factory.close()]);
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("recovers every uncertain-commit crash handoff before acknowledging and pruning", async () => {
     await withPostgreSqlTestDatabase("passive-crash", async (database) => {
       await grantPassiveEventRuntimePrivileges(database);
@@ -419,6 +506,95 @@ describe("PostgreSQL 18 passive-event replication", () => {
           }
         }
       } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("moves rows that still await a previous project to the new one after a relink", async () => {
+    await withPostgreSqlTestDatabase("passive-relink", async (database) => {
+      await grantPassiveEventRuntimePrivileges(database);
+      const oldProjectId = await createProject(database, "Passive relink old project");
+      const newProjectId = await createProject(database, "Passive relink new project");
+      const machineId = await createMachine(database, "Passive relink machine");
+      await database.migrator.query({
+        text: `CREATE TABLE public.passive_event_effects(
+                 event_id uuid PRIMARY KEY,
+                 machine_id uuid NOT NULL
+               );
+               REVOKE ALL ON public.passive_event_effects FROM PUBLIC;
+               GRANT INSERT, SELECT ON public.passive_event_effects
+               TO lcm_test_runtime`,
+      }, { domain: "passive-events", operation: "createRelinkEffects" });
+      const inboxRows = async (projectId: string): Promise<number> => {
+        const result = await database.migrator.query<{ count: string }>({
+          text: `SELECT COUNT(*)::pg_catalog.text AS count
+                 FROM lcm.passive_event_inbox WHERE project_id = $1`,
+          values: [projectId],
+        }, { domain: "passive-events", operation: "countRelinkInbox" });
+        return Number(result.rows[0].count);
+      };
+      const directory = mkdtempSync(join(tmpdir(), "lcm-passive-relink-"));
+      const factory = new SQLiteLocalHookOutboxFactory();
+      try {
+        const path = join(directory, "events.db");
+        const local = await factory.open(path);
+        await insertLocalEvents(local, "relink", 3);
+        clearCapturedMachineIdentity(path);
+        const oldRemote = new PostgreSqlPassiveEventRepository(
+          database.runtime,
+          oldProjectId,
+          machineId,
+        );
+        const newRemote = new PostgreSqlPassiveEventRepository(
+          database.runtime,
+          newProjectId,
+          machineId,
+        );
+
+        // The previous project receives every row and never applies any.
+        const abandoned = new Proxy(oldRemote, {
+          get: (target, property) => {
+            if (property === "claimEvents") return async () => [];
+            const value: unknown = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        const beforeRelink = worker(local, abandoned, "replication-old");
+        await beforeRelink.runOnce();
+        await beforeRelink.runOnce();
+        expect((await local.getUnprocessed(500)).map((row) => row.delivery_state))
+          .toEqual(["replicated", "replicated", "replicated"]);
+        expect(await inboxRows(oldProjectId)).toBe(3);
+
+        // The relinked pass withdraws two copies and crashes before the local
+        // transition: the rows stay replicated and absent from every project.
+        const crashing = new Proxy(local, {
+          get: (target, property) => {
+            if (property === "requeueReplicated") {
+              return async () => { throw new Error("injected crash before requeue"); };
+            }
+            const value: unknown = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        await expect(worker(crashing, newRemote, "replication-new").runOnce())
+          .rejects.toThrow("injected crash before requeue");
+        expect(await inboxRows(oldProjectId)).toBe(1);
+        expect((await local.getUnprocessed(500)).map((row) => row.delivery_state))
+          .toEqual(["replicated", "replicated", "replicated"]);
+
+        // A later pass re-queues what is absent everywhere, withdraws the
+        // last copy, and delivers all rows to the new project.
+        await driveUntilPruned(worker(local, newRemote, "replication-new"), local, 3);
+        expect(await inboxRows(oldProjectId)).toBe(0);
+        expect(await inboxRows(newProjectId)).toBe(0);
+        const effects = await database.migrator.query<{ count: string }>({
+          text: "SELECT COUNT(*)::pg_catalog.text AS count FROM public.passive_event_effects",
+        }, { domain: "passive-events", operation: "countRelinkEffects" });
+        expect(effects.rows[0].count).toBe("3");
+      } finally {
+        await factory.close();
         rmSync(directory, { recursive: true, force: true });
       }
     });

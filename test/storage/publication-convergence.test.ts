@@ -38,6 +38,131 @@ function deps(overrides: Partial<PublicationConvergenceDeps> = {}): PublicationC
 }
 
 describe("publication convergence", () => {
+  const carriedOwner = { version: 1 as const, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) };
+  const carried = (
+    path = "/tmp/lock",
+    owner: typeof carriedOwner = carriedOwner,
+  ): PrivateMutationLockContentionError =>
+    new PrivateMutationLockContentionError("owned by live PID", { contendedLock: { path, owner } });
+
+  it("retries a contention whose carried owner is the authenticated daemon even after the lock file is gone", async () => {
+    let now = 0;
+    const sleeps: number[] = [];
+    const readOwner = vi.fn(() => null);
+    const processBirth = vi.fn(() => "birth");
+    const fetch = healthFetch();
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity,
+      deps: deps({ now: () => now, sleep: async (ms) => { sleeps.push(ms); now += ms; }, readOwner, processBirth, fetch }),
+    });
+    let attempts = 0;
+    await expect(withPublicationAdmissionRetry(() => {
+      attempts += 1;
+      if (attempts === 1) throw carried();
+      return "acquired";
+    }, convergence)).resolves.toBe("acquired");
+    expect(attempts).toBe(2);
+    expect(sleeps).toEqual([50]);
+    expect(readOwner).not.toHaveBeenCalled();
+    expect(processBirth).toHaveBeenCalledWith(42, undefined, { timeoutMs: 2_000 });
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it("compares the carried lock path after resolving both sides", async () => {
+    let now = 0;
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity,
+      deps: deps({ now: () => now, sleep: async (ms) => { now += ms; }, lockPath: "/tmp/a/../lock", readOwner: () => null }),
+    });
+    let attempts = 0;
+    await expect(withPublicationAdmissionRetry(() => {
+      attempts += 1;
+      if (attempts === 1) throw carried("/tmp/lock");
+      return "acquired";
+    }, convergence)).resolves.toBe("acquired");
+  });
+
+  it.each([
+    ["a foreign carried owner", () => carried("/tmp/lock", { ...carriedOwner, pid: 99 })],
+    ["a carried owner without a recorded birth", () => carried("/tmp/lock", { ...carriedOwner, processStartTime: null })],
+    ["a carried owner whose birth no longer matches", () => carried("/tmp/lock", { ...carriedOwner, processStartTime: "other" })],
+  ])("fails closed for %s even when the lock file is gone", async (_label, make) => {
+    const sleep = vi.fn(async (_ms: number) => undefined);
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity,
+      deps: deps({ sleep, readOwner: () => null }),
+    });
+    const contention = make();
+    await expect(withPublicationAdmissionRetry(() => { throw contention; }, convergence)).rejects.toBe(contention);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("refuses a carried owner for a different lock without sleeping or re-reading the convergence lock", async () => {
+    const sleep = vi.fn(async (_ms: number) => undefined);
+    const readOwner = vi.fn(() => carriedOwner);
+    const processBirth = vi.fn(() => "birth");
+    const fetch = healthFetch();
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity,
+      deps: deps({ sleep, readOwner, processBirth, fetch }),
+    });
+    const contention = carried("/tmp/lcm-config.lock");
+    await expect(withPublicationAdmissionRetry(() => { throw contention; }, convergence)).rejects.toBe(contention);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(readOwner).not.toHaveBeenCalled();
+    expect(processBirth).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("shares one stored deadline across carried-owner retries and preserves the first contention at expiry", async () => {
+    let now = 0;
+    const sleeps: number[] = [];
+    const readOwner = vi.fn(() => null);
+    const first = carried();
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity,
+      deps: deps({ now: () => now, sleep: async (ms) => { sleeps.push(ms); now += ms; }, readOwner }),
+    });
+    let attempts = 0;
+    await expect(withPublicationAdmissionRetry(() => {
+      attempts += 1;
+      if (attempts === 1) {
+        expect(convergence.deadline).toBeUndefined();
+        throw first;
+      }
+      expect(convergence.deadline).toBe(2_000);
+      throw carried();
+    }, convergence)).rejects.toBe(first);
+    expect(convergence.deadline).toBe(2_000);
+    expect(attempts).toBe(40);
+    expect(sleeps).toEqual(Array.from({ length: 40 }, () => 50));
+    expect(now).toBe(2_000);
+    expect(readOwner).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the carried owner's health no longer matches", async () => {
+    const sleep = vi.fn(async (_ms: number) => undefined);
+    const convergence = createPublicationConvergence({
+      port: 3737,
+      identity,
+      deps: deps({ sleep, fetch: healthFetch(42, { runtimeDigest: "b".repeat(64) }), readOwner: () => null }),
+    });
+    const contention = carried();
+    await expect(withPublicationAdmissionRetry(() => { throw contention; }, convergence)).rejects.toBe(contention);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("ignores a carried owner without an authenticated identity", async () => {
+    const convergence = createPublicationConvergence({ port: 3737, identity: undefined, deps: deps() });
+    const contention = carried();
+    await expect(withPublicationAdmissionRetry(() => { throw contention; }, convergence)).rejects.toBe(contention);
+  });
+
   it("captures a fully authenticated identity and rejects drift", async () => {
     await expect(capturePublicationIdentity({
       port: 3737, expectedVersion: undefined, expectedStorageBackend: "sqlite",
@@ -72,6 +197,11 @@ describe("publication convergence", () => {
       port: 3737, expectedVersion: "1.0.0", expectedStorageBackend: "sqlite",
       expectedEntrypoint: "/opt/lcm.mjs", expectedRuntimeDigest: "b".repeat(64),
       deps: deps(),
+    })).resolves.toBeUndefined();
+    await expect(capturePublicationIdentity({
+      port: 3737, expectedVersion: "1.0.0", expectedStorageBackend: "sqlite",
+      expectedEntrypoint: "/opt/lcm.mjs", expectedRuntimeDigest: "a".repeat(64),
+      deps: deps({ fetch: healthFetch(42, { storageBackend: undefined }) }),
     })).resolves.toBeUndefined();
     await expect(capturePublicationIdentity({
       port: 3737, expectedVersion: "1.0.0", expectedStorageBackend: "sqlite",
@@ -382,23 +512,13 @@ describe("publication convergence", () => {
     }, healthMismatch)).rejects.toBe(contention);
     expect(healthMismatchAttempts).toBe(1);
     expect(sleeps).toEqual([]);
-    const sqliteDefault = createPublicationConvergence({
-      port: 3737,
-      identity,
-      deps: deps({ fetch: healthFetch(42, { storageBackend: undefined }), platform: undefined, sleep: async () => undefined }),
-    });
-    let sqliteAttempts = 0;
-    await expect(withPublicationAdmissionRetry(() => {
-      sqliteAttempts += 1;
-      if (sqliteAttempts === 1) throw contention;
-      return undefined;
-    }, sqliteDefault)).resolves.toBeUndefined();
   });
 
   it.each([
     ["pid", { pid: 43 }],
     ["version", { version: "2.0.0" }],
     ["storage backend", { storageBackend: "postgresql" }],
+    ["missing storage backend", { storageBackend: undefined }],
     ["entrypoint", { entrypoint: "/different.mjs" }],
     ["runtime digest", { runtimeDigest: "b".repeat(64) }],
     ["missing entrypoint", { entrypoint: undefined }],

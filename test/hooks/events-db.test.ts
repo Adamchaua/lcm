@@ -801,6 +801,78 @@ describe("EventsDb", () => {
     db.close();
   });
 
+  it("returns a replicated row to the pending queue only for its recorded inbox id", () => {
+    const db = new EventsDb(dbPath);
+    db.insertEvent(
+      "s1",
+      { type: "choice", category: "decision", data: "requeue", priority: 1 },
+      "PostToolUse",
+    );
+    const machineId = machineIdFor(db);
+    const [claimed] = db.claimDeliveries({
+      machineId,
+      claimOwner: "owner-a",
+      limit: 1,
+      staleClaimMs: 60_000,
+    });
+    // Only a replicated row can be re-queued (#1509).
+    expect(db.requeueReplicated(claimed.event_uuid, 41n)).toBe(false);
+    expect(db.markDeliveryRetry(
+      claimed.event_uuid,
+      "owner-a",
+      "transient",
+      "2020-01-01T00:00:00.000Z",
+    )).toBe(true);
+    const [retryClaim] = db.claimDeliveries({
+      machineId,
+      claimOwner: "owner-b",
+      limit: 1,
+      staleClaimMs: 60_000,
+    });
+    expect(db.markReplicated(retryClaim.event_uuid, "owner-b", 41n)).toBe(true);
+    const [replicated] = db.listAwaitingRemote();
+
+    // A decision about another inbox id never moves the row.
+    expect(db.requeueReplicated(replicated.event_uuid, 42n)).toBe(false);
+    expect(db.listAwaitingRemote()).toHaveLength(1);
+    expect(() => db.requeueReplicated(replicated.event_uuid, 0n))
+      .toThrow("outside the PostgreSQL bigint range");
+    expect(() => db.requeueReplicated("not-an-event-uuid", 41n)).toThrow();
+
+    expect(db.requeueReplicated(replicated.event_uuid, 41n)).toBe(true);
+    // It is no longer replicated, so the same decision cannot repeat.
+    expect(db.requeueReplicated(replicated.event_uuid, 41n)).toBe(false);
+    expect(db.listAwaitingRemote()).toEqual([]);
+    const [requeued] = withSqlite(dbPath, (raw) => raw.prepare(
+      "SELECT * FROM events WHERE event_uuid = ?",
+    ).all(replicated.event_uuid)) as Array<Record<string, unknown>>;
+    expect(requeued).toMatchObject({
+      delivery_state: "pending",
+      delivery_generation: Number(replicated.delivery_generation) + 1,
+      delivery_attempts: replicated.delivery_attempts,
+      delivery_owner: null,
+      delivery_claimed_at: null,
+      delivery_last_error: null,
+      remote_inbox_id: null,
+      quarantine_reason: null,
+      machine_id: machineId,
+      machine_sequence: replicated.machine_sequence,
+    });
+
+    // Eligible at once, with identity and attempt count preserved.
+    const [again] = db.claimDeliveries({
+      machineId,
+      claimOwner: "owner-c",
+      limit: 1,
+      staleClaimMs: 60_000,
+    });
+    expect(again).toMatchObject({
+      event_uuid: replicated.event_uuid,
+      delivery_attempts: replicated.delivery_attempts + 1,
+    });
+    db.close();
+  });
+
   it("rejects remote inbox IDs outside the exact PostgreSQL bigint range", () => {
     const db = new EventsDb(dbPath);
     db.insertEvent(
@@ -998,6 +1070,85 @@ describe("EventsDb", () => {
     expect(db.pruneProcessed(7)).toBe(0);
     expect(db.markRemotePruned(claimed.event_uuid)).toBe(true);
     expect(db.pruneProcessed(7)).toBe(1);
+    db.close();
+  });
+
+  // #1395: the acknowledged/remote-pruned gate is unsatisfiable without a
+  // remote inbox, so a SQLite install pruned nothing and grew without bound.
+  it("prunes aged processed events when replication cannot claim them", () => {
+    const db = new EventsDb(dbPath);
+    db.insertEvent("s1", { type: "a", category: "file", data: "x", priority: 3 }, "PostToolUse");
+    const events = db.getUnprocessed();
+    db.markProcessed([events[0].event_id]);
+    withSqlite(dbPath, (raw) => raw.exec(
+      `UPDATE events SET processed_at = datetime('now', '-10 days') WHERE event_id = ${events[0].event_id}`
+    ));
+
+    // The replicating contract still retains it: nothing has drained it.
+    expect(db.pruneProcessed(7, { awaitingReplication: true })).toBe(0);
+    // The default stays conservative for callers that say nothing.
+    expect(db.pruneProcessed(7)).toBe(0);
+    // With no remote inbox to wait for, age alone is enough, as before #91.
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(1);
+    db.close();
+  });
+
+  it("retains a remotely enrolled event even when replication is absent", () => {
+    const db = new EventsDb(dbPath);
+    db.insertEvent("s1", { type: "a", category: "file", data: "x", priority: 3 }, "PostToolUse");
+    const events = db.getUnprocessed();
+    db.markProcessed([events[0].event_id]);
+    withSqlite(dbPath, (raw) => raw.exec(
+      `UPDATE events SET processed_at = datetime('now', '-10 days') WHERE event_id = ${events[0].event_id}`
+    ));
+    const [claimed] = db.claimDeliveries({
+      machineId: events[0].machine_id ?? fallbackMachineId,
+      claimOwner: "test-owner",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+
+    // A claimed row is mid-flight and is never prunable on age.
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(0);
+
+    // An uploaded row carries remote state, so it still needs the full drained
+    // proof. This is the install that moved from PostgreSQL back to SQLite.
+    expect(db.markReplicated(claimed.event_uuid, "test-owner", 10n)).toBe(true);
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(0);
+    expect(db.markAcknowledged(claimed.event_uuid, 10n)).toBe(true);
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(0);
+    expect(db.markRemotePruned(claimed.event_uuid)).toBe(true);
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(1);
+    db.close();
+  });
+
+  // A retry row is not proof that nothing reached the remote inbox. The
+  // replication worker marks a claimed row `retry` when the insert throws and
+  // the readback that would settle it is unavailable too, so the insert may
+  // well have committed remotely. After a move back to SQLite, age alone must
+  // not delete a row whose remote outcome is still unknown.
+  it("retains an aged processed event whose remote outcome is unknown", () => {
+    const db = new EventsDb(dbPath);
+    db.insertEvent("s1", { type: "a", category: "file", data: "x", priority: 3 }, "PostToolUse");
+    const events = db.getUnprocessed();
+    db.markProcessed([events[0].event_id]);
+    withSqlite(dbPath, (raw) => raw.exec(
+      `UPDATE events SET processed_at = datetime('now', '-10 days') WHERE event_id = ${events[0].event_id}`
+    ));
+    const [claimed] = db.claimDeliveries({
+      machineId: events[0].machine_id ?? fallbackMachineId,
+      claimOwner: "test-owner",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+    expect(db.markDeliveryRetry(
+      claimed.event_uuid,
+      "test-owner",
+      "upload failed",
+      new Date(Date.now() + 60_000).toISOString(),
+    )).toBe(true);
+
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(0);
     db.close();
   });
 

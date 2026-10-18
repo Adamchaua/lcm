@@ -10,7 +10,7 @@ import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
 import { StorageOperationError } from "../../storage/errors.js";
 import {
-  storageRouteFailureResponse,
+  storageReadFailureResponse,
   withProjectStorage,
 } from "./storage-lifecycle.js";
 
@@ -89,7 +89,7 @@ export function createSearchHandler(config: DaemonConfig, storageFactory?: Stora
         );
         sendJson(res, 200, result ?? { episodic: [], promoted: [] });
       } catch (error) {
-        const storageFailure = storageRouteFailureResponse(config.storage.backend, error, "search", storageFactory);
+        const storageFailure = storageReadFailureResponse(config.storage.backend, error, "search", storageFactory);
         if (storageFailure) {
           sendJson(res, storageFailure.status, storageFailure.body);
           return;

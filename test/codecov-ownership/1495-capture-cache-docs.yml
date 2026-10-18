@@ -1,0 +1,6 @@
+references: ["#1495"]
+rationale: >-
+  #1495 is a comment-only correction of the capture-cache residual cases;
+  the file keeps its established owner.
+pins:
+  - ["src/storage/sqlite/portable-capture.ts", "unit-local-persistence"]

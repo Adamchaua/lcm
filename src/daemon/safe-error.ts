@@ -114,6 +114,24 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let exactFileScheme = false;
   let foundFilePath = false;
   let filePathBracketDepth = 0;
+  let filePathStartedInBrackets = false;
+  let filePathQueryHasPublicUrl = false;
+  // End of the latest private span this pass has claimed, measured exactly as
+  // the redacting scan will measure it. Scheme text inside it is path text.
+  let claimedPrivateSpanEnd = -1;
+  const claimPrivateSpan = (start: number, fileUrl: boolean, forced: boolean, quote?: string): void => {
+    if (start < claimedPrivateSpanEnd) return;
+    const { windows, driveColonIndex } = redactionScanOptions(chars, start, fileUrl, forced);
+    claimedPrivateSpanEnd = scanAbsolutePath(
+      chars,
+      start,
+      windows,
+      driveColonIndex,
+      true,
+      nestedFileSchemeStarts,
+      quote,
+    ).end;
+  };
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
   let quotedQueryTail = false;
@@ -658,6 +676,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         nestedPublicUrlBracketDepth = brackets;
       }
       if (
+        exactFileScheme &&
+        foundFilePath &&
+        brackets === 0 &&
+        index >= claimedPrivateSpanEnd &&
+        isPublicUrlTailColon(chars, index, separator + 1)
+      ) {
+        // The rest of this tail belongs to an unbracketed public URL.
+        filePathQueryHasPublicUrl = true;
+      }
+      if (
         quotedQueryTail &&
         brackets === 0 &&
         char === "/" &&
@@ -676,6 +704,31 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         forcedPath[index] = 1;
         continue;
       }
+      if (
+        exactFileScheme &&
+        foundFilePath &&
+        char === "/" &&
+        nestedPublicUrlBracketDepth === 0 &&
+        (chars[index - 1] === "&" ||
+          (chars[index - 1] === "?" && chars[index - 2] === "&") ||
+          // A question mark, equals sign or fragment marker after a path that
+          // did not start inside an authority bracket also starts a fresh root,
+          // unless an unbracketed public URL in the query owns that delimiter.
+          ((chars[index - 1] === "?" || chars[index - 1] === "=" || chars[index - 1] === "#") &&
+            !filePathStartedInBrackets &&
+            !filePathQueryHasPublicUrl))
+      ) {
+        const forcedRoot = scanAbsolutePath(chars, index, false, -1, true, nestedFileSchemeStarts);
+        if (forcedRoot.sawNonSeparator) {
+          // An ampersand after the path starts a fresh root, not URL authority.
+          // A scheme inside that root is private path text and cannot arm the
+          // public URL guard.
+          forcedPath[index] = 1;
+          claimPrivateSpan(index, false, true);
+          filePathQueryHasPublicUrl = false;
+          continue;
+        }
+      }
       if (char === "/" && !quotedPathEnded) authority[index] = 1;
       if (
         exactFileScheme &&
@@ -691,6 +744,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       ) {
         file[index] = 1;
         fileQuote[index] = schemeQuote;
+        claimPrivateSpan(index, true, false, quoteFromCode(schemeQuote));
+        if (!foundFilePath) filePathStartedInBrackets = brackets > 0;
+        // A query backslash restart starts a private path that the earlier
+        // public URL no longer owns.
+        filePathQueryHasPublicUrl = false;
         foundFilePath = true;
         filePathBracketDepth = brackets;
       }
@@ -803,10 +861,20 @@ function startsUrlSchemeLiteral(chars: readonly string[], index: number): boolea
 }
 
 function isUrlSchemeColon(chars: readonly string[], index: number, lowerBound: number): boolean {
-  if (chars[index] !== ":" || chars[index + 1] !== "/" || chars[index + 2] !== "/") return false;
+  return urlSchemeStart(chars, index, lowerBound) >= 0;
+}
+
+function isPublicUrlTailColon(chars: readonly string[], index: number, lowerBound: number): boolean {
+  const start = urlSchemeStart(chars, index, lowerBound);
+  // A scheme directly after a path separator belongs to a private path span.
+  return start >= 0 && chars[start - 1] !== "/" && chars[start - 1] !== "\\";
+}
+
+function urlSchemeStart(chars: readonly string[], index: number, lowerBound: number): number {
+  if (chars[index] !== ":" || chars[index + 1] !== "/" || chars[index + 2] !== "/") return -1;
   let start = index;
   while (start > lowerBound && URL_SCHEME_CHARACTER_PATTERN.test(chars[start - 1])) start -= 1;
-  return URL_SCHEME_START_PATTERN.test(chars[start]);
+  return URL_SCHEME_START_PATTERN.test(chars[start]) ? start : -1;
 }
 
 function isSpanLocalSchemeColon(chars: readonly string[], start: number, index: number): boolean {
@@ -1040,6 +1108,29 @@ function scanAbsolutePath(
   return { end: index, sawNonSeparator };
 }
 
+function redactionScanOptions(
+  chars: readonly string[],
+  start: number,
+  fileUrl: boolean,
+  forcedPath: boolean,
+): { windows: boolean; windowsDrive: boolean; driveColonIndex: number } {
+  const windowsDrive = isWindowsDrivePathStart(chars, start);
+  const forcedDriveColonIndex = forcedPath ? fileUrlDriveColonIndex(chars, start) : -1;
+  const forcedWindowsSeparators = forcedPath && forcedSeparatorRunHasBackslash(chars, start);
+  const windows =
+    fileUrl ||
+    windowsDrive ||
+    forcedDriveColonIndex >= 0 ||
+    forcedWindowsSeparators ||
+    isUncPathStart(chars, start);
+  const driveColonIndex = fileUrl
+    ? fileUrlDriveColonIndex(chars, start)
+    : windowsDrive
+      ? start + 1
+      : forcedDriveColonIndex;
+  return { windows, windowsDrive, driveColonIndex };
+}
+
 function sanitizeAbsolutePaths(message: string): string {
   const chars = Array.from(message);
   const urlPathStarts = findUrlPathStarts(chars);
@@ -1049,15 +1140,12 @@ function sanitizeAbsolutePaths(message: string): string {
     const forcedPath = urlPathStarts.forcedPath[index] === 1;
     const openingQuote = chars[index] === "'" || chars[index] === '"' ? chars[index] : undefined;
     const start = fileUrl || openingQuote === undefined ? index : index + 1;
-    const windowsDrive = isWindowsDrivePathStart(chars, start);
-    const forcedDriveColonIndex = forcedPath ? fileUrlDriveColonIndex(chars, start) : -1;
-    const forcedWindowsSeparators = forcedPath && forcedSeparatorRunHasBackslash(chars, start);
-    const windows =
-      fileUrl ||
-      windowsDrive ||
-      forcedDriveColonIndex >= 0 ||
-      forcedWindowsSeparators ||
-      isUncPathStart(chars, start);
+    const { windows, windowsDrive, driveColonIndex } = redactionScanOptions(
+      chars,
+      start,
+      fileUrl,
+      forcedPath,
+    );
     const posix = forcedPath || (!fileUrl && isPosixPathStart(chars, start, urlPathStarts.authority));
     if (!fileUrl && !windows && !posix) {
       sanitized.push(chars[index]);
@@ -1065,11 +1153,6 @@ function sanitizeAbsolutePaths(message: string): string {
       continue;
     }
     const quote = fileUrl ? quoteFromCode(urlPathStarts.fileQuote[index]) : openingQuote;
-    const driveColonIndex = fileUrl
-      ? fileUrlDriveColonIndex(chars, start)
-      : windowsDrive
-        ? start + 1
-        : forcedDriveColonIndex;
     const { end, sawNonSeparator } = scanAbsolutePath(
       chars,
       start,

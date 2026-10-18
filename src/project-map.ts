@@ -90,6 +90,18 @@ export type ProjectIdentity = {
   remoteProjectId?: string;
 };
 
+/**
+ * A project identity with an explicit PostgreSQL remote binding.
+ *
+ * Distinct from the deliberately-unbound hook-durability identity
+ * (LocalProjectIdentity in src/daemon/project.ts), which must never satisfy
+ * a call site that requires a remote binding. Prefer this alias at such
+ * call sites so pairing the two no longer compiles silently.
+ */
+export type BoundProjectIdentity = ProjectIdentity & {
+  readonly remoteProjectId: string;
+};
+
 export type ProjectMapValidation = {
   ok: boolean;
   map: ProjectMap | null;
@@ -972,7 +984,7 @@ class InvalidProjectMapError extends Error {
   }
 }
 
-function parseProjectMap(content: string): ProjectMap {
+export function parseProjectMap(content: string): ProjectMap {
   let parsed: unknown;
   try {
     parsed = JSON.parse(content) as unknown;

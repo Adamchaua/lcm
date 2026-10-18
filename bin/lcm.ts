@@ -42,7 +42,7 @@ import {
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
 import { CliProjectStorageMissingError } from "../src/cli-storage.js";
-import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../src/storage/identity-context.js";
+import { StorageIdentityConfigurationError, TransportedUnboundProjectError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../src/storage/identity-context.js";
 import { MachineIdentityFileError } from "../src/machine-identity.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
@@ -1237,7 +1237,18 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
     || action === "describe"
     || action === "expand"
   )) return false;
-  if (topLevel && action === "post-tool") return false;
+  // Installed hook entrypoints own their bounded bootstrap and publication
+  // admission policy. SessionStart bootstrap and installation own legacy-root
+  // migration, so the global preflight must not turn publication-lock
+  // contention into a hook failure before the handler runs.
+  if (topLevel && (
+    action === "post-tool"
+    || action === "restore"
+    || action === "session-end"
+    || action === "session-snapshot"
+    || action === "user-prompt"
+    || (action === "compact" && actionCommand.opts<{ hook?: boolean }>().hook === true)
+  )) return false;
   if (topLevel && action === "status") return false;
   if (topLevel && (action === "stats" || action === "doctor")) return false;
   if (topLevel && (action === "diagnose" || action === "help")) return false;
@@ -1362,6 +1373,7 @@ function shouldUsePublicationConvergence(actionCommand: Command): boolean {
   const topLevel = actionCommand.parent?.name() === "lcm";
   if (topLevel && action === "install") return true;
   if (topLevel && action === "export") return true;
+  if (topLevel && action === "mcp") return true;
   if (isNestedUnderRoot(actionCommand, "machine", "show")) return true;
   if (isNestedUnderRoot(actionCommand, "project", "list")
     || isNestedUnderRoot(actionCommand, "project", "show")) return true;
@@ -3118,7 +3130,7 @@ export async function runCli(
         printHelp("mcp"); exit(0);
       }
       const { startMcpServer } = await import("../src/mcp/server.js");
-      await startMcpServer();
+      await startMcpServer({ withPublicationAdmissionRetry: publicationAdmissionRetry });
     });
 
   // ─── install ───────────────────────────────────────────────────────────────
@@ -4186,11 +4198,12 @@ export async function runCli(
         } catch (err: any) {
           if (err instanceof PrivateMutationLockContentionError || err instanceof BackendPublicationJournalError) throw err;
           failures++;
-          process.stderr.write(`  ${knownCliErrorDiagnostic(err) ?? "Export failed for a selected project. Check its storage binding and retry."}\n`);
+          process.stderr.write(`  ${sanitizeTerminalText(cwd)}: ${knownCliErrorDiagnostic(err) ?? "Export failed for a selected project. Check its storage binding and retry."}\n`);
         }
       }
 
       if (all) console.error(`\n  Total: ${total} entries exported`);
+      if (all && failures > 0) console.error(`  Failed: ${failures} ${failures === 1 ? "project" : "projects"} could not be exported`);
       if (failures > 0) exit(1);
     });
 
@@ -4309,6 +4322,7 @@ export async function runCli(
 function knownCliErrorDiagnostic(error: unknown): string | undefined {
   if (error instanceof BackendPublicationJournalError) return BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC;
   if (error instanceof StorageIdentityConfigurationError) return UNBOUND_POSTGRESQL_PROJECT_MESSAGE;
+  if (error instanceof TransportedUnboundProjectError) return UNBOUND_POSTGRESQL_PROJECT_MESSAGE;
   if (error instanceof CliProjectStorageMissingError) return "No LCM storage found for this project. Run `lcm import` or `lcm import-knowledge <file>` in the intended project, then retry.";
   if (error instanceof MachineIdentityFileError) return "LCM machine identity is unavailable. Run `lcm machine show` and register or recover the machine before retrying.";
   if (error instanceof ConfigValidationError) return "LCM configuration is invalid. Check config.json and the required environment variables, then retry.";

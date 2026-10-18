@@ -415,4 +415,465 @@ describe("PostgreSQL 18 passive-event repository", () => {
         .toBe(false);
     });
   });
+
+  describe("withdrawing this machine's copies from other projects (#1509)", () => {
+    const eventIds = Array.from(
+      { length: 12 },
+      (_, index) => `aaaaaaaa-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+    );
+
+    async function seed(
+      database: PostgreSqlTestDatabase,
+      eventId: string,
+      assignments: string,
+    ): Promise<void> {
+      await database.migrator.query({
+        text: `UPDATE lcm.passive_event_inbox SET ${assignments} WHERE event_id = $1`,
+        values: [eventId],
+      }, { domain: "passive-events", operation: "seedReleasedPassiveEvent" });
+    }
+
+    async function remaining(database: PostgreSqlTestDatabase): Promise<string[]> {
+      const rows = await database.migrator.query<{ label: string }>({
+        text: `SELECT project.display_name || ':' || event_id::pg_catalog.text || ':' || status AS label
+               FROM lcm.passive_event_inbox AS event
+               JOIN lcm.projects AS project USING (project_id)`,
+      }, { domain: "passive-events", operation: "listRemainingPassiveEvents" });
+      return rows.rows.map(({ label }) => label).sort();
+    }
+
+    type HeldTransaction = Parameters<Parameters<PostgreSqlTestDatabase["runtime"]["transaction"]>[0]>[0];
+
+    const heldRowCapMs = 5_000;
+    const blockedPollAttempts = 40;
+    const blockedPollIntervalMs = 50;
+
+    function within<T>(promise: Promise<T>, milliseconds: number, what: string): Promise<T> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const expired = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${what} did not happen within ${milliseconds} ms`)),
+          milliseconds,
+        );
+      });
+      return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+    }
+
+    // Polls, a finite number of times, until a backend of the runtime role is
+    // waiting on a lock held by the holder's backend while running the release
+    // statement, and returns that backend's pid.
+    async function findBlockedRelease(
+      database: PostgreSqlTestDatabase,
+      projectId: string,
+      holderPid: number,
+    ): Promise<number> {
+      for (let attempt = 0; attempt < blockedPollAttempts; attempt += 1) {
+        const blocked = await database.runtime.query<{ pid: number }>({
+          text: `SELECT pid FROM pg_catalog.pg_stat_activity
+                 WHERE datname = pg_catalog.current_database()
+                   AND wait_event_type = 'Lock'
+                   AND pg_catalog.pg_blocking_pids(pid) @> ARRAY[$1::pg_catalog.int4]
+                   AND query LIKE '%FOR UPDATE OF event%'`,
+          values: [holderPid],
+        }, { domain: "passive-events", operation: "findBlockedPassiveEventRelease", projectId });
+        if (blocked.rows.length === 1) return blocked.rows[0].pid;
+        await new Promise((resolve) => setTimeout(resolve, blockedPollIntervalMs));
+      }
+      throw new Error("the release statement was never blocked on the holder's row lock");
+    }
+
+    // Starts the release while another transaction holds every row of the
+    // machine, proves from pg_stat_activity that the release statement is
+    // blocked on that transaction's row lock, then lets writeWhileHeld change
+    // rows inside the holder (given the release backend's pid) and commit.
+    // Every wait is bounded, and on every failure path the holder is rolled
+    // back and both promises are settled before this returns or throws.
+    async function releaseWhileRowsAreHeld<T>(
+      database: PostgreSqlTestDatabase,
+      machineId: string,
+      projectId: string,
+      startRelease: () => Promise<T>,
+      writeWhileHeld: (transaction: HeldTransaction, releasePid: number) => Promise<void>,
+    ): Promise<T> {
+      let proceed!: (releasePid: number) => void;
+      let abort!: (reason: Error) => void;
+      const holderMayFinish = new Promise<number>((resolve, reject) => {
+        proceed = resolve;
+        abort = reject;
+      });
+      holderMayFinish.catch(() => undefined);
+      let holderLocked!: (holderPid: number) => void;
+      let holderFailed!: (reason: unknown) => void;
+      const locked = new Promise<number>((resolve, reject) => {
+        holderLocked = resolve;
+        holderFailed = reject;
+      });
+      const context = { domain: "passive-events", operation: "holdReleasedPassiveEvents", projectId };
+      const holder = database.runtime.transaction(async (transaction) => {
+        const pid = await transaction.query<{ pid: number }>({
+          text: "SELECT pg_catalog.pg_backend_pid() AS pid",
+        }, context);
+        await transaction.query({
+          text: `SELECT 1 FROM lcm.passive_event_inbox
+                 WHERE machine_id = $1 FOR UPDATE`,
+          values: [machineId],
+        }, context);
+        holderLocked(pid.rows[0].pid);
+        await writeWhileHeld(transaction, await holderMayFinish);
+      }, context);
+      holder.catch(holderFailed);
+      let release: Promise<T> | undefined;
+      try {
+        const holderPid = await within(locked, heldRowCapMs, "the holder taking its row locks");
+        release = startRelease();
+        proceed(await findBlockedRelease(database, projectId, holderPid));
+        await within(holder, heldRowCapMs, "the holder committing");
+        return await within(release, heldRowCapMs, "the release finishing");
+      } finally {
+        abort(new Error("release race aborted"));
+        await within(
+          Promise.allSettled(release === undefined ? [holder] : [holder, release]),
+          heldRowCapMs,
+          "the holder and the release settling",
+        );
+      }
+    }
+
+    it("deletes only safe copies of its own rows and reports the rest", async () => {
+      await withPostgreSqlTestDatabase("passive-release", async (database) => {
+        await grantPassiveEventRuntimePrivileges(database);
+        const oldId = await createProject(database, "old");
+        const boundId = await createProject(database, "bound");
+        const machineId = await createMachine(database, "Passive release machine");
+        const otherMachineId = await createMachine(database, "Passive release other machine");
+        const old = new PostgreSqlPassiveEventRepository(database.runtime, oldId, machineId);
+        const bound = new PostgreSqlPassiveEventRepository(database.runtime, boundId, machineId);
+        const [pending, retry, staleClaim, freshClaim, applied, quarantined, envelope, inbox] =
+          eventIds;
+        const inserted = await old.insertEvents(
+          [pending, retry, staleClaim, freshClaim, applied, quarantined, envelope, inbox]
+            .map((eventId, index) => input(machineId, eventId, BigInt(index + 1), eventId)),
+        );
+        const inboxOf = new Map(inserted.map((event) => [event.eventId, event.inboxId]));
+        const [boundCopy] = await bound.insertEvents([input(machineId, eventIds[8], 9n, "bound")]);
+        await new PostgreSqlPassiveEventRepository(database.runtime, oldId, otherMachineId)
+          .insertEvents([input(otherMachineId, eventIds[9], 1n, "other machine")]);
+        await seed(database, retry, "status = 'retry'");
+        await seed(
+          database,
+          staleClaim,
+          `received_at = pg_catalog.statement_timestamp() - interval '1 hour',
+            status = 'claimed', claimed_by = 'dead',
+            claimed_at = pg_catalog.statement_timestamp() - interval '30 minutes'`,
+        );
+        await seed(
+          database,
+          freshClaim,
+          "status = 'claimed', claimed_by = 'alive', claimed_at = pg_catalog.statement_timestamp()",
+        );
+        await seed(database, applied, "status = 'applied', applied_at = pg_catalog.statement_timestamp()");
+        await seed(
+          database,
+          quarantined,
+          "status = 'quarantined', quarantined_at = pg_catalog.statement_timestamp(), quarantine_reason = 'poison'",
+        );
+
+        const keys = [
+          ...[pending, retry, staleClaim, freshClaim, applied, quarantined]
+            .map((eventId, index) =>
+              ({ ...input(machineId, eventId, BigInt(index + 1), eventId), inboxId: inboxOf.get(eventId)! })),
+          // The envelope differs from the stored copy.
+          { ...input(machineId, envelope, 7n, "forged"), inboxId: inboxOf.get(envelope)! },
+          // The recorded inbox id is not the stored copy's.
+          { ...input(machineId, inbox, 8n, inbox), inboxId: inboxOf.get(inbox)! + 1000n },
+          { ...input(machineId, eventIds[8], 9n, "bound"), inboxId: boundCopy.inboxId },
+          { ...input(machineId, eventIds[10], 11n, "never inserted"), inboxId: 4242n },
+        ];
+        await expect(bound.releaseFromOtherProjects(keys, { staleClaimMs: 60_000 }))
+          .resolves.toEqual([
+            { eventId: pending, outcome: "released" },
+            { eventId: retry, outcome: "released" },
+            { eventId: staleClaim, outcome: "released" },
+            { eventId: freshClaim, outcome: "busy" },
+            { eventId: applied, outcome: "applied", inboxId: inboxOf.get(applied)! },
+            {
+              eventId: quarantined,
+              outcome: "quarantined",
+              inboxId: inboxOf.get(quarantined)!,
+              quarantineReason: "poison",
+            },
+            { eventId: envelope, outcome: "mismatch" },
+            { eventId: inbox, outcome: "mismatch" },
+            { eventId: eventIds[8], outcome: "bound" },
+            { eventId: eventIds[10], outcome: "absent" },
+          ]);
+        // Quarantine, the live claim, mismatches, the bound project's row and
+        // another machine's row all survive; nothing else does.
+        expect(await remaining(database)).toEqual([
+          `bound:${eventIds[8]}:pending`,
+          `old:${eventIds[9]}:pending`,
+          `old:${envelope}:pending`,
+          `old:${freshClaim}:claimed`,
+          `old:${inbox}:pending`,
+          `old:${quarantined}:quarantined`,
+        ].sort());
+
+        // The withdrawn row can now be uploaded to the bound project.
+        await expect(bound.insertEvents([input(machineId, pending, 1n, pending)]))
+          .resolves.toMatchObject([{ projectId: boundId, status: "pending" }]);
+        // Repeating the call finds nothing left to release.
+        await expect(bound.releaseFromOtherProjects(keys.slice(0, 3), { staleClaimMs: 60_000 }))
+          .resolves.toEqual([
+            { eventId: pending, outcome: "bound" },
+            { eventId: retry, outcome: "absent" },
+            { eventId: staleClaim, outcome: "absent" },
+          ]);
+      });
+    });
+
+    it("releases a copy by event id alone so the rolled-back batch can be inserted (#1511)", async () => {
+      await withPostgreSqlTestDatabase("passive-release-without-inbox-id", async (database) => {
+        await grantPassiveEventRuntimePrivileges(database);
+        const oldId = await createProject(database, "old");
+        const boundId = await createProject(database, "bound");
+        const machineId = await createMachine(database, "Passive release without inbox id machine");
+        const old = new PostgreSqlPassiveEventRepository(database.runtime, oldId, machineId);
+        const bound = new PostgreSqlPassiveEventRepository(database.runtime, boundId, machineId);
+        const [unrelated, pending, applied, envelope] = eventIds;
+        const inserted = await old.insertEvents([
+          input(machineId, pending, 2n, pending),
+          input(machineId, applied, 3n, applied),
+          input(machineId, envelope, 4n, envelope),
+        ]);
+        const appliedInboxId = inserted.find((event) => event.eventId === applied)!.inboxId;
+        await seed(database, applied, "status = 'applied', applied_at = pg_catalog.statement_timestamp()");
+
+        // The copy in the old project fails the whole bound batch, so the
+        // unrelated row ahead of it is not inserted either.
+        const batch = [input(machineId, unrelated, 1n, unrelated), input(machineId, pending, 2n, pending)];
+        await expect(bound.insertEvents(batch)).rejects.toMatchObject({
+          name: "PostgreSqlPassiveEventDataError",
+          field: "idempotency_readback",
+          eventId: pending,
+        });
+        expect(await bound.readEvents(batch.map(({ machineId: machine, eventId }) =>
+          ({ machineId: machine, eventId })))).toEqual([]);
+
+        // The upload that went to the old project was never recorded locally,
+        // so the keys carry no inbox id.
+        await expect(bound.releaseFromOtherProjects([
+          input(machineId, unrelated, 1n, unrelated),
+          input(machineId, pending, 2n, pending),
+          input(machineId, applied, 3n, applied),
+          // The envelope differs from the stored copy.
+          input(machineId, envelope, 4n, "forged"),
+        ], { staleClaimMs: 60_000 })).resolves.toEqual([
+          { eventId: unrelated, outcome: "absent" },
+          { eventId: pending, outcome: "released" },
+          { eventId: applied, outcome: "applied", inboxId: appliedInboxId },
+          { eventId: envelope, outcome: "mismatch" },
+        ]);
+        expect(await remaining(database)).toEqual([`old:${envelope}:pending`]);
+
+        await expect(bound.insertEvents(batch)).resolves.toMatchObject([
+          { eventId: unrelated, projectId: boundId, status: "pending" },
+          { eventId: pending, projectId: boundId, status: "pending" },
+        ]);
+      });
+    });
+
+    it("rejects keys of another machine and duplicate keys without touching any row", async () => {
+      await withPostgreSqlTestDatabase("passive-release-input", async (database) => {
+        await grantPassiveEventRuntimePrivileges(database);
+        const oldId = await createProject(database, "old");
+        const boundId = await createProject(database, "bound");
+        const machineId = await createMachine(database, "Passive release input machine");
+        const otherMachineId = await createMachine(database, "Passive release input other");
+        const old = new PostgreSqlPassiveEventRepository(database.runtime, oldId, machineId);
+        const otherOld = new PostgreSqlPassiveEventRepository(database.runtime, oldId, otherMachineId);
+        const bound = new PostgreSqlPassiveEventRepository(database.runtime, boundId, machineId);
+        const [mine] = await old.insertEvents([input(machineId, eventIds[0], 1n, "mine")]);
+        const [theirs] = await otherOld.insertEvents([input(otherMachineId, eventIds[1], 1n, "theirs")]);
+        await expect(bound.releaseFromOtherProjects([
+          { ...input(otherMachineId, eventIds[1], 1n, "theirs"), inboxId: theirs.inboxId },
+        ], { staleClaimMs: 60_000 })).rejects.toMatchObject({
+          name: "PostgreSqlPassiveEventDataError",
+          field: "machine_id",
+        });
+        // The row of another machine is not reachable by event id alone either.
+        await expect(bound.releaseFromOtherProjects([
+          { ...input(machineId, eventIds[1], 1n, "theirs"), inboxId: theirs.inboxId },
+        ], { staleClaimMs: 60_000 })).resolves.toEqual([{ eventId: eventIds[1], outcome: "absent" }]);
+        const key = { ...input(machineId, eventIds[0], 1n, "mine"), inboxId: mine.inboxId };
+        await expect(bound.releaseFromOtherProjects([key, key], { staleClaimMs: 60_000 }))
+          .rejects.toMatchObject({ field: "duplicate_batch_event_id" });
+        expect((await remaining(database)).length).toBe(2);
+      });
+    });
+
+    it("classifies a copy on the version it locked, whoever held it first", async () => {
+      await withPostgreSqlTestDatabase("passive-release-race", async (database) => {
+        await grantPassiveEventRuntimePrivileges(database);
+        const oldId = await createProject(database, "old");
+        const boundId = await createProject(database, "bound");
+        const machineId = await createMachine(database, "Passive release race machine");
+        const old = new PostgreSqlPassiveEventRepository(database.runtime, oldId, machineId);
+        const bound = new PostgreSqlPassiveEventRepository(database.runtime, boundId, machineId);
+        const [claimedLater, appliedLater] = eventIds;
+        const inserted = await old.insertEvents([
+          input(machineId, claimedLater, 1n, "claimed later"),
+          input(machineId, appliedLater, 2n, "applied later"),
+        ]);
+        const keys = inserted.map((event) => ({
+          ...input(event.machineId, event.eventId, event.machineSequence, String((event.payload as { data: string }).data)),
+          inboxId: event.inboxId,
+        }));
+
+        // Another process holds both rows and changes them before committing;
+        // the release statement is proven blocked on that row lock first.
+        const released = await releaseWhileRowsAreHeld(
+          database,
+          machineId,
+          oldId,
+          () => bound.releaseFromOtherProjects(keys, { staleClaimMs: 60_000 }),
+          async (transaction) => {
+            await transaction.query({
+              text: `UPDATE lcm.passive_event_inbox
+                     SET status = 'claimed', claimed_by = 'live',
+                         claimed_at = pg_catalog.statement_timestamp()
+                     WHERE event_id = $1`,
+              values: [claimedLater],
+            }, { domain: "passive-events", operation: "claimReleasedPassiveEvent", projectId: oldId });
+            await transaction.query({
+              text: `UPDATE lcm.passive_event_inbox
+                     SET status = 'applied', applied_at = pg_catalog.statement_timestamp()
+                     WHERE event_id = $1`,
+              values: [appliedLater],
+            }, { domain: "passive-events", operation: "applyReleasedPassiveEvent", projectId: oldId });
+          },
+        );
+        // It then judges the committed versions: a live claim is left alone
+        // and an applied copy is deleted.
+        expect(released).toEqual([
+          { eventId: claimedLater, outcome: "busy" },
+          { eventId: appliedLater, outcome: "applied", inboxId: inserted[1].inboxId },
+        ]);
+        expect(await remaining(database)).toEqual([`old:${claimedLater}:claimed`]);
+      });
+    });
+
+    it("counts a claim exactly staleClaimMs old on database time as stale", async () => {
+      await withPostgreSqlTestDatabase("passive-release-boundary", async (database) => {
+        await grantPassiveEventRuntimePrivileges(database);
+        const oldId = await createProject(database, "old");
+        const boundId = await createProject(database, "bound");
+        const machineId = await createMachine(database, "Passive release boundary machine");
+        const old = new PostgreSqlPassiveEventRepository(database.runtime, oldId, machineId);
+        const bound = new PostgreSqlPassiveEventRepository(database.runtime, boundId, machineId);
+        const [onCutoff, newerThanCutoff, olderThanCutoff] = eventIds;
+        const inserted = await old.insertEvents(
+          [onCutoff, newerThanCutoff, olderThanCutoff]
+            .map((eventId, index) => input(machineId, eventId, BigInt(index + 1), eventId)),
+        );
+        // Every claim starts on the side of the cutoff opposite to the one it
+        // ends on, so only the version committed by the holder can give the
+        // expected outcome.
+        for (const [eventId, claimedAt] of [
+          [onCutoff, "pg_catalog.statement_timestamp()"],
+          [newerThanCutoff, "pg_catalog.statement_timestamp() - interval '30 minutes'"],
+          [olderThanCutoff, "pg_catalog.statement_timestamp()"],
+        ]) {
+          await seed(
+            database,
+            eventId,
+            `received_at = pg_catalog.statement_timestamp() - interval '1 hour',
+              status = 'claimed', claimed_by = 'dead', claimed_at = ${claimedAt}`,
+          );
+        }
+        const staleClaimMs = 60_000;
+
+        // The release statement's statement_timestamp() is its pg_stat_activity
+        // query_start, known only once it runs. While it waits for the row
+        // locks, the holder moves each claim to that cutoff plus a skew,
+        // computed in SQL with the production expression.
+        const released = await releaseWhileRowsAreHeld(
+          database,
+          machineId,
+          oldId,
+          () => bound.releaseFromOtherProjects(
+            inserted.map((event) => ({
+              ...input(machineId, event.eventId, event.machineSequence, event.eventId),
+              inboxId: event.inboxId,
+            })),
+            { staleClaimMs },
+          ),
+          async (transaction, releasePid) => {
+            for (const [eventId, skew] of [
+              [onCutoff, "0 microseconds"],
+              [newerThanCutoff, "1 microsecond"],
+              [olderThanCutoff, "-1 microsecond"],
+            ]) {
+              const moved = await transaction.query({
+                text: `UPDATE lcm.passive_event_inbox
+                       SET claimed_at = (
+                         SELECT query_start FROM pg_catalog.pg_stat_activity
+                         WHERE pid = $1::pg_catalog.int4
+                       ) - $2::pg_catalog.float8 * interval '1 millisecond'
+                         + $3::pg_catalog.interval
+                       WHERE event_id = $4`,
+                values: [releasePid, staleClaimMs, skew, eventId],
+              }, { domain: "passive-events", operation: "moveClaimToCutoff", projectId: oldId });
+              expect(moved.rowCount).toBe(1);
+            }
+          },
+        );
+
+        // A claim on the cutoff is stale, one a microsecond newer is live and
+        // one a microsecond older is stale.
+        expect(released).toEqual([
+          { eventId: onCutoff, outcome: "released" },
+          { eventId: newerThanCutoff, outcome: "busy" },
+          { eventId: olderThanCutoff, outcome: "released" },
+        ]);
+        expect(await remaining(database)).toEqual([`old:${newerThanCutoff}:claimed`]);
+      });
+    });
+
+    it("leaves a stale claimer unable to resurrect a released copy", async () => {
+      await withPostgreSqlTestDatabase("passive-release-stale", async (database) => {
+        await grantPassiveEventRuntimePrivileges(database);
+        const oldId = await createProject(database, "old");
+        const boundId = await createProject(database, "bound");
+        const machineId = await createMachine(database, "Passive release stale machine");
+        const old = new PostgreSqlPassiveEventRepository(database.runtime, oldId, machineId);
+        const bound = new PostgreSqlPassiveEventRepository(database.runtime, boundId, machineId);
+        const [event] = await old.insertEvents([input(machineId, eventIds[0], 1n, "stale")]);
+        const lease = await old.acquireDrainLease("old-worker", 30_000);
+        const [claim] = await old.claimEvents({
+          claimOwner: "old-worker:1",
+          limit: 1,
+          staleClaimMs: 1_000,
+        });
+        await seed(
+          database,
+          eventIds[0],
+          `received_at = pg_catalog.statement_timestamp() - interval '1 hour',
+            claimed_at = pg_catalog.statement_timestamp() - interval '30 minutes'`,
+        );
+        await expect(bound.releaseFromOtherProjects(
+          [{ ...input(machineId, eventIds[0], 1n, "stale"), inboxId: event.inboxId }],
+          { staleClaimMs: 60_000 },
+        )).resolves.toEqual([{ eventId: eventIds[0], outcome: "released" }]);
+
+        let applied = false;
+        await expect(old.completeApplied({
+          claim,
+          processId: "old-worker",
+          fencingToken: lease!.fencingToken,
+        }, async () => { applied = true; })).rejects.toMatchObject({ field: "claimed_row" });
+        expect(applied).toBe(false);
+        expect(await remaining(database)).toEqual([]);
+      });
+    });
+  });
 });

@@ -87,6 +87,51 @@ extends PostgreSqlPassiveEventKey {
   readonly inboxId: bigint;
 }
 
+/**
+ * One local row to recover after a project relink: the full envelope the
+ * local row would upload plus, for a row replicated to the previous project
+ * (#1509), the inbox id the local outbox recorded. A local row that never
+ * recorded where its upload landed (#1511) omits the inbox id; its copy is
+ * then identified by machine, event id, and envelope alone.
+ */
+export interface PostgreSqlPassiveEventReleaseKey
+extends PostgreSqlPassiveEventInput {
+  readonly inboxId?: bigint;
+}
+
+export interface PostgreSqlPassiveEventReleaseOptions {
+  /** Same staleness rule as `claimEvents`: a claim older than this is dead. */
+  readonly staleClaimMs: number;
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * What `releaseFromOtherProjects` observed for one requested key:
+ * - `absent`: this machine's copy exists in no project (positive observation);
+ * - `released`: an undelivered copy in another project was withdrawn;
+ * - `applied`: the copy in another project was applied and has been deleted;
+ * - `quarantined`: the copy is quarantined in another project and was kept;
+ * - `busy`: another process holds a live claim on the copy; nothing changed;
+ * - `bound`: the copy is in the bound project; nothing changed;
+ * - `mismatch`: the copy differs from the requested row; nothing changed.
+ */
+export type PostgreSqlPassiveEventReleaseResult =
+  | {
+    readonly eventId: string;
+    readonly outcome: "absent" | "released" | "busy" | "bound" | "mismatch";
+  }
+  | {
+    readonly eventId: string;
+    readonly outcome: "applied";
+    readonly inboxId: bigint;
+  }
+  | {
+    readonly eventId: string;
+    readonly outcome: "quarantined";
+    readonly inboxId: bigint;
+    readonly quarantineReason: string;
+  };
+
 type PassiveEventRow = QueryResultRow & {
   inbox_id: unknown;
   project_id: unknown;
@@ -353,10 +398,11 @@ function status(
 function passiveEventFromRow(
   row: PassiveEventRow,
   projectId: string,
+  expectedRowProjectId: string = projectId,
 ): PostgreSqlPassiveEventRecord {
   const eventId = uuid(row.event_id, projectId, "event_id");
   const rowProjectId = uuidV7(row.project_id, projectId, "project_id", eventId);
-  if (rowProjectId !== projectId) {
+  if (rowProjectId !== expectedRowProjectId) {
     return dataError(projectId, "project_id", eventId);
   }
   const machineId = uuidV7(row.machine_id, projectId, "machine_id", eventId);
@@ -524,19 +570,24 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function sameEvent(
+  expected: PostgreSqlPassiveEventInput,
+  actual: PostgreSqlPassiveEventRecord,
+): boolean {
+  return actual.machineId === expected.machineId
+    && actual.eventId === expected.eventId
+    && actual.eventVersion === expected.eventVersion
+    && actual.machineSequence === expected.machineSequence
+    && actual.eventType === expected.eventType
+    && canonicalJson(actual.payload) === canonicalJson(expected.payload);
+}
+
 function assertSameEvent(
   expected: PostgreSqlPassiveEventInput,
   actual: PostgreSqlPassiveEventRecord,
   projectId: string,
 ): void {
-  if (
-    actual.machineId !== expected.machineId
-    || actual.eventId !== expected.eventId
-    || actual.eventVersion !== expected.eventVersion
-    || actual.machineSequence !== expected.machineSequence
-    || actual.eventType !== expected.eventType
-    || canonicalJson(actual.payload) !== canonicalJson(expected.payload)
-  ) {
+  if (!sameEvent(expected, actual)) {
     dataError(projectId, "idempotency_collision", expected.eventId);
   }
 }
@@ -934,6 +985,137 @@ export class PostgreSqlPassiveEventRepository {
         deleted += BigInt(result.rowCount ?? 0);
       }
       return deleted;
+    });
+  }
+
+  /**
+   * Withdraw this machine's own copies of the requested rows from every
+   * project other than the bound one (#1509).
+   *
+   * After a project relink, local rows that were replicated to the previous
+   * project and not yet applied there are invisible to the bound project, and
+   * `UNIQUE (machine_id, event_id)` is global, so they can neither be
+   * acknowledged nor re-uploaded while the old copy exists. One transaction
+   * locks the copies (waiting, in inbox_id order), classifies each on the
+   * locked version, and deletes only copies that are safe to drop: undelivered
+   * ones (pending, retry, or claimed with a stale claim) and applied ones.
+   * Quarantined copies stay as remote evidence, live claims are left alone, and
+   * a copy whose envelope, or inbox id when the key carries one, differs from
+   * the requested row is reported and never deleted. Only rows of this
+   * repository's machine are ever touched.
+   *
+   * Deleting without the previous project's drain lease is safe only while
+   * applying a passive event has no remote effect: a stale claimer's
+   * completion fails its claim assertion before any apply callback runs. A
+   * future real apply effect must revisit this method.
+   */
+  async releaseFromOtherProjects(
+    keys: readonly PostgreSqlPassiveEventReleaseKey[],
+    options: PostgreSqlPassiveEventReleaseOptions,
+  ): Promise<PostgreSqlPassiveEventReleaseResult[]> {
+    batchSize(keys.length);
+    if (!Number.isSafeInteger(options.staleClaimMs) || options.staleClaimMs <= 0) {
+      throw new Error("passive-event stale claim milliseconds must be a positive safe integer");
+    }
+    const requested = keys.map((key) => {
+      const expected = normalizedInput(key, this.projectId, this.machineId);
+      return {
+        expected,
+        inboxId: key.inboxId === undefined
+          ? undefined
+          : exactBigInt(key.inboxId, this.projectId, "inbox_id", 1n, expected.eventId),
+      };
+    });
+    const distinct = new Set(requested.map(({ expected }) => expected.eventId));
+    if (distinct.size !== requested.length) {
+      return dataError(this.projectId, "duplicate_batch_event_id");
+    }
+    const operation = "releaseFromOtherProjects";
+    return this.atomic(operation, options.signal, async (transaction) => {
+      const located = await transaction.query<PassiveEventRow & { claim_stale: unknown }>({
+        text: `SELECT event.*,
+                      (
+                        event.status = 'claimed'
+                        AND event.claimed_at
+                              <= pg_catalog.statement_timestamp()
+                                - $3::pg_catalog.float8
+                                  * interval '1 millisecond'
+                      ) AS claim_stale
+               FROM lcm.passive_event_inbox AS event
+               WHERE event.machine_id = $1
+                 AND event.event_id = ANY($2::pg_catalog.uuid[])
+               ORDER BY event.inbox_id
+               FOR UPDATE OF event`,
+        values: [
+          this.machineId,
+          requested.map(({ expected }) => expected.eventId),
+          options.staleClaimMs,
+        ],
+      }, this.options(operation, options.signal));
+      const byEventId = new Map(located.rows.map((row) => [
+        uuid(row.event_id, this.projectId, "event_id"),
+        row,
+      ]));
+      const results: PostgreSqlPassiveEventReleaseResult[] = [];
+      for (const { expected, inboxId } of requested) {
+        const eventId = expected.eventId;
+        const row = byEventId.get(eventId);
+        if (row === undefined) {
+          results.push({ eventId, outcome: "absent" });
+          continue;
+        }
+        const rowProjectId = uuidV7(row.project_id, this.projectId, "project_id", eventId);
+        if (rowProjectId === this.projectId) {
+          results.push({ eventId, outcome: "bound" });
+          continue;
+        }
+        const record = passiveEventFromRow(row, this.projectId, rowProjectId);
+        if (
+          (inboxId !== undefined && record.inboxId !== inboxId)
+          || !sameEvent(expected, record)
+        ) {
+          results.push({ eventId, outcome: "mismatch" });
+          continue;
+        }
+        if (record.status === "quarantined") {
+          results.push({
+            eventId,
+            outcome: "quarantined",
+            inboxId: record.inboxId,
+            // passiveEventFromRow ties a quarantined status to its reason.
+            quarantineReason: record.quarantineReason as string,
+          });
+          continue;
+        }
+        if (record.status === "claimed" && row.claim_stale !== true) {
+          results.push({ eventId, outcome: "busy" });
+          continue;
+        }
+        const deleted = await transaction.query({
+          text: `DELETE FROM lcm.passive_event_inbox
+                 WHERE inbox_id = $1::pg_catalog.int8
+                   AND machine_id = $2
+                   AND event_id = $3
+                   AND project_id = $4
+                   AND status = $5
+                 RETURNING inbox_id`,
+          values: [
+            record.inboxId.toString(),
+            this.machineId,
+            eventId,
+            rowProjectId,
+            record.status,
+          ],
+        }, this.options(operation, options.signal));
+        if (deleted.rows.length !== 1) {
+          results.push({ eventId, outcome: "busy" });
+        } else if (record.status === "applied") {
+          results.push({ eventId, outcome: "applied", inboxId: record.inboxId });
+        } else {
+          results.push({ eventId, outcome: "released" });
+        }
+      }
+      return results;
     });
   }
 

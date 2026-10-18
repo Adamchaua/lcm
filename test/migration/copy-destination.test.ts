@@ -30,24 +30,34 @@ it('requires proof even after acknowledged commit and leaves unavailable proof u
 });
 
 const state=vi.hoisted(()=>({run:false,completed:false,receipt:false,lease:false,fences:0,expires:false,owned:true,locked:true,
- failure:'' as string,closed:0,writerClosed:0,transactions:0,renew:false}));
+ failure:'' as string,closed:0,writerClosed:0,transactions:0,renew:false,runtimeIdentifier:'1',writes:[] as string[],queries:[] as string[]}));
+// Every statement the mocked runtime serves, whether through a bare runtime or a
+// transaction executor. Writes are recorded on whichever cluster the runtime reaches.
+const runtimeQuery=async(config:{text:string})=>{
+ state.queries.push(config.text);
+ if(config.text.includes('pg_control_system()'))return {rows:[{system_identifier:state.runtimeIdentifier}]};
+ if(/^(INSERT|UPDATE)/u.test(config.text))state.writes.push(config.text);
+ return {rows:state.locked?[{locked:1}]:[]};
+};
 vi.mock('../../src/storage/postgresql/runtime.js',()=>({PostgreSqlRuntime:class{
  constructor(){if(state.failure.includes('runtime-construction'))throw new Error('runtime construction');}
- async query(){throw new Error('unscoped mutation');}
+ async query(config:{text:string}){return runtimeQuery(config);}
  async transaction<T>(operation:(executor:unknown)=>Promise<T>){
   const saved={run:state.run,completed:state.completed,receipt:state.receipt};state.transactions++;
-  const executor={transactionScope:'active',query:async()=>({rows:state.locked?[{locked:1}]:[]}),savepoint:async(fn:(value:unknown)=>unknown)=>fn(executor)};
+  const executor={transactionScope:'active',query:runtimeQuery,savepoint:async(fn:(value:unknown)=>unknown)=>fn(executor)};
   try{return await operation(executor);}catch(error){Object.assign(state,saved);throw error;}
  }
  async close(){state.closed++;if(state.failure.includes('runtime-close'))throw new Error('runtime close');}
 }}));
 vi.mock('../../src/storage/postgresql/coordination.js',()=>({PostgreSqlWorkCoordinator:class{
- async acquireLease(){state.lease=state.owned;return state.owned?{fencingToken:1n}:null;}
- async renewLease(){state.renew=true;return state.owned?{fencingToken:1n}:null;}
+ constructor(readonly executor:{query:(config:{text:string})=>Promise<unknown>}){}
+ async acquireLease(){await this.executor.query({text:'INSERT INTO lcm.fenced_leases'});state.lease=state.owned;return state.owned?{fencingToken:1n}:null;}
+ async renewLease(){await this.executor.query({text:'UPDATE lcm.fenced_leases SET renewed'});state.renew=true;return state.owned?{fencingToken:1n}:null;}
  async assertLeaseFence(){state.fences++;if(state.expires&&state.fences%2===0)throw new Error('expired');}
- async releaseLease(){state.lease=false;if(state.failure==='release')throw new Error('release');}
+ async releaseLease(){await this.executor.query({text:'UPDATE lcm.fenced_leases SET released'});state.lease=false;if(state.failure==='release')throw new Error('release');}
 }}));
-vi.mock('../../src/storage/postgresql/portable-destination.js',()=>({
+vi.mock('../../src/storage/postgresql/portable-destination.js',async importOriginal=>({
+ assertPostgreSqlSystemIdentifier:(await importOriginal<typeof import('../../src/storage/postgresql/portable-destination.js')>()).assertPostgreSqlSystemIdentifier,
  createPostgreSqlPortableDestination:async()=>({preflight:async()=>{if(state.failure.includes('preflight'))throw new Error('preflight');return {};},close:async()=>{state.writerClosed++;if(state.failure.includes('writer-close'))throw new Error('writer close');}}),
  admitPortableDestinationInTransaction:async()=>{state.run=true;},
  readPortableRunInTransaction:async()=>state.run?{state:state.completed?'completed':'active'}:null,
@@ -57,10 +67,10 @@ vi.mock('../../src/storage/postgresql/portable-destination.js',()=>({
  completePortableDestinationInTransaction:async()=>{state.completed=true;},
  readPortableCompletedRunInTransaction:async()=>state.completed,
 }));
-beforeEach(()=>{Object.assign(state,{run:false,completed:false,receipt:false,lease:false,fences:0,expires:false,owned:true,locked:true,failure:'',closed:0,writerClosed:0,transactions:0,renew:false});});
-async function destination(){
+beforeEach(()=>{Object.assign(state,{run:false,completed:false,receipt:false,lease:false,fences:0,expires:false,owned:true,locked:true,failure:'',closed:0,writerClosed:0,transactions:0,renew:false,runtimeIdentifier:'1',writes:[],queries:[]});});
+async function destination(expectedSystemIdentifier?:string){
  const api=await import('../../src/migration/copy-destination.js');
- return api.openMigrationCopyDestination({settings:{} as never,expectedOwner:'owner',expectedIdentity:{id:'project',machineId:'machine'},generationId:'generation',runId:'run',source:{describe:()=>({manifestSha256:'b'.repeat(64)})} as never,
+ return api.openMigrationCopyDestination({expectedSystemIdentifier,settings:{} as never,expectedOwner:'owner',expectedIdentity:{id:'project',machineId:'machine'},generationId:'generation',runId:'run',source:{describe:()=>({manifestSha256:'b'.repeat(64)})} as never,
   ownerProcessId:'owner',leaseTtlMs:1000,maximumTransactionAttempts:3,withSourceAuthority:async operation=>operation(async()=>{})});
 }
 it('uses the fenced transaction for admission, data and completion and closes only its lease',async()=>{
@@ -93,11 +103,34 @@ it('closes both owners after preflight refusal',async()=>{
  state.failure='preflight';await expect(destination()).rejects.toThrow('preflight');expect(state.closed).toBe(1);expect(state.writerClosed).toBe(1);
 });
 
-it('keeps readback mode after unavailable proof and counts recovery against the same budget',async()=>{
+it('retries readback without repeating the mutation after a transient failure',async()=>{
  const {settleMigrationCopyOperation}=await import('../../src/migration/copy-destination.js');
  let writes=0,reads=0,reconnections=0;
  expect(await settleMigrationCopyOperation({maximumTransactionAttempts:3,mutate:async()=>{writes++;},readback:async()=>{if(++reads===1)throw new Error('unavailable');return 'exact';},reconnect:async()=>{reconnections++;}})).toBe('exact');
  expect({writes,reads,reconnections}).toEqual({writes:1,reads:2,reconnections:1});
+});
+it('reports the current readback failure instead of a stale retried-mutation error',async()=>{
+ const {settleMigrationCopyOperation}=await import('../../src/migration/copy-destination.js');
+ const {PostgreSqlStorageOperationError}=await import('../../src/storage/postgresql/errors.js');
+ const stale=new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'factory',operation:'test'},'40001',true);
+ const fresh=new Error('fresh readback failure');
+ let attempt=0;
+ await expect(settleMigrationCopyOperation({maximumTransactionAttempts:2,
+  mutate:async()=>{attempt++;if(attempt===1)throw stale;},
+  readback:async()=>{throw fresh;},
+  reconnect:async()=>{}})).rejects.toBe(fresh);
+});
+it('reports the current readback failure instead of a stale ambiguous-commit error',async()=>{
+ const {settleMigrationCopyOperation}=await import('../../src/migration/copy-destination.js');
+ const {PostgreSqlCommitOutcomeUnknownError}=await import('../../src/storage/postgresql/errors.js');
+ const stale=new PostgreSqlCommitOutcomeUnknownError({domain:'factory',operation:'test'});
+ const fresh=new Error('fresh readback failure');
+ let attempt=0,reads=0;
+ await expect(settleMigrationCopyOperation({maximumTransactionAttempts:2,
+  mutate:async()=>{attempt++;if(attempt===1)throw stale;},
+  readback:async()=>{reads++;if(attempt===1)return null;throw fresh;},
+  reconnect:async()=>{}})).rejects.toBe(fresh);
+ expect(reads).toBe(3);
 });
 it('retries whole transactions only for the two supported serialization states',async()=>{
  const {settleMigrationCopyOperation}=await import('../../src/migration/copy-destination.js');
@@ -167,4 +200,65 @@ it('does not acknowledge completion when the exact completed readback is absent'
 });
 it('preserves preflight failure when both cleanup operations fail',async()=>{
  state.failure='preflight runtime-close writer-close';await expect(destination()).rejects.toThrow('preflight');expect(state.closed).toBe(1);expect(state.writerClosed).toBe(1);
+});
+
+describe('runtime checkouts are bound to the recorded cluster (#1508)',()=>{
+ const wrongCluster=()=>{state.runtimeIdentifier='2';};
+ it('keeps the lease, data and readback transactions working on the matching cluster',async()=>{
+  const target=await destination('1');
+  await target.admit(false);await target.applyBatch({} as never);await target.admit(true);
+  expect(state.run).toBe(true);expect(state.receipt).toBe(true);expect(state.renew).toBe(true);
+  const identifierReads=state.queries.filter(text=>text.includes('pg_control_system()')).length;
+  expect(identifierReads).toBeGreaterThan(0);
+  await target.close();expect(state.lease).toBe(false);
+  expect(state.writes).toEqual(expect.arrayContaining(['INSERT INTO lcm.fenced_leases','UPDATE lcm.fenced_leases SET renewed','UPDATE lcm.fenced_leases SET released']));
+ });
+ it('checks the cluster before the first statement of every lease transaction',async()=>{
+  const target=await destination('1');await target.admit(false);
+  const firstQuery=state.queries.findIndex(text=>text.includes('pg_control_system()'));
+  const firstWrite=state.queries.findIndex(text=>/^(INSERT|UPDATE)/u.test(text));
+  expect(firstQuery).toBeGreaterThanOrEqual(0);expect(firstQuery).toBeLessThan(firstWrite);
+  await target.close();
+ });
+ it('gives a mismatching runtime no lease write on acquire',async()=>{
+  wrongCluster();const target=await destination('1');
+  try{await expect(target.admit(false)).rejects.toMatchObject({code:'destination-conflict'});}finally{await expect(target.close()).resolves.toBeUndefined();}
+  expect(state.writes).toEqual([]);expect(state.run).toBe(false);expect(state.lease).toBe(false);
+ });
+ it('gives a mismatching runtime no lease write on renew',async()=>{
+  const target=await destination('1');await target.admit(false);state.writes=[];wrongCluster();
+  try{await expect(target.applyBatch({} as never)).rejects.toMatchObject({code:'destination-conflict'});}finally{await expect(target.close()).rejects.toMatchObject({code:'destination-conflict'});}
+  expect(state.writes).toEqual([]);expect(state.receipt).toBe(false);
+ });
+ it('gives a runtime rebuilt after an ambiguous commit no write and refuses its readback',async()=>{
+  const {PostgreSqlRuntime}=await import('../../src/storage/postgresql/runtime.js');const {PostgreSqlCommitOutcomeUnknownError}=await import('../../src/storage/postgresql/errors.js');
+  const transaction=PostgreSqlRuntime.prototype.transaction;
+  const target=await destination('1');await target.admit(false);state.writes=[];
+  const spy=vi.spyOn(PostgreSqlRuntime.prototype,'transaction').mockImplementationOnce(async function(...args){await transaction.apply(this,args);wrongCluster();throw new PostgreSqlCommitOutcomeUnknownError({domain:'factory',operation:'apply'});});
+  try{
+   await expect(target.applyBatch({} as never)).rejects.toBeInstanceOf(PostgreSqlCommitOutcomeUnknownError);
+   expect(state.closed).toBeGreaterThan(0);
+   await expect(target.readBatch({} as never)).rejects.toMatchObject({code:'destination-conflict'});
+   await expect(target.admit(true)).rejects.toMatchObject({code:'destination-conflict'});
+  }finally{spy.mockRestore();await target.close().catch(()=>undefined);}
+  expect(state.writes.filter(text=>!text.includes('renewed'))).toEqual([]);
+ });
+ it('gives a mismatching runtime no release write on close and still closes both owners',async()=>{
+  const target=await destination('1');await target.admit(false);state.writes=[];wrongCluster();
+  await expect(target.close()).rejects.toMatchObject({code:'destination-conflict'});
+  expect(state.writes).toEqual([]);expect(state.lease).toBe(true);expect(state.closed).toBe(1);expect(state.writerClosed).toBe(1);
+ });
+ it('refuses a readback on a mismatching cluster before the lease serialization lock, even without a lease row',async()=>{
+  const target=await destination('1');wrongCluster();state.locked=false;
+  try{
+   await expect(target.admit(true)).rejects.toMatchObject({code:'destination-conflict'});
+   await expect(target.readCompleted({} as never)).rejects.toMatchObject({code:'destination-conflict'});
+  }finally{state.runtimeIdentifier='1';await target.close();}
+  expect(state.queries.some(text=>text.includes('FOR UPDATE'))).toBe(false);
+ });
+ it('leaves the runtime unchecked when no cluster is expected',async()=>{
+  wrongCluster();const target=await destination();
+  await target.admit(false);await target.close();
+  expect(state.queries.some(text=>text.includes('pg_control_system()'))).toBe(false);
+ });
 });

@@ -385,6 +385,7 @@ export type BackendPublicationLockToken = object;
 
 const activePublicationLockTokens = new WeakMap<BackendPublicationLockToken, {
   readonly rootPath: string;
+  readonly origin: "sync" | "async";
   active: boolean;
 }>();
 /**
@@ -1455,6 +1456,17 @@ export function readBackendPublicationJournal(homeDir?: string): BackendPublicat
   return readJournal(homeDir);
 }
 
+/**
+ * Read the v2 journal with the consumer's evidence rules: `null` only when
+ * the publication directory is confirmed absent. An existing directory
+ * without `journal.json` fails with `publication-evidence-missing` (empty,
+ * history-only or recognized residue) or `unsafe-storage` (unknown residue).
+ * Never creates the directory.
+ */
+export function readBackendPublicationJournalForConsumer(homeDir?: string): BackendPublicationJournal | null {
+  return readPublicationJournalForConsumer(homeDir);
+}
+
 /** Read the exact v3 migration-maintenance record without accepting v2 data. */
 export function readBackendMaintenanceJournal(homeDir?: string): BackendMaintenanceJournal | null {
   return withBackendPublicationDirectoryRead(
@@ -1541,11 +1553,11 @@ function readPublicationJournalForAccess(
   return journal;
 }
 
-function assertTerminalPublicationEvidence(
+function authenticateTerminalPublicationEvidence(
   journal: BackendPublicationJournal,
   directoryHandle: BackendPublicationDirectoryHandle,
   homeDir?: string,
-): void {
+): BackendPublicationRecoveryMaterial | null {
   if (journal.phase !== "completed" && journal.phase !== "aborted") {
     return fail("unresolved-publication", "backend publication is unresolved; recover it before consuming local state");
   }
@@ -1557,8 +1569,9 @@ function assertTerminalPublicationEvidence(
       return fail("malformed-journal", "terminal backend publication retains an active remote fence");
     }
   }
+  let material: BackendPublicationRecoveryMaterial | null = null;
   try {
-    authenticateMaterial(homeDir, journal, directoryHandle);
+    material = authenticateMaterial(homeDir, journal, directoryHandle).material;
   } catch (error) {
     // Aborted publications remove their recovery material after the journal
     // reaches its terminal state. The journal checksum and state witnesses
@@ -1577,6 +1590,15 @@ function assertTerminalPublicationEvidence(
   ) {
     return fail("malformed-journal", "completed backend publication lacks intended-state witnesses");
   }
+  return material;
+}
+
+function assertTerminalPublicationEvidence(
+  journal: BackendPublicationJournal,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  homeDir?: string,
+): void {
+  authenticateTerminalPublicationEvidence(journal, directoryHandle, homeDir);
 }
 
 function withConsumerPublicationJournal<T>(
@@ -1702,9 +1724,12 @@ function contextualAppendLockToken(
   return inherited.token;
 }
 
-function newLockToken(homeDir: string | undefined): BackendPublicationLockToken {
+function newLockToken(
+  homeDir: string | undefined,
+  origin: "sync" | "async",
+): BackendPublicationLockToken {
   const token = {};
-  activePublicationLockTokens.set(token, { rootPath: rootPath(homeDir), active: true });
+  activePublicationLockTokens.set(token, { rootPath: rootPath(homeDir), origin, active: true });
   return token;
 }
 
@@ -1823,7 +1848,7 @@ function completeConsumerOperation<T>(
   if (outcome.error instanceof PrivateMutationLockContentionError) {
     throw new PrivateMutationLockContentionError(
       outcome.error.message,
-      { cause: aggregate },
+      { cause: aggregate, contendedLock: outcome.error.contendedLock },
     );
   }
   throw aggregate;
@@ -1897,7 +1922,7 @@ function consumerLockCallback<T>(
   };
   const run = (): T => {
     refreshDirectories();
-    const token = newLockToken(homeDir);
+    const token = newLockToken(homeDir, "sync");
     if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
     if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
     try {
@@ -1961,7 +1986,7 @@ export async function withBackendPublicationConsumerLockAsync<T>(
   };
   const run = async (): Promise<T> => {
     refreshDirectories();
-    const token = newLockToken(homeDir);
+    const token = newLockToken(homeDir, "async");
     if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
     if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
     try {
@@ -3534,6 +3559,105 @@ function authenticateMaterial(
   }
 }
 
+/**
+ * Read and authenticate the sealed recovery material for a publication
+ * journal that already carries a recovery reference, opening and closing
+ * its own root and publication directory handles for one lock-free read.
+ *
+ * This is the ONLY authenticator for the on-disk material format. It exists
+ * so that external readers (#1433's retained-material reader, built for
+ * rollback eligibility) never reimplement path derivation, byte-cap, mode,
+ * or digest checks in a second place that would have to agree with this one.
+ * A second encoding of "what a valid material file looks like" is exactly
+ * the defect #1433 exists to close, one level down.
+ *
+ * Unlike the in-flight {@link BackendPublicationCoordinator} call sites that
+ * reach {@link authenticateMaterial} while a live journal is still being
+ * driven forward, this export REFUSES a journal whose {@link
+ * BackendPublicationJournal.recoveryReference} is `null`. Internally,
+ * {@link authenticateMaterial} tolerates a `null` reference by synthesizing
+ * one with an empty seal digest and a zero byte length, and its digest
+ * comparison is written as `reference.sealSha256 !== "" && ...`, so a
+ * synthesized reference silently skips the checksum comparison entirely.
+ * That tolerance is correct for its own caller (a publication still in the
+ * `preparing` phase, before a reference has ever been sealed) and would be
+ * wrong evidence for this one: a caller reading a journal from outside the
+ * coordinator has no other reason to expect an unauthenticated read to
+ * "succeed" silently. Refuse before calling through, rather than change
+ * {@link authenticateMaterial}'s behavior for its existing callers.
+ */
+export function readAuthenticatedBackendPublicationMaterial(
+  journal: BackendPublicationJournal,
+  homeDir?: string,
+): BackendPublicationRecoveryMaterial {
+  if (journal.recoveryReference === null) {
+    return fail(
+      "publication-evidence-missing",
+      "backend publication journal has no recovery reference to authenticate",
+    );
+  }
+  const rootHandle = openOptionalRootDirectory(homeDir);
+  let publicationHandle: BackendPublicationDirectoryHandle | undefined;
+  try {
+    publicationHandle = openOptionalPublicationDirectory(homeDir);
+    if (publicationHandle === undefined) {
+      return fail(
+        "publication-evidence-missing",
+        "backend publication directory is missing",
+      );
+    }
+    return authenticateMaterial(homeDir, journal, publicationHandle, true).material;
+  } finally {
+    publicationHandle?.close();
+    rootHandle?.close();
+  }
+}
+
+/**
+ * Read the live journal and, only when it is `completed`, the retained
+ * recovery material, validated as terminal consumer evidence: a recovery
+ * reference, no active remote fence, material that authenticates, and
+ * published hashes equal to the intended hashes. Returns `null` when the
+ * publication directory is confirmed absent or the journal is not
+ * `completed` (including `aborted`).
+ *
+ * The journal, the terminal checks and the material read share one
+ * publication directory handle, and the material is authenticated once with
+ * the strict directory checks. Afterwards the journal is re-read through the
+ * same handle: a different checksum fails with `unexpected-state` and a
+ * missing journal with `publication-evidence-missing`. This is an
+ * observation, not a snapshot; the journal can still change after the
+ * re-read. The function takes no publication lock, so a caller that already
+ * holds the consumer lock may call it.
+ */
+export function readRetainedCompletedBackendPublicationEvidence(
+  homeDir?: string,
+): Readonly<{ journal: BackendPublicationJournal; material: BackendPublicationRecoveryMaterial }> | null {
+  return withPublicationJournalForConsumer(homeDir, (journal, handle) => {
+    if (journal === null || journal.phase !== "completed") return null;
+    const rootHandle = openOptionalRootDirectory(homeDir);
+    try {
+      const material = authenticateTerminalPublicationEvidence(journal, handle!, homeDir)!;
+      const current = readJournalFromDirectory(homeDir, handle);
+      if (current === null) {
+        return fail(
+          "publication-evidence-missing",
+          "backend publication journal disappeared while reading retained material",
+        );
+      }
+      if (current.checksumSha256 !== journal.checksumSha256) {
+        return fail(
+          "unexpected-state",
+          "backend publication journal changed while reading retained material",
+        );
+      }
+      return { journal, material };
+    } finally {
+      rootHandle?.close();
+    }
+  });
+}
+
 function prospectiveJournal(
   input: PrepareBackendPublicationInput & Readonly<{ now: Date }> ,
   sourceState: BackendPublicationStateWitness,
@@ -3583,6 +3707,22 @@ function transition(
 function activeFence(fence: BackendPublicationFenceRecord | null): boolean {
   return fence !== null && fence.releasedAt === null && !fence.databaseExpired;
 }
+
+function hasCompleteGuardProvider(driver: BackendPublicationDriver): boolean {
+  return driver.acquireRemoteGuard !== undefined
+    && driver.readRemoteGuard !== undefined
+    && driver.releaseRemoteGuard !== undefined;
+}
+
+const GUARD_RECORDED_FORWARD_PHASES: readonly BackendPublicationPhase[] = [
+  "guarded",
+  "map-publishing",
+  "map-published",
+  "config-publishing",
+  "config-published",
+  "releasing",
+  "released",
+];
 
 function sameFenceIdentity(left: BackendPublicationFenceRecord, right: BackendPublicationFenceRecord): boolean {
   return left.projectId === right.projectId
@@ -3806,6 +3946,12 @@ export class BackendPublicationCoordinator {
   ): Promise<BackendPublicationJournal> {
     return this.#locked(async (directoryHandle) => {
       const validated = validateInput(input);
+      if (validated.projects.length > 0 && !hasCompleteGuardProvider(this.#driver)) {
+        return fail(
+          "invalid-input",
+          "backend publication with projects requires a complete remote guard provider",
+        );
+      }
       const existing = readParsedJournalFromDirectory(
         this.#homeDir,
         directoryHandle,
@@ -3905,6 +4051,12 @@ export class BackendPublicationCoordinator {
     };
     if (lockToken !== undefined) {
       assertLockToken(lockToken, this.#homeDir);
+      if (activePublicationLockTokens.get(lockToken)!.origin === "sync") {
+        return fail(
+          "permit-mismatch",
+          "synchronous-origin publication lock token cannot authorize an asynchronous coordinator seam because the synchronous wrapper releases the lock when its callback returns",
+        );
+      }
       return operation();
     }
     return withBackendPublicationLockAsync(this.#homeDir, operation);
@@ -3972,6 +4124,9 @@ export class BackendPublicationCoordinator {
       this.#driver.acquireRemoteGuard === undefined
       || this.#driver.readRemoteGuard === undefined
     ) {
+      if (journal.projects.length > 0) {
+        return fail("unexpected-state", "remote guard acquisition requires a complete remote guard provider");
+      }
       return transition(journal, "guarded", directoryHandle, this.#homeDir, this.#observer);
     }
     let current = journal;
@@ -3996,6 +4151,11 @@ export class BackendPublicationCoordinator {
     directoryHandle: BackendPublicationDirectoryHandle,
   ): Promise<BackendPublicationJournal> {
     const phase = aborting ? "abort-releasing" : "releasing" as const;
+    const releaseUnavailable = this.#driver.releaseRemoteGuard === undefined
+      || this.#driver.readRemoteGuard === undefined;
+    if (releaseUnavailable && journal.projects.some((project) => project.fence !== null)) {
+      return fail("unexpected-state", "remote guard release requires a complete remote guard provider");
+    }
     let current = aborting
       ? transition(journal, phase, directoryHandle, this.#homeDir, this.#observer)
       : journal;
@@ -4255,6 +4415,12 @@ export class BackendPublicationCoordinator {
       journal = transition(journal, "acquiring", directoryHandle, this.#homeDir, this.#observer);
     }
     if (journal.phase === "acquiring") journal = await this.#acquireAll(journal, directoryHandle);
+    if (
+      GUARD_RECORDED_FORWARD_PHASES.includes(journal.phase)
+      && journal.projects.some((project) => project.fence === null)
+    ) {
+      return fail("unexpected-state", "backend publication journal lacks a recorded remote guard fence");
+    }
     if (journal.phase === "guarded" || journal.phase === "map-publishing") journal = await this.#publishMap(journal, directoryHandle);
     if (journal.phase === "map-published" || journal.phase === "config-publishing") journal = await this.#publishConfig(journal, directoryHandle);
     if (journal.phase === "config-published") {

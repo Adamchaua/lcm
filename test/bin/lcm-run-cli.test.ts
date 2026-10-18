@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { ConfigValidationError, type DaemonConfig } from "../../src/daemon/config.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
-import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
+import { StorageIdentityConfigurationError, TransportedUnboundProjectError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
 import { CliProjectStorageMissingError } from "../../src/cli-storage.js";
 import { MachineIdentityFileError } from "../../src/machine-identity.js";
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
@@ -126,6 +126,7 @@ const state = vi.hoisted(() => ({
   migrateLegacyHome: vi.fn(),
   install: vi.fn(async () => undefined),
   createInstallerPublicationConvergence: vi.fn(),
+  startMcpServer: vi.fn(async (_options?: unknown): Promise<undefined> => undefined),
   ensureAuthToken: vi.fn(),
   createDaemon: vi.fn(async () => ({ address: () => ({ port: 3737 }) })),
   privateFsRoots: [] as string[],
@@ -280,7 +281,7 @@ vi.mock("../../src/cli-help.js", () => ({
   printHelp: state.printHelp,
 }));
 vi.mock("../../src/hooks/dispatch.js", () => ({ dispatchHook: state.dispatchHook }));
-vi.mock("../../src/mcp/server.js", () => ({ startMcpServer: vi.fn(async () => undefined) }));
+vi.mock("../../src/mcp/server.js", () => ({ startMcpServer: state.startMcpServer }));
 vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (options: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
   options.onProgress?.(state.batchProgressLast ? { lastResult: { ok: true } } : {});
   return state.batchResult;
@@ -712,6 +713,39 @@ describe("runCli registration and help dispatch", () => {
     await invoke(args);
     expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
     expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries mcp startup publication contention and hands the wrapper to the server", async () => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence());
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.migrateLegacyHome.mockImplementationOnce(() => { throw contention; }).mockImplementationOnce(() => undefined);
+
+    expect(await invoke(["mcp"])).toBeUndefined();
+
+    expect(state.createInstallerPublicationConvergence).toHaveBeenCalledOnce();
+    expect(state.migrateLegacyHome).toHaveBeenCalledTimes(2);
+    expect(state.startMcpServer).toHaveBeenCalledOnce();
+    const options = state.startMcpServer.mock.calls[0]?.[0] as {
+      withPublicationAdmissionRetry: <T>(run: () => T | Promise<T>) => Promise<T>;
+    };
+    const retried = vi.fn()
+      .mockImplementationOnce(() => { throw contention; })
+      .mockImplementationOnce(() => "admitted");
+    expect(await options.withPublicationAdmissionRetry(retried)).toBe("admitted");
+    expect(retried).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps mcp startup fail-closed when the lock owner is not the authenticated daemon", async () => {
+    state.createInstallerPublicationConvergence.mockResolvedValue(makeTestConvergence(
+      () => ({ version: 1, pid: 43, processStartTime: "birth", nonce: "a".repeat(32) }),
+    ));
+    const contention = new PrivateMutationLockContentionError("publication busy");
+    state.migrateLegacyHome.mockImplementation(() => { throw contention; });
+
+    expect(await invoke(["mcp"])).toBe(contention);
+
+    expect(state.migrateLegacyHome).toHaveBeenCalledOnce();
+    expect(state.startMcpServer).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -1180,6 +1214,52 @@ describe("runCli registration and help dispatch", () => {
     expect((await invoke(["import-knowledge","x"]))?.message).toBe("exit:1");
     expect(error.mock.calls.flat().join(" ")).toContain(UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
     expect([...error.mock.calls,...stderr.mock.calls].flat().join(" ")).not.toContain("SECRET_CANARY");
+  });
+
+  it("reports the static unbound remedy for daemon-transported promote failures", async () => {
+    // Bug #1413: promote --all reached unbound PostgreSQL projects as a
+    // generic per-project failure because the daemon-transported 409 lost
+    // its type. The transported failure keeps the static remedy without
+    // triggering the machine-wide StorageIdentityConfigurationError rethrow.
+    state.cliProjects = [
+      { id: "one", canonical: "/one", aliases: [] },
+      { id: "two", canonical: "/two", aliases: [] },
+    ];
+    state.post
+      .mockRejectedValueOnce(Object.assign(
+        new TransportedUnboundProjectError("SECRET_CANARY postgresql://private SQL"),
+        { statusCode: 409 },
+      ))
+      .mockResolvedValueOnce({ processed: 1, promoted: 1 });
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect((await invoke(["promote", "--all"]))?.message).toBe("exit:1");
+    expect(state.post).toHaveBeenCalledTimes(2);
+    expect(state.post).toHaveBeenNthCalledWith(1, "/promote", { cwd: "/one", dry_run: false });
+    expect(state.post).toHaveBeenNthCalledWith(2, "/promote", { cwd: "/two", dry_run: false });
+    const text = diagnostic.mock.calls.flat().join(" ");
+    expect(text).toContain("promote failed for /one");
+    expect(text).toContain(UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
+    expect(text).not.toContain("promotion request failed");
+    expect(text).not.toContain("SECRET_CANARY");
+  });
+
+  it("names the project alongside the remedy for export-all failures", async () => {
+    // Bug #1413 follow-up: export --all named the unbound remedy but not
+    // the affected project directory.
+    state.cliProjects = [
+      { id: "first", canonical: "/first", aliases: [] },
+      { id: "second", canonical: "/second", aliases: [] },
+    ];
+    state.exportError = new StorageIdentityConfigurationError("SECRET_CANARY postgresql://private SQL");
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect((await invoke(["export", "--all"]))?.message).toBe("exit:1");
+    const text = stderr.mock.calls.flat().join(" ");
+    expect(text).toContain("/first: " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
+    expect(text).toContain("/second: " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
+    expect(text).not.toContain("SECRET_CANARY");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Total: 0 entries exported"));
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Failed: 2 projects could not be exported"));
   });
 
   it("routes executable failures to the supplied top-level handler", async () => {
@@ -2613,7 +2693,14 @@ describe("runCli failure and alternate presentation branches", () => {
     });
   });
 
-  it("dispatches post-tool without root bootstrap migration", async () => {
+  it.each([
+    [["post-tool", "--client", "codex"], "post-tool"],
+    [["restore", "--client", "codex"], "restore"],
+    [["session-end", "--client", "codex"], "session-end"],
+    [["session-snapshot", "--client", "codex"], "session-snapshot"],
+    [["user-prompt", "--client", "codex"], "user-prompt"],
+    [["compact", "--hook", "--client", "codex"], "compact"],
+  ] as const)("dispatches hook entrypoint %j without root bootstrap migration", async (args, hook) => {
     fakeStdin.isTTY = false;
     fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
       if (event === "data") queueMicrotask(() => callback(Buffer.from(JSON.stringify({
@@ -2626,12 +2713,40 @@ describe("runCli failure and alternate presentation branches", () => {
     const contention = new PrivateMutationLockContentionError("publication lock is busy");
     const migrate = vi.fn(() => { throw contention; });
 
-    expect((await invoke(["post-tool", "--client", "codex"], {
+    expect((await invoke([...args], {
       migrate,
       sleep: async (_delayMs: number) => undefined,
     }))?.message).toBe("exit:0");
     expect(migrate).not.toHaveBeenCalled();
-    expect(state.dispatchHook).toHaveBeenCalledWith("post-tool", expect.any(String));
+    expect(state.dispatchHook).toHaveBeenCalledWith(hook, expect.any(String), ...(hook === "user-prompt" ? [expect.anything()] : []));
+  });
+
+  it("keeps the legacy-root preflight for compact without --hook", async () => {
+    fakeStdin.isTTY = true;
+    const migrate = vi.fn();
+
+    await invoke(["compact", "--dry-run"], { migrate, sleep: async (_delayMs: number) => undefined });
+
+    expect(migrate).toHaveBeenCalled();
+    expect(state.dispatchHook).not.toHaveBeenCalled();
+  });
+
+  it("keeps hook dispatch fail-closed when a hook entrypoint rejects with a journal error", async () => {
+    fakeStdin.isTTY = false;
+    fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
+      if (event === "data") queueMicrotask(() => callback(Buffer.from("{}")));
+      if (event === "end") queueMicrotask(() => callback());
+      return fakeStdin;
+    });
+    const journal = new BackendPublicationJournalError("malformed-journal", "evidence is malformed");
+    state.dispatchHook.mockRejectedValueOnce(journal);
+    const migrate = vi.fn();
+
+    await expect(runCli(["node", "lcm", "restore", "--client", "codex"], {
+      migrate,
+      sleep: async (_delayMs: number) => undefined,
+    })).rejects.toBe(journal);
+    expect(migrate).not.toHaveBeenCalled();
   });
 
   it("reports exact Codex structure and functional capture health", async () => {
@@ -3921,6 +4036,10 @@ describe("selected-backend operational CLI acceptance", () => {
     expect(new Set(outputs).size).toBe(3);
     expect([...stderr.mock.calls, ...error.mock.calls].flat().join(" ")).not.toContain("SECRET_CANARY");
     expect(error).toHaveBeenCalledWith(expect.stringContaining("Total: 2 entries exported"));
+    // Bug #1466: the failing project's path is on its failure line and the
+    // summary reports the failed-project count next to the successes.
+    expect(stderr.mock.calls.flat().join(" ")).toContain("/same/name: Export failed for a selected project.");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Failed: 1 project could not be exported"));
     expect(stdout).not.toHaveBeenCalled();
     expect(log).not.toHaveBeenCalled();
   });

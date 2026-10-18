@@ -35,6 +35,7 @@ import {
 } from "../../src/storage/postgresql/identity-repository.js";
 import { runPostgreSqlMigrations } from "../../src/storage/postgresql/migrations.js";
 import { applyBackendPublicationProjectMapFile } from "../../src/project-map.js";
+import { inMemoryPublicationGuard } from "./operational-fixture.js";
 import { withStorageBackendConsumerLockAsync } from "../../src/storage/backend.js";
 import {
   assertHarnessReady,
@@ -95,6 +96,7 @@ function recoveryFile(content: string): BackendPublicationRecoveryFile {
 
 function publicationDriver(homeDir: string): BackendPublicationDriver {
   return {
+    ...inMemoryPublicationGuard(),
     observeLocalState: async () => captureBackendPublicationState(homeDir),
     publishProjectMap: (input: BackendPublicationFileMutationContext) =>
       applyBackendPublicationProjectMapFile(input),

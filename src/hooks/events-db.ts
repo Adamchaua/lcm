@@ -624,11 +624,43 @@ export class EventsDb {
     this.db.prepare("DELETE FROM missing_cwd_state WHERE id = 1").run();
   }
 
-  pruneProcessed(olderThanDays: number): number {
+  /**
+   * Delete processed events past the retention window.
+   *
+   * Pass `awaitingReplication: false` only when PostgreSQL replication cannot
+   * claim these rows. #91 added the acknowledged/remote-pruned gate so that an
+   * event is never destroyed before the remote inbox durably holds it, which is
+   * correct wherever replication runs. That gate is unsatisfiable without a
+   * remote inbox, though, because the schema requires `remote_inbox_id` for
+   * `'acknowledged'`. A SQLite-backed install therefore pruned nothing at all
+   * and its events table grew without bound (#1395).
+   *
+   * With replication absent, a row that never entered the remote pipeline is
+   * prunable on age alone, as it was before #91. A row that does carry remote
+   * state still needs the full drained proof, so an install that moved from
+   * PostgreSQL back to SQLite cannot lose an undrained event.
+   *
+   * "Never entered the pipeline" means never claimed. A claimed row that came
+   * back as `retry` is not proof that nothing reached the remote inbox: the
+   * worker marks a row `retry` when its insert throws and the readback that
+   * would settle the outcome is unavailable too, so the insert may have
+   * committed. Claiming is what increments `delivery_attempts`, so an
+   * untouched row is exactly `pending` with no attempts and no inbox id.
+   */
+  pruneProcessed(
+    olderThanDays: number,
+    options: { awaitingReplication?: boolean } = {},
+  ): number {
+    const drained = "delivery_state = 'acknowledged' AND remote_pruned_at IS NOT NULL";
+    const prunable = options.awaitingReplication === false
+      ? `((${drained})
+          OR (remote_inbox_id IS NULL
+              AND delivery_state = 'pending'
+              AND delivery_attempts = 0))`
+      : drained;
     const result = this.db.prepare(
       `DELETE FROM events WHERE processed_at IS NOT NULL
-       AND delivery_state = 'acknowledged'
-       AND remote_pruned_at IS NOT NULL
+       AND ${prunable}
        AND processed_at < datetime('now', '-' || ? || ' days')`
     ).run(olderThanDays);
     return Number(result.changes);
@@ -886,6 +918,32 @@ export class EventsDb {
       eventUuid(eventId),
       nonblank(claimOwner, "claim owner"),
     );
+    return Number(result.changes) === 1;
+  }
+
+  /**
+   * Return a row that was replicated to a remote project the daemon is no
+   * longer bound to (#1509) to the pending queue, so a later pass uploads it
+   * to the current binding. The inbox id guard keeps a row that was already
+   * moved or acknowledged from being re-queued by a stale decision.
+   */
+  requeueReplicated(eventId: string, remoteInboxId: bigint): boolean {
+    const inboxId = formatRemoteInboxId(remoteInboxId);
+    const result = this.db.prepare(`
+      UPDATE events
+      SET delivery_state = 'pending',
+          delivery_generation = delivery_generation + 1,
+          delivery_owner = NULL,
+          delivery_claimed_at = NULL,
+          delivery_next_attempt_at = datetime('now'),
+          delivery_last_error = NULL,
+          remote_inbox_id = NULL,
+          quarantine_reason = NULL,
+          delivery_updated_at = datetime('now')
+      WHERE event_uuid = ?
+        AND delivery_state = 'replicated'
+        AND remote_inbox_id = ?
+    `).run(eventUuid(eventId), inboxId);
     return Number(result.changes) === 1;
   }
 

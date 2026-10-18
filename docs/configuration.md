@@ -492,6 +492,17 @@ project binding, or backend support are unavailable. The daemon starts one
 selected-backend factory and routes bounded repository batches through it. An
 unbound or invalid project returns sanitized `409` identity guidance; a
 selected-backend initialization or operation failure returns a sanitized `503`.
+On PostgreSQL, the read routes `/search`, `/grep`, `/recent`, `/describe`, and
+`/expand` likewise return a sanitized `503` when project storage fails,
+including publication-lock contention (marked retryable), instead of an empty
+or null `200`.
+When such a read first meets the daemon's own publication work, for example a
+replication sweep phase, it waits up to one second for a turn in the daemon's
+publication queue and retries once. If the retry fails, the read returns the
+sanitized `503`; contention with publication work and an expired wait are
+marked retryable, while a genuine storage failure keeps `retryable: false`.
+The one-second limit only bounds waiting in the queue: a lock held by another process
+fails immediately once the turn is granted.
 The daemon cancels request-scoped work on client disconnect and drains active
 consumers before closing the factory during shutdown. No PostgreSQL failure
 opens a project SQLite database as a recovery path.
@@ -510,7 +521,8 @@ timeout settings in `~/.lcm/config.json`:
       "poolMax": 5,
       "connectionTimeoutMs": 10000,
       "idleTimeoutMs": 30000,
-      "statementTimeoutMs": 60000
+      "statementTimeoutMs": 60000,
+      "snapshotIdleTimeoutMs": 300000
     }
   }
 }
@@ -523,6 +535,33 @@ timeout settings in `~/.lcm/config.json`:
 | `connectionTimeoutMs` | `10000` | `1`-`600000` |
 | `idleTimeoutMs` | `30000` | `0`-`3600000` |
 | `statementTimeoutMs` | `60000` | `1`-`3600000` |
+| `snapshotIdleTimeoutMs` | `300000` | `1`-`3600000` |
+
+`snapshotIdleTimeoutMs` bounds only the read-only, repeatable-read snapshot
+transaction that a portable transfer holds open for the lifetime of its source
+handle (`idle_in_transaction_session_timeout`, set with `SET LOCAL` semantics
+inside that transaction only). It is deliberately separate from
+`statementTimeoutMs`, which bounds how long a single query may run:
+deriving the idle bound from the statement bound previously caused a
+long-lived snapshot to be killed for doing exactly what it exists to do,
+surfacing as a sanitized `source-unavailable` transfer failure.
+
+PostgreSQL resets this timer on every statement the snapshot issues, so it
+bounds the longest single gap between reads, not the snapshot's total
+lifetime. A transfer that keeps paging through source records, however long
+that takes overall, is never killed by this setting; only a snapshot that
+goes idle for longer than the bound (an abandoned or stalled handle) is
+reclaimed. Raise the value for a slow or remote destination whose
+per-batch write, verify, or backpressure gap can exceed the default; lower it
+for a strict-autovacuum deployment that needs abandoned snapshots reclaimed
+faster, since every open snapshot pins the database's `xmin` horizon for as
+long as it stays open and multiple concurrent snapshots multiply that
+autovacuum-holdback pressure. Each open snapshot also holds one pooled
+connection for its lifetime, so raising this value on a deployment that runs
+many concurrent transfers reduces effective pool capacity for other work;
+size `poolMax` accordingly. The value is rejected below `1`: PostgreSQL
+treats `0` as disabling the bound entirely, and a bound must always exist so
+an abandoned snapshot is eventually reclaimed.
 
 Supply the connection URL and CA certificate path through the environment. LCM
 rejects `url` and `caFile` keys in JSON so credentials cannot be persisted by
@@ -999,12 +1038,22 @@ interactive session, but the daemon is launched through the trusted
 addresses). Process-based Claude and Codex providers also receive
 `CLAUDE_CONFIG_DIR` and `CODEX_HOME` only when each is an absolute, canonical,
 user-owned private directory. For managed systemd and launchd starts, `PATH` is
-synthesized from the trusted packaged daemon entrypoint and fixed system
-directories so the service sees the same provider search path that `lcm doctor`
-checks, even when the command was invoked through a user-level wrapper. Default
-managed lifecycle calls use that same packaged entrypoint in their manager
-arguments, keeping start and restart admission on one stable identity. Doctor
-observes that same packaged runtime identity without invoking lifecycle work.
+synthesized from directly observed absolute executables, authenticated
+per-user package layouts, and fixed system directories. Derived package-manager
+bins such as `~/.local/bin` are included only when the layout is recognized and
+its canonical prefix is rooted at the authenticated owner home. An implicit
+home is trusted when it resolves to the operating-system account home, or when
+the resolved directory is owned by the current user and is not group- or
+other-writable. If account lookup, path resolution, or ownership validation
+fails, managed start and restart omit per-user derived bins while retaining
+directly observed executables and fixed system directories. Checkout-contained
+`.local` directories and renamed package prefixes are never promoted into the
+stable managed PATH, even when the caller is outside that checkout. Default
+managed lifecycle calls use the packaged entrypoint in their manager arguments,
+keeping start and restart admission on one stable identity. `lcm doctor`
+observes the packaged runtime without invoking lifecycle work; its caller-scoped
+non-stable PATH observation is intentionally distinct from managed-launch home
+authentication.
 Service identity metadata and credential-file markers are passed as
 names and paths only. API keys and database URLs are never copied into argv,
 unit properties, plist contents, or logs; the daemon reads them from the
@@ -1108,8 +1157,12 @@ recognized active storage backend, the PID file, process liveness, and exact
 `/stats/pool` then verify authenticated access; the entrypoint identity is
 checked through authenticated health, while pool diagnostics omit paths. An
 occupied port with missing or unverifiable identity is rejected rather than
-trusted. Daemons that predate backend identity are recognized as SQLite-only,
-so selecting PostgreSQL cannot silently reuse an existing SQLite process.
+trusted. Daemons through 1.4.3 omit the backend from `/health` and are
+recognized as SQLite-only, so selecting PostgreSQL cannot silently reuse an
+existing SQLite process. A newer daemon that omits the backend is treated as
+unknown: LCM does not reuse it, does not replace it without authentication,
+and `lcm daemon restart` refuses it. Admission is blocked with the
+storage-backend warning until you stop that daemon yourself.
 The PID, PID-file, and listener observations in this admission check are
 consistency evidence for a responsive managed service; they are never offline
 authority to signal or replace a process.
