@@ -76,7 +76,9 @@ the project map, it would be silently stranded on a backend it no longer
 routes to. Rollback therefore refuses (`multiple-remote-projects`) unless the covered project is the only one bound to
 PostgreSQL. A local-only entry never blocks. The check runs before maintenance
 is entered and again right before the selection is prepared. Unbind or migrate
-the other projects first.
+the other projects first. Installation-wide (multi-project) rollback is tracked
+by [#1544](https://github.com/donadiosolutions/lcm/issues/1544); until then the
+refusal stands.
 
 ## What activation evidence rollback relies on
 

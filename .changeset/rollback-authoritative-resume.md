@@ -11,7 +11,8 @@ fresh SQLite generation from a fenced PostgreSQL snapshot, verifies
 it independently before installing it, and preserves the prior live
 database and the original pre-migration snapshot untouched. The
 rollback publishes the SQLite selection through the same coordinator as
-activation, refuses while another project is still bound to PostgreSQL,
+activation, refuses while another project is still bound to PostgreSQL (installation-wide
+rollback is tracked by #1544),
 and refuses a generation that never completed an activation, including one
 whose project was never bound to PostgreSQL or whose configuration was switched
 to PostgreSQL by hand (restore the configuration, or leave it with
