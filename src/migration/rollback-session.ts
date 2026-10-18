@@ -278,11 +278,18 @@ class FencedRollbackSession implements RollbackProductionSession {
     if (external?.aborted) controller.abort(external.reason);
     else external?.addEventListener("abort", onExternalAbort, { once: true });
     if (this.target.settings.poolMax <= 1) {
-      return {
+      // Inert (no periodic renewal), but owned like an active keeper: session cleanup of an export whose stream
+      // was never closed must still detach the caller-signal listener (E11).
+      const inert: LeaseRenewalKeeper = {
         signal: controller.signal,
         assertFenced: () => undefined,
-        stop: async () => { external?.removeEventListener("abort", onExternalAbort); },
+        stop: async () => {
+          this.keepers.delete(inert);
+          external?.removeEventListener("abort", onExternalAbort);
+        },
       };
+      this.keepers.add(inert);
+      return inert;
     }
     let failure: unknown;
     let pending: Promise<void> | null = null;

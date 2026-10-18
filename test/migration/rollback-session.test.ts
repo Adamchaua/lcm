@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getEventListeners } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalSha256, PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_RECORD_SCHEMA_SHA256 } from "../../src/storage/portable-record.js";
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
@@ -748,6 +749,19 @@ describe("lease renewal during long fenced reads", () => {
     // The snapshot and runtime were still closed.
     expect(h.snapshots[0]!.close).toHaveBeenCalledTimes(1);
     expect(h.runtime.close).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([1, 2])("E11: with poolMax %i, release() and closeKeepingLease() of an unclosed export leave no listener on the caller's signal", async (poolMax) => {
+    vi.useFakeTimers();
+    for (const close of ["release", "closeKeepingLease"] as const) {
+      const controller = new AbortController();
+      const h = harness();
+      const session = await open(h, { ...openInput, signal: controller.signal }, { ...target, settings: { ...target.settings, poolMax } });
+      await session.openPortableSource();
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(1);
+      await session[close]();
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    }
   });
 
   it("does not overlap renewals: a renewal still waiting (one-connection pool) is awaited at the end of the scan, not duplicated", async () => {
