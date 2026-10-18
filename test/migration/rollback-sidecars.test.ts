@@ -672,6 +672,27 @@ describe("verifyPassiveEventsAgainstArchive", () => {
     expect(readEventRow(outcome.eventsDbPath, appended)).toMatchObject({ delivery_state: "pending", remote_inbox_id: null });
   });
 
+  it("F12: an archived applied event whose existing row was acknowledged without ever being processed also materializes", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const applied = passiveEventRecords.find((record) => record.value.disposition === "applied")!;
+    const local = new DatabaseSync(first.eventsDbPath);
+    try {
+      // Acknowledged by the replication worker, with no processed_at of its own: only the delivery state says applied.
+      local.exec(
+        `UPDATE events SET processed_at = NULL, delivery_state = 'acknowledged', remote_inbox_id = '1',
+           acknowledged_at = '2026-01-03T00:00:00.000000Z' WHERE event_uuid = '\${applied.value.eventId}'`,
+      );
+    } finally {
+      local.close();
+    }
+    const before = readEventRow(first.eventsDbPath, applied.value.eventId);
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    expect(outcome.passiveEventsMaterialized).toBe(0);
+    expect(readEventRow(outcome.eventsDbPath, applied.value.eventId)).toEqual(before);
+  });
+
   it("F12: an existing row whose disposition contradicts the archive refuses, in either direction", () => {
     const contradictions: ReadonlyArray<readonly [string, string]> = [
       ["applied", "processed_at = NULL, delivery_state = 'pending'"],

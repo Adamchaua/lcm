@@ -517,8 +517,10 @@ export async function checkRollbackRecoveryAdmission(input: Readonly<{
       if (
         maintenance.generationId !== input.generationId
         || maintenance.publicationId !== input.publicationId
+        // The journal reader accepts a target backend only at selection-prepared or selection-completed (a held,
+        // entering or aborted maintenance must carry none: backend-publication.ts, readMaintenanceJournal), so a
+        // sqlite target already means one of the two phases this recovery admits.
         || maintenance.targetBackend !== "sqlite"
-        || (maintenance.phase !== "selection-prepared" && maintenance.phase !== "selection-completed")
       ) {
         return refuse("the maintenance journal (phase " + maintenance.phase + ") is not this rollback's attempted selection");
       }
