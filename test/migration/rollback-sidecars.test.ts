@@ -19,7 +19,7 @@
  * directly -- never a mock standing in for corruption.
  */
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -34,6 +34,11 @@ import { createPortableRecord, type PortableRecord } from "../../src/storage/por
 import { buildRecords, postgresGeneration, MACHINE_A, MACHINE_B, MACHINE_A_UUID } from "../fixtures/portable-records.js";
 import { eventsDir, eventSequenceDbPath } from "../../src/db/events-path.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
+import { closeLcmConnection } from "../../src/db/connection.js";
+import { parseDaemonConfig } from "../../src/daemon/config.js";
+import { projectId as projectIdOfCwd } from "../../src/daemon/project.js";
+import { promoteEventsForCwd } from "../../src/daemon/routes/promote-events.js";
+import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import { LocalHookEventSequenceAllocator, formatLocalHookMachineSequence } from "../../src/storage/local-hook-event-sequence.js";
 import {
   materializeRollbackSidecars,
@@ -672,11 +677,12 @@ describe("verifyPassiveEventsAgainstArchive", () => {
     expect(readEventRow(outcome.eventsDbPath, appended)).toMatchObject({ delivery_state: "pending", remote_inbox_id: null });
   });
 
-  it("F12: an archived applied event whose existing row was acknowledged without ever being processed also materializes", () => {
+  it("F12/E2: an archived applied event whose existing row was acknowledged without ever being processed materializes and gains the applied marker", () => {
     const homeDir = tempHome();
     const { path, passiveEventRecords } = seedGeneration();
     const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
     const applied = passiveEventRecords.find((record) => record.value.disposition === "applied")!;
+    const freshlyApplied = readEventRow(first.eventsDbPath, applied.value.eventId);
     const local = new DatabaseSync(first.eventsDbPath);
     try {
       // Acknowledged by the replication worker, with no processed_at of its own: only the delivery state says applied.
@@ -691,7 +697,118 @@ describe("verifyPassiveEventsAgainstArchive", () => {
     expect(before).toMatchObject({ delivery_state: "acknowledged", processed_at: null });
     const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
     expect(outcome.passiveEventsMaterialized).toBe(0);
-    expect(readEventRow(outcome.eventsDbPath, applied.value.eventId)).toEqual(before);
+    // Only the processing marker changes, to what the fresh insert encoded; the acknowledgement stays.
+    expect(readEventRow(outcome.eventsDbPath, applied.value.eventId)).toEqual({ ...before, processed_at: freshlyApplied.processed_at });
+  });
+
+  /**
+   * #626 E2 (round-3 S3-2). The replication worker acknowledges a local event without ever setting processed_at
+   * (EventsDb.markAcknowledged), so acknowledged + processed_at NULL is the ordinary shape of a replicated event
+   * on the PostgreSQL side. The SQLite consumer the rollback hands the project back to selects on processed_at
+   * alone (EventsDb.getUnprocessed, the passive sweep behind promoteEventsForCwd): an archive-applied event left
+   * in that shape would be applied a second time. The real consumer runs here, after the real materialization.
+   */
+  describe("E2: an archive-applied event acknowledged locally without processed_at is not selected or promoted again", () => {
+    const DECISION = '{"decision":"replay-proof decision"}';
+
+    /** A generation whose archive holds exactly one passive event, applied, promotable at tier 1. */
+    function seedAppliedOnlyGeneration(): { path: string; eventId: string } {
+      const { path } = tempGenerationPath();
+      const db = new DatabaseSync(path);
+      try {
+        runLcmMigrations(db, { fts5Available: false });
+        initializePortableArchive(db);
+        const all = buildRecords({
+          ...postgresGeneration(),
+          mutate: (domain, values) => domain === "passive-events"
+            ? values.map((value) => ({ ...value, priority: "1", category: "decision", data: DECISION }))
+            : values,
+        });
+        const applied = all.get("passive-events")!.find((record) => (record.value as { disposition: string }).disposition === "applied")!;
+        for (const record of all.get("machines")!) writePortableArchiveRecord(db, record);
+        for (const record of all.get("session-instructions")!) writePortableArchiveRecord(db, record);
+        writePortableArchiveRecord(db, applied);
+        return { path, eventId: (applied.value as { eventId: string }).eventId };
+      } finally {
+        db.close();
+      }
+    }
+
+    async function materializeThenSweep(options: { nullProcessedAt: boolean }) {
+      const homeDir = tempHome();
+      mkdirSync(join(homeDir, ".lcm"), { mode: 0o700 });
+      chmodSync(homeDir, 0o700);
+      const cwd = mkdtempSync(join(homeDir, "project-"));
+      const localProjectId = projectIdOfCwd(cwd);
+      const { path, eventId } = seedAppliedOnlyGeneration();
+      const previousHome = process.env.HOME;
+      process.env.HOME = homeDir;
+      const factory = new SqliteStorageBackendFactory({ resolveProject: (identity) => ({ id: identity.id, dbPath: path }) });
+      try {
+        const input = { homeDir, databasePath: path, localProjectId, machineId: MACHINE_A_UUID };
+        const first = materializeRollbackSidecars(input);
+        const freshlyApplied = readEventRow(first.eventsDbPath, eventId);
+        expect(freshlyApplied.processed_at).toEqual(expect.any(String));
+        if (options.nullProcessedAt) {
+          const local = new DatabaseSync(first.eventsDbPath);
+          try {
+            local.prepare("UPDATE events SET processed_at = NULL WHERE event_uuid = ?").run(eventId);
+          } finally {
+            local.close();
+          }
+        }
+        // The replication worker's acknowledgement: delivery_state, remote_inbox_id and acknowledged_at, never processed_at.
+        const worker = new EventsDb(first.eventsDbPath);
+        try {
+          expect(worker.markAcknowledged(eventId, 1n)).toBe(true);
+        } finally {
+          worker.close();
+        }
+        const acknowledged = readEventRow(first.eventsDbPath, eventId);
+        expect(acknowledged).toMatchObject({
+          delivery_state: "acknowledged", remote_inbox_id: "1", processed_at: options.nullProcessedAt ? null : freshlyApplied.processed_at,
+        });
+
+        const outcome = materializeRollbackSidecars(input);
+        expect(outcome.passiveEventsMaterialized).toBe(0);
+
+        const consumer = new EventsDb(outcome.eventsDbPath);
+        let selected: string[];
+        try {
+          selected = consumer.getUnprocessed().map((event) => event.event_uuid);
+        } finally {
+          consumer.close();
+        }
+        const promotion = await promoteEventsForCwd(parseDaemonConfig("{}"), cwd, outcome.eventsDbPath, factory);
+        const generation = new DatabaseSync(path, { readOnly: true });
+        let promoted: number;
+        try {
+          promoted = (generation.prepare("SELECT count(*) AS n FROM promoted").get() as { n: number }).n;
+        } finally {
+          generation.close();
+        }
+        return { selected, promotion, promoted, before: acknowledged, after: readEventRow(outcome.eventsDbPath, eventId), freshlyApplied };
+      } finally {
+        await factory.close();
+        closeLcmConnection();
+        if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+      }
+    }
+
+    it("sets the processing marker exactly as a fresh applied insert encodes it, keeping the acknowledgement, so the real consumer selects and promotes nothing", async () => {
+      const result = await materializeThenSweep({ nullProcessedAt: true });
+      expect({ promotion: result.promotion, promotedMemories: result.promoted, selected: result.selected })
+        .toMatchObject({ promotion: { promoted: 0, errors: 0 }, promotedMemories: 0, selected: [] });
+      // Identity, acknowledgement and remote inbox id are exactly as the worker left them; only processed_at was reconciled.
+      expect(result.after).toEqual({ ...result.before, processed_at: result.freshlyApplied.processed_at });
+    });
+
+    it("control: a row the consumer already processed is left untouched and is not selected or promoted either", async () => {
+      const result = await materializeThenSweep({ nullProcessedAt: false });
+      expect({ promotion: result.promotion, promotedMemories: result.promoted, selected: result.selected })
+        .toMatchObject({ promotion: { promoted: 0, errors: 0 }, promotedMemories: 0, selected: [] });
+      expect(result.after).toEqual(result.before);
+    });
   });
 
   it("F12: an existing row whose disposition contradicts the archive refuses, in either direction", () => {

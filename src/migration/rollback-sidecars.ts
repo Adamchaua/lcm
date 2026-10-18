@@ -336,6 +336,14 @@ function materializePassiveEvents(
      delivery_next_attempt_at, delivery_updated_at, processed_at, quarantine_reason)
     VALUES (?,?,?,?,?,?, ?,?,?,?,?,?, ?,0,0,?,?,?,?)
     ON CONFLICT(event_uuid) DO NOTHING`);
+  // E2: the replication worker acknowledges a local row (delivery_state, remote_inbox_id, acknowledged_at) without
+  // ever setting processed_at, and the SQLite consumer this rollback hands the project to selects on processed_at
+  // alone (EventsDb.getUnprocessed). An archive-applied event whose existing row is acknowledged but unmarked would
+  // be applied a second time, so its marker is set to exactly what a fresh applied insert encodes; the row's
+  // identity, acknowledgement and remote inbox id are kept. Any other existing shape is left for the verifier.
+  const markApplied = eventsDb.prepare(
+    "UPDATE events SET processed_at = ? WHERE event_uuid = ? AND processed_at IS NULL AND delivery_state = 'acknowledged'",
+  );
   let count = 0;
   let highestSequence: bigint | null = null;
   for (const row of readArchiveDomain(db, "passive-events")) {
@@ -356,6 +364,7 @@ function materializePassiveEvents(
       columns.deliveryState, createdAt, createdAt, columns.processedAt, columns.quarantineReason,
     ).changes;
     if (changes > 0) count++;
+    else if (columns.processedAt !== null) markApplied.run(columns.processedAt, v.eventId);
     if (highestSequence === null || sequence > highestSequence) highestSequence = sequence;
   }
   return { count, highestSequence };
@@ -390,8 +399,9 @@ type PassiveEventReadbackRow = Readonly<{
  * postgresql/portable-mapping.ts): applied when processed_at is set or delivery_state is 'acknowledged',
  * quarantined when delivery_state is 'quarantined', else pending. The row a fresh insert writes and a row the
  * replication worker has since acknowledged are both applied, so an existing acknowledged row keeps its
- * remote_inbox_id and acknowledgement and is neither rewritten nor replayed; a row whose content or disposition
- * differs from the archive still refuses.
+ * remote_inbox_id and acknowledgement and is not rewritten; materializePassiveEvents gives it the processing
+ * marker a fresh applied insert carries so the SQLite consumer does not replay it (E2). A row whose content or
+ * disposition differs from the archive still refuses.
  *
  * The two sets are accounted for separately. The live local outbox legitimately holds appends made after the
  * cutoff that the archive never saw. The events table's own state model (hooks/events-db.ts) marks a row as
