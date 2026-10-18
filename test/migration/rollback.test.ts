@@ -62,6 +62,7 @@ import {
   recordMigrationWitnessBinding,
   resolveMigrationWitnessBindings,
 } from "../../src/migration/generation-binding-store.js";
+import { readRollbackPreemptionRecord } from "../../src/migration/rollback-install.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
 import {
   FIXTURE_LOCAL_PROJECT_ID,
@@ -1356,6 +1357,81 @@ it("refuses a generation that was never activated before any durable change (an 
     expect(buildEntries).toHaveLength(2);
     expect(new Set(buildEntries).size).toBe(2);
     for (const entry of buildEntries) expect(existsSync(join(buildRoot, entry, "witness.json"))).toBe(true);
+  });
+
+  // PR #1556 thread 4308518705: a crash between the install's move-aside rename and its completion. The retry
+  // builds under the next manifest revision, in a different directory, and must still find and finish the
+  // crashed attempt's preserved pre-rollback database through the durable move-aside record.
+  it("finishes a crashed move-aside on the retry: the preserved pre-rollback database ends read-only, verified and recorded (post-write)", async () => {
+    const homeDir = tempHome();
+    const store = new MigrationManifestStore({ homeDir });
+    manifestAtVerified(store, "gen-move-aside-crash");
+    const canonicalPath = join(homeDir, "live.sqlite");
+    const live = new DatabaseSync(canonicalPath);
+    try {
+      runLcmMigrations(live, { fts5Available: false });
+      live.exec("INSERT INTO conversations(conversation_id,session_id,title,created_at,updated_at) VALUES (1,'s','pre-rollback-live-row','2026-09-06 00:00:00','2026-09-06 00:00:00')");
+    } finally {
+      live.close();
+    }
+    chmodSync(canonicalPath, 0o600);
+    const destinationIdentity = fixtureDestinationIdentity("d");
+    const deps: RunMigrationRollbackDependencies = {
+      coordinator: coordinatorFor(homeDir),
+      ...authoritativeDeps(fixtureActivationScenario({
+        destinationIdentity, censusVector: fixtureCensusVector("census-mac"), canonicalDeltaBaseline: fixtureCanonicalDelta("mac-baseline"),
+      })),
+      recordSelectionBinding: () => undefined,
+      recordWitnessBinding: () => undefined,
+      openFencedSession: async () => fakeSession({
+        observations: [{ destinationIdentity, postEpochDelta: fixtureCanonicalDelta("mac-changed"), postEpochCensus: null }],
+        source: sqliteSourceStream,
+      }),
+    };
+    const run = () => runRollback({
+      homeDir, generationId: "gen-move-aside-crash", canonicalPath,
+      projectIdentity: identity, localProjectId: "local-mac",
+      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+    }, deps);
+
+    // The process dies right after the real move-aside rename, before the chmod, the flush and the after-witness.
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const realRenameSync = nodeFs.renameSync as (from: string, to: string) => void;
+    nodeFs.renameSync = ((from: string, to: string) => {
+      realRenameSync(from, to);
+      if (to.endsWith("preempted-canonical.sqlite")) throw new Error("simulated crash right after the move-aside rename");
+    });
+    syncBuiltinESMExports();
+    try {
+      await expect(run()).rejects.toThrow("simulated crash right after the move-aside rename");
+    } finally {
+      nodeFs.renameSync = realRenameSync;
+      syncBuiltinESMExports();
+    }
+    expect(existsSync(canonicalPath)).toBe(false);
+    const crashed = readRollbackPreemptionRecord(homeDir, "gen-move-aside-crash")!;
+    expect(crashed).toMatchObject({ canonicalPath, after: null });
+    expect(statSync(crashed.preemptedPath).mode & 0o777).toBe(0o600);
+    expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+
+    const outcome = await run();
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+    const finished = readRollbackPreemptionRecord(homeDir, "gen-move-aside-crash")!;
+    expect(finished.preemptedPath).toBe(crashed.preemptedPath);
+    expect(finished.after).toMatchObject({ sha256: crashed.before.sha256, mode: 0o400 });
+    expect(statSync(crashed.preemptedPath).mode & 0o777).toBe(0o400);
+    const preserved = new DatabaseSync(crashed.preemptedPath, { readOnly: true });
+    try {
+      expect(preserved.prepare("SELECT title FROM conversations").all()).toEqual([{ title: "pre-rollback-live-row" }]);
+    } finally {
+      preserved.close();
+    }
+    // The retry's own build directory holds no second preserved file: the canonical path was absent when it installed.
+    const buildRoot = join(homeDir, ".lcm", "migration-rollback-generations");
+    const attempts = readdirSync(buildRoot).filter((name) => name.startsWith("gen-move-aside-crash-rb"));
+    expect(attempts).toHaveLength(2);
+    expect(attempts.map((entry) => existsSync(join(buildRoot, entry, "preempted-canonical.sqlite"))).sort()).toEqual([false, true]);
   });
 
   // Red-first: the enumeration must REFUSE when the read fails, never
