@@ -231,13 +231,14 @@ export function installRollbackGeneration(
     const before = witnessFile(canonicalPath);
     const preemptedPath = join(rollbackGenerationPath(input.homeDir, input.generationId), "preempted-canonical.sqlite");
     renameSync(canonicalPath, preemptedPath);
+    // The preserved file is made read-only before the directories are flushed, so the flush covers its mode too (F14).
+    chmodSync(preemptedPath, 0o400);
     // Both directories changed (the entry left one and entered the other): flush them before anything else.
     syncRenamedDirectories(syncDirectory, dirname(canonicalPath), dirname(preemptedPath));
     const after = witnessFile(preemptedPath);
     if (before.sha256 !== after.sha256 || before.size !== after.size) {
       throw new RollbackInstallError("move-aside-content-changed", "canonical database bytes changed across the move-aside rename");
     }
-    chmodSync(preemptedPath, 0o400);
     preempted = { path: preemptedPath, before, after };
   }
 

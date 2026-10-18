@@ -161,6 +161,23 @@ describe("installRollbackGeneration", () => {
     ]);
   });
 
+  // F14: the preserved database is read-only before the first flush, so the flush covers its mode.
+  it("F14: makes the preserved database read-only before any directory is flushed", () => {
+    const homeDir = tempHome();
+    const canonicalPath = liveCanonicalDatabase(homeDir, "live-for-mode");
+    const generationDir = makeGenerationDir(homeDir, "gen-install-mode");
+    const verifiedPath = verifiedGenerationDatabase(generationDir, "verified-for-mode");
+    const modes: number[] = [];
+    installRollbackGeneration({
+      homeDir, generationId: "gen-install-mode", canonicalPath, verifiedDatabasePath: verifiedPath,
+      syncDirectory: () => {
+        const preempted = join(generationDir, "preempted-canonical.sqlite");
+        if (modes.length === 0) modes.push(statSync(preempted).mode & 0o777);
+      },
+    });
+    expect(modes).toEqual([0o400]);
+  });
+
   it("F3: a failing directory flush after the move-aside refuses before the install rename", () => {
     const homeDir = tempHome();
     const canonicalPath = liveCanonicalDatabase(homeDir, "live-sync-fails");
