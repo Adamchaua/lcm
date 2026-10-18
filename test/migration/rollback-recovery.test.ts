@@ -544,6 +544,14 @@ describe("recovery of a publication crashed while preparing (E6): unsealed journ
     // Same journal, another covered project: not this rollback's composition, so the authenticated reader decides.
     expect(() => readOwnPublicationSourceFromMaterial(t.homeDir, PUBLICATION_ID, "d".repeat(64)))
       .toThrow(expect.objectContaining({ reason: "publication-evidence-missing" }));
+    // A forward-shaped (sqlite -> postgresql) unsealed journal under the rollback's id: not its composition either.
+    const journalPath = backendPublicationJournalPath(t.homeDir);
+    const { checksumSha256: _checksum, ...body } = JSON.parse(readFileSync(journalPath, "utf8"));
+    body.sourceBackend = "sqlite";
+    body.targetBackend = "postgresql";
+    writeFileSync(journalPath, JSON.stringify({ ...body, checksumSha256: backendPublicationCanonicalSha256(body) }));
+    expect(() => readOwnPublicationSourceFromMaterial(t.homeDir, PUBLICATION_ID, LOCAL))
+      .toThrow(expect.objectContaining({ reason: "publication-evidence-missing" }));
   });
 
   it("a resume failure other than missing material propagates untouched, with nothing aborted and the lease kept", async () => {
