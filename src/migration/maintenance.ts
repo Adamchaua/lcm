@@ -355,7 +355,7 @@ export function assertMigrationReplayAdmission(input: Readonly<{
     journalForGeneration.phase === "maintenance-aborted"
     && journalForGeneration.abortEvidenceSha256 === input.evidenceSha256
   ) {
-    return { backend: "sqlite", disposition: "source-abort" };
+    return { backend: journalForGeneration.sourceBackend, disposition: "source-abort" };
   }
   // 5. Anything else refuses.
   throw new BackendPublicationJournalError(

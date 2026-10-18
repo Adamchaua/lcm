@@ -24,6 +24,9 @@ rationale: >-
   src/migration/index.ts (the rollback export surface) and
   src/storage/postgresql/factory.ts (an export made visible to the rollback
   session) are also materially changed and keep their existing owners.
+  src/storage/backend-publication.ts (the maintenance journal's source
+  backend, which an aborted window leaves selected) is materially changed
+  and keeps its storage abstractions owner.
 pins:
   - ["src/migration/activation-evidence-store.ts", "unit-migration-cutover"]
   - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]
@@ -39,3 +42,4 @@ pins:
   - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
   - ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"]
   - ["src/storage/local-hook-event-sequence.ts", "unit-local-event-storage"]
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]

@@ -202,11 +202,15 @@ describe("backend maintenance v3 failure boundaries", () => {
     const value = await held(); rewrite(value.home, change, false);
     expect(() => value.coordinator.inspectMaintenance()).toThrow("journal");
   });
-  it.each([{ publicationId: "!" }, { sourceBackend: "postgresql" }, { targetBackend: "bad" }, { phase: "unknown" },
+  it.each([{ publicationId: "!" }, { sourceBackend: "redis" }, { targetBackend: "bad" }, { phase: "unknown" },
     { createdAt: "bad" }, { updatedAt: "bad" }, { generationId: "!" }, { sourceSelectionSha256: "bad" }, { queueEvidenceSha256: "bad" },
     { selectedGenerationId: "!" }, { terminalEvidenceSha256: "bad" }, { abortEvidenceSha256: "bad" }])("refuses rechecksummed malformed journal fields %j", async (change) => {
     const value = await held(); rewrite(value.home, change);
     expect(() => value.coordinator.inspectMaintenance()).toThrow("fields are malformed");
+  });
+  it.each(["sqlite", "postgresql"] as const)("reads a stored %s source backend (PR #1556 thread 4307516130)", async (sourceBackend) => {
+    const value = await held(); rewrite(value.home, { sourceBackend });
+    expect(value.coordinator.inspectMaintenance()).toMatchObject({ phase: "maintenance-held", sourceBackend });
   });
   it.each([
     [{ targetBackend: "sqlite" }, "held backend maintenance"],

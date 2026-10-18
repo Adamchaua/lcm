@@ -16,7 +16,10 @@ rollback is tracked by #1544),
 and refuses a generation that never completed an activation, including one
 whose project was never bound to PostgreSQL or whose configuration was switched
 to PostgreSQL by hand (restore the configuration, or leave it with
-`lcm migration abort`). Every step is resumable after a crash, including
+`lcm migration abort`). A rollback refused after it entered its maintenance
+window leaves PostgreSQL selected: the maintenance journal now records the
+backend a window was entered from, and an aborted window keeps that backend
+(an aborted activation still selects SQLite). Every step is resumable after a crash, including
 after the selection flips and during the coordinator publication: a retry never guesses which
 outcome already happened, an interrupted build never reuses a
 partial generation, and an incomplete or failed attempt is kept as

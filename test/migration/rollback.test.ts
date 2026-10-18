@@ -38,6 +38,7 @@ import { createPortableRecordStream, type PortableRecordStream } from "../../src
 import { canonicalSha256, PORTABLE_RECORD_SCHEMA_SHA256 } from "../../src/storage/portable-record.js";
 import {
   BackendPublicationCoordinator,
+  assertBackendPublicationConsumerAccess,
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
   withBackendPublicationConsumerLockAsync,
@@ -109,6 +110,36 @@ import {
   fixtureEpoch,
   fixtureEvidenceAbsent,
 } from "../fixtures/migration-activation-records.js";
+
+/**
+ * PR #1556 thread 4307516130: a refused rollback aborts a maintenance window whose source is PostgreSQL. The
+ * real consumer admission and replay admission must keep answering PostgreSQL for that aborted window, never
+ * the activation-only "abort selects SQLite" reading. Replay admission answers from the generation's selection
+ * bindings first (plan-v3.2 A15): a generation that was never activated has none, so its abort evidence is
+ * admitted as a PostgreSQL source-abort; a generation with its activation binding answers PostgreSQL for the
+ * activation witness and refuses the abort evidence outright.
+ */
+function expectAbortedWindowKeepsPostgreSql(homeDir: string, generationId: string, bound: "never-activated" | "activated"): void {
+  const maintenance = readBackendMaintenanceJournal(homeDir)!;
+  expect(maintenance).toMatchObject({ phase: "maintenance-aborted", sourceBackend: "postgresql" });
+  expect(() => assertBackendPublicationConsumerAccess({ backend: "postgresql", homeDir })).not.toThrow();
+  expect(() => assertBackendPublicationConsumerAccess({ backend: "sqlite", homeDir }))
+    .toThrow(expect.objectContaining({ reason: "backend-mismatch" }));
+  const abortEvidenceSha256 = maintenance.abortEvidenceSha256!;
+  if (bound === "never-activated") {
+    expect(assertMigrationReplayAdmission({ homeDir, generationId, evidenceSha256: abortEvidenceSha256 }))
+      .toEqual({ backend: "postgresql", disposition: "source-abort" });
+    return;
+  }
+  const bindings = resolveMigrationWitnessBindings({ homeDir, generationId });
+  expect(bindings.state).toBe("resolved");
+  const activation = (bindings as Extract<typeof bindings, { state: "resolved" }>).selections.at(-1)!;
+  expect(activation.kind).toBe("activation");
+  expect(assertMigrationReplayAdmission({ homeDir, generationId, evidenceSha256: activation.witnessChecksumSha256 }))
+    .toEqual({ backend: "postgresql", disposition: "selected" });
+  expect(() => assertMigrationReplayAdmission({ homeDir, generationId, evidenceSha256: abortEvidenceSha256 }))
+    .toThrow(expect.objectContaining({ reason: "unresolved-publication" }));
+}
 
 /** A project map whose only remote binding is the covered project (plan-v3.2 A14). */
 const COVERED_REMOTE_PROJECT_ID = FIXTURE_REMOTE_PROJECT_ID;
@@ -634,6 +665,8 @@ it("refuses a generation that was never activated before any durable change (an 
 
    const maintenance = readBackendMaintenanceJournal(homeDir);
    expect(maintenance?.phase).toBe("maintenance-aborted");
+   // The real consumer and replay admission stay on PostgreSQL after the refusal (step-4 readback abort site).
+   expectAbortedWindowKeepsPostgreSql(homeDir, "gen-refuse-late", "never-activated");
  });
 
   it("refuses as a racing post-activation write when step 10's revalidation observes a mode change from step 9's, leaving the generation preserved and unreferenced", async () => {
@@ -1540,6 +1573,23 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
         .rejects.toThrow("release failed");
     });
 
+    it("keeps PostgreSQL selected for the real consumer and replay admission when the step-4 readback of an activated, bound generation refuses", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: async () => fakeSession({
+          observations: [{
+            destinationIdentity: fixtureDestinationIdentity("swapped"), postEpochDelta: baseline, postEpochCensus: census,
+          }],
+          source: sqliteSourceStream,
+        }),
+      }))).rejects.toMatchObject({ name: "RollbackOrchestrationError", reason: "not-eligible", message: expect.stringContaining("destination identity") });
+      expect(new MigrationManifestStore({ homeDir }).read(GEN).phase).toBe("verified");
+      expect(rollbackBinding(homeDir)).toBeUndefined();
+      // Step-4 readback abort site, generation activated and bound: the binding answers replay admission.
+      expectAbortedWindowKeepsPostgreSql(homeDir, GEN, "activated");
+    });
+
     it("converges after a crash inside the real binding writer between link and unlink: the retry through the entry reuses the binding", async () => {
       const homeDir = tempHome();
       prepareAuthoritative(homeDir);
@@ -1955,6 +2005,8 @@ it("F1: a prepared selection is refused, and left prepared, once the stores no l
         expect(outcome.manifest.phase).toBe("verified");
         expect(outcome.report).toMatchObject({ kind: "abandonment", reason: expect.stringContaining("destination identity") });
         expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-aborted");
+        // The real consumer and replay admission stay on PostgreSQL after the abandonment (recovery abort site).
+        expectAbortedWindowKeepsPostgreSql(homeDir, GEN, "activated");
       });
 
       it("leaves the effect pending and the maintenance held when the readback fails for any other reason", async () => {

@@ -1449,6 +1449,9 @@ export async function runMigrationRollback(
       : await deps.coordinator.enterMaintenance({
         publicationId,
         generationId: input.generationId,
+        // A rollback's window starts from PostgreSQL: an abort (a refused readback, an abandoned recovery)
+        // leaves PostgreSQL selected for consumers and replay admission (PR #1556 thread 4307516130).
+        sourceBackend: "postgresql",
         sourceSelectionSha256: input.sourceSelectionSha256,
         queueEvidenceSha256: input.queueEvidenceSha256,
         roster: input.roster,
