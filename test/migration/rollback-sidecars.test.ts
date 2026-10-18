@@ -23,7 +23,20 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+/** Every DatabaseSync the code under test (or this file) opens, so a leaked handle is observable (PR #1556 thread 4308518712). */
+const openedDatabases = vi.hoisted(() => [] as { isOpen: boolean }[]);
+vi.mock("node:sqlite", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:sqlite")>();
+  class TrackedDatabaseSync extends actual.DatabaseSync {
+    constructor(...args: ConstructorParameters<typeof actual.DatabaseSync>) {
+      super(...args);
+      openedDatabases.push(this);
+    }
+  }
+  return { ...actual, DatabaseSync: TrackedDatabaseSync };
+});
 import { runLcmMigrations } from "../../src/db/migration.js";
 import {
   initializePortableArchive,
@@ -195,6 +208,17 @@ describe("materializeRollbackSidecars", () => {
     } finally {
       allocator.close();
     }
+  });
+
+  it("closes every database handle it opened, including the read-only one the schema validation reads through (PR #1556 thread 4308518712)", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    const before = openedDatabases.length;
+    materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const opened = openedDatabases.slice(before);
+    // The generation itself, EventsDb's bootstrap, the raw events connection, the allocator and the validation handle.
+    expect(opened.length).toBeGreaterThanOrEqual(4);
+    expect(opened.map((db) => db.isOpen)).toEqual(opened.map(() => false));
   });
 
   it("materializes only this machine's session instructions when another machine holds the same scope hash (#1518)", () => {

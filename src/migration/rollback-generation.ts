@@ -111,6 +111,11 @@ function assertGenerationId(value: string): void {
   if (!GENERATION_ID_PATTERN.test(value)) throw new RollbackGenerationError("invalid-input", "invalid rollback generation id");
 }
 
+/** Refuses an id that could not name a rollback generation (the same pattern every path here derives from). */
+export function assertRollbackGenerationId(value: string): void {
+  assertGenerationId(value);
+}
+
 /** .lcm/migration-rollback-generations. Idempotent to ensure across many generation ids. */
 export function rollbackGenerationsRoot(homeDir: string): string {
   return join(resolve(homeDir), ".lcm", "migration-rollback-generations");

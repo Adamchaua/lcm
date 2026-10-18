@@ -530,7 +530,13 @@ export function materializeRollbackSidecars(
     }
     // The passive-events surface genuinely is an isolated sidecar file
     // (see the module doc comment), so this check is meaningful here.
-    validateSqliteSidecarSchema(new DatabaseSync(targetEventsDbPath, { readOnly: true }), "passive-events");
+    // validateSqliteSidecarSchema only reads; the handle is this function's to close (PR #1556 thread 4308518712).
+    const validation = new DatabaseSync(targetEventsDbPath, { readOnly: true });
+    try {
+      validateSqliteSidecarSchema(validation, "passive-events");
+    } finally {
+      validation.close();
+    }
   } finally {
     db.close();
   }

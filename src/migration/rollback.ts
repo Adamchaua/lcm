@@ -1903,6 +1903,7 @@ async function runPostPrepareSequence(
     const installOutcome = installRollbackGeneration({
       homeDir: input.homeDir,
       generationId: built!.generationId,
+      rollbackGenerationId: input.generationId,
       canonicalPath: input.canonicalPath,
       verifiedDatabasePath: built!.databasePath,
       syncDirectory: deps.syncDirectory,

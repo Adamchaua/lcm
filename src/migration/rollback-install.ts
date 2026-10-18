@@ -44,6 +44,18 @@
  * process. This function's own idempotence (skipping preemption when the
  * canonical path is already absent) is what makes a retry after such a
  * crash safe to call again.
+ *
+ * PR #1556 thread 4308518705. The move-aside is recorded durably BEFORE
+ * its rename, in a record keyed by the rollback's own generation id
+ * (.lcm/migration-rollback-preemptions/<rollbackGenerationId>.json), and
+ * completed in that record once the preserved file is read-only, flushed
+ * and witnessed again. A retry whose build lands in a different generation
+ * directory (every attempt's does) therefore still finds the preserved
+ * file of a crashed attempt and finishes it: a crash between the rename
+ * and the chmod no longer leaves the pre-rollback database writable,
+ * unflushed and unverified. A record that is complete leaves nothing to
+ * finish; a live canonical file beside an unfinished preserved file is a
+ * state no path here produces and refuses.
  */
 
 import { chmodSync, lstatSync, openSync, closeSync, readSync, renameSync } from "node:fs";
@@ -56,8 +68,13 @@ import {
   getExistingLcmConnection,
   invalidateLcmConnection,
 } from "../db/connection.js";
-import { syncPrivateDirectory } from "../security-files.js";
-import { rollbackGenerationPath } from "./rollback-generation.js";
+import {
+  atomicWritePrivateFileDurable,
+  ensurePrivateDirectory,
+  readBoundedRegularFileWithStat,
+  syncPrivateDirectory,
+} from "../security-files.js";
+import { assertRollbackGenerationId, rollbackGenerationPath } from "./rollback-generation.js";
 
 export type RollbackInstallErrorReason =
   | "unsafe-storage"
@@ -92,6 +109,8 @@ export interface InstallRollbackGenerationInput {
   readonly homeDir: string;
   /** The generation being installed; the preempted file is recorded beside it. */
   readonly generationId: string;
+  /** The rollback's own generation id, stable across its attempts; the move-aside record is keyed by it. */
+  readonly rollbackGenerationId: string;
   readonly canonicalPath: string;
   /** BuildRollbackGenerationOutcome's databasePath when state is "verified". */
   readonly verifiedDatabasePath: string;
@@ -104,6 +123,77 @@ export interface InstallRollbackGenerationInput {
 
 const COPY_CHUNK = 1024 * 1024;
 const OWNER_FILE_MODES = new Set([0o400, 0o500, 0o600, 0o700]);
+const MAX_ROLLBACK_PREEMPTION_RECORD_BYTES = 8192;
+
+/** The durable move-aside record: its intent (`after` null) before the rename, its completion after the witness. */
+export type RollbackPreemptionRecord = Readonly<{
+  version: 1;
+  rollbackGenerationId: string;
+  canonicalPath: string;
+  preemptedPath: string;
+  before: RollbackFileWitness;
+  after: RollbackFileWitness | null;
+}>;
+
+function rollbackPreemptionDirectory(homeDir: string): string {
+  return join(resolve(homeDir), ".lcm", "migration-rollback-preemptions");
+}
+
+/** .lcm/migration-rollback-preemptions/<rollbackGenerationId>.json. */
+export function rollbackPreemptionRecordPath(homeDir: string, rollbackGenerationId: string): string {
+  assertRollbackGenerationId(rollbackGenerationId);
+  return join(rollbackPreemptionDirectory(homeDir), rollbackGenerationId + ".json");
+}
+
+function isFileWitness(value: unknown): value is RollbackFileWitness {
+  if (typeof value !== "object" || value === null) return false;
+  const witness = value as Record<string, unknown>;
+  return typeof witness.dev === "string" && typeof witness.ino === "string" && typeof witness.mode === "number"
+    && typeof witness.size === "string" && typeof witness.sha256 === "string";
+}
+
+function writePreemptionRecord(homeDir: string, record: RollbackPreemptionRecord): void {
+  ensurePrivateDirectory(rollbackPreemptionDirectory(homeDir));
+  atomicWritePrivateFileDurable(rollbackPreemptionRecordPath(homeDir, record.rollbackGenerationId), JSON.stringify(record), {
+    maxExistingBytes: MAX_ROLLBACK_PREEMPTION_RECORD_BYTES,
+  });
+}
+
+/** @internal Exported for direct unit testing only; not part of the module's public surface. */
+export function readRollbackPreemptionRecord(homeDir: string, rollbackGenerationId: string): RollbackPreemptionRecord | null {
+  const path = rollbackPreemptionRecordPath(homeDir, rollbackGenerationId);
+  let content: string;
+  try {
+    content = Buffer.from(readBoundedRegularFileWithStat(path, {
+      allowedRoot: rollbackPreemptionDirectory(homeDir),
+      maxBytes: MAX_ROLLBACK_PREEMPTION_RECORD_BYTES,
+      allowedModes: [0o600],
+      requireSingleLink: true,
+    }).content).toString("utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new RollbackInstallError("unsafe-storage", "the move-aside record could not be read", { cause: error });
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    throw new RollbackInstallError("unsafe-storage", "the move-aside record is malformed", { cause: error });
+  }
+  const record = parsed as Record<string, unknown>;
+  if (
+    typeof parsed !== "object" || parsed === null
+    || record.version !== 1
+    || record.rollbackGenerationId !== rollbackGenerationId
+    || typeof record.canonicalPath !== "string"
+    || typeof record.preemptedPath !== "string"
+    || !isFileWitness(record.before)
+    || !(record.after === null || isFileWitness(record.after))
+  ) {
+    throw new RollbackInstallError("unsafe-storage", "the move-aside record is malformed");
+  }
+  return parsed as RollbackPreemptionRecord;
+}
 
 function releasePooledCanonicalConnection(canonicalPath: string): void {
   const db = getExistingLcmConnection(canonicalPath);
@@ -209,13 +299,28 @@ function syncRenamedDirectories(sync: (path: string) => void, fromDir: string, t
  * Moves the live canonical database aside (if one exists) and installs
  * the verified generation in its place. Idempotent across a crash: if the
  * canonical path is already absent (a prior attempt already moved it
- * aside but crashed before installing), this skips straight to install.
+ * aside but crashed before installing), this first finishes that attempt's
+ * move-aside from its durable record when it is unfinished, then skips
+ * straight to install.
  */
 export function installRollbackGeneration(
   input: InstallRollbackGenerationInput,
 ): RollbackInstallOutcome {
   const canonicalPath = resolve(input.canonicalPath);
   const syncDirectory = input.syncDirectory ?? ((path: string) => syncPrivateDirectory(path));
+  /** Makes the preserved file read-only, flushes both directories, witnesses it again and completes the record. */
+  const finishPreemption = (record: RollbackPreemptionRecord): NonNullable<RollbackInstallOutcome["preempted"]> => {
+    // The preserved file is made read-only before the directories are flushed, so the flush covers its mode too (F14).
+    chmodSync(record.preemptedPath, 0o400);
+    // Both directories changed (the entry left one and entered the other): flush them before anything else.
+    syncRenamedDirectories(syncDirectory, dirname(record.canonicalPath), dirname(record.preemptedPath));
+    const after = witnessFile(record.preemptedPath);
+    if (record.before.sha256 !== after.sha256 || record.before.size !== after.size) {
+      throw new RollbackInstallError("move-aside-content-changed", "canonical database bytes changed across the move-aside rename");
+    }
+    writePreemptionRecord(input.homeDir, { ...record, after });
+    return { path: record.preemptedPath, before: record.before, after };
+  };
   try {
     releasePooledCanonicalConnection(canonicalPath);
   } catch (error) {
@@ -224,22 +329,33 @@ export function installRollbackGeneration(
 
   let preempted: RollbackInstallOutcome["preempted"] = null;
   const liveExists = checkCanonicalLiveExists(canonicalPath);
+  const record = readRollbackPreemptionRecord(input.homeDir, input.rollbackGenerationId);
 
   if (liveExists) {
+    if (record !== null && record.after === null && existsSync(record.preemptedPath)) {
+      throw new RollbackInstallError("unsafe-storage", "a live canonical database and an unfinished preserved database both exist");
+    }
     checkpointAndConvertToDelete(canonicalPath);
     assertNoWalSiblings(canonicalPath);
     const before = witnessFile(canonicalPath);
     const preemptedPath = join(rollbackGenerationPath(input.homeDir, input.generationId), "preempted-canonical.sqlite");
+    const intent: RollbackPreemptionRecord = {
+      version: 1, rollbackGenerationId: input.rollbackGenerationId, canonicalPath, preemptedPath, before, after: null,
+    };
+    // The intent is durable before the rename, so a crash anywhere after it is finished by the retry below.
+    writePreemptionRecord(input.homeDir, intent);
     renameSync(canonicalPath, preemptedPath);
-    // The preserved file is made read-only before the directories are flushed, so the flush covers its mode too (F14).
-    chmodSync(preemptedPath, 0o400);
-    // Both directories changed (the entry left one and entered the other): flush them before anything else.
-    syncRenamedDirectories(syncDirectory, dirname(canonicalPath), dirname(preemptedPath));
-    const after = witnessFile(preemptedPath);
-    if (before.sha256 !== after.sha256 || before.size !== after.size) {
-      throw new RollbackInstallError("move-aside-content-changed", "canonical database bytes changed across the move-aside rename");
+    preempted = finishPreemption(intent);
+  } else if (record !== null && record.after === null) {
+    // A prior attempt crashed between its rename and its completion: the canonical file is gone and the record is
+    // its only account. The preserved file must be where the record says; its absence as well means the rename
+    // never became durable and something else removed the canonical file, which nothing here can repair.
+    if (record.canonicalPath !== canonicalPath || !existsSync(record.preemptedPath)) {
+      throw new RollbackInstallError("unsafe-storage", "the canonical database is absent and its unfinished move-aside record does not account for it");
     }
-    preempted = { path: preemptedPath, before, after };
+    preempted = finishPreemption(record);
+  } else if (record !== null && record.after !== null) {
+    preempted = { path: record.preemptedPath, before: record.before, after: record.after };
   }
 
   renameSync(input.verifiedDatabasePath, canonicalPath);
