@@ -211,9 +211,13 @@ A refusal after rollback has entered its maintenance window (the readback's
 eligibility check, or an abandoned recovery of a pending selection) closes
 that window as aborted, and an aborted rollback window leaves PostgreSQL
 selected: the maintenance journal records the backend the window was entered
-from, so consumers keep opening PostgreSQL and a replayed abort is admitted on
-PostgreSQL. Only an aborted activation window selects SQLite, because that is
-the backend it was entered from.
+from, so consumers keep opening PostgreSQL. Replay admission keeps resolving
+PostgreSQL as well: for a generation with its activation binding, the binding
+answers PostgreSQL for the activation evidence and refuses the abort evidence
+(bindings decide before the maintenance journal); only when no binding decides
+is the abort evidence itself admitted, on PostgreSQL. Neither path ever answers
+SQLite. Only an aborted activation window selects SQLite, because that is the
+backend it was entered from.
 
 ## The maintenance window scales with data size
 

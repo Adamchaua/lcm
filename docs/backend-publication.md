@@ -181,8 +181,10 @@ compare-and-swap; completion is reserved for a caller that has authoritative
 terminal readback. A source-preserving abort verifies the original selection
 evidence and never invokes the version-2 target config/map restoration path.
 
-After `maintenance-aborted`, normal configuration loading resumes for SQLite,
-including installations whose configuration file is absent. After
+After `maintenance-aborted`, normal configuration loading resumes for the
+source backend the journal recorded when the window was entered: SQLite for an
+activation's window, including installations whose configuration file is
+absent, and PostgreSQL for a rollback's. After
 `selection-completed`, it resumes for the target backend recorded in the
 journal. Entering, held, and prepared maintenance continue to block normal
 configuration reads. A terminal journal for a different backend is also refused.
@@ -275,8 +277,10 @@ pre-journal directory state, does not block durable local enqueue. Existing
 journals must still have an authenticated supported shape; malformed or unknown
 versions and unsafe paths refuse. Consumer operations remain fenced until their
 own authoritative terminal readback.
-After an authenticated abort, SQLite consumer admission resumes. After selected-
-generation completion, only the recorded target backend is admitted.
+After an authenticated abort, consumer admission resumes for the journal's
+recorded source backend (SQLite for an activation's window, PostgreSQL for a
+rollback's). After selected-generation completion, only the recorded target
+backend is admitted.
 
 A daemon that is already running authenticates its startup backend once and
 keeps it for its whole lifetime. Changing the configured backend underneath it

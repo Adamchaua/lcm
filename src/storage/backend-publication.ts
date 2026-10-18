@@ -3779,6 +3779,7 @@ export class BackendPublicationCoordinator {
         || !PUBLICATION_ID_PATTERN.test(input.generationId)
         || !HASH_PATTERN.test(input.sourceSelectionSha256)
         || !HASH_PATTERN.test(input.queueEvidenceSha256)
+        || (input.sourceBackend !== undefined && input.sourceBackend !== "sqlite" && input.sourceBackend !== "postgresql")
         || (input.now !== undefined && !Number.isFinite(input.now.getTime()))
       ) {
         return fail("invalid-input", "backend maintenance input is malformed");

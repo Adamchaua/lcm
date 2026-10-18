@@ -1264,6 +1264,7 @@ function maintenanceAlreadyHeldForThisAttempt(
   attempt: Readonly<{
     publicationId: string;
     generationId: string;
+    sourceBackend: StorageBackendName;
     sourceSelectionSha256: string;
     queueEvidenceSha256: string;
     roster: readonly BackendMaintenanceRosterEntry[];
@@ -1272,6 +1273,7 @@ function maintenanceAlreadyHeldForThisAttempt(
   if (existing === null || existing.phase !== "maintenance-held") return false;
   return existing.publicationId === attempt.publicationId
     && existing.generationId === attempt.generationId
+    && existing.sourceBackend === attempt.sourceBackend
     && existing.sourceSelectionSha256 === attempt.sourceSelectionSha256
     && existing.queueEvidenceSha256 === attempt.queueEvidenceSha256
     && sameMaintenanceRoster(existing.roster, attempt.roster);
@@ -1441,6 +1443,7 @@ export async function runMigrationRollback(
     const maintenanceJournal = maintenanceAlreadyHeldForThisAttempt(existingMaintenance, {
       publicationId,
       generationId: input.generationId,
+      sourceBackend: "postgresql",
       sourceSelectionSha256: input.sourceSelectionSha256,
       queueEvidenceSha256: input.queueEvidenceSha256,
       roster: input.roster,
@@ -1577,9 +1580,12 @@ const ROLLBACK_GENERATION_BUILD_BASE_DIGEST_LENGTH = 32;
  * The base a post-write rollback's generation ids are derived from (`<base>-rb<revision>-<ordinal>`). A generation
  * id may itself be the full 128 characters the stores allow, so appending the suffix verbatim could exceed the
  * limit the builder enforces and fail every build. A base within the budget is used unchanged; a longer one is
- * bounded deterministically to its leading characters plus a 128-bit digest of the whole id, which keeps distinct
- * bases distinct, stays within the generation-id character set, and lets a retry after a crash find the earlier
- * attempts of the same base.
+ * bounded deterministically to its leading characters plus a 128-bit digest of the whole id, which stays within
+ * the generation-id character set and lets a retry after a crash find the earlier attempts of the same base.
+ * The bounding is not injective: its 92-character output is itself a legal base that is used unchanged, so a
+ * crafted id equal to another id's bounded form shares that id's build prefix and ordinal space. The builder
+ * refuses an existing directory (generation-exists) rather than adopting or overwriting it, so such an alias
+ * fails closed.
  */
 /** @internal Exported for direct unit testing only; not part of the module's public surface. */
 export function rollbackGenerationBuildBase(baseGenerationId: string): string {

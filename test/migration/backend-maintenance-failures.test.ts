@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -211,6 +211,14 @@ describe("backend maintenance v3 failure boundaries", () => {
   it.each(["sqlite", "postgresql"] as const)("reads a stored %s source backend (PR #1556 thread 4307516130)", async (sourceBackend) => {
     const value = await held(); rewrite(value.home, { sourceBackend });
     expect(value.coordinator.inspectMaintenance()).toMatchObject({ phase: "maintenance-held", sourceBackend });
+  });
+  it.each(["redis", "", null, 1])("refuses an entering source backend %j before any durable write (E12)", async (sourceBackend) => {
+    const value = fixture();
+    await expect(value.coordinator.enterMaintenance({ ...input(), sourceBackend } as unknown as EnterBackendMaintenanceInput))
+      .rejects.toMatchObject({ reason: "invalid-input" });
+    expect(existsSync(backendPublicationJournalPath(value.home))).toBe(false);
+    expect(value.coordinator.inspectMaintenance()).toBeNull();
+    await expect(value.coordinator.enterMaintenance(input())).resolves.toMatchObject({ phase: "maintenance-held", sourceBackend: "sqlite" });
   });
   it.each([
     [{ targetBackend: "sqlite" }, "held backend maintenance"],

@@ -39,6 +39,7 @@ import { canonicalSha256, PORTABLE_RECORD_SCHEMA_SHA256 } from "../../src/storag
 import {
   BackendPublicationCoordinator,
   assertBackendPublicationConsumerAccess,
+  backendPublicationCanonicalSha256,
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
   withBackendPublicationConsumerLockAsync,
@@ -850,7 +851,7 @@ it("refuses a generation that was never activated before any durable change (an 
     const publicationId = deriveRollbackPublicationId("gen-resume-2-7");
     await coordinator.enterMaintenance({
       publicationId, generationId: "gen-resume-2-7",
-      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+      sourceBackend: "postgresql", sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
       now: new Date(capturedAt),
     });
     writeRollbackAuthorityArtifact(homeDir, activation.artifact());
@@ -886,7 +887,7 @@ it("refuses a generation that was never activated before any durable change (an 
     const publicationId = deriveRollbackPublicationId("gen-resume-7-8");
     await coordinator.enterMaintenance({
       publicationId, generationId: "gen-resume-7-8",
-      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
+      sourceBackend: "postgresql", sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64), roster: ROSTER,
       now: new Date(capturedAt),
     });
     writeRollbackAuthorityArtifact(homeDir, activation.artifact());
@@ -1588,6 +1589,28 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       expect(rollbackBinding(homeDir)).toBeUndefined();
       // Step-4 readback abort site, generation activated and bound: the binding answers replay admission.
       expectAbortedWindowKeepsPostgreSql(homeDir, GEN, "activated");
+    });
+
+    it("does not adopt a held window of this attempt whose recorded source backend is not PostgreSQL (E14)", async () => {
+      const homeDir = tempHome();
+      prepareAuthoritative(homeDir);
+      // A prior attempt of this very rollback entered maintenance and died before opening its session.
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir, {
+        openFencedSession: async () => { throw new Error("simulated crash right after enterMaintenance"); },
+      }))).rejects.toThrow("simulated crash right after enterMaintenance");
+      const held = readBackendMaintenanceJournal(homeDir)!;
+      expect(held).toMatchObject({ phase: "maintenance-held", sourceBackend: "postgresql" });
+      // Every field this attempt supplies matches, except the window was entered from SQLite.
+      const journalPath = backendPublicationJournalPath(homeDir);
+      const { checksumSha256: _checksum, ...body } = JSON.parse(readFileSync(journalPath, "utf8")) as Record<string, unknown>;
+      const foreign = { ...body, sourceBackend: "sqlite" };
+      writeFileSync(journalPath, JSON.stringify({ ...foreign, checksumSha256: backendPublicationCanonicalSha256(foreign) }), { mode: 0o600 });
+      const bytes = readFileSync(journalPath);
+
+      await expect(runRollback(RUN(homeDir), depsFor(homeDir)))
+        .rejects.toMatchObject({ reason: "unresolved-publication", message: expect.stringContaining("already exists") });
+      expect(readFileSync(journalPath)).toEqual(bytes);
+      expect(new MigrationManifestStore({ homeDir }).read(GEN).phase).toBe("verified");
     });
 
     it("converges after a crash inside the real binding writer between link and unlink: the retry through the entry reuses the binding", async () => {
@@ -2776,7 +2799,7 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
     const coordinator = coordinatorFor(homeDir);
     await coordinator.enterMaintenance({
       publicationId: deriveRollbackPublicationId("gen-roster"), generationId: "gen-roster",
-      sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64),
+      sourceBackend: "postgresql", sourceSelectionSha256: "5".repeat(64), queueEvidenceSha256: "6".repeat(64),
       roster: rosterOf(MACHINE_ID, second), now: new Date(capturedAt),
     });
     writeRollbackAuthorityArtifact(homeDir, {
