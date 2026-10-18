@@ -488,7 +488,8 @@ export type RollbackRecoveryAdmissionResult = Readonly<{
  *
  * Every other journal, including a freshly held maintenance (which has the strict first-open path), is refused.
  * The lease tuple (project, machine, publicationId, target, evidence) is matched by the lease acquisition that
- * follows. The check proves no more about local writers than the retained barrier does; the guarded PostgreSQL
+ * precedes this check (openRollbackFencedSession acquires first and keeps the lease if the check refuses). The
+ * check proves no more about local writers than the retained barrier does; the guarded PostgreSQL
  * writers are barred by the lease row itself (acquirePostgreSqlProjectMutationGuard refuses while an unreleased
  * lease exists).
  */

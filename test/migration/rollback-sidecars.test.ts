@@ -644,7 +644,7 @@ describe("verifyPassiveEventsAgainstArchive", () => {
     }
   });
 
-+  it("F12: an archived applied event the replication worker already acknowledged materializes, stays acknowledged and is not replayed, beside pending-only extras", () => {
+  it("F12: an archived applied event the replication worker already acknowledged materializes, stays acknowledged and is not replayed, beside pending-only extras", () => {
     const homeDir = tempHome();
     const { path, passiveEventRecords } = seedGeneration();
     const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
