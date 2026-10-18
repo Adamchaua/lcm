@@ -283,9 +283,9 @@ function rolledBackWithoutPendingEffect(homeDir: string, generationId: string): 
  * which backend it selects. Decided from durable authority in this order (plan-v3.2 A15): a live
  * non-terminal maintenance of the generation refuses; the generation's selection bindings decide (the
  * last by manifest revision: activation selects postgresql, rollback selects sqlite); with no selection
- * recorded, a migration manifest at rolled-back with no pending effect selects sqlite (the manifest is the
- * rollback's last durable record); the generation's own terminal maintenance
- * journal, if the coordinator has not yet archived it, decides as before; everything else refuses.
+ * recorded, a migration manifest at rolled-back refuses (no supported path leaves one without its selection
+ * binding, and the replayed evidence could not be compared to anything); the generation's own terminal
+ * maintenance journal, if the coordinator has not yet archived it, decides as before; everything else refuses.
  * Unresolvable bindings and an unreadable manifest refuse. Between the coordinator's archival of the
  * maintenance journal and the manifest's completion, admission refuses until the resume completes.
  */
@@ -325,10 +325,16 @@ export function assertMigrationReplayAdmission(input: Readonly<{
     }
     return { backend: last.kind === "activation" ? "postgresql" : "sqlite", disposition: "selected" };
   }
-  // 3. No selection binding is readable: a rolled-back manifest is still the rollback's last durable record, which
-  // the coordinator never archives.
+  // 3. No selection binding is readable although the manifest is rolled back. The rollback records its selection
+  // binding before its publication is prepared and before the manifest completes, and a generation that never
+  // activated is refused before anything is written, so no supported path produces this state; admitting it would
+  // route on evidence nothing here can be compared to. It refuses; re-running the rollback restores the binding
+  // from the rollback report (recoverRolledBackAuthority), after which the binding decides as in step 2.
   if (rolledBackWithoutPendingEffect(input.homeDir, input.generationId)) {
-    return { backend: "sqlite", disposition: "selected" };
+    throw new BackendPublicationJournalError(
+      "unexpected-state",
+      "migration manifest is rolled back but records no selection binding; re-run the rollback to restore it",
+    );
   }
   // 4. The terminal maintenance journal of this generation, not yet archived.
   const journalForGeneration = live;

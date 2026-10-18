@@ -163,12 +163,16 @@ describe("assertMigrationReplayAdmission routes from durable authority (A15)", (
     expect(replay(homeDir, HASH_A)).toEqual({ backend: "postgresql", disposition: "selected" });
   });
 
-  it("admits an unactivated rollback as sqlite from its manifest at rolled-back, with no selection binding", async () => {
+  it("refuses a rolled-back manifest with no selection binding (no supported path produces one; the rollback re-run restores the binding)", async () => {
     const homeDir = home();
     manifestRolledBack(homeDir);
     await selectBackend(homeDir, "sqlite", HASH_B);
     await archiveMaintenanceJournal(homeDir);
-    expect(replay(homeDir, HASH_B)).toEqual({ backend: "sqlite", disposition: "selected" });
+    for (const evidence of [HASH_B, HASH_A]) {
+      expect(() => replay(homeDir, evidence)).toThrow(expect.objectContaining({
+        reason: "unexpected-state", message: expect.stringContaining("records no selection binding"),
+      }));
+    }
   });
 
   it("refuses between archival and manifest completion: a pending publish effect is not rolled-back", async () => {
