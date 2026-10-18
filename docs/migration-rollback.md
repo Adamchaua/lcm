@@ -97,8 +97,9 @@ unreadable, rollback refuses.
 A rollback can be interrupted at any point -- before entering maintenance,
 while maintenance is held, mid-build, or after the destination selection has
 already flipped but before the run finished recording that fact. Every one of
-those windows resumes to exactly one authoritative outcome; none of them can
-strand a generation in a state that a retry cannot resolve.
+those windows resumes to exactly one authoritative outcome, and a retry
+resolves every one of them except the single case described under "A prepared
+selection that drifted" below.
 
 On a post-write rollback specifically, a retry after a crash **never
 resumes copying into the same partial generation**. It builds a brand-new
@@ -125,6 +126,28 @@ automatically; there is nothing an operator needs to do to make a stalled
 rollback resumable, other than removing whatever caused the crash (an
 unreachable PostgreSQL host, a permissions problem, and so on) and running it
 again.
+
+### A prepared selection that drifted
+
+One window does not resolve by retry. If the run died after the maintenance
+selection was *prepared* but before it was *completed*, and PostgreSQL was then
+written to by something that bypassed the publication guard (the rollback's
+lease is still held, so an ordinary guarded writer is refused), the retry
+re-reads the destination under a fresh fence and finds that it no longer
+reproduces the evidence the prepared selection was authorized on. Completing
+that selection would publish a stale decision, so the retry refuses with
+`drift` ("the destination no longer reproduces the pending publish-rollback's
+terminal evidence; the prepared selection is not completed") and changes
+nothing: the maintenance journal stays at `selection-prepared`, the effect
+stays pending, the lease stays held, PostgreSQL stays authoritative and the
+out-of-band data is preserved. Every further retry refuses the same way,
+because the coordinator has no abort from `selection-prepared` (tracked as
+#1529).
+
+What the operator sees is that same `drift` refusal on every run. Do not
+force a re-selection or edit the journal: investigate the write that got past
+the fence, and treat the installation as PostgreSQL-authoritative until #1529
+provides the authenticated abort that returns it to a resumable state.
 
 ## Operator-owned cleanup of quarantined and incomplete generations
 
@@ -169,6 +192,7 @@ to check.
 | `multiple-remote-projects`, `covered-project-mismatch` | The project map binds another project to PostgreSQL. | See "Only one project may be remotely bound". |
 | "actively held by a different publication generation" | The activation's fence on the PostgreSQL project is still held, so a rollback cannot take it over. | Wait for the holder to finish or its lease to expire; rollback does not break a live lease. |
 | Drift: the destination changed between the export and the final check, or the rollback mode changed | PostgreSQL was written to while rollback was building, so the generation it built no longer matches. | Nothing was installed or selected. Run the rollback again. |
+| Drift on a retry: "the destination no longer reproduces the pending publish-rollback's terminal evidence; the prepared selection is not completed" | A prepared selection's destination was written to out of band before the retry (see "A prepared selection that drifted"). | The selection stays prepared and nothing is changed; a retry refuses again until #1529 lands. Manual investigation; do not force a re-selection. |
 
 A production rollback ends with one of seven reasons: `not-eligible`,
 `unresolvable`, `lease-lost`, `quiescence-unsatisfied`, `drift`,

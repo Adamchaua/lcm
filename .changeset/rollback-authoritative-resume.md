@@ -20,6 +20,8 @@ to PostgreSQL by hand (restore the configuration, or leave it with
 after the selection flips and during the coordinator publication: a retry never guesses which
 outcome already happened, an interrupted build never reuses a
 partial generation, and an incomplete or failed attempt is kept as
-evidence rather than deleted. There is no operator-facing command
+evidence rather than deleted. The one exception is a prepared selection whose
+PostgreSQL destination was written out of band before the retry: it refuses
+fail-closed on every retry until #1529 adds an abort from that state. There is no operator-facing command
 for this yet; it ships as an internal capability that a future
 release will expose.
