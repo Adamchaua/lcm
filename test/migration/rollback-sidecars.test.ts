@@ -682,12 +682,13 @@ describe("verifyPassiveEventsAgainstArchive", () => {
       // Acknowledged by the replication worker, with no processed_at of its own: only the delivery state says applied.
       local.exec(
         `UPDATE events SET processed_at = NULL, delivery_state = 'acknowledged', remote_inbox_id = '1',
-           acknowledged_at = '2026-01-03T00:00:00.000000Z' WHERE event_uuid = '\${applied.value.eventId}'`,
+           acknowledged_at = '2026-01-03T00:00:00.000000Z' WHERE event_uuid = '${applied.value.eventId}'`,
       );
     } finally {
       local.close();
     }
     const before = readEventRow(first.eventsDbPath, applied.value.eventId);
+    expect(before).toMatchObject({ delivery_state: "acknowledged", processed_at: null });
     const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
     expect(outcome.passiveEventsMaterialized).toBe(0);
     expect(readEventRow(outcome.eventsDbPath, applied.value.eventId)).toEqual(before);
