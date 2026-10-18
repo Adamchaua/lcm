@@ -721,6 +721,35 @@ describe("lease renewal during long fenced reads", () => {
     await session.release();
   });
 
+  it("a read started after the caller already aborted sees an aborted signal from the start", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const h = harness();
+    const session = await openPooled(h, { ...openInput, signal: controller.signal });
+    controller.abort(new Error("caller aborted before the read"));
+    const census = pendingCensus(h);
+    const capture = session.captureReadback({ canonicalDeltaBaseline: fixtureCanonicalDelta("x") });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(census.signal()?.aborted).toBe(true);
+    census.finish();
+    await capture;
+    await session.release();
+  });
+
+  it("closeKeepingLease() reports a renewal failure recorded by a keeper of a stream that was never closed", async () => {
+    vi.useFakeTimers();
+    const lease = statefulGuard();
+    const h = harness({ guard: lease.guard });
+    const session = await openPooled(h);
+    await session.openPortableSource();
+    lease.state.row = { ...lease.state.row!, releasedAt: "released elsewhere" };
+    await vi.advanceTimersByTimeAsync(ROLLBACK_LEASE_RENEWAL_INTERVAL_MS);
+    await expect(session.closeKeepingLease()).rejects.toMatchObject({ reason: "lease-lost" });
+    // The snapshot and runtime were still closed.
+    expect(h.snapshots[0]!.close).toHaveBeenCalledTimes(1);
+    expect(h.runtime.close).toHaveBeenCalledTimes(1);
+  });
+
   it("does not overlap renewals: a renewal still waiting (one-connection pool) is awaited at the end of the scan, not duplicated", async () => {
     vi.useFakeTimers();
     const lease = statefulGuard();
