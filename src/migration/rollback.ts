@@ -69,11 +69,13 @@ import {
 } from "../security-files.js";
 import { parseDaemonConfig, resolveDaemonConfigEnv, type ResolvedStorageConfig } from "../daemon/config.js";
 import { canonicalJson, canonicalSha256, sha256 } from "../storage/portable-record.js";
+import { lcmHomeDir } from "../runtime-paths.js";
 import type { PortableRecordStream } from "../storage/portable-record-stream.js";
 import type { PortableProjectIdentity } from "../storage/portable-record-stream.js";
 import {
   BackendPublicationJournalError,
   backendPublicationCanonicalSha256,
+  captureBackendPublicationFileWitness,
   captureBackendPublicationState,
   readAuthenticatedBackendPublicationMaterial,
   readBackendMaintenanceJournal,
@@ -83,10 +85,10 @@ import {
   withBackendPublicationAppendBarrierAsync,
   BackendPublicationCoordinator,
   type BackendPublicationJournal,
+  type BackendPublicationFileWitness,
   type BackendPublicationLockToken,
   type BackendPublicationPhase,
   type BackendPublicationRecoveryFile,
-  type BackendPublicationRecoveryMaterial,
   type BackendMaintenanceRosterEntry,
   type BackendMaintenanceJournal,
 } from "../storage/backend-publication.js";
@@ -1000,36 +1002,70 @@ function isAbortedUnsealedJournal(journal: BackendPublicationJournal): boolean {
   return journal.phase === "aborted" && journal.recoveryReference === null;
 }
 
+/** The decoded pre-rollback source files of this rollback's own publication. */
+type OwnPublicationSourceFiles = Readonly<{ config: string; projectMap: string }>;
+
+/**
+ * E6. The source files of this rollback's own publication still at preparing without a reference. The coordinator
+ * observed the live configuration and project map when it wrote that journal (sourceState) and has mutated neither
+ * since, so the live files are the source -- read privately (the ordinary readers refuse any in-flight publication)
+ * and accepted only byte-for-byte as the journal witnessed them.
+ */
+function readUnsealedPreparingSource(homeDir: string, journal: BackendPublicationJournal): OwnPublicationSourceFiles {
+  const root = lcmHomeDir(homeDir);
+  const read = (name: string, expected: BackendPublicationFileWitness, field: string): string => {
+    const observed = captureBackendPublicationFileWitness(join(root, name), root);
+    if (
+      observed.content === null
+      || expected.presence !== "present"
+      || observed.witness.rawSha256 !== expected.rawSha256
+      || observed.witness.byteLength !== expected.byteLength
+    ) {
+      throw new RollbackOrchestrationError(
+        "unexpected-state",
+        "the live " + field + " is not the one the rollback's unsealed publication observed as its source",
+      );
+    }
+    return observed.content;
+  };
+  return {
+    config: read("config.json", journal.sourceState.config, "configuration"),
+    projectMap: read("map.json", journal.sourceState.projectMap, "project map"),
+  };
+}
+
 /**
  * The configuration and project map as they were before this rollback's own publication, read from the
  * authenticated recovery material that publication sealed; null when no publication of this rollback is in the
  * live slot (or it was aborted, which restored the files). Once the publication has begun the live files and the
  * consumer reads are the rollback's in-flight state -- the config selects sqlite, the project is unbound, and the
  * consumer read refuses an unresolved publication -- so every re-run reads its inputs from this sealed source.
- * A journal still at preparing without a reference (E6) has published nothing, so it reads as no source either.
+ * A journal still at preparing without a reference (E6) has sealed nothing yet and published nothing: its source
+ * is read from the live files, matched against the witnesses that journal recorded.
  */
-function readOwnPublicationMaterial(homeDir: string, publicationId: string, localProjectId: string): BackendPublicationRecoveryMaterial | null {
+function readOwnPublicationSourceFiles(homeDir: string, publicationId: string, localProjectId: string): OwnPublicationSourceFiles | null {
   // While maintenance holds the live slot no publication journal is readable, and none of this rollback's exists.
   if (readBackendMaintenanceJournal(homeDir) !== null) return null;
   const journal = readBackendPublicationJournal(homeDir);
   if (journal === null || journal.publicationId !== publicationId || journal.phase === "aborted") return null;
-  if (isOwnUnsealedPreparingJournal(journal, publicationId, localProjectId)) return null;
-  return readAuthenticatedBackendPublicationMaterial(journal, homeDir);
+  if (isOwnUnsealedPreparingJournal(journal, publicationId, localProjectId)) return readUnsealedPreparingSource(homeDir, journal);
+  const material = readAuthenticatedBackendPublicationMaterial(journal, homeDir);
+  return { config: decodeRecoveryFile(material.source.config), projectMap: decodeRecoveryFile(material.source.projectMap) };
 }
 
 /** The sealed pre-rollback project map of the rollback's own publication, or null when it is not in the live slot. */
 function readOwnPublicationProjectMap(homeDir: string, publicationId: string, localProjectId: string): ProjectMap | null {
-  const material = readOwnPublicationMaterial(homeDir, publicationId, localProjectId);
-  return material === null ? null : parseProjectMap(decodeRecoveryFile(material.source.projectMap));
+  const source = readOwnPublicationSourceFiles(homeDir, publicationId, localProjectId);
+  return source === null ? null : parseProjectMap(source.projectMap);
 }
 
 /** The sealed pre-rollback configuration and project map of the rollback's own publication, or null. */
 export function readOwnPublicationSourceFromMaterial(homeDir: string, publicationId: string, localProjectId: string): OwnPublicationSource | null {
-  const material = readOwnPublicationMaterial(homeDir, publicationId, localProjectId);
-  if (material === null) return null;
+  const source = readOwnPublicationSourceFiles(homeDir, publicationId, localProjectId);
+  if (source === null) return null;
   return {
-    storage: parseDaemonConfig(decodeRecoveryFile(material.source.config), undefined, resolveDaemonConfigEnv()).storage,
-    projectMap: parseProjectMap(decodeRecoveryFile(material.source.projectMap)),
+    storage: parseDaemonConfig(source.config, undefined, resolveDaemonConfigEnv()).storage,
+    projectMap: parseProjectMap(source.projectMap),
   };
 }
 

@@ -9,7 +9,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BackendPublicationCoordinator,
   backendPublicationCanonicalSha256,
@@ -125,6 +125,11 @@ const baselineCensus = buildMigrationCensusVector(census);
 
 function setup() {
   const homeDir = tempHome();
+  // The live files the rollback's publication observes as its source (the fixture driver witnesses these bytes).
+  const sourceFiles = rollbackPublicationMaterial().source;
+  for (const [name, file] of [["config.json", sourceFiles.config], ["map.json", sourceFiles.projectMap]] as const) {
+    if (file.presence === "present") writeFileSync(join(homeDir, ".lcm", name), file.content, { mode: 0o600 });
+  }
   const lease = leaseStandIn();
   let observed = census;
   const target: RollbackSessionTarget = {
@@ -464,6 +469,19 @@ describe("recovery across the coordinator's lease handoff (E1): one lease row sh
  * whose original lease the coordinator adopts and releases exactly once.
  */
 describe("recovery of a publication crashed while preparing (E6): unsealed journal, material absent or sealed", () => {
+  beforeEach(() => {
+    vi.stubEnv("LCM_POSTGRES_URL", "postgresql://user:secret@example/db");
+    const caFile = join(tempHome(), "ca.pem");
+    writeFileSync(caFile, "-----BEGIN CERTIFICATE-----\n", { mode: 0o600 });
+    vi.stubEnv("LCM_POSTGRES_CA_FILE", caFile);
+    vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE", "lcm_owner");
+  });
+  afterEach(() => { vi.unstubAllEnvs(); });
+  const expectLiveSource = (t: ReturnType<typeof setup>) => {
+    expect(readOwnPublicationSourceFromMaterial(t.homeDir, PUBLICATION_ID, LOCAL)).toMatchObject({
+      storage: { backend: "postgresql" }, projectMap: { [LOCAL]: { remoteProjectId: REMOTE } },
+    });
+  };
   const releases = (t: ReturnType<typeof setup>) => t.lease.calls.filter((call) => call === "release").length;
   const acquires = (t: ReturnType<typeof setup>) => t.lease.calls.filter((call) => call === "acquire").length;
   const counting = (coordinator: BackendPublicationCoordinator) => {
@@ -493,8 +511,9 @@ describe("recovery of a publication crashed while preparing (E6): unsealed journ
     expect(readBackendPublicationJournal(t.homeDir)).toMatchObject({ phase: "preparing", publicationId: PUBLICATION_ID, recoveryReference: null });
     expect(t.pending()?.kind).toBe("publish-rollback");
     expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: null });
-    // The production input resolver reads this journal too: it must not refuse, and it must read the live files.
-    expect(readOwnPublicationSourceFromMaterial(t.homeDir, PUBLICATION_ID, LOCAL)).toBeNull();
+    // The production input resolver reads this journal too: it must not refuse, and it reads the live files the
+    // journal witnessed (nothing was published from it).
+    expectLiveSource(t);
 
     const { coordinator, counts } = counting(t.sharedLeaseCoordinator());
     const outcome = await runMigrationRollback(t.input, t.dependencies(coordinator));
@@ -540,7 +559,7 @@ describe("recovery of a publication crashed while preparing (E6): unsealed journ
   it("the input reader recognizes only this rollback's own unsealed composition and still refuses any other unreferenced journal", async () => {
     const t = setup();
     await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("after-material-seal")))).rejects.toThrow("crash at after-material-seal");
-    expect(readOwnPublicationSourceFromMaterial(t.homeDir, PUBLICATION_ID, LOCAL)).toBeNull();
+    expectLiveSource(t);
     // Same journal, another covered project: not this rollback's composition, so the authenticated reader decides.
     expect(() => readOwnPublicationSourceFromMaterial(t.homeDir, PUBLICATION_ID, "d".repeat(64)))
       .toThrow(expect.objectContaining({ reason: "publication-evidence-missing" }));
@@ -552,6 +571,21 @@ describe("recovery of a publication crashed while preparing (E6): unsealed journ
     writeFileSync(journalPath, JSON.stringify({ ...body, checksumSha256: backendPublicationCanonicalSha256(body) }));
     expect(() => readOwnPublicationSourceFromMaterial(t.homeDir, PUBLICATION_ID, LOCAL))
       .toThrow(expect.objectContaining({ reason: "publication-evidence-missing" }));
+  });
+
+  it("refuses live files that no longer match what the unsealed journal witnessed, keeping everything as it is", async () => {
+    const t = setup();
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("before-material-seal")))).rejects.toThrow("crash at before-material-seal");
+    writeFileSync(join(t.homeDir, ".lcm", "map.json"), JSON.stringify({ [LOCAL]: { canonical: "/elsewhere", aliases: [], remoteProjectId: REMOTE } }), { mode: 0o600 });
+
+    expect(() => readOwnPublicationSourceFromMaterial(t.homeDir, PUBLICATION_ID, LOCAL))
+      .toThrow(expect.objectContaining({ reason: "unexpected-state", message: expect.stringContaining("live project map is not the one") }));
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator())))
+      .rejects.toMatchObject({ reason: "not-eligible", message: expect.stringContaining("project-map-unreadable") });
+    expect(t.opens).toEqual([{ recovery: false }]);
+    expect(readBackendPublicationJournal(t.homeDir)).toMatchObject({ phase: "preparing", recoveryReference: null });
+    expect(t.pending()?.kind).toBe("publish-rollback");
+    expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: null });
   });
 
   it("a resume failure other than missing material propagates untouched, with nothing aborted and the lease kept", async () => {
