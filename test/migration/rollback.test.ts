@@ -62,7 +62,7 @@ import {
   recordMigrationWitnessBinding,
   resolveMigrationWitnessBindings,
 } from "../../src/migration/generation-binding-store.js";
-import { readRollbackPreemptionRecord } from "../../src/migration/rollback-install.js";
+import { originalRollbackPreemption, readRollbackPreemptionRecord } from "../../src/migration/rollback-install.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
 import {
   FIXTURE_LOCAL_PROJECT_ID,
@@ -1409,15 +1409,18 @@ it("refuses a generation that was never activated before any durable change (an 
       syncBuiltinESMExports();
     }
     expect(existsSync(canonicalPath)).toBe(false);
-    const crashed = readRollbackPreemptionRecord(homeDir, "gen-move-aside-crash")!;
-    expect(crashed).toMatchObject({ canonicalPath, after: null });
+    const crashedRecord = readRollbackPreemptionRecord(homeDir, "gen-move-aside-crash")!;
+    expect(crashedRecord).toMatchObject({ canonicalPath, moves: [{ after: null }] });
+    const crashed = crashedRecord.moves[0]!;
     expect(statSync(crashed.preemptedPath).mode & 0o777).toBe(0o600);
     expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
 
     const outcome = await run();
     expect(outcome.manifest.phase).toBe("rolled-back");
     expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
-    const finished = readRollbackPreemptionRecord(homeDir, "gen-move-aside-crash")!;
+    const finishedRecord = readRollbackPreemptionRecord(homeDir, "gen-move-aside-crash")!;
+    expect(finishedRecord.moves).toHaveLength(1);
+    const finished = originalRollbackPreemption(finishedRecord)!;
     expect(finished.preemptedPath).toBe(crashed.preemptedPath);
     expect(finished.after).toMatchObject({ sha256: crashed.before.sha256, mode: 0o400 });
     expect(statSync(crashed.preemptedPath).mode & 0o777).toBe(0o400);

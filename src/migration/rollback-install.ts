@@ -58,7 +58,7 @@
  * state no path here produces and refuses.
  */
 
-import { chmodSync, lstatSync, openSync, closeSync, readSync, renameSync } from "node:fs";
+import { chmodSync, lstatSync, openSync, closeSync, readSync, renameSync, type BigIntStats } from "node:fs";
 import { existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -123,17 +123,33 @@ export interface InstallRollbackGenerationInput {
 
 const COPY_CHUNK = 1024 * 1024;
 const OWNER_FILE_MODES = new Set([0o400, 0o500, 0o600, 0o700]);
-const MAX_ROLLBACK_PREEMPTION_RECORD_BYTES = 8192;
+const MAX_ROLLBACK_PREEMPTION_RECORD_BYTES = 65536;
 
-/** The durable move-aside record: its intent (`after` null) before the rename, its completion after the witness. */
-export type RollbackPreemptionRecord = Readonly<{
-  version: 1;
-  rollbackGenerationId: string;
-  canonicalPath: string;
+/** One move-aside of the canonical database: its intent (`after` null) before the rename, its completion after the witness. */
+export type RollbackPreemptionMove = Readonly<{
   preemptedPath: string;
   before: RollbackFileWitness;
   after: RollbackFileWitness | null;
 }>;
+
+/**
+ * The durable move-aside record of one rollback: every move of its canonical database, appended in order and
+ * never rewritten once complete. The first completed move preserved the true pre-rollback database (the
+ * original); a later move, after a crash between an install and the selection, preserved an installed generation
+ * and is recorded beside it. Only the last move can be unfinished; an earlier unfinished one was superseded (its
+ * rename never became durable).
+ */
+export type RollbackPreemptionRecord = Readonly<{
+  version: 2;
+  rollbackGenerationId: string;
+  canonicalPath: string;
+  moves: readonly RollbackPreemptionMove[];
+}>;
+
+/** The first completed move: the preserved pre-rollback database. */
+export function originalRollbackPreemption(record: RollbackPreemptionRecord): RollbackPreemptionMove | null {
+  return record.moves.find((move) => move.after !== null) ?? null;
+}
 
 function rollbackPreemptionDirectory(homeDir: string): string {
   return join(resolve(homeDir), ".lcm", "migration-rollback-preemptions");
@@ -181,18 +197,43 @@ export function readRollbackPreemptionRecord(homeDir: string, rollbackGeneration
     throw new RollbackInstallError("unsafe-storage", "the move-aside record is malformed", { cause: error });
   }
   const record = parsed as Record<string, unknown>;
+  const isMove = (value: unknown): boolean => typeof value === "object" && value !== null
+    && typeof (value as Record<string, unknown>).preemptedPath === "string"
+    && isFileWitness((value as Record<string, unknown>).before)
+    && ((value as Record<string, unknown>).after === null || isFileWitness((value as Record<string, unknown>).after));
   if (
     typeof parsed !== "object" || parsed === null
-    || record.version !== 1
+    || record.version !== 2
     || record.rollbackGenerationId !== rollbackGenerationId
     || typeof record.canonicalPath !== "string"
-    || typeof record.preemptedPath !== "string"
-    || !isFileWitness(record.before)
-    || !(record.after === null || isFileWitness(record.after))
+    || !Array.isArray(record.moves)
+    || !record.moves.every(isMove)
   ) {
     throw new RollbackInstallError("unsafe-storage", "the move-aside record is malformed");
   }
   return parsed as RollbackPreemptionRecord;
+}
+
+/**
+ * A preserved file must still be exactly what its completion witnessed: a plain single-link regular file at
+ * mode 0400 with the same identity and bytes. Anything else refuses; the record is not trusted over the file.
+ */
+function assertPreservedFileMatches(move: RollbackPreemptionMove & Readonly<{ after: RollbackFileWitness }>): void {
+  let stat: BigIntStats;
+  try {
+    stat = lstatSync(move.preemptedPath, { bigint: true });
+  } catch (error) {
+    throw new RollbackInstallError("unsafe-storage", "a preserved database recorded as complete is missing", { cause: error });
+  }
+  if (!stat.isFile() || stat.nlink !== 1n || (Number(stat.mode) & 0o777) !== 0o400) {
+    throw new RollbackInstallError("unsafe-storage", "a preserved database is no longer a plain single-link read-only file");
+  }
+  if (stat.dev.toString() !== move.after.dev || stat.ino.toString() !== move.after.ino || stat.size.toString() !== move.after.size) {
+    throw new RollbackInstallError("unsafe-storage", "a preserved database is not the file its move-aside record completed");
+  }
+  if (streamSha256(move.preemptedPath, Number(stat.size)) !== move.after.sha256) {
+    throw new RollbackInstallError("unsafe-storage", "a preserved database's bytes differ from its move-aside record");
+  }
 }
 
 function releasePooledCanonicalConnection(canonicalPath: string): void {
@@ -308,18 +349,35 @@ export function installRollbackGeneration(
 ): RollbackInstallOutcome {
   const canonicalPath = resolve(input.canonicalPath);
   const syncDirectory = input.syncDirectory ?? ((path: string) => syncPrivateDirectory(path));
-  /** Makes the preserved file read-only, flushes both directories, witnesses it again and completes the record. */
-  const finishPreemption = (record: RollbackPreemptionRecord): NonNullable<RollbackInstallOutcome["preempted"]> => {
+  const outcomeOf = (move: RollbackPreemptionMove): RollbackInstallOutcome["preempted"] =>
+    move.after === null ? null : { path: move.preemptedPath, before: move.before, after: move.after };
+  /**
+   * Finishes the record's last move: the preserved file is checked to be a plain single-link regular file (never
+   * a symlink, whose target a chmod would follow) and made read-only, both directories are flushed, the file is
+   * witnessed again and compared, and the move is completed in the record. Returns the record as completed.
+   */
+  const finishPreemption = (record: RollbackPreemptionRecord): RollbackPreemptionRecord => {
+    const move = record.moves[record.moves.length - 1]!;
+    let stat: BigIntStats;
+    try {
+      stat = lstatSync(move.preemptedPath, { bigint: true });
+    } catch (error) {
+      throw new RollbackInstallError("unsafe-storage", "the preserved database of an unfinished move-aside is missing", { cause: error });
+    }
+    if (!stat.isFile() || stat.nlink !== 1n) {
+      throw new RollbackInstallError("unsafe-storage", "the preserved database of an unfinished move-aside is not a plain single-link regular file");
+    }
     // The preserved file is made read-only before the directories are flushed, so the flush covers its mode too (F14).
-    chmodSync(record.preemptedPath, 0o400);
+    chmodSync(move.preemptedPath, 0o400);
     // Both directories changed (the entry left one and entered the other): flush them before anything else.
-    syncRenamedDirectories(syncDirectory, dirname(record.canonicalPath), dirname(record.preemptedPath));
-    const after = witnessFile(record.preemptedPath);
-    if (record.before.sha256 !== after.sha256 || record.before.size !== after.size) {
+    syncRenamedDirectories(syncDirectory, dirname(record.canonicalPath), dirname(move.preemptedPath));
+    const after = witnessFile(move.preemptedPath);
+    if (move.before.sha256 !== after.sha256 || move.before.size !== after.size) {
       throw new RollbackInstallError("move-aside-content-changed", "canonical database bytes changed across the move-aside rename");
     }
-    writePreemptionRecord(input.homeDir, { ...record, after });
-    return { path: record.preemptedPath, before: record.before, after };
+    const completed: RollbackPreemptionRecord = { ...record, moves: [...record.moves.slice(0, -1), { ...move, after }] };
+    writePreemptionRecord(input.homeDir, completed);
+    return completed;
   };
   try {
     releasePooledCanonicalConnection(canonicalPath);
@@ -327,36 +385,49 @@ export function installRollbackGeneration(
     throw new RollbackInstallError("unsafe-storage", "canonical database pool could not be released", { cause: error });
   }
 
-  let preempted: RollbackInstallOutcome["preempted"] = null;
   const liveExists = checkCanonicalLiveExists(canonicalPath);
-  const record = readRollbackPreemptionRecord(input.homeDir, input.rollbackGenerationId);
+  let record = readRollbackPreemptionRecord(input.homeDir, input.rollbackGenerationId);
+  if (record !== null) {
+    // The record is this rollback's account of this canonical path, and every move it recorded as complete must
+    // still be exactly the file it witnessed. Nothing is trusted, moved or installed before that holds.
+    if (record.canonicalPath !== canonicalPath) {
+      throw new RollbackInstallError("unsafe-storage", "the move-aside record names another canonical database");
+    }
+    for (const move of record.moves) {
+      if (move.after !== null) assertPreservedFileMatches({ ...move, after: move.after });
+    }
+  }
+  const last = record === null ? null : record.moves[record.moves.length - 1] ?? null;
+  const unfinished = last !== null && last.after === null ? last : null;
 
   if (liveExists) {
-    if (record !== null && record.after === null && existsSync(record.preemptedPath)) {
+    if (unfinished !== null && existsSync(unfinished.preemptedPath)) {
       throw new RollbackInstallError("unsafe-storage", "a live canonical database and an unfinished preserved database both exist");
     }
     checkpointAndConvertToDelete(canonicalPath);
     assertNoWalSiblings(canonicalPath);
     const before = witnessFile(canonicalPath);
     const preemptedPath = join(rollbackGenerationPath(input.homeDir, input.generationId), "preempted-canonical.sqlite");
+    // The intent is appended durably before the rename, so a crash anywhere after it is finished by the retry
+    // below; an earlier completed move (the original) is never rewritten.
     const intent: RollbackPreemptionRecord = {
-      version: 1, rollbackGenerationId: input.rollbackGenerationId, canonicalPath, preemptedPath, before, after: null,
+      version: 2, rollbackGenerationId: input.rollbackGenerationId, canonicalPath,
+      moves: [...(record?.moves ?? []), { preemptedPath, before, after: null }],
     };
-    // The intent is durable before the rename, so a crash anywhere after it is finished by the retry below.
     writePreemptionRecord(input.homeDir, intent);
     renameSync(canonicalPath, preemptedPath);
-    preempted = finishPreemption(intent);
-  } else if (record !== null && record.after === null) {
+    record = finishPreemption(intent);
+  } else if (unfinished !== null) {
     // A prior attempt crashed between its rename and its completion: the canonical file is gone and the record is
     // its only account. The preserved file must be where the record says; its absence as well means the rename
     // never became durable and something else removed the canonical file, which nothing here can repair.
-    if (record.canonicalPath !== canonicalPath || !existsSync(record.preemptedPath)) {
+    if (!existsSync(unfinished.preemptedPath)) {
       throw new RollbackInstallError("unsafe-storage", "the canonical database is absent and its unfinished move-aside record does not account for it");
     }
-    preempted = finishPreemption(record);
-  } else if (record !== null && record.after !== null) {
-    preempted = { path: record.preemptedPath, before: record.before, after: record.after };
+    record = finishPreemption(record!);
   }
+  const original = record === null ? null : originalRollbackPreemption(record);
+  const preempted = original === null ? null : outcomeOf(original);
 
   renameSync(input.verifiedDatabasePath, canonicalPath);
   // The selection must not become durable before the installed database's directory entries are (A-03 / F3).

@@ -163,10 +163,20 @@ A post-write rollback also preserves the database it replaced, read-only, as
 `preempted-canonical.sqlite` inside the directory of the generation that
 replaced it, and records that move in
 `<home>/.lcm/migration-rollback-preemptions/<generation id>.json` before it
-happens. A retry after a crash in the middle of the move finishes it from that
-record (the preserved file is made read-only, flushed and verified against the
-bytes recorded before the move); a record whose preserved file is missing, or a
-live database beside an unfinished one, refuses rather than guessing. Treat the
+happens. The record lists every move of that rollback in order and never
+rewrites a completed one: the first completed move is the original, the
+pre-rollback database itself, and that is the file the rollback reports as
+preserved. A retry after a crash between the install and the selection moves
+the generation it had installed aside as a later move, recorded beside the
+original, which stays where it was. A retry after a crash in the middle of a
+move finishes it from the record (the preserved file is checked to be a plain
+file, made read-only, flushed and verified against the bytes recorded before
+the move). Before acting on a record, the rollback checks that it names the
+same canonical database and that every file it recorded as preserved is still
+exactly that file: a plain, single-link, read-only file with the recorded
+identity and bytes. A preserved file that is missing, replaced, rewritten,
+writable or linked elsewhere, a record for another canonical path, or a live
+database beside an unfinished move all refuse rather than guess. Treat the
 record like the generation directories: it is evidence, and LCM never deletes it.
 
 Because nothing is deleted automatically, disk usage under this directory

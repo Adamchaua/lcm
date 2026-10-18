@@ -32,6 +32,7 @@ import {
   checkCanonicalLiveExists,
   streamSha256,
   checkpointAndConvertToDelete,
+  originalRollbackPreemption,
   readRollbackPreemptionRecord,
   rollbackPreemptionRecordPath,
 } from "../../src/migration/rollback-install.js";
@@ -43,6 +44,11 @@ vi.mock("node:fs", async (importOriginal) => ({
 const renameSpy = vi.spyOn(fsModule, "renameSync");
 /** The unmocked rename, bound to the actual module so a persistent mock implementation can call it. */
 const realRenameSync = (await vi.importActual<typeof import("node:fs")>("node:fs")).renameSync;
+/** The last move of a rollback's move-aside record (the one a retry finishes). */
+function lastMove(homeDir: string, rollbackGenerationId: string) {
+  const record = readRollbackPreemptionRecord(homeDir, rollbackGenerationId)!;
+  return record.moves[record.moves.length - 1]!;
+}
 /** The renames of the database files themselves; the durable move-aside record publishes through renames of its own. */
 function databaseRenames(): number {
   return renameSpy.mock.calls.filter(([, to]) => String(to).endsWith(".sqlite")).length;
@@ -101,6 +107,27 @@ function conversationTitles(path: string): readonly string[] {
     return (db.prepare("SELECT title FROM conversations ORDER BY conversation_id").all() as { title: string }[])
       .map((row) => row.title);
   } finally { db.close(); }
+}
+
+/** Runs a first attempt and crashes it right after the real move-aside rename, before the chmod. */
+function crashAfterMoveAsideOf(homeDir: string, canonicalPath: string, preemptedPath: string, attempt: string, rollbackGenerationId: string): void {
+  const generationDir = makeGenerationDir(homeDir, attempt);
+  const verifiedPath = verifiedGenerationDatabase(generationDir, "attempt-1-never-installed");
+  renameSpy.mockImplementation((from, to) => {
+    realRenameSync(from as string, to as string);
+    if (to === preemptedPath) throw new Error("simulated crash right after the move-aside rename");
+  });
+  try {
+    expect(() => installRollbackGeneration({
+      homeDir, generationId: attempt, rollbackGenerationId, canonicalPath, verifiedDatabasePath: verifiedPath,
+    })).toThrow("simulated crash right after the move-aside rename");
+  } finally {
+    renameSpy.mockReset();
+    renameSpy.mockImplementation((from, to) => realRenameSync(from as string, to as string));
+  }
+  expect(existsSync(canonicalPath)).toBe(false);
+  expect(statSync(preemptedPath).mode & 0o777).toBe(0o600);
+  expect(readRollbackPreemptionRecord(homeDir, rollbackGenerationId)).toMatchObject({ version: 2, canonicalPath, moves: [{ preemptedPath, after: null }] });
 }
 
 describe("installRollbackGeneration", () => {
@@ -270,23 +297,7 @@ describe("installRollbackGeneration", () => {
     const ROLLBACK = "gen-crash-after-rename";
     /** Runs the first attempt and crashes it right after the real move-aside rename. */
     function crashAfterMoveAside(homeDir: string, canonicalPath: string, preemptedPath: string): void {
-      const generationDir = makeGenerationDir(homeDir, "gen-crash-after-rename-rb1-1");
-      const verifiedPath = verifiedGenerationDatabase(generationDir, "attempt-1-never-installed");
-      renameSpy.mockImplementation((from, to) => {
-        realRenameSync(from as string, to as string);
-        if (to === preemptedPath) throw new Error("simulated crash right after the move-aside rename");
-      });
-      try {
-        expect(() => installRollbackGeneration({
-          homeDir, generationId: "gen-crash-after-rename-rb1-1", rollbackGenerationId: ROLLBACK, canonicalPath, verifiedDatabasePath: verifiedPath,
-        })).toThrow("simulated crash right after the move-aside rename");
-      } finally {
-        renameSpy.mockReset();
-        renameSpy.mockImplementation((from, to) => realRenameSync(from as string, to as string));
-      }
-      expect(existsSync(canonicalPath)).toBe(false);
-      expect(statSync(preemptedPath).mode & 0o777).toBe(0o600);
-      expect(readRollbackPreemptionRecord(homeDir, ROLLBACK)).toMatchObject({ version: 1, canonicalPath, preemptedPath, after: null });
+      crashAfterMoveAsideOf(homeDir, canonicalPath, preemptedPath, "gen-crash-after-rename-rb1-1", ROLLBACK);
     }
 
     it("finishes the crashed attempt's move-aside from its record on the retry: read-only, both directories flushed, witnessed again, record completed", () => {
@@ -297,7 +308,7 @@ describe("installRollbackGeneration", () => {
       crashAfterMoveAside(homeDir, canonicalPath, preemptedPath);
       // The bytes the first attempt witnessed (after its checkpoint and journal-mode conversion), unchanged since.
       const liveSha256 = createHash("sha256").update(readFileSync(preemptedPath)).digest("hex");
-      expect(readRollbackPreemptionRecord(homeDir, ROLLBACK)!.before.sha256).toBe(liveSha256);
+      expect(lastMove(homeDir, ROLLBACK).before.sha256).toBe(liveSha256);
 
       // The retry builds attempt 2 under the next manifest revision, in its own directory.
       const secondDir = makeGenerationDir(homeDir, "gen-crash-after-rename-rb2-1");
@@ -314,7 +325,7 @@ describe("installRollbackGeneration", () => {
       expect(outcome.preempted).toMatchObject({ path: preemptedPath, before: { sha256: liveSha256 }, after: { sha256: liveSha256, mode: 0o400 } });
       expect(modeAtFirstFlush).toEqual([0o400]);
       expect(flushed).toEqual([join(homeDir, ".lcm", "projects", "proj-1"), firstDir, secondDir, join(homeDir, ".lcm", "projects", "proj-1")]);
-      expect(readRollbackPreemptionRecord(homeDir, ROLLBACK)).toMatchObject({ after: { sha256: liveSha256, mode: 0o400 } });
+      expect(readRollbackPreemptionRecord(homeDir, ROLLBACK)).toMatchObject({ moves: [{ preemptedPath, after: { sha256: liveSha256, mode: 0o400 } }] });
       expect(conversationTitles(canonicalPath)).toEqual(["attempt-2-installed"]);
       expect(conversationTitles(preemptedPath)).toEqual(["pre-rollback-live-data"]);
       expect(existsSync(join(secondDir, "preempted-canonical.sqlite"))).toBe(false);
@@ -348,7 +359,7 @@ describe("installRollbackGeneration", () => {
       });
       const otherCanonical = join(homeDir, ".lcm", "projects", "proj-other", "db.sqlite");
       mkdirSync(join(homeDir, ".lcm", "projects", "proj-other"), { recursive: true, mode: 0o700 });
-      expect(retry(otherCanonical)).toThrow(expect.objectContaining({ reason: "unsafe-storage", message: expect.stringContaining("does not account") }));
+      expect(retry(otherCanonical)).toThrow(expect.objectContaining({ reason: "unsafe-storage", message: expect.stringContaining("names another canonical database") }));
       realRenameSync(preemptedPath, preemptedPath + ".moved");
       expect(retry(canonicalPath)).toThrow(expect.objectContaining({ reason: "unsafe-storage", message: expect.stringContaining("does not account") }));
       expect(existsSync(canonicalPath)).toBe(false);
@@ -382,7 +393,8 @@ describe("installRollbackGeneration", () => {
       });
       const secondPreempted = join(secondDir, "preempted-canonical.sqlite");
       expect(outcome.preempted?.path).toBe(secondPreempted);
-      expect(readRollbackPreemptionRecord(homeDir, ROLLBACK)).toMatchObject({ preemptedPath: secondPreempted, after: { mode: 0o400 } });
+      // The undone move stays in the record as unfinished history; the new move is the first completed one, the original.
+      expect(readRollbackPreemptionRecord(homeDir, ROLLBACK)).toMatchObject({ moves: [{ preemptedPath, after: null }, { preemptedPath: secondPreempted, after: { mode: 0o400 } }] });
       expect(conversationTitles(secondPreempted)).toEqual(["pre-rollback-live-data"]);
     });
 
@@ -404,24 +416,29 @@ describe("installRollbackGeneration", () => {
         renameSpy.mockReset();
         renameSpy.mockImplementation((from, to) => realRenameSync(from as string, to as string));
       }
-      const completed = readRollbackPreemptionRecord(homeDir, ROLLBACK)!;
+      const completed = lastMove(homeDir, ROLLBACK);
       expect(completed.after).not.toBeNull();
+      const completedRecord = readFileSync(rollbackPreemptionRecordPath(homeDir, ROLLBACK), "utf8");
       const secondDir = makeGenerationDir(homeDir, "gen-crash-after-rename-rb2-1");
       const outcome = installRollbackGeneration({
         homeDir, generationId: "gen-crash-after-rename-rb2-1", rollbackGenerationId: ROLLBACK, canonicalPath,
         verifiedDatabasePath: verifiedGenerationDatabase(secondDir, "attempt-2-installed"),
       });
       expect(outcome.preempted).toEqual({ path: preemptedPath, before: completed.before, after: completed.after });
-      expect(readFileSync(rollbackPreemptionRecordPath(homeDir, ROLLBACK), "utf8")).toBe(JSON.stringify(completed));
+      expect(readFileSync(rollbackPreemptionRecordPath(homeDir, ROLLBACK), "utf8")).toBe(completedRecord);
       expect(conversationTitles(canonicalPath)).toEqual(["attempt-2-installed"]);
     });
 
     it.each([
       ["unreadable mode", (path: string) => chmodSync(path, 0o644), "could not be read"],
       ["malformed JSON", (path: string) => writeFileSync(path, "{", { mode: 0o600 }), "is malformed"],
-      ["malformed shape", (path: string) => writeFileSync(path, JSON.stringify({ version: 1 }), { mode: 0o600 }), "is malformed"],
+      ["malformed shape", (path: string) => writeFileSync(path, JSON.stringify({ version: 2 }), { mode: 0o600 }), "is malformed"],
+      ["a version-1 shape", (path: string) => writeFileSync(path, JSON.stringify({ version: 1, rollbackGenerationId: ROLLBACK, canonicalPath: "", preemptedPath: "", before: null, after: null }), { mode: 0o600 }), "is malformed"],
       ["a null before-witness", (path: string) => writeFileSync(path, JSON.stringify({
-        ...JSON.parse(readFileSync(path, "utf8")), before: null,
+        ...JSON.parse(readFileSync(path, "utf8")), moves: [{ preemptedPath: "x", before: null, after: null }],
+      }), { mode: 0o600 }), "is malformed"],
+      ["a move that is not an object", (path: string) => writeFileSync(path, JSON.stringify({
+        ...JSON.parse(readFileSync(path, "utf8")), moves: [null],
       }), { mode: 0o600 }), "is malformed"],
       ["another rollback's id", (path: string) => writeFileSync(path, JSON.stringify({
         ...JSON.parse(readFileSync(path, "utf8")), rollbackGenerationId: "gen-other",
@@ -439,6 +456,163 @@ describe("installRollbackGeneration", () => {
       })).toThrow(expect.objectContaining({ reason: "unsafe-storage", message: expect.stringContaining(message) }));
     });
   });
+
+  // Escalation review 8 (E17, E18, E19): the record keeps the original attribution across later moves, a completed
+  // move is trusted only when its preserved file is exactly what it witnessed, and a chmod never follows a symlink.
+  describe("the move-aside record across later attempts and external interference (escalation review 8)", () => {
+    const ROLLBACK = "gen-record-review";
+    const ATTEMPT = (n: number, revision = 1) => `gen-record-review-rb${revision}-${n}`;
+    function install(homeDir: string, canonicalPath: string, attempt: string, marker: string, extra: Partial<Parameters<typeof installRollbackGeneration>[0]> = {}) {
+      const dir = makeGenerationDir(homeDir, attempt);
+      return installRollbackGeneration({
+        homeDir, generationId: attempt, rollbackGenerationId: ROLLBACK, canonicalPath,
+        verifiedDatabasePath: verifiedGenerationDatabase(dir, marker), ...extra,
+      });
+    }
+    /** A completed first move whose install rename then failed: the canonical path is absent, the record complete. */
+    function completedThenCrashedBeforeInstall(homeDir: string, canonicalPath: string) {
+      const dir = makeGenerationDir(homeDir, ATTEMPT(1));
+      expect(() => installRollbackGeneration({
+        homeDir, generationId: ATTEMPT(1), rollbackGenerationId: ROLLBACK, canonicalPath,
+        verifiedDatabasePath: join(dir, "missing.sqlite"),
+      })).toThrow(/ENOENT/);
+      const original = originalRollbackPreemption(readRollbackPreemptionRecord(homeDir, ROLLBACK)!)!;
+      expect(existsSync(canonicalPath)).toBe(false);
+      return original;
+    }
+
+    it("E17: a held resume that crashes inside its own move-aside, then a third attempt, leave the original attribution intact and record the intermediate move beside it", () => {
+      const homeDir = tempHome();
+      const canonicalPath = liveCanonicalDatabase(homeDir, "original-pre-rollback");
+      const first = install(homeDir, canonicalPath, ATTEMPT(1), "installed-1");
+      const originalPath = first.preempted!.path;
+      const originalIno = statSync(originalPath, { bigint: true }).ino;
+      expect(conversationTitles(canonicalPath)).toEqual(["installed-1"]);
+      // The supported held resume after a crash between the install and the selection: a second attempt under the
+      // next revision moves the installed generation aside, and dies at its first flush (after the chmod).
+      expect(() => install(homeDir, canonicalPath, ATTEMPT(1, 2), "installed-2", {
+        syncDirectory: () => { throw new Error("second attempt crash after chmod"); },
+      })).toThrow("directory could not be flushed");
+      const crashed = readRollbackPreemptionRecord(homeDir, ROLLBACK)!;
+      expect(crashed.moves).toHaveLength(2);
+      expect(crashed.moves[0]).toEqual(first.preempted === null ? null : { preemptedPath: originalPath, before: first.preempted.before, after: first.preempted.after });
+      expect(crashed.moves[1]!.after).toBeNull();
+      expect(conversationTitles(crashed.moves[1]!.preemptedPath)).toEqual(["installed-1"]);
+      expect(existsSync(canonicalPath)).toBe(false);
+
+      const third = install(homeDir, canonicalPath, ATTEMPT(2, 2), "installed-3");
+      expect(conversationTitles(canonicalPath)).toEqual(["installed-3"]);
+      // The outcome and the record still name the original; the intermediate move is completed beside it.
+      expect(third.preempted).toEqual(first.preempted);
+      const record = readRollbackPreemptionRecord(homeDir, ROLLBACK)!;
+      expect(originalRollbackPreemption(record)).toEqual(record.moves[0]);
+      expect(record.moves).toHaveLength(2);
+      expect(record.moves[1]!.after).toMatchObject({ mode: 0o400, sha256: record.moves[1]!.before.sha256 });
+      expect(conversationTitles(record.moves[1]!.preemptedPath)).toEqual(["installed-1"]);
+      expect(statSync(record.moves[1]!.preemptedPath).mode & 0o777).toBe(0o400);
+      expect(statSync(originalPath, { bigint: true }).ino).toBe(originalIno);
+      expect(statSync(originalPath).mode & 0o777).toBe(0o400);
+      expect(conversationTitles(originalPath)).toEqual(["original-pre-rollback"]);
+    });
+
+    it("E17: a plain reinstall (a retry after a crash past the install) moves the installed generation aside as a second move and still reports the original", () => {
+      const homeDir = tempHome();
+      const canonicalPath = liveCanonicalDatabase(homeDir, "original-pre-rollback");
+      const first = install(homeDir, canonicalPath, ATTEMPT(1), "installed-1");
+      const second = install(homeDir, canonicalPath, ATTEMPT(1, 2), "installed-2");
+      expect(second.preempted).toEqual(first.preempted);
+      const record = readRollbackPreemptionRecord(homeDir, ROLLBACK)!;
+      expect(record.moves.map((move) => move.preemptedPath)).toEqual([
+        join(rollbackGenerationPath(homeDir, ATTEMPT(1)), "preempted-canonical.sqlite"),
+        join(rollbackGenerationPath(homeDir, ATTEMPT(1, 2)), "preempted-canonical.sqlite"),
+      ]);
+      expect(conversationTitles(record.moves[0]!.preemptedPath)).toEqual(["original-pre-rollback"]);
+      expect(conversationTitles(record.moves[1]!.preemptedPath)).toEqual(["installed-1"]);
+      expect(conversationTitles(canonicalPath)).toEqual(["installed-2"]);
+    });
+
+    it.each([
+      ["missing", (path: string) => { chmodSync(path, 0o600); fsModule.unlinkSync(path); }, "is missing"],
+      ["replaced by another database", (path: string) => {
+        chmodSync(path, 0o600); fsModule.unlinkSync(path);
+        verifiedGenerationDatabase(join(path, ".."), "replacement-after-crash"); fsModule.renameSync(join(path, "..", "db.sqlite"), path); chmodSync(path, 0o600);
+      }, "no longer a plain single-link read-only file"],
+      ["replaced by another read-only database", (path: string) => {
+        chmodSync(path, 0o600); fsModule.unlinkSync(path);
+        verifiedGenerationDatabase(join(path, ".."), "replacement-after-crash"); fsModule.renameSync(join(path, "..", "db.sqlite"), path); chmodSync(path, 0o400);
+      }, "not the file its move-aside record completed"],
+      ["the same bytes in a different file", (path: string) => {
+        fsModule.copyFileSync(path, path + ".copy"); chmodSync(path, 0o600); fsModule.unlinkSync(path); fsModule.renameSync(path + ".copy", path); chmodSync(path, 0o400);
+      }, "not the file its move-aside record completed"],
+      ["writable again", (path: string) => chmodSync(path, 0o600), "no longer a plain single-link read-only file"],
+      ["hardlinked", (path: string) => linkSync(path, path + ".link"), "no longer a plain single-link read-only file"],
+    ])("E18: a completed record whose preserved file is %s refuses without installing", (_label, damage, message) => {
+      const homeDir = tempHome();
+      const canonicalPath = liveCanonicalDatabase(homeDir, "original-pre-rollback");
+      const original = completedThenCrashedBeforeInstall(homeDir, canonicalPath);
+      damage(original.preemptedPath);
+      expect(() => install(homeDir, canonicalPath, ATTEMPT(1, 2), "must-not-install"))
+        .toThrow(expect.objectContaining({ reason: "unsafe-storage", message: expect.stringContaining(message) }));
+      expect(existsSync(canonicalPath)).toBe(false);
+    });
+
+    it("E18: a completed record whose bytes were rewritten in place under the same identity refuses", () => {
+      const homeDir = tempHome();
+      const canonicalPath = liveCanonicalDatabase(homeDir, "original-pre-rollback");
+      const original = completedThenCrashedBeforeInstall(homeDir, canonicalPath);
+      const bytes = readFileSync(original.preemptedPath);
+      bytes[bytes.length - 1] = (bytes[bytes.length - 1]! + 1) % 256;
+      chmodSync(original.preemptedPath, 0o600);
+      writeFileSync(original.preemptedPath, bytes);
+      chmodSync(original.preemptedPath, 0o400);
+      expect(() => install(homeDir, canonicalPath, ATTEMPT(1, 2), "must-not-install"))
+        .toThrow(expect.objectContaining({ reason: "unsafe-storage", message: expect.stringContaining("bytes differ") }));
+      expect(existsSync(canonicalPath)).toBe(false);
+    });
+
+    it("E18: a completed record for another canonical path refuses, whether the canonical path is absent or live", () => {
+      const homeDir = tempHome();
+      const canonicalPath = liveCanonicalDatabase(homeDir, "original-pre-rollback");
+      const original = completedThenCrashedBeforeInstall(homeDir, canonicalPath);
+      const other = join(homeDir, ".lcm", "projects", "proj-other", "db.sqlite");
+      mkdirSync(join(homeDir, ".lcm", "projects", "proj-other"), { recursive: true, mode: 0o700 });
+      expect(() => install(homeDir, other, ATTEMPT(1, 2), "must-not-install"))
+        .toThrow(expect.objectContaining({ reason: "unsafe-storage", message: expect.stringContaining("names another canonical database") }));
+      expect(existsSync(other)).toBe(false);
+      // Live at the other path: still this rollback's record for a different canonical, refused before any move.
+      writeFileSync(other, readFileSync(original.preemptedPath), { mode: 0o600 });
+      expect(() => install(homeDir, other, ATTEMPT(2, 2), "must-not-install")).toThrow(expect.objectContaining({ reason: "unsafe-storage", message: expect.stringContaining("names another canonical database") }));
+      expect(conversationTitles(other)).toEqual(["original-pre-rollback"]);
+    });
+
+    it("E19: an unfinished move whose preserved path is a symlink refuses without touching the link's target", () => {
+      const homeDir = tempHome();
+      const canonicalPath = liveCanonicalDatabase(homeDir, "original-pre-rollback");
+      const preemptedPath = join(rollbackGenerationPath(homeDir, ATTEMPT(1)), "preempted-canonical.sqlite");
+      crashAfterMoveAsideOf(homeDir, canonicalPath, preemptedPath, ATTEMPT(1), ROLLBACK);
+      const victim = join(homeDir, "victim.sqlite");
+      fsModule.renameSync(preemptedPath, victim);
+      chmodSync(victim, 0o600);
+      fsModule.symlinkSync(victim, preemptedPath);
+      expect(() => install(homeDir, canonicalPath, ATTEMPT(1, 2), "must-not-install"))
+        .toThrow(expect.objectContaining({ reason: "unsafe-storage", message: expect.stringContaining("not a plain single-link regular file") }));
+      expect(statSync(victim).mode & 0o777).toBe(0o600);
+      expect(existsSync(canonicalPath)).toBe(false);
+      expect(lastMove(homeDir, ROLLBACK).after).toBeNull();
+    });
+
+    it("E19: an unfinished move whose preserved file is hardlinked refuses before the chmod", () => {
+      const homeDir = tempHome();
+      const canonicalPath = liveCanonicalDatabase(homeDir, "original-pre-rollback");
+      const preemptedPath = join(rollbackGenerationPath(homeDir, ATTEMPT(1)), "preempted-canonical.sqlite");
+      crashAfterMoveAsideOf(homeDir, canonicalPath, preemptedPath, ATTEMPT(1), ROLLBACK);
+      linkSync(preemptedPath, preemptedPath + ".link");
+      expect(() => install(homeDir, canonicalPath, ATTEMPT(1, 2), "must-not-install"))
+        .toThrow(expect.objectContaining({ reason: "unsafe-storage", message: expect.stringContaining("not a plain single-link regular file") }));
+      expect(statSync(preemptedPath).mode & 0o777).toBe(0o600);
+    });
+  });
+
 
   it("refuses when the canonical path is a symlink rather than a plain regular file", async () => {
     const homeDir = tempHome();
