@@ -101,4 +101,10 @@ describe("local Vitest worker budget", () => {
 
     expect(configuration.test.maxWorkers).toBe(1);
   });
+
+  it("keeps the passing-test lines out of the capture-capped harness output", () => {
+    const configuration = createPostgresqlVitestConfiguration({});
+
+    expect(configuration.test.slowTestThreshold).toBeGreaterThan(configuration.test.testTimeout);
+  });
 });
