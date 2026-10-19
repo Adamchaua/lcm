@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
@@ -18,8 +18,24 @@ import {
 import { parseTranscript } from "../src/transcript.js";
 
 const roots: string[] = [];
+const children: ChildProcess[] = [];
 
-afterEach(() => {
+// Probe budget: startup <= PROBE_STARTUP_MS, then the operation watchdog
+// PROBE_OPERATION_MS, then SIGKILL reaping. The per-test timeout exceeds the
+// sum with headroom so Vitest never abandons a live child.
+const PROBE_STARTUP_MS = 15_000;
+const PROBE_OPERATION_MS = 1_000;
+const PROBE_TEST_TIMEOUT_MS = 30_000;
+
+afterEach(async () => {
+  await Promise.all(children.splice(0).map(async (child) => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = new Promise<void>((resolveExit) => {
+      child.once("exit", () => resolveExit());
+    });
+    child.kill("SIGKILL");
+    await exited;
+  }));
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
@@ -68,6 +84,7 @@ async function runProbe(body: string): Promise<{ code: number; stdout: string }>
     "--eval",
     childSource,
   ], { stdio: ["ignore", "pipe", "pipe"] });
+  children.push(child);
   let stdout = "";
   let stderr = "";
   let watchdog: NodeJS.Timeout | undefined;
@@ -85,13 +102,13 @@ async function runProbe(body: string): Promise<{ code: number; stdout: string }>
     stdout += chunk.toString();
     if (watchdog === undefined && stdout.includes("ready")) {
       clearTimeout(startupWatchdog);
-      watchdog = setTimeout(kill, 1_000);
+      watchdog = setTimeout(kill, PROBE_OPERATION_MS);
     }
   });
   child.stderr.on("data", (chunk: Buffer) => {
     stderr += chunk.toString();
   });
-  startupWatchdog = setTimeout(kill, 30_000);
+  startupWatchdog = setTimeout(kill, PROBE_STARTUP_MS);
   return await new Promise((resolveResult, reject) => {
     child.once("error", (error) => {
       clearTimeout(watchdog);
@@ -142,6 +159,7 @@ describe("transcript paths that are not regular files", () => {
 
       expect(result).toEqual({ code: 0, stdout: "invalid-input\n" });
     },
+    PROBE_TEST_TIMEOUT_MS,
   );
 
   it.runIf(process.platform === "linux")(
@@ -154,6 +172,7 @@ describe("transcript paths that are not regular files", () => {
 
       expect(result).toEqual({ code: 0, stdout: "[]\n" });
     },
+    PROBE_TEST_TIMEOUT_MS,
   );
 
   it.runIf(process.platform === "linux")(
@@ -166,6 +185,7 @@ describe("transcript paths that are not regular files", () => {
 
       expect(result).toEqual({ code: 0, stdout: "[]\n" });
     },
+    PROBE_TEST_TIMEOUT_MS,
   );
 
   it.runIf(process.platform === "linux")(
@@ -178,6 +198,7 @@ describe("transcript paths that are not regular files", () => {
 
       expect(result).toEqual({ code: 0, stdout: "undefined\n" });
     },
+    PROBE_TEST_TIMEOUT_MS,
   );
 
   it("keeps reading regular files, including through a symlink", () => {
