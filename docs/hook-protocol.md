@@ -147,6 +147,38 @@ publication-journal errors fail closed.
 
 **Response:** Exit code `0`. Context is injected via stdout (printed as a `<context>` block that Claude Code prepends to the session).
 
+### Codex SessionStart sources
+
+Codex runs the hook for the sources `startup`, `resume`, `clear`, `compact`, and
+`fork` (matcher `startup|resume|clear|compact|fork`). The payload also carries
+`source` and `transcript_path`.
+
+- Every non-empty Codex restoration begins with the line
+  `<!-- lcm-restoration -->`, followed by the usual output. Empty output stays
+  empty. Claude output is unchanged.
+- `startup`, `clear`, and unknown sources print as before.
+- `resume`, `fork`, and `compact` print nothing when the session's own rollout
+  (`transcript_path`, which must resolve under `$CODEX_HOME/sessions` or
+  `$CODEX_HOME/archived_sessions`, default `~/.codex`) holds a developer message
+  starting with the marker line after the last `compacted` record and the last
+  `thread_rolled_back` event. A line that is not valid JSON counts as a reset.
+  Only the last 64 MiB of the rollout is read; any read failure prints.
+- For `compact`, the daemon returns the full memory (recent summaries, promoted
+  project knowledge, passive insights, and the stored project-instructions row)
+  instead of orientation only, and never rewrites stored instructions. For Codex,
+  a recent LCM summarization no longer reduces `resume` or `clear` to
+  orientation only.
+- The hook writes no state files. The per-session lock is released when the hook
+  returns.
+
+Limits: referenced forks, rollouts outside `$CODEX_HOME`, unreadable rollouts,
+and restorations from earlier LCM versions print a fresh restoration, which can
+duplicate an existing one; restorations carried only inside compaction
+replacement history are not detected; and if Codex fails to write the
+compaction record (or other history) to its rollout, the post-compaction hook can
+see the pre-compaction restoration and skip, and the live continuation can lack
+restored memory while those write failures persist.
+
 ## SessionEnd Hook
 
 **Command:** `lcm session-end`
@@ -332,14 +364,63 @@ The `--global` option selects the existing global connector scope; no new
 configuration option is required for native command capture, and the 2,000-
 character adapter bound is fixed rather than configurable.
 
-Codex sends native tool names `functions.exec` and `functions.exec_command`.
-For those names, lcm accepts only the bounded semantic command (`command`, or
-`cmd` when `command` is absent) and a direct status projection. `tool_output` is
-checked before `tool_response`; status fields are considered in this order:
-`isError`, `is_error`, `exit_code`, and `exitCode`. Boolean values are used
-directly, while finite numeric exit codes map zero to success and nonzero to an
-error. A valid false or zero value is authoritative. Nested or invalid values
-are ignored.
+Codex reports unified-exec shell commands (`exec_command`, and the
+`write_stdin` poll that finishes a long-running one) as `tool_name: "Bash"`
+with `tool_input.command` set to the original command and `tool_use_id` set to
+the original call's id; MCP tools arrive as `mcp__<server>__<tool>`. lcm adapts
+`Bash` and, as legacy compatibility aliases, `functions.exec` and
+`functions.exec_command` (command from `command`, or `cmd` when `command` is
+absent). Every adapted payload is reduced to a bounded command or tool name and
+an outcome of `succeeded`, `failed`, or `unknown`.
+
+Outcome rules:
+
+- **Shell.** `tool_output` is checked before `tool_response`; status fields are
+  considered in this order: `isError`, `is_error`, `exit_code`, `exitCode`.
+  Booleans are used directly and finite numeric exit codes map zero to success
+  and nonzero to failure. Nested or invalid values are ignored. With no such
+  field, including Codex's textual result, the outcome is `unknown`. Text is
+  never parsed for an exit status.
+- **MCP.** A boolean `isError` (or `is_error`) decides the outcome; a
+  non-boolean value is `unknown`. Otherwise a `content` array, even an empty
+  one, means `succeeded`. Anything else, such as `structuredContent` alone,
+  is `unknown`. Arguments and result content are never stored.
+
+How each outcome is stored:
+
+| Outcome | Shell command | MCP tool |
+|---|---|---|
+| `succeeded` | Existing git or environment event | `mcp_call` (tool name only) |
+| `failed` | `error_tool` (`Bash error: <first three tokens>`) | `error_tool` (`<tool> error`) |
+| `unknown` | `tool_outcome_unknown` naming only the matched git or install command (for example `Bash outcome unknown: git commit`); nothing for other commands | `tool_outcome_unknown` |
+
+A `tool_outcome_unknown` observation (category `tool`, priority 3) is
+scrubbed and queued like any passive event, but promotion never promotes or
+reinforces it and never correlates it as the fix for an earlier error. Its data
+holds only the matched command (such as `git commit` or `npm install`), never
+arguments or a commit message.
+
+What Codex 0.163 can actually deliver to PostToolUse (the hook runs only when
+`success_for_logging` is true, per `codex-rs/core/src/tools/registry.rs`; it
+is always true for unified exec, so shell completions with nonzero exit codes
+are delivered, but MCP `isError: true`, handler errors and aborted tools are
+not):
+
+| Situation | PostToolUse payload | lcm result |
+|---|---|---|
+| Ordinary unified-exec shell completion, exit 0 or nonzero | `Bash`, original command, output text | `tool_outcome_unknown` for git/install commands; nothing for others |
+| Shell command still running | none | nothing |
+| Shell command finished by a later `write_stdin` poll | one `Bash` payload with the original command and call id | attributed to the original command, recorded once |
+| MCP call succeeded | `CallToolResult` with `content` | `mcp_call` |
+| MCP `isError: true`, handler error, aborted or interrupted call | none | nothing; not observable through PostToolUse |
+| `apply_patch` intercepted from a shell command | none | nothing; native `apply_patch` calls are captured separately (see below) |
+
+Shell completions arrive without a status, so a nonzero exit is recorded the
+same way as a success. For MCP failures, handler errors and interrupted tools
+Codex sends no payload, so lcm records nothing for them. Interruption
+lifecycle capture is tracked in #1561 and Codex hook certification in #1565.
+The structured-failure rows of the outcome tables apply to payloads from other
+Codex versions or tools that do supply a status.
 
 The adapter does not persist raw Codex responses, stdout, stderr, or unknown
 fields, and it does not infer file events from shell text or unrecognized
@@ -348,25 +429,28 @@ runs on derived event data. Commands whose trimmed text begins with `lcm
 store` are suppressed to prevent LCM's own writes from feeding back into
 passive learning.
 
-`lcm connectors doctor codex` performs two checks for the targeted Codex
-connector. It first verifies the exact structural hook contract above. Only
-when that check passes does it run the native-exec functional probe. The probe
-is pure and in-memory: it exercises normalization and extraction without
-invoking the PostToolUse handler, opening an EventsDb, appending sidecar
-events, writing hook files, or creating a database. A structurally absent or
-incomplete hook never reports functional success; its functional result is
-reported as:
+The native `apply_patch`, `spawn_agent` (reported as
+`collaborationspawn_agent` by Codex multi-agent v2), `request_user_input`, and
+`update_plan` tools are not adapted to Bash: their payloads reach the extractor
+unchanged and produce bounded file, dispatch, decision, and plan events. See
+[Codex native activity](passive-learning.md#codex-native-activity).
+
+`lcm connectors doctor codex` reports the readiness of every LCM Codex hook from the
+base user `hooks.json` and `config.toml` (enabled, trusted, modified, missing, and so
+on; see [Codex hook readiness](vscode-codex.md#codex-hook-readiness)). That check
+is static and writes nothing. It then runs a pure, in-memory fixture self-test of
+native-exec normalization and extraction. The self-test checks a current `Bash`
+payload with a textual result (an unknown-outcome observation) and a legacy alias
+with a structured status. It does not invoke the PostToolUse handler, open an
+EventsDb, append sidecar events, write hook files, or create a database:
 
 ```text
-Codex: native exec capture functional check skipped
+✓ Codex: native exec normalization self-test passed (fixtures only; not proof of runtime execution)
 ```
 
-When the exact structure and the pure probe both pass, doctor reports:
-
-```text
-✓ Codex: PostToolUse hook installed
-✓ Codex: native exec capture functional
-```
+The self-test is independent of installation state and of readiness; it never
+substitutes for the readiness report, and neither proves that Codex executed a
+hook.
 
 ## SessionSnapshot Hook
 
@@ -561,3 +645,15 @@ this is not a new total-size or execution-time limit.
 
 Previously retained ingest errors remain in diagnostic history. This repair does
 not remove historical errors or change their retention period.
+
+A native transcript linkage failure now logs the condition code and the source
+ordinal of the failing record, for example `native transcript message linkage
+failed: content-mismatch at source ordinal 12 (session sequence 9)`. The
+session sequence appears for exact lookup misses. The codes are
+`session-not-found`, `invalid-session-snapshot`, `sequence-out-of-range`,
+`role-mismatch`, `content-mismatch`, `invalid-input`, and `unresolved` for exact
+misses, plus `unsupported-pending-after-quarantine`,
+`ambiguous-pending-match`, and `unmatched-pending-window` after quarantined
+records. The added text contains no transcript content; the error-log row still
+carries the session ID and working directory as before. Older rows keep the
+previous fixed sentence.
