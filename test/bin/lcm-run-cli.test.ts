@@ -275,7 +275,7 @@ vi.mock("../../src/cli-help.js", () => ({
   hasCommandHelp: vi.fn((command: string) => new Set([
     "install", "uninstall", "daemon", "config", "status", "doctor", "machine", "project",
     "postgres", "search", "grep", "describe", "expand", "store", "compact", "restore",
-    "session-end", "user-prompt", "post-tool", "session-snapshot", "mcp", "events", "diagnose",
+    "session-end", "user-prompt", "post-tool", "pre-tool", "session-snapshot", "mcp", "events", "diagnose",
     "connectors", "sensitive", "import", "promote", "export", "import-knowledge",
   ]).has(command)),
   printHelp: state.printHelp,
@@ -1414,7 +1414,7 @@ describe("runCli registration and help dispatch", () => {
     [["config", "set", "daemon.port", "4242", "-h"], "config"],
     [["config"], "config"],
     [["compact", "--help"], "compact"], [["restore", "--help"], "restore"], [["session-end", "--help"], "session-end"],
-    [["user-prompt", "--help"], "user-prompt"], [["post-tool", "--help"], "post-tool"], [["session-snapshot", "--help"], "session-snapshot"],
+    [["user-prompt", "--help"], "user-prompt"], [["post-tool", "--help"], "post-tool"], [["pre-tool", "--help"], "pre-tool"], [["session-snapshot", "--help"], "session-snapshot"],
     [["mcp", "--help"], "mcp"], [["install", "--help"], "install"], [["uninstall", "--help"], "uninstall"], [["status", "--help"], "status"],
     [["stats", "--help"], "stats"], [["doctor", "--help"], "doctor"], [["events", "--help"], "events"], [["events", "promote", "--help"], "events"],
     [["diagnose", "--help"], "diagnose"], [["connectors", "--help"], "connectors"], [["sensitive", "--help"], "sensitive"], [["import", "--help"], "import"],
@@ -2408,7 +2408,7 @@ describe("runCli orchestration actions", () => {
   });
 
   it.each([
-    ["restore"], ["session-end", "--client", "codex"], ["user-prompt"], ["post-tool"],
+    ["restore"], ["session-end", "--client", "codex"], ["user-prompt"], ["post-tool"], ["pre-tool", "--client", "codex"],
     ["session-snapshot"], ["compact", "--hook", "--client", "claude"],
   ])("dispatches hook action %#", async (...args) => {
     expect((await invoke(args))?.message).toBe("exit:0");
@@ -2695,6 +2695,7 @@ describe("runCli failure and alternate presentation branches", () => {
 
   it.each([
     [["post-tool", "--client", "codex"], "post-tool"],
+    [["pre-tool", "--client", "codex"], "pre-tool"],
     [["restore", "--client", "codex"], "restore"],
     [["session-end", "--client", "codex"], "session-end"],
     [["session-snapshot", "--client", "codex"], "session-snapshot"],
@@ -2743,6 +2744,24 @@ describe("runCli failure and alternate presentation branches", () => {
     const migrate = vi.fn();
 
     await expect(runCli(["node", "lcm", "restore", "--client", "codex"], {
+      migrate,
+      sleep: async (_delayMs: number) => undefined,
+    })).rejects.toBe(journal);
+    expect(migrate).not.toHaveBeenCalled();
+  });
+
+  it("lets a pre-tool journal error reach the CLI error handler without root migration", async () => {
+    fakeStdin.isTTY = false;
+    fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
+      if (event === "data") queueMicrotask(() => callback(Buffer.from("{}")));
+      if (event === "end") queueMicrotask(() => callback());
+      return fakeStdin;
+    });
+    const journal = new BackendPublicationJournalError("unresolved-publication", "publication is unresolved");
+    state.dispatchHook.mockRejectedValueOnce(journal);
+    const migrate = vi.fn();
+
+    await expect(runCli(["node", "lcm", "pre-tool", "--client", "codex"], {
       migrate,
       sleep: async (_delayMs: number) => undefined,
     })).rejects.toBe(journal);
@@ -3883,7 +3902,7 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(await invoke(["compact", "--no-promote"])).toBeUndefined();
     state.importProgressLast = false;
     expect(await invoke(["import"])).toBeUndefined();
-    for (const command of ["session-end", "user-prompt", "post-tool", "session-snapshot", "compact"] as const) {
+    for (const command of ["session-end", "user-prompt", "post-tool", "pre-tool", "session-snapshot", "compact"] as const) {
       state.dispatchHook.mockResolvedValueOnce({ stdout: "", exitCode: 0 });
       const args = command === "compact" ? [command, "--hook"] : [command];
       expect((await invoke(args))?.message).toBe("exit:0");

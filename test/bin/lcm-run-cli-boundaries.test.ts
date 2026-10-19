@@ -812,7 +812,7 @@ describe("runCli lifecycle and connector boundaries", () => {
       ["daemon/start", [{ help: true }]], ["daemon/restart", [{ help: true }]], ["root/daemon", [{ help: true }]],
       ["config/get", ["x", { help: true }]], ["config/set", ["x", "y", { help: true }]],
       ["lcm/compact", [{ help: true }]], ["lcm/restore", [{ help: true }]], ["lcm/session-end", [{ help: true }]],
-      ["lcm/user-prompt", [{ help: true }]], ["lcm/post-tool", [{ help: true }]], ["lcm/session-snapshot", [{ help: true }]],
+      ["lcm/user-prompt", [{ help: true }]], ["lcm/post-tool", [{ help: true }]], ["lcm/pre-tool", [{ help: true }]], ["lcm/session-snapshot", [{ help: true }]],
       ["lcm/mcp", [{ help: true }]], ["lcm/status", [{ help: true }]], ["lcm/stats", [{ help: true }]],
       ["lcm/doctor", [{ help: true }]], ["lcm/diagnose", [{ help: true }]], ["lcm/sensitive", [[], { help: true }]],
       ["lcm/import", [{ help: true }]], ["lcm/promote", [{ help: true }]], ["lcm/export", [{ help: true }]],

@@ -172,13 +172,22 @@ function rankResults(
     .sort(compareRankedResults);
 }
 
+/** A pre-tool request returns and emits at most this many memories. */
+const PRE_TOOL_MAX_RESULTS = 2;
+
+// Recency decay keeps a full 2-term match just below the default minimum score of 2.
+const PRE_TOOL_MIN_SCORE_RELIEF = 0.5;
+
 function applyCooldown(
   results: RankedPromptSearchResult[],
   minScore: number,
   resurfaceMargin: number,
+  strictCooldown = false,
 ): RankedPromptSearchResult[] {
   const eligible = results.filter((result) => result.finalScore >= minScore);
   if (eligible.length === 0) return [];
+  // Pre-tool hints never resurface a cooled-down memory, not even as the only result.
+  if (strictCooldown) return eligible.filter((result) => !result.cooledDown);
 
   const bestNonCooled = eligible.find((result) => !result.cooledDown);
   if (!bestNonCooled) return [eligible[0]];
@@ -197,6 +206,8 @@ export interface PromptSearchRequest {
   learningInstructionBytes?: number;
   logSurfacing?: boolean;
   debug?: boolean;
+  /** Only the exact value "pre-tool" selects the stricter pre-tool hint policy. */
+  recallMode?: "pre-tool";
 }
 
 function validatePromptSearchInput(input: unknown): PromptSearchRequest {
@@ -222,6 +233,7 @@ function validatePromptSearchInput(input: unknown): PromptSearchRequest {
         : undefined,
     logSurfacing: obj.logSurfacing !== false,
     debug: obj.debug === true,
+    ...(obj.recallMode === "pre-tool" ? { recallMode: "pre-tool" as const } : {}),
   };
 }
 
@@ -236,7 +248,8 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
       return;
     }
 
-    const { query, session_id, cwd, learningInstructionBytes, logSurfacing, debug: isDebug } = input;
+    const { query, session_id, cwd, learningInstructionBytes, logSurfacing, debug: isDebug, recallMode } = input;
+    const preTool = recallMode === "pre-tool";
 
     // Redundant check (validatePromptSearchInput should have already caught these),
     // but kept for defensive programming.
@@ -265,14 +278,19 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
       const result = await withProjectStorage(
         { config, cwd: validatedCwd, factory: storageFactory, context, mode: "existing" },
         async (project) => {
-          const maxResults = config.restoration.promptSearchMaxResults;
-          if (maxResults === 0) return { hints: [], ids: [] };
+          const configuredMaxResults = config.restoration.promptSearchMaxResults;
+          if (configuredMaxResults === 0) return { hints: [], ids: [] };
+          const maxResults = preTool ? Math.min(configuredMaxResults, PRE_TOOL_MAX_RESULTS) : configuredMaxResults;
 
-          const minScore = config.restoration.promptSearchMinScore;
+          const minScore = preTool
+            ? Math.max(0, config.restoration.promptSearchMinScore - PRE_TOOL_MIN_SCORE_RELIEF)
+            : config.restoration.promptSearchMinScore;
           const snippetLength = config.restoration.promptSnippetLength;
           const maxInjectedMemoryBytes = config.restoration.maxInjectedMemoryBytes;
           const reservedForLearningInstruction = config.restoration.reservedForLearningInstruction;
-          const maxInjectedMemoryItems = config.restoration.maxInjectedMemoryItems;
+          const maxInjectedMemoryItems = preTool
+            ? Math.min(config.restoration.maxInjectedMemoryItems, PRE_TOOL_MAX_RESULTS)
+            : config.restoration.maxInjectedMemoryItems;
           const dedupMinPrefix = config.restoration.dedupMinPrefix;
           const halfLife = config.restoration.recencyHalfLifeHours;
           const crossSessionAffinity = config.restoration.crossSessionAffinity;
@@ -323,7 +341,7 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
             stalePenalty,
             allowStaleOnStrongMatch,
           });
-          const filtered = applyCooldown(ranked, minScore, resurfaceMargin);
+          const filtered = applyCooldown(ranked, minScore, resurfaceMargin, preTool);
 
           // Cap ranked results before selecting the best-fitting subset for the byte budget.
           const selection = selectMemoryHintsWithinBudget(

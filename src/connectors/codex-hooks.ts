@@ -63,8 +63,20 @@ function lcmCommand(command: string, transport: ConnectorTransport = "cli"): str
   return `lcm ${command} --client codex${suffix}`;
 }
 
-function codexLcmHooks(transport: ConnectorTransport = "cli"): Record<string, CodexHookGroup[]> {
-  return {
+/** Optional Codex hook registrations; callers resolve the value, generators never read config. */
+export interface CodexLcmHookOptions {
+  /** Register the opt-in PreToolUse memory hint hook (default off). */
+  readonly preToolRecall?: boolean;
+}
+
+/** Tools whose pending call the opt-in PreToolUse hook can derive a memory query from. */
+const PRE_TOOL_RECALL_MATCHER = "^(Bash|apply_patch|mcp__.*)$";
+
+export function codexLcmHooks(
+  transport: ConnectorTransport = "cli",
+  options: CodexLcmHookOptions = {},
+): Record<string, CodexHookGroup[]> {
+  const hooks: Record<string, CodexHookGroup[]> = {
     SessionStart: [
       {
         matcher: "startup|resume|clear",
@@ -129,6 +141,22 @@ function codexLcmHooks(transport: ConnectorTransport = "cli"): Record<string, Co
       },
     ],
   };
+  if (options.preToolRecall === true) {
+    hooks.PreToolUse = [
+      {
+        matcher: PRE_TOOL_RECALL_MATCHER,
+        hooks: [
+          {
+            type: "command",
+            command: lcmCommand("pre-tool"),
+            timeout: 5,
+            statusMessage: "Checking LCM memory for this action",
+          },
+        ],
+      },
+    ];
+  }
+  return hooks;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -148,7 +176,7 @@ function isLcmHookCommand(command: unknown): boolean {
   if (/\blcm\s+user-prompt\s+--client\s+codex(?:\s+--transport\s+(?:cli|mcp))?$/.test(command)) {
     return true;
   }
-  return /\blcm\s+(restore|post-tool|session-snapshot)\b/.test(command);
+  return /\blcm\s+(restore|post-tool|pre-tool|session-snapshot)\b/.test(command);
 }
 
 function stripLcmHooks(config: CodexHooksConfig): { config: CodexHooksConfig; removed: boolean } {
@@ -190,9 +218,13 @@ function hasNonHookKeys(config: CodexHooksConfig): boolean {
 }
 
 /** Pure content operation used by the anchored installer mutation seam. */
-export function mergeCodexHooksContent(content: string, transport: ConnectorTransport = "cli"): string {
+export function mergeCodexHooksContent(
+  content: string,
+  transport: ConnectorTransport = "cli",
+  options: CodexLcmHookOptions = {},
+): string {
   const config = stripLcmHooks(readHooksConfigFromContent(content)).config;
-  const lcmHooks = codexLcmHooks(transport);
+  const lcmHooks = codexLcmHooks(transport, options);
   for (const [event, groups] of Object.entries(lcmHooks)) {
     config.hooks[event] = [...(config.hooks[event] ?? []), ...groups];
   }
@@ -293,7 +325,9 @@ export function installCodexHooks(
   configPath: string,
   transport: ConnectorTransport = "cli",
 ): void {
-  // Legacy two-path helper; callers requiring Bug #713 guarantees use installConnector.
+  // Legacy two-path helper with no production callers (tests only); it never
+  // reads daemon config, so the opt-in PreToolUse hook is always off here.
+  // Callers requiring Bug #713 guarantees use installConnector.
   mkdirSync(dirname(hooksPath), { recursive: true });
   enableCodexHooksFeature(configPath);
   let existing = "";

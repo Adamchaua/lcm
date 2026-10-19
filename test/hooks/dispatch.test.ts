@@ -26,6 +26,9 @@ vi.mock("../../src/hooks/session-snapshot.js", () => ({
 vi.mock("../../src/hooks/post-tool.js", () => ({
   handlePostToolUse: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
 }));
+vi.mock("../../src/hooks/pre-tool.js", () => ({
+  handlePreToolUse: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
+}));
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: vi.fn().mockImplementation(function () {
     return {};
@@ -54,6 +57,7 @@ describe("HOOK_COMMANDS", () => {
     const commandToEvent: Record<string, string> = {
       "compact": "PreCompact",
       "post-tool": "PostToolUse",
+      "pre-tool": "PreToolUse",
       "restore": "SessionStart",
       "session-end": "SessionEnd",
       "session-snapshot": "Stop",
@@ -75,6 +79,7 @@ import { handleSessionEnd } from "../../src/hooks/session-end.js";
 import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
 import { handleSessionSnapshot } from "../../src/hooks/session-snapshot.js";
 import { handlePostToolUse } from "../../src/hooks/post-tool.js";
+import { handlePreToolUse } from "../../src/hooks/pre-tool.js";
 import { loadHookConfig, type HookConfig } from "../../src/hooks/config.js";
 import type { StorageBackendSelection } from "../../src/storage/backend.js";
 
@@ -401,6 +406,29 @@ describe("dispatchHook", () => {
 
     expect(handlePostToolUse).toHaveBeenCalledWith(expect.any(String));
     expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it("routes pre-tool straight to its handler without bootstrap, repair or config load", async () => {
+    const payload = JSON.stringify({ session_id: "test", client: "codex", tool_name: "Bash" });
+    vi.mocked(handlePreToolUse).mockClear();
+    vi.mocked(ensureBootstrapped).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockClear();
+    vi.mocked(validateAndFixHooks).mockClear();
+    vi.mocked(loadHookConfig).mockClear();
+
+    const result = await dispatchHook("pre-tool", payload);
+
+    expect(result).toEqual({ exitCode: 0, stdout: "" });
+    expect(handlePreToolUse).toHaveBeenCalledTimes(1);
+    expect(handlePreToolUse).toHaveBeenCalledWith(payload);
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it("recognizes pre-tool as a valid hook command", () => {
+    expect(isHookCommand("pre-tool")).toBe(true);
   });
 
   it("recognizes post-tool as a valid hook command", () => {

@@ -10,7 +10,7 @@ lcm <hook-command> < <stdin-json>
 
 ## Hook entrypoints and legacy-root migration
 
-Installed hook entrypoints (`post-tool`, `restore`, `session-end`,
+Installed hook entrypoints (`post-tool`, `pre-tool`, `restore`, `session-end`,
 `session-snapshot`, `user-prompt`, and `compact --hook`) skip the CLI's
 global legacy-root migration preflight, so a busy backend publication lock
 cannot fail a hook before its own handler runs. Interactive `lcm compact` and
@@ -367,6 +367,44 @@ When the exact structure and the pure probe both pass, doctor reports:
 ✓ Codex: PostToolUse hook installed
 ✓ Codex: native exec capture functional
 ```
+
+## PreToolUse Hook (Codex, opt-in)
+
+**Command:** `lcm pre-tool --client codex`
+
+Registered only when `hooks.preToolRecall` is `true` when the Codex hooks are
+installed (see [Opt-in PreToolUse memory hints](configuration.md#opt-in-pretooluse-memory-hints-codex)).
+The registration uses the matcher `^(Bash|apply_patch|mcp__.*)$`, a 5 second
+timeout, and the status message "Checking LCM memory for this action". Like
+`post-tool`, the entrypoint skips the legacy-root migration preflight and the
+dispatcher does not bootstrap or start the daemon.
+
+**Stdin fields used:** `session_id`, `cwd`, `tool_name`, `tool_input`, and the
+presence of `agent_id` or `agent_type` (subagent calls are skipped).
+
+**Response:** Exit code `0`. When a relevant memory is found, stdout is a single
+JSON document and nothing else:
+
+```json
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"..."}}
+```
+
+`additionalContext` is a one-line advisory preamble ("shell command", "file edit"
+or "MCP tool") followed by the usual `<memory-context>` block. Codex records the
+context and then runs the already-selected call unchanged. The hook never emits
+a decision, permission verdict, input rewrite, system message, or exit code `2`.
+
+Every failure path ends with empty stdout and exit `0`: invalid input, a disabled
+setting, `LCM_ENABLED=false`, a subagent call, an unsupported tool or a query with
+fewer than two useful terms, an absent LCM root, publication-lock contention,
+missing publication evidence, an unavailable or slow daemon (1.5 second wall
+deadline), and a malformed response. Any other backend publication error is
+rethrown so the CLI prints its fixed diagnostic and exits `1` with empty stdout;
+the tool call still runs.
+
+The request goes to `/prompt-search` with `recallMode: "pre-tool"`, which returns
+at most two results, never falls back to a cooled-down memory, and relaxes the
+minimum score by 0.5. Surfacing is logged like prompt recall.
 
 ## SessionSnapshot Hook
 

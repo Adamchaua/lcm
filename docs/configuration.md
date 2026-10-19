@@ -439,6 +439,74 @@ Prompt-time recall now has a second budget layer after `/prompt-search` ranking.
 
 In practice, the hook asks the daemon for ranked candidates, the daemon dedupes and trims them against the final byte budget, and only the emitted hints get surfaced back to the hook. That means increasing `promptSearchMaxResults` without adjusting `maxInjectedMemoryBytes` just gives the reranker more candidates to choose from; it does not guarantee more emitted context.
 
+### Opt-in PreToolUse memory hints (Codex)
+
+Codex can surface one or two relevant memories just before it runs a shell
+command, an `apply_patch` edit, or an MCP tool call. The feature is off by
+default and applies only to Codex 0.163.0 and later; Claude Code is unaffected.
+
+Enable it, then reinstall the Codex hooks so the `PreToolUse` registration is
+written:
+
+```bash
+lcm config set hooks.preToolRecall true --json
+lcm connectors install codex
+```
+
+To turn it off, set the key to `false` and reinstall. The installer then
+removes the `PreToolUse` entry and leaves any hooks you added yourself. The hook
+also re-reads the key on every call, so `false` stops new hints immediately even
+before you reinstall. The install reads `hooks.preToolRecall` from the daemon
+configuration file (never from Codex's `config.toml`); if that file cannot be
+read, the install fails before it writes any Codex file.
+
+**What is sent.** The hook derives a short query from the *identity* of the
+pending call and sends it, with the working directory and session id, to the
+authenticated loopback daemon:
+
+- Shell commands: the executable name, a small set of subcommands (`git status`,
+  `pnpm run <script>`), and file path names for `cat`, `head`, `tail`, `less`,
+  `more`, and `wc`. Anything with quotes, redirections, expansions, subshells,
+  heredocs, background jobs, or other unsupported shell syntax is skipped
+  entirely. Flags and everything after them, environment assignments, and
+  interpreter or inline code are never used.
+- `apply_patch`: the file paths named in the `*** Add File`, `*** Update File`,
+  `*** Delete File`, and `*** Move to` header lines. Patch bodies are never used.
+- MCP tools: the server and tool names. Arguments are never used, and the `lcm`
+  MCP server itself is skipped.
+
+Generic words such as `src`, `test`, `run`, and `build` are dropped, and at least
+two distinct terms must remain. LCM adds no new storage of the query or of the
+injected text; the only new record is the existing surfacing log (memory ids and
+session id), which is shared with prompt recall. The injected context does
+enter Codex's own history, and Codex may spill oversized hook output (default
+2,500-token limit) to operating-system temporary `hook_outputs` files.
+
+**Behavior and limits.**
+
+- Hints are advisory. Codex records them and then runs the already-selected call
+  unchanged, so they inform later steps; they do not make the model reconsider
+  the pending call. The hook never blocks, approves, or rewrites a call.
+- Only the root thread receives hints; subagent calls are skipped.
+- The hook never starts the daemon. If the daemon is unavailable, slower than
+  1.5 seconds, or returns an unusable answer, the call proceeds with no hint.
+  Codex also bounds the hook at 5 seconds.
+- At most two memories are returned, within `maxInjectedMemoryBytes` in total
+  (the short `LCM memory related to the pending ...` line is reserved from that
+  budget).
+- Cooldown is shared with prompt recall. A memory shown by either path is not
+  shown again by the pre-tool path until `surfacingCooldownWindow` hours pass
+  (with `surfacingCooldownWindow: 0` there is no cooldown), and pre-tool never
+  re-shows a cooled-down memory even when it is the only match. A pre-tool hint
+  also counts as an unused surfacing for the usual
+  `unusedSurfacingPenalty`, which can lower that memory's later prompt-recall
+  score. Concurrent duplicate calls can surface the same memory twice, and
+  distinct hints accumulate in the conversation history.
+- Because recency decay keeps a full two-term match just below 2, pre-tool
+  requests use `promptSearchMinScore - 0.5` (never below 0) as their minimum
+  score: 1.5 with the default of 2. A stricter configured value is still honored
+  (a value of 4 requires 3.5). Prompt recall is unchanged.
+
 ### Leaf chunk tokens
 
 `LCM_LEAF_CHUNK_TOKENS` (default `20000`) caps the amount of source material per leaf compaction pass.

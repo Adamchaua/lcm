@@ -1243,6 +1243,7 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   // contention into a hook failure before the handler runs.
   if (topLevel && (
     action === "post-tool"
+    || action === "pre-tool"
     || action === "restore"
     || action === "session-end"
     || action === "session-snapshot"
@@ -3095,6 +3096,25 @@ export async function runCli(
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("post-tool", input);
+      if (r.stdout) stdout.write(r.stdout);
+      exit(r.exitCode);
+    });
+
+  // ─── pre-tool (hook) ───────────────────────────────────────────────────────
+  program
+    .command("pre-tool")
+    .description("Dispatch the pre-tool hook (PreToolUse event)")
+    .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
+    .option("-h, --help", "Show help")
+    .action(async (opts) => {
+      if (opts.help) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("pre-tool"); exit(0);
+      }
+      const { dispatchHook } = await import("../src/hooks/dispatch.js");
+      const input = withHookClient(await readStdin(), opts.client);
+      const r = await dispatchHook("pre-tool", input);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });

@@ -45,7 +45,7 @@ export const CLI_SCENARIO_PATHS = {
   control: ["<root>", "help", "daemon", "config", "events", "machine", "project", "postgres", "connectors", "daemon start", "daemon restart", "config get", "config set", "install", "uninstall", "mcp", "connectors list", "connectors install", "connectors remove", "connectors doctor"],
   memory: ["search", "grep", "describe", "expand", "store"],
   compaction: ["compact"],
-  hooks: ["restore", "session-end", "user-prompt", "post-tool", "session-snapshot"],
+  hooks: ["restore", "session-end", "user-prompt", "post-tool", "pre-tool", "session-snapshot"],
   diagnostics: ["status", "stats", "doctor", "diagnose"],
   events: ["events promote", "events status", "events validate", "events quarantine", "events replay"],
   identity: ["machine register", "machine show", "machine recover", "project reconcile-worktrees", "project renew-retired-identity", "project list", "project show", "project link", "project unlink", "project create"],
