@@ -33,6 +33,7 @@ import {
   withHookPublicationFenceAsync,
 } from "./publication-fence.js";
 import { withBackendPublicationAppendBarrierAsync } from "../storage/backend-publication.js";
+import { resolveHookSessionScope } from "./subagent-scope.js";
 
 function assertStableRoot(
   handle: PrivateDirectoryHandle,
@@ -182,7 +183,8 @@ export async function handleSessionStart(
     return { exitCode: 0, stdout: "" };
   }
   const input = parsed as RestoreHookInput;
-  if ((input.session_id != null && typeof input.session_id !== "string")
+  const scope = resolveHookSessionScope(input);
+  if ((!scope.isSubagent && input.session_id != null && typeof input.session_id !== "string")
     || (input.cwd != null && typeof input.cwd !== "string")) {
     return { exitCode: 0, stdout: "" };
   }
@@ -201,7 +203,9 @@ export async function handleSessionStart(
     return { exitCode: 0, stdout: "" };
   }
 
-  const sessionId = input.session_id ?? "";
+  // A Codex subagent restores under its own thread id so the parent's and
+  // siblings' restore locks, and their recorded sessions, never suppress it.
+  const sessionId = scope.sessionId ?? "";
   if (sessionId && !tryAcquireSessionLock(sessionId)) {
     return { exitCode: 0, stdout: "" };
   }
@@ -231,8 +235,10 @@ export async function handleSessionStart(
 
   try {
 
-    // SessionStart scavenge: prune old processed events and trigger promotion for unprocessed ones
-    try {
+    // SessionStart scavenge: prune old processed events and trigger promotion for unprocessed ones.
+    // Subagents skip it: it is root maintenance that the next root start
+    // repeats, and concurrent children would contend on the outbox lock.
+    if (!scope.isSubagent) try {
       const { SQLiteLocalHookOutboxFactory } = await import("../storage/local-hook-outbox.js");
       const { eventsDbPath } = await import("../db/events-path.js");
       const cwd = input.cwd ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
@@ -287,7 +293,10 @@ export async function handleSessionStart(
     // The client owns its network lifecycle; perform only a short admission
     // check immediately before the request and do not retain the lock over it.
     assertHookPublicationFence();
-    const result = await client.post<{ context: string; insights?: Array<{ content: string; confidence: number; tags: string[] }> }>("/restore", input);
+    const result = await client.post<{ context: string; insights?: Array<{ content: string; confidence: number; tags: string[] }> }>(
+      "/restore",
+      scope.isSubagent ? { ...input, session_id: scope.sessionId } : input,
+    );
     let stdout = result.context || "";
 
     if (result.insights && result.insights.length > 0) {

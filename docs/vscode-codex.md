@@ -132,6 +132,8 @@ The hook connector installs these Codex events:
 | `PostToolUse` | `lcm post-tool --client codex` | Captures bounded semantic signals from `functions.exec` and `functions.exec_command` |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingests transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingests transcript deltas and triggers compaction once the configured token threshold is reached |
+| `SubagentStart` | `lcm restore --client codex` | Loads project memory into a Codex subagent when it starts |
+| `SubagentStop` | `lcm session-snapshot --client codex` | Ingests the subagent rollout under the subagent's own session when it finishes |
 
 Codex must trust the project `.codex/` layer for project-local hooks to load. For a global setup, run:
 
@@ -246,6 +248,7 @@ lcm import --provider all
    commands; default/fresh Codex CLI installation remains hook+skill+minimal
    rules and does not inspect MCP.
 4. Codex `Stop` hooks are turn-scoped, not final-session hooks. LCM therefore uses rolling snapshots and thresholded compaction instead of marking Codex sessions complete on each `Stop`; the `PreCompact` snapshot hook fills the pre-compaction gap.
+   Subagents spawned by Codex are recorded as their own sessions through `SubagentStart` and `SubagentStop`; see [Codex subagent lifecycle](hook-protocol.md#codex-subagent-lifecycle).
 5. Claude Code and Codex use native integrations, but their setup commands remain different.
 
 ## Improvement candidates

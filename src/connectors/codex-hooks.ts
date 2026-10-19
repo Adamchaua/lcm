@@ -128,6 +128,30 @@ function codexLcmHooks(transport: ConnectorTransport = "cli"): Record<string, Co
         ],
       },
     ],
+    SubagentStart: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: lcmCommand("restore"),
+            timeout: 30,
+            statusMessage: "Loading LCM memory for subagent",
+          },
+        ],
+      },
+    ],
+    SubagentStop: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: lcmCommand("session-snapshot"),
+            timeout: 30,
+            statusMessage: "Saving LCM subagent memory",
+          },
+        ],
+      },
+    ],
   };
 }
 

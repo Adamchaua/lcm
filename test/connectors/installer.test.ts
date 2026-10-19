@@ -1061,6 +1061,8 @@ describe('installConnector — Codex native hooks', () => {
       statusMessage: 'Saving LCM memory before compaction',
     });
     expect(hooks.hooks.Stop[0].hooks[0].command).toBe('lcm session-snapshot --client codex');
+    expect(hooks.hooks.SubagentStart[0].hooks[0].command).toBe('lcm restore --client codex');
+    expect(hooks.hooks.SubagentStop[0].hooks[0].command).toBe('lcm session-snapshot --client codex');
     expect(JSON.stringify(hooks)).not.toMatch(/claude/i);
 
     const skill = readFileSync(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'), 'utf-8');

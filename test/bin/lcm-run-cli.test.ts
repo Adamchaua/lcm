@@ -2749,6 +2749,38 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(migrate).not.toHaveBeenCalled();
   });
 
+  it("maps a SubagentStop snapshot journal rejection to exit 1, never the Codex continue code 2", async () => {
+    fakeStdin.isTTY = false;
+    const payload = {
+      hook_event_name: "SubagentStop",
+      session_id: "tree-root",
+      agent_id: "child-thread",
+      agent_transcript_path: "/rollouts/child.jsonl",
+    };
+    fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
+      if (event === "data") queueMicrotask(() => callback(Buffer.from(JSON.stringify(payload))));
+      if (event === "end") queueMicrotask(() => callback());
+      return fakeStdin;
+    });
+    const journal = new BackendPublicationJournalError("malformed-journal", "evidence is malformed");
+    state.dispatchHook.mockRejectedValueOnce(journal);
+
+    await expect(runCli(["node", "lcm", "session-snapshot", "--client", "codex"], {
+      migrate: vi.fn(),
+      sleep: async (_delayMs: number) => undefined,
+    })).rejects.toBe(journal);
+    expect(state.dispatchHook).toHaveBeenCalledWith(
+      "session-snapshot",
+      JSON.stringify({ ...payload, client: "codex" }),
+    );
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      expect(() => handleCliError(journal)).toThrow("exit:1");
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it("reports exact Codex structure and functional capture health", async () => {
     state.installed = [{ agentId: "codex", type: "hook", path: "/partial/hooks.json" }];
     state.inspectCodexPostToolHook.mockReturnValue({

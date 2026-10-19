@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { dirname, join } from "node:path";
 import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -965,5 +965,83 @@ describe("handleSessionStart", () => {
       else process.env.HOME = previousHome;
       rmSync(home, { recursive: true, force: true });
     }
+  });
+
+  describe("Codex subagent scope", () => {
+    const ids = ["tree-root", "child-a", "child-b", "grandchild-c"];
+    const codexChild = (agentId: string, extra: Record<string, unknown> = {}) => JSON.stringify({
+      client: "codex",
+      session_id: "tree-root",
+      agent_id: agentId,
+      agent_type: "worker",
+      cwd: "/proj",
+      hook_event_name: "SubagentStart",
+      ...extra,
+    });
+
+    beforeEach(() => {
+      for (const id of ids) rmSync(sessionLockPathForTesting(id), { force: true });
+      mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    });
+
+    afterEach(() => {
+      for (const id of ids) rmSync(sessionLockPathForTesting(id), { force: true });
+    });
+
+    it("restores concurrent children while the parent lock is held, keyed by agent_id", async () => {
+      const parentLock = sessionLockPathForTesting("tree-root");
+      mkdirSync(dirname(parentLock), { recursive: true });
+      writeFileSync(parentLock, String(process.pid));
+      const post = vi.fn().mockResolvedValue({ context: "child ctx" });
+      const [a, b] = await Promise.all([
+        handleSessionStart(codexChild("child-a"), { post }),
+        handleSessionStart(codexChild("child-b"), { post }),
+      ]);
+      expect(a).toEqual({ exitCode: 0, stdout: "child ctx" });
+      expect(b).toEqual({ exitCode: 0, stdout: "child ctx" });
+      expect(post).toHaveBeenCalledWith("/restore", expect.objectContaining({ session_id: "child-a", agent_id: "child-a" }));
+      expect(post).toHaveBeenCalledWith("/restore", expect.objectContaining({ session_id: "child-b" }));
+      // A repeat child start is deduplicated by its own lock, not the parent's.
+      expect(await handleSessionStart(codexChild("child-a"), { post })).toEqual({ exitCode: 0, stdout: "" });
+      expect(post).toHaveBeenCalledTimes(2);
+      // The parent's lock is untouched and the parent itself stays suppressed.
+      expect(await handleSessionStart(JSON.stringify({ session_id: "tree-root", cwd: "/proj" }), { post }))
+        .toEqual({ exitCode: 0, stdout: "" });
+    });
+
+    it("gives a grandchild its own lock and skips the root scavenge for children only", async () => {
+      const restoreHome = usePrivatePublicationHome("lcm-restore-subagent-scavenge-");
+      const post = vi.fn().mockResolvedValue({ context: "ctx" });
+      vi.mocked(eventsDbPath).mockClear();
+      try {
+        await handleSessionStart(codexChild("grandchild-c"), { post });
+        expect(eventsDbPath).not.toHaveBeenCalled();
+        await handleSessionStart(JSON.stringify({ session_id: "tree-root", cwd: "/proj" }), { post });
+        expect(eventsDbPath).toHaveBeenCalled();
+      } finally {
+        restoreHome();
+      }
+    });
+
+    it("restores a child whose payload lacks a usable tree session_id", async () => {
+      const post = vi.fn().mockResolvedValue({ context: "ctx" });
+      const result = await handleSessionStart(codexChild("child-a", { session_id: 42 }), { post });
+      expect(result.stdout).toBe("ctx");
+      expect(post).toHaveBeenCalledWith("/restore", expect.objectContaining({ session_id: "child-a" }));
+    });
+
+    it("treats a malformed agent_id as a root start", async () => {
+      const post = vi.fn().mockResolvedValue({ context: "ctx" });
+      await handleSessionStart(codexChild("", { agent_id: 7 }), { post });
+      expect(post).toHaveBeenCalledWith("/restore", expect.objectContaining({ session_id: "tree-root" }));
+      expect(await handleSessionStart(JSON.stringify({ client: "codex", agent_id: 7, session_id: 9, cwd: "/proj" }), { post }))
+        .toEqual({ exitCode: 0, stdout: "" });
+    });
+
+    it("keeps session_id for a non-Codex payload that carries agent_id", async () => {
+      const post = vi.fn().mockResolvedValue({ context: "ctx" });
+      await handleSessionStart(codexChild("child-a", { client: "claude" }), { post });
+      expect(post).toHaveBeenCalledWith("/restore", expect.objectContaining({ session_id: "tree-root" }));
+    });
   });
 });

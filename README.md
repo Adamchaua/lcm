@@ -179,6 +179,8 @@ The native hooks use:
 | `PostToolUse` | `lcm post-tool --client codex` | Capture passive learning signals from tool use |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingest transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingest Codex transcript deltas and compact when the configured token threshold is reached |
+| `SubagentStart` | `lcm restore --client codex` | Load project memory into a Codex subagent when it starts |
+| `SubagentStop` | `lcm session-snapshot --client codex` | Ingest the subagent rollout under the subagent's own session when it finishes |
 
 Import older Codex sessions when needed:
 
