@@ -129,7 +129,7 @@ The hook connector installs these Codex events:
 |---|---|---|
 | `SessionStart` | `lcm restore --client codex` | Restores project context when Codex starts, resumes, or clears a session |
 | `UserPromptSubmit` | `lcm user-prompt --client codex` | Searches memory and injects prompt-time hints |
-| `PostToolUse` | `lcm post-tool --client codex` | Captures bounded semantic signals from `functions.exec` and `functions.exec_command` |
+| `PostToolUse` | `lcm post-tool --client codex` | Captures bounded semantic signals from Codex shell (`Bash`) and MCP tool results |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingests transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingests transcript deltas and triggers compaction once the configured token threshold is reached |
 
@@ -222,16 +222,29 @@ event database, open an EventsDb, or append sidecar events, and it reports
 `native exec normalization self-test passed (fixtures only; not proof of runtime execution)`.
 It does not show that Codex runs the hook; that is the readiness report above.
 
-Codex capture is deliberately narrow. Only `client: "codex"` payloads with
-`tool_name` equal to `functions.exec` or `functions.exec_command` are adapted.
-The adapter takes `tool_input.command`, or `tool_input.cmd` when `command` is
-absent, and bounds the accepted command to 2,000 characters before passing it
-through the existing event-data truncation and sensitive-data scrubbing. It
-projects only direct status fields from `tool_output` (preferred) or
-`tool_response`, using `isError`, `is_error`, `exit_code`, and `exitCode` in
-that order. Raw stdout/stderr, raw responses, nested or unknown output fields,
-and file-like fields are not persisted or interpreted as file events. A
-trimmed command beginning with `lcm store` is suppressed to avoid a feedback
+Codex capture is deliberately narrow. Current Codex reports shell commands
+(`exec_command` and the `write_stdin` polls that finish them) to hooks as the
+tool `Bash`; LCM also accepts the legacy names `functions.exec` and
+`functions.exec_command` as aliases. The adapter takes `tool_input.command`, or
+`tool_input.cmd` when `command` is absent, and bounds the accepted command to
+2,000 characters before passing it through the existing event-data truncation
+and sensitive-data scrubbing. MCP tools (`mcp__<server>__<tool>`) are recorded
+by tool name only.
+
+Codex's PostToolUse payload carries no shell exit status, only the output text,
+and LCM never parses that text. A completed git or install command is
+therefore stored as a `tool_outcome_unknown` observation (for example
+`Bash outcome unknown: git commit`) instead of a success. Unknown
+observations are kept as passive history but are never promoted, reinforced, or
+treated as the fix for an earlier error. A structured status
+(`isError`, `is_error`, `exit_code`, `exitCode`) is still honored when a payload
+supplies one. A successful MCP result is recorded as before. Codex does not run
+PostToolUse for a failed or interrupted MCP call or for an interrupted shell
+command, so those cannot be observed. See
+[Codex native PostToolUse capture](hook-protocol.md#codex-native-posttooluse-capture)
+for the full matrix. Raw stdout/stderr, raw responses, MCP arguments and
+content, and file-like fields are not persisted or interpreted as file events.
+A trimmed command beginning with `lcm store` is suppressed to avoid a feedback
 loop from LCM's own storage calls. There is no new configuration option for
 these fixed capture rules.
 
