@@ -265,6 +265,73 @@ describe("inspectCodexReadiness statuses", () => {
     accepted(withForeign(mcp({ a: 2 ** 62, b: -(2 ** 62), c: 1.5, d: 1e-7, e: [0, -1, 4611686018427387904], f: { g: 123456789 } })));
   });
 
+  it("rejects repeated member names in typed hooks.json objects, including escaped spellings, beside trusted LCM hooks", () => {
+    const rawRows = (content: string) => inspectCodexReadiness(input({ hooks: { state: "content", content, mtimeMs: 1000 } }));
+    const sessionStart = (report: ReturnType<typeof inspectCodexReadiness>) => report.rows.find((row) => row.event === "SessionStart")?.status;
+    expect(sessionStart(rawRows(FULL_HOOKS))).toBe("ready");
+    const handler = (members: string) => '{"hooks":{"Stop":[{"hooks":[{"type":"command",' + members + "}]}]}}";
+    for (const content of [
+      FULL_HOOKS.slice(0, -1) + ',"hooks":{}}',
+      '{"description":"a","description":"b","hooks":{}}',
+      '{"extra":{"a":1,"a":2}}',
+      '{"hooks":{"Stop":[],"Stop":[]}}',
+      '{"hooks":{"Stop":[{"matcher":"a","matcher":"b","hooks":[]}]}}',
+      '{"hooks":{"Stop":[{"hooks":[],"hooks":[]}]}}',
+      handler('"command":"echo a","command":"echo b"'),
+      handler('"command":"echo a","\\u0063ommand":"echo b"'),
+      handler('"command":"echo a","timeout":1,"timeout":2'),
+    ]) {
+      expect(new Set(rawRows(content).rows.map((row) => row.status)), content).toEqual(new Set(["hooks-file-unreadable"]));
+    }
+  });
+
+  it("keeps a repeated member name below the typed hooks.json objects readable", () => {
+    const withForeign = (handler: string) => {
+      const hooks = JSON.parse(FULL_HOOKS).hooks as Record<string, any[]>;
+      hooks.PostToolUse.push({ hooks: ["__HANDLER__"] });
+      const content = JSON.stringify({ hooks }).replace('"__HANDLER__"', handler);
+      return inspectCodexReadiness(input({ hooks: { state: "content", content, mtimeMs: 1000 } }));
+    };
+    const ready = (report: ReturnType<typeof inspectCodexReadiness>) =>
+      expect(report.rows.find((row) => row.event === "SessionStart")?.status).toBe("ready");
+    ready(withForeign('{"type":"mcp_tool","server":"s","tool":"t","input":{"a":1,"a":2,"b":{"c":1,"c":2}}}'));
+    ready(withForeign('{"type":"command","command":"echo f","extra":{"k":1,"k":2}}'));
+  });
+
+  it("rejects a timeout or additionalContextLimit that is not an unsigned integer token, beside trusted LCM hooks", () => {
+    const withForeign = (handler: string) => {
+      const hooks = JSON.parse(FULL_HOOKS).hooks as Record<string, any[]>;
+      hooks.PostToolUse.push({ hooks: ["__HANDLER__"] });
+      const content = JSON.stringify({ hooks }).replace('"__HANDLER__"', handler);
+      return inspectCodexReadiness(input({ hooks: { state: "content", content, mtimeMs: 1000 } }));
+    };
+    const rejected = (handler: string) =>
+      expect(new Set(withForeign(handler).rows.map((row) => row.status)), handler).toEqual(new Set(["hooks-file-unreadable"]));
+    const accepted = (handler: string) =>
+      expect(withForeign(handler).rows.find((row) => row.event === "SessionStart")?.status, handler).toBe("ready");
+    const command = (members: string) => '{"type":"command","command":"echo f",' + members + "}";
+    for (const spelling of ["30.0", "3e1", "1E1", "0.0", "-0", "-0.0", "1e+1", "5E-0"]) {
+      rejected(command('"timeout":' + spelling));
+      rejected(command('"additionalContextLimit":' + spelling));
+    }
+    rejected(command('"timeout":2500.0'));
+    rejected(command('"additionalContextLimit":2500.0'));
+    rejected('{"type":"mcp_tool","server":"s","tool":"t","timeout":30.0}');
+    rejected('{"type":"mcp_tool","server":"s","tool":"t","timeout":3e1}');
+    // Codex ignores the timeout of prompt and agent handlers, so only the base safe-integer check applies.
+    rejected('{"type":"prompt","timeout":-1}');
+    rejected('{"type":"agent","timeout":1.5}');
+    accepted('{"type":"prompt","timeout":3e1}');
+    accepted('{"type":"agent","timeout":-0}');
+    accepted('{"type":"agent","timeout":30.0}');
+    for (const spelling of ["30", "0", "2500", "9007199254740991"]) {
+      accepted(command('"timeout":' + spelling + ',"additionalContextLimit":' + spelling));
+    }
+    accepted(command('"timeout":null,"additionalContextLimit":null'));
+    accepted(command('"statusMessage":"1.0"'));
+    accepted('{"type":"mcp_tool","server":"s","tool":"t","timeout":30,"input":{"n":1.0,"m":1e2}}');
+  });
+
   it("reports state-unknown, never ready, for TOML values outside their domains beside a trusted hook", () => {
     const trusted = trustToml(TRUSTED_ALL);
     const C0 = (code: number) => String.fromCharCode(code);
@@ -542,7 +609,7 @@ describe("formatCodexReadiness", () => {
   it("prints global statuses once and counts them as one failure each", () => {
     const unreadable = format([row({ status: "hooks-file-unreadable" }), row({ status: "hooks-file-unreadable", event: "Stop" })]);
     expect(unreadable.failures).toBe(1);
-    expect(unreadable.lines.join("\n")).toContain(HOOKS + " is unreadable or malformed; fix or reinstall");
+    expect(unreadable.lines.join("\n")).toContain(HOOKS + " is unreadable or malformed; fix the file (or move it aside), then reinstall");
     const disabled = format([row({ status: "feature-disabled" }), row({ status: "feature-disabled", event: "Stop" })]);
     expect(disabled.failures).toBe(1);
     expect(disabled.lines.join("\n")).toContain("[features] hooks is disabled; all LCM lifecycle capabilities unavailable; LCM left it unchanged");
