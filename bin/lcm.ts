@@ -3115,8 +3115,12 @@ export async function runCli(
       if (opts.terminal === true) {
         // Terminal hooks never fail the session they are saving: this path has
         // its own catch boundary and always exits 0 with no output.
-        const { runTerminalSnapshotCommand } = await import("../src/hooks/terminal-snapshot.js");
-        await runTerminalSnapshotCommand();
+        try {
+          const { runTerminalSnapshotCommand } = await import("../src/hooks/terminal-snapshot.js");
+          await runTerminalSnapshotCommand();
+        } catch {
+          // A failed import or an unexpected rejection must stay silent too.
+        }
         exit(0);
       }
       const { dispatchHook } = await import("../src/hooks/dispatch.js");

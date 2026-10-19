@@ -197,15 +197,28 @@ accepts at most eight sessions at a time and answers 503 beyond that; an `Interr
 followed closely by `SessionEnd` for one session is combined so the newest
 transcript tail is read once more rather than duplicated.
 
+If shutdown happens while a project's storage open is still pending, the shared
+storage factory can close before that open settles, so accepted work may be
+cancelled rather than committed (tracked in #1582).
+
 `LCM_ENABLED=false` turns these hooks into a no-op: the command exits before it
 reads its input, contacts the daemon or writes any diagnostic.
 
 Whether a stored span ended in an interruption is only as visible as Codex makes
-it. When Codex writes its `<turn_aborted>` marker before running the hook, the
-marker is part of the stored user-role message and is searchable like any other text.
-Codex's own `TurnAborted` event is written after the hook, so it is archived only
-by a later ingest. When no marker was written, an interrupted turn cannot be
-told apart from a completed one in LCM.
+it, and LCM never adds a marker of its own:
+
+- Codex writes a `<turn_aborted>` marker before it runs the hook, but only when
+  its interrupt message is enabled (`agent_interrupt_message_enabled`). Unless
+  multi-agent v2 is in use, the marker is a user-role message, so it is parsed,
+  stored with the conversation and searchable like any other text.
+- With multi-agent v2 the marker is a developer-role message, and the parser does
+  not read developer messages. It is kept only in the raw transcript archive.
+- Codex's own `TurnAborted` event is written after the hook, so it is not in the
+  transcript the hook saves. A later ingest archives it; it is never a parsed,
+  searchable message.
+- When Codex wrote no marker, the interrupted turn and a completed one cannot be
+  told apart in LCM. A continuation turn after an interruption is stored like any
+  other turn.
 
 The time limit is an engineering bound, not a guarantee: LCM budgets 1.5 seconds of
 its own process time and stops starting work after 1.35 seconds, but it cannot

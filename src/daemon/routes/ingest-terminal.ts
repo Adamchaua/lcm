@@ -116,9 +116,18 @@ export function createTerminalIngestQueue(options: TerminalIngestQueueOptions): 
   const maxKeys = options.maxKeys ?? TERMINAL_INGEST_MAX_KEYS;
   const setTimer = options.setTimeout ?? setTimeout;
   const clearTimer = options.clearTimeout ?? clearTimeout;
-  const report = options.report ?? ((outcome: TerminalIngestOutcome): void => {
+  const reportOutcome = options.report ?? ((outcome: TerminalIngestOutcome): void => {
     if (outcome !== "captured") console.warn(`[lcm] terminal ingest ${outcome}`);
   });
+  // Reporting and drain notification are observers: a throwing one must never
+  // end the drain, leave accepted entries behind or reject the owned promise.
+  const report = (outcome: TerminalIngestOutcome): void => {
+    try {
+      reportOutcome(outcome);
+    } catch {
+      // Ignored on purpose.
+    }
+  };
   const slots = new Map<string, TerminalIngestSlot>();
   let drain: Promise<void> | undefined;
 
@@ -144,14 +153,16 @@ export function createTerminalIngestQueue(options: TerminalIngestQueueOptions): 
     const deadline = new AbortController();
     const timer = setTimer(() => deadline.abort(), remainingMs);
     const cancellation = composeAbortSignals([options.shutdownSignal, deadline.signal]);
+    let outcome: TerminalIngestOutcome;
     try {
-      report(await ingestOnce(entry, cancellation.signal));
+      outcome = await ingestOnce(entry, cancellation.signal);
     } catch (error) {
-      report(error instanceof BackendPublicationJournalError ? "blocked" : "failed");
+      outcome = error instanceof BackendPublicationJournalError ? "blocked" : "failed";
     } finally {
       clearTimer(timer);
       cancellation.cleanup();
     }
+    report(outcome);
   };
 
   const runDrain = async (): Promise<void> => {
@@ -172,7 +183,11 @@ export function createTerminalIngestQueue(options: TerminalIngestQueueOptions): 
       }
     } finally {
       drain = undefined;
-      options.onDrained();
+      try {
+        options.onDrained();
+      } catch {
+        // Ignored on purpose.
+      }
     }
   };
 

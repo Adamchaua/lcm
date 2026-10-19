@@ -368,6 +368,13 @@ describe("lcm session-snapshot --terminal entry", () => {
     expect(logError).toHaveBeenCalledWith("TerminalSnapshot", expect.objectContaining({ message: "ingest-failed" }), {});
   });
 
+  it("contains a failure while building its dependencies", async () => {
+    // A failure while building the dependencies is contained and has nothing to log with.
+    const failing = { get env(): NodeJS.ProcessEnv { throw new Error("construction failed"); } };
+    await expect(runTerminalSnapshotCommand(failing as never)).resolves.toBeUndefined();
+    expect(logError).not.toHaveBeenCalled();
+  });
+
   it("dispatches through the real hook dispatcher by default", async () => {
     const stdin = input();
     const done = runTerminalSnapshotCommand({ env: {}, deadline, input: stdin, logError: logError as never });

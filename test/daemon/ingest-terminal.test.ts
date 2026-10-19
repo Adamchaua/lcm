@@ -371,5 +371,56 @@ describe("terminal ingest queue", () => {
       warn.mockRestore();
     }
   });
-});
 
+  describe("throwing observers", () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    beforeEach(() => { unhandled.length = 0; process.on("unhandledRejection", onUnhandled); });
+    afterEach(() => { process.off("unhandledRejection", onUnhandled); });
+
+    it("keeps draining and retires every entry when the reporter throws on results", async () => {
+      const reported: TerminalIngestOutcome[] = [];
+      const queue = make({ report: (outcome) => { reported.push(outcome); throw new Error("reporter failed"); } });
+      behavior = (call) => { if (call === 1) throw new Error("ingest failed"); };
+      await post(queue, request({ session_id: "one" }));
+      await post(queue, request({ session_id: "two" }));
+      await post(queue, request({ session_id: "three" }));
+      await expect(queue.drained()).resolves.toBeUndefined();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(calls.map((call) => call.body.session_id)).toEqual(["one", "two", "three"]);
+      expect(reported).toHaveLength(3);
+      expect(queue.busy()).toBe(false);
+      expect(drained).toHaveBeenCalledOnce();
+      expect(unhandled).toEqual([]);
+      expect((await post(queue, request({ session_id: "later" }))).status).toBe(202);
+      await queue.drained();
+      expect(calls).toHaveLength(4);
+    });
+
+    it("keeps draining and retires every entry when the reporter throws on expiry", async () => {
+      const reported: TerminalIngestOutcome[] = [];
+      const queue = make({ deadlineMs: 0, report: (outcome) => { reported.push(outcome); throw new Error("reporter failed"); } });
+      await post(queue, request({ session_id: "one" }));
+      await post(queue, request({ session_id: "two" }));
+      await expect(queue.drained()).resolves.toBeUndefined();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(reported).toEqual(["expired", "expired"]);
+      expect(calls).toHaveLength(0);
+      expect(queue.busy()).toBe(false);
+      expect(unhandled).toEqual([]);
+    });
+
+    it("settles the owned drain when the drained callback throws", async () => {
+      const queue = make({ onDrained: () => { throw new Error("idle timer failed"); } });
+      await post(queue, request({ session_id: "one" }));
+      await expect(queue.drained()).resolves.toBeUndefined();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(queue.busy()).toBe(false);
+      expect(outcomes).toEqual(["captured"]);
+      expect(unhandled).toEqual([]);
+      expect((await post(queue, request({ session_id: "two" }))).status).toBe(202);
+      await queue.drained();
+      expect(outcomes).toEqual(["captured", "captured"]);
+    });
+  });
+});

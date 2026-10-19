@@ -456,6 +456,17 @@ before it closes shared storage. The outcome of each deferred run (captured, no
 new observations, cancelled, blocked, failed or expired) is logged by the daemon
 as a short reason without request contents.
 
+If shutdown happens while a project's storage open is still pending, the shared
+storage factory can close before that open settles, so accepted work may be
+cancelled rather than committed (tracked in #1582).
+
+LCM adds no interruption marker of its own. A user-role `<turn_aborted>` marker that
+Codex wrote before the hook (only with `agent_interrupt_message_enabled` and not under
+multi-agent v2) is an ordinary parsed, searchable message. A developer-role marker
+and the `TurnAborted` event Codex emits after the hook are archived with the raw
+transcript only, the event by a later ingest. Without a marker an interrupted turn
+is indistinguishable from a completed one.
+
 ## Auto-heal
 
 All lcm hooks self-repair on each invocation: before dispatching, `validateAndFixHooks()` checks that all required hook entries remain registered in `~/.claude/settings.json` and re-adds any missing entries. This means lcm hooks survive `claude settings reset` or manual edits to the settings file.

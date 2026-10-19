@@ -223,15 +223,16 @@ async function defaultDispatch(stdinText: string, terminal: TerminalHookContext)
 export async function runTerminalSnapshotCommand(
   overrides: Partial<TerminalSnapshotCommandDeps> = {},
 ): Promise<void> {
-  const deps: TerminalSnapshotCommandDeps = {
-    env: process.env,
-    deadline: createTerminalDeadline(),
-    input: stdin,
-    dispatch: defaultDispatch,
-    logError: defaultLogError,
-    ...overrides,
-  };
+  let deps: TerminalSnapshotCommandDeps | undefined;
   try {
+    deps = {
+      env: process.env,
+      deadline: createTerminalDeadline(),
+      input: stdin,
+      dispatch: defaultDispatch,
+      logError: defaultLogError,
+      ...overrides,
+    };
     // A disabled LCM neither reads the payload nor leaves a diagnostic.
     if (deps.env.LCM_ENABLED === "false") return;
     const scope = deps.deadline.openPhase("stdin");
@@ -247,7 +248,10 @@ export async function runTerminalSnapshotCommand(
     }
     await deps.dispatch(read.text, { deadline: deps.deadline });
   } catch {
-    await reportTerminalOutcome("ingest-failed", FALLBACK_EVENT, deps.deadline, deps.logError);
+    // Without constructed dependencies there is no budget or logger to use.
+    if (deps !== undefined) {
+      await reportTerminalOutcome("ingest-failed", FALLBACK_EVENT, deps.deadline, deps.logError);
+    }
   }
 }
 

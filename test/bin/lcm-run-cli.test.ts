@@ -2429,6 +2429,24 @@ describe("runCli orchestration actions", () => {
     write.mockRestore();
   });
 
+  it.each([
+    ["rejects", () => state.runTerminalSnapshot.mockRejectedValueOnce(new Error("terminal entry failed"))],
+    ["throws", () => state.runTerminalSnapshot.mockImplementationOnce(() => { throw new Error("terminal entry failed"); })],
+  ])("exits 0 silently when the terminal entry %s", async (_name, arrange) => {
+    const write = vi.spyOn(process.stdout, "write");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    state.runTerminalSnapshot.mockClear();
+    arrange();
+
+    expect((await invoke(["session-snapshot", "--client", "codex", "--terminal"]))?.message).toBe("exit:0");
+
+    expect(state.runTerminalSnapshot).toHaveBeenCalledOnce();
+    expect(consoleError).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    write.mockRestore();
+    consoleError.mockRestore();
+  });
+
   it("dispatches PreCompact without resolving PostgreSQL storage secrets", async () => {
     state.storageBackend = "postgresql";
     const loadConfig = state.loadConfig.getMockImplementation()!;
