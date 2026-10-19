@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { HOOK_COMMANDS, type HookCommand } from "../../src/hooks/dispatch.js";
 import { REQUIRED_HOOKS } from "../../installer/install.js";
 
@@ -461,5 +461,61 @@ describe("dispatchHook", () => {
     vi.mocked(loadHookConfig).mockReturnValueOnce({} as unknown as HookConfig);
     await dispatchHook("post-tool", "{}");
     expect(handlePostToolUse).toHaveBeenCalledWith("{}");
+  });
+});
+
+describe("LCM_ENABLED=false", () => {
+  const handlers = {
+    compact: handlePreCompact,
+    "post-tool": handlePostToolUse,
+    restore: handleSessionStart,
+    "session-end": handleSessionEnd,
+    "session-snapshot": handleSessionSnapshot,
+    "user-prompt": handleUserPromptSubmit,
+  } satisfies Record<HookCommand, unknown>;
+  const payload = JSON.stringify({ session_id: "disabled-session", prompt: "remember this" });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each(HOOK_COMMANDS)("makes %s a no-op without side effects", async (command) => {
+    vi.clearAllMocks();
+    vi.stubEnv("LCM_ENABLED", "false");
+
+    await expect(dispatchHook(command, payload)).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handlers[command]).not.toHaveBeenCalled();
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+  });
+
+  it("makes MCP-transport user prompts and Codex snapshots no-ops", async () => {
+    vi.clearAllMocks();
+    vi.stubEnv("LCM_ENABLED", "false");
+
+    await expect(dispatchHook("user-prompt", payload, { transport: "mcp" })).resolves.toEqual({ exitCode: 0, stdout: "" });
+    await expect(
+      dispatchHook("session-snapshot", JSON.stringify({ session_id: "disabled-session", client: "codex" })),
+    ).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handleUserPromptSubmit).not.toHaveBeenCalled();
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "0", "False"])("keeps hooks enabled when LCM_ENABLED is %j", async (value) => {
+    vi.clearAllMocks();
+    if (value === undefined) vi.stubEnv("LCM_ENABLED", undefined);
+    else vi.stubEnv("LCM_ENABLED", value);
+
+    await dispatchHook("restore", payload);
+
+    expect(ensureBootstrapped).toHaveBeenCalledWith("disabled-session");
+    expect(handleSessionStart).toHaveBeenCalledOnce();
   });
 });

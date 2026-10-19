@@ -14,7 +14,9 @@ Installed hook entrypoints (`post-tool`, `restore`, `session-end`,
 `session-snapshot`, `user-prompt`, and `compact --hook`) skip the CLI's
 global legacy-root migration preflight, so a busy backend publication lock
 cannot fail a hook before its own handler runs. Interactive `lcm compact` and
-installation keep the preflight.
+installation keep the preflight, except that `lcm compact` skips it (and
+compaction) when `LCM_ENABLED=false`; see
+[Disabling LCM](configuration.md#disabling-lcm).
 
 - Hook-side legacy-root migration is attempted only through the dispatch
   bootstrap (`bootstrapLcmHome`): on every `session-snapshot` with a
