@@ -147,6 +147,38 @@ publication-journal errors fail closed.
 
 **Response:** Exit code `0`. Context is injected via stdout (printed as a `<context>` block that Claude Code prepends to the session).
 
+### Codex SessionStart sources
+
+Codex runs the hook for the sources `startup`, `resume`, `clear`, `compact`, and
+`fork` (matcher `startup|resume|clear|compact|fork`). The payload also carries
+`source` and `transcript_path`.
+
+- Every non-empty Codex restoration begins with the line
+  `<!-- lcm-restoration -->`, followed by the usual output. Empty output stays
+  empty. Claude output is unchanged.
+- `startup`, `clear`, and unknown sources print as before.
+- `resume`, `fork`, and `compact` print nothing when the session's own rollout
+  (`transcript_path`, which must resolve under `$CODEX_HOME/sessions` or
+  `$CODEX_HOME/archived_sessions`, default `~/.codex`) holds a developer message
+  starting with the marker line after the last `compacted` record and the last
+  `thread_rolled_back` event. A line that is not valid JSON counts as a reset.
+  Only the last 64 MiB of the rollout is read; any read failure prints.
+- For `compact`, the daemon returns the full memory (recent summaries, promoted
+  project knowledge, passive insights, and the stored project-instructions row)
+  instead of orientation only, and never rewrites stored instructions. For Codex,
+  a recent LCM summarization no longer reduces `resume` or `clear` to
+  orientation only.
+- The hook writes no state files. The per-session lock is released when the hook
+  returns.
+
+Limits: referenced forks, rollouts outside `$CODEX_HOME`, unreadable rollouts,
+and restorations from earlier LCM versions print a fresh restoration, which can
+duplicate an existing one; restorations carried only inside compaction
+replacement history are not detected; and if Codex fails to write the
+compaction record (or other history) to its rollout, the post-compaction hook can
+see the pre-compaction restoration and skip, and the live continuation can lack
+restored memory while those write failures persist.
+
 ## SessionEnd Hook
 
 **Command:** `lcm session-end`

@@ -127,7 +127,7 @@ The hook connector installs these Codex events:
 
 | Event | Command | Behavior |
 |---|---|---|
-| `SessionStart` | `lcm restore --client codex` | Restores project context when Codex starts, resumes, or clears a session |
+| `SessionStart` (`startup\|resume\|clear\|compact\|fork`) | `lcm restore --client codex` | Restores project context when Codex starts, resumes, clears, compacts, or forks a session |
 | `UserPromptSubmit` | `lcm user-prompt --client codex` | Searches memory and injects prompt-time hints |
 | `PostToolUse` | `lcm post-tool --client codex` | Captures bounded semantic signals from Codex shell (`Bash`) and MCP tool results |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingests transcript deltas before manual or automatic Codex compaction |
@@ -139,6 +139,45 @@ Codex must trust the project `.codex/` layer for project-local hooks to load. Fo
 lcm connectors install codex --global
 lcm connectors doctor codex --global
 ```
+
+### Memory after compaction and in forked conversations
+
+Codex drops hook-injected context when it compacts a conversation, and a forked
+conversation starts from a copy of its parent's history. The `SessionStart` hook
+therefore also runs after compaction (`compact`) and when a conversation is
+forked (`fork`), and restores recent summaries, promoted project knowledge,
+passive insights, and stored project instructions.
+
+Each restoration starts with the line `<!-- lcm-restoration -->`. On `resume`,
+`fork`, and `compact`, the hook reads the session's own rollout under
+`$CODEX_HOME` (default `~/.codex`) and prints nothing when a restoration since
+the latest compaction or rollback is still in the conversation, so a resumed or
+forked conversation does not receive the same block twice. `startup` and
+`clear` always print.
+
+Existing installs keep the old `startup|resume|clear` matcher until you re-run
+`lcm connectors install codex`. Codex may ask you to re-trust the changed hook.
+
+Known limits:
+
+- Referenced (paginated-thread) forks, rollouts outside `$CODEX_HOME`, unreadable
+  rollouts, and restorations printed by earlier LCM versions (no marker line)
+  print a fresh restoration, which can duplicate an existing one once per event.
+- A restoration carried only inside Codex's compaction replacement history is
+  not detected, so the next `resume` or `fork` prints again.
+- If Codex fails to write the compaction record (or other history) to its
+  rollout, the post-compaction hook can see the pre-compaction restoration and
+  skip, and the live continuation can lack restored memory while those write
+  failures persist.
+- Memory promoted after the parent's last restoration is not injected into a
+  fork that inherited a restoration; per-prompt hints and the next compaction
+  surface it.
+- Restored summaries can lag content captured at `PreCompact`, because
+  summarization is asynchronous.
+- Guardian review and post-turn compactions restore at the next
+  `SessionStart` drain.
+- Messages copied into a fork are ingested again for the fork; this is tracked
+  in #1578.
 
 ### Codex PostToolUse capture boundary
 
