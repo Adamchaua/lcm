@@ -734,6 +734,9 @@ boundaries and the user-facing failure cases.
 
 ## Compact concurrency and cancellation
 
+With `LCM_ENABLED=false` in the environment, `lcm compact` exits `0` after one
+stderr line without compacting; see [Disabling LCM](configuration.md#disabling-lcm).
+
 `lcm compact` accepts a bounded worker-pool setting for manual batch work:
 
 ```bash

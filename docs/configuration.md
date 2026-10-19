@@ -1889,8 +1889,11 @@ Stored data is untouched, and work that is already queued or in flight is not
 cancelled. A daemon that is already running keeps running, including its
 10-minute Claude transcript scan and passive replication, until it exits on its
 own after `daemon.idleTimeoutMs` (see [Daemon safety](#daemon-safety); `0`
-disables the idle timer). There is no daemon stop command. Other CLI commands,
-MCP tools, and MCP startup are unaffected.
+disables the idle timer). There is no daemon stop command.
+
+`lcm compact` (without `--hook`) is skipped as well, with exit code `0` and one
+line on stderr, because older installations may still invoke it as their
+PreCompact hook. Other CLI commands, MCP tools, and MCP startup are unaffected.
 
 Unset `LCM_ENABLED` or set it to any other value, including `0` or `False`,
 to re-enable LCM. Run `lcm uninstall` to remove the native Claude integration.

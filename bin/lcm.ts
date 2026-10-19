@@ -54,6 +54,7 @@ import {
 } from "../src/storage/backend-publication.js";
 import { BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC } from "../src/hooks/publication-fence.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
+import { resolveLcmConfig } from "../src/db/config.js";
 import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
 import {
   clearDaemonRemediation,
@@ -2632,6 +2633,14 @@ export async function runCli(
       // Hook dispatch only when --hook is explicit; all other invocations go to batch.
       const hook: boolean = opts.hook ?? false;
       if (!hook) {
+        // Older installations register the bare `lcm compact` as their PreCompact
+        // hook, and dispatchHook() is not reached without --hook; honor the
+        // documented LCM_ENABLED=false contract before any batch work.
+        if (!resolveLcmConfig(process.env).enabled) {
+          process.stderr.write("lcm compact: skipped because LCM_ENABLED=false\n");
+          process.exitCode = 0;
+          return;
+        }
         let invocationLifecycle: CompactInvocationLifecycle | undefined;
         let localWorkPromise: Promise<void> | undefined;
         let compactPort = 3737;
