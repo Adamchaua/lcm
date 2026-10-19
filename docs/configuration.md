@@ -1879,5 +1879,18 @@ overrides use environment variables set in the agent's config.
 
 ## Disabling LCM
 
-Set `LCM_ENABLED=false` to disable LCM while keeping its native hooks
-registered. Run `lcm uninstall` to remove the native Claude integration.
+Set `LCM_ENABLED=false` (exactly this lowercase value, with no trimming) in the
+environment of the agent process that runs the hooks. Every native LCM hook,
+for Claude and Codex, then exits `0` with no output and skips capture, the
+user-prompt outbox append, recall and restore context injection, compaction,
+daemon start, and hook auto-repair. The hooks stay registered.
+
+Stored data is untouched, and work that is already queued or in flight is not
+cancelled. A daemon that is already running keeps running, including its
+10-minute Claude transcript scan and passive replication, until it exits on its
+own after `daemon.idleTimeoutMs` (see [Daemon safety](#daemon-safety); `0`
+disables the idle timer). There is no daemon stop command. Other CLI commands,
+MCP tools, and MCP startup are unaffected.
+
+Unset `LCM_ENABLED` or set it to any other value, including `0` or `False`,
+to re-enable LCM. Run `lcm uninstall` to remove the native Claude integration.

@@ -1,4 +1,5 @@
 import { validateAndFixHooks } from "./auto-heal.js";
+import { resolveLcmConfig } from "../db/config.js";
 import { configPath as defaultConfigPath } from "../runtime-paths.js";
 import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import {
@@ -36,6 +37,10 @@ export async function dispatchHook(
   stdinText: string,
   context: HookExecutionContext = {},
 ): Promise<{ exitCode: number; stdout: string }> {
+  // Documented contract (docs/configuration.md#disabling-lcm): LCM_ENABLED=false
+  // keeps the hooks installed but makes every one of them a no-op.
+  if (!resolveLcmConfig(process.env).enabled) return { exitCode: 0, stdout: "" };
+
   let verifiedSnapshotPort: number | undefined;
   // Early return for post-tool — runs on EVERY tool call, must skip bootstrap for performance
   if (command === "post-tool") {

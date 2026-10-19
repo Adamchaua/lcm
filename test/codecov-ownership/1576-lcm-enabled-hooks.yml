@@ -1,0 +1,7 @@
+references: ["#1576"]
+rationale: >-
+  #1576 makes hook dispatch honor the documented LCM_ENABLED=false setting by
+  returning a no-op before any hook work; dispatch.ts keeps its unit-hooks
+  owner.
+pins:
+  - ["src/hooks/dispatch.ts", "unit-hooks"]

@@ -397,7 +397,7 @@ All environment variables are optional. The default summarizer mode is `auto`.
 | `LCM_MAX_EXPAND_TOKENS` | `4000` | Default expansion token cap for the unregistered `buildExpansionToolDefinition` helper; the shipped `lcm_expand` tool does not apply it |
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File size (tokens) above which content is extracted to disk |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Set to `true` to disable automatic compaction after each turn |
-| `LCM_ENABLED` | `true` | Set to `false` to disable LCM while keeping its native integration installed |
+| `LCM_ENABLED` | `true` | Exactly lowercase `false` makes LCM's native hooks no-ops while leaving the integration installed; see [Disabling LCM](docs/configuration.md#disabling-lcm) |
 
 The JSON setting `llm.maxConcurrency` defaults to `1` and accepts integers from
 `1` through `32`. It limits only in-flight manual `/compact` requests; promotion
