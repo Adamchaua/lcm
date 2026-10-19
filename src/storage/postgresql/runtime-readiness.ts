@@ -752,6 +752,13 @@ const OPTIONAL_RELATION_PRIVILEGES: readonly RelationPrivilegeSpec[] = [
   ["ingest_checkpoints", ["SELECT"]],
 ];
 
+const MESSAGE_PARTS_TRANSCRIPT_COLUMNS = [
+  "project_id",
+  "conversation_id",
+  "message_id",
+  "part_type",
+] as const;
+
 const OPTIONAL_COLUMN_PRIVILEGES: readonly ColumnPrivilegeSpec[] = [
   ["conversations", "project_id", "SELECT"],
   ["conversations", "conversation_id", "SELECT"],
@@ -3959,6 +3966,14 @@ async function verifyPostgreSqlSchema(
       ...relationOptionalPrivileges,
       ...columnOptionalPrivileges,
     ]);
+    if (observed.size !== 0) {
+      // A transcript role granted before these column grants existed reads
+      // them through its conversation table SELECT; the effective-privilege
+      // check below still proves that read.
+      for (const column of MESSAGE_PARTS_TRANSCRIPT_COLUMNS) {
+        observed.add(privilegeKey(columnEntry("message_parts", column, "SELECT")));
+      }
+    }
     const exactOptionalKeys = new Set(
       manifest.optional.map(privilegeKey),
     );

@@ -941,4 +941,3 @@ describe("POST /ingest with compaction event rows", () => {
   });
 
 });
-
