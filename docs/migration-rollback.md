@@ -98,8 +98,9 @@ A rollback can be interrupted at any point -- before entering maintenance,
 while maintenance is held, mid-build, or after the destination selection has
 already flipped but before the run finished recording that fact. Every one of
 those windows resumes to exactly one authoritative outcome, and a retry
-resolves every one of them except the single case described under "A prepared
-selection that drifted" below.
+resolves every one of them except the cases described under "A prepared
+selection that drifted" and "An externally aborted rollback publication" below
+when the destination changed in between.
 
 On a post-write rollback specifically, a retry after a crash **never
 resumes copying into the same partial generation**. It builds a brand-new
@@ -149,6 +150,52 @@ What the operator sees is that same `drift` refusal on every run. Do not
 force a re-selection or edit the journal: investigate the write that got past
 the fence, and treat the installation as PostgreSQL-authoritative until #1529
 provides the authenticated abort that returns it to a resumable state.
+
+### An externally aborted rollback publication
+
+The rollback's own backend publication can be aborted by something other than
+the rollback (an operator or another tool running the publication abort). An
+abort restores the configuration and project map the publication began from,
+releases the PostgreSQL lease it had recorded and removes the publication's
+sealed material; it can also stop part-way, for instance after the lease was
+released but before the publication was marked aborted. The rollback itself
+stays pending in every case, and running the same rollback operation again
+completes it:
+
+1. A part-way abort is finished first, without opening any PostgreSQL session.
+2. The restored configuration and project map must be byte-for-byte the files
+   the publication recorded as its source. A file edited since then refuses the
+   run (`unexpected-state` or `not-eligible`) and changes nothing: the aborted
+   journal, the pending effect and the lease row are left as they were. A lease
+   the abort released stays released, and a lease the publication never acquired
+   is left unchanged.
+3. A session then takes the rollback's lease: a new lease token when the abort
+   released the one the publication held, or the existing lease when the
+   publication never acquired one.
+4. The destination is re-read under that lease and must still reproduce the
+   pending rollback's terminal evidence, and the activation authority is
+   resolved again. Because the rollback's own aborted publication now occupies
+   the slot where the activation's operability fact used to be read, that fact
+   is taken from the rollback authority artifact written before the rollback
+   began, only after the live slot reports no positive fact; an unreadable slot
+   or a missing artifact refuses.
+5. Only then is the publication prepared again over the aborted journal, which
+   is archived, and published forward as usual. The rollback settles as
+   `rolled-back`, replay admission routes to SQLite from the rollback
+   binding, and the lease is released.
+
+If step 4 finds that the destination drifted (or the authority no longer
+resolves), the run refuses with `drift` or `not-eligible` and changes
+nothing further. What remains is the pending `publish-rollback` effect, the
+aborted publication in the slot, the lease held by the recovery session, the
+PostgreSQL configuration and project map the abort restored, and replay
+admission routed to SQLite from the rollback binding. Every further retry
+refuses the same way until the destination again reproduces the recorded
+evidence. Do not edit the journal or the restored files. The composition check
+on the journal (PostgreSQL back to the pre-activation backend, for the covered
+project) proves what the publication was meant to do; it does not prove that
+the restored files are the original bytes, which is why the files are compared
+with the recorded witnesses.
 
 ## Operator-owned cleanup of quarantined and incomplete generations
 
