@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
-import { readDaemonConfigSnapshot } from "../daemon/config.js";
+import { DEFAULT_DAEMON_PORT, parseStoredConfig, readDaemonConfigRawSnapshot } from "../daemon/config.js";
 import { requireMachineIdentity } from "../machine-identity.js";
 import { configPath, daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { PRIVATE_FILE_MODE, readBoundedRegularFileWithStat } from "../security-files.js";
@@ -169,7 +169,13 @@ import {
  *   state-unresolvable. Settled active with an authenticated stored G5
  *   report returns activated from durable state with a fresh read-only
  *   restart verdict; settled active without it is interrupted
- *   report-unresolvable at S16.
+ *   report-unresolvable at S16. The restart verdict is an observation:
+ *   the daemon port comes from the stored config without resolving the
+ *   daemon's storage secrets (the published selection is postgresql, and
+ *   the activation process need not carry LCM_POSTGRES_URL / CA_FILE), and
+ *   a failure to observe (unreadable config, probe error) is reported as
+ *   the restart module's own unresolvable / health-unreachable result,
+ *   never thrown, at S15 and on settled-active alike.
  * - S0 (fresh only): publicationId = deriveActivationPublicationId;
  *   evidenceSha256 read back from lcm.transfer_runs (A5) on a transfer
  *   session that is opened, used once and closed before S2.
@@ -546,10 +552,24 @@ export function createMigrationActivationDependencies(
     persistReport: persistMigrationActivationReport,
     readReport: readMigrationActivationReport,
     machineId: (homeDir) => requireMachineIdentity(homeDir).machineId,
-    daemonPort: (homeDir) => readDaemonConfigSnapshot(configPath(homeDir)).config.daemon.port,
+    daemonPort: storedDaemonPort,
     checkRestart: checkActivationRestartAdmission,
     leaseTtlMs: MIGRATION_ACTIVATION_LEASE_TTL_MS,
   };
+}
+
+/**
+ * The daemon's configured port from the validated stored config, without
+ * applying defaults from the environment and without resolving storage
+ * secrets: after the publication selects postgresql, the full daemon config
+ * would demand LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE, which the
+ * activation process does not carry (it receives its connection settings as
+ * arguments). An absent config or daemon section means the default port.
+ */
+function storedDaemonPort(homeDir: string): number {
+  const stored = parseStoredConfig(readDaemonConfigRawSnapshot(configPath(homeDir)).content);
+  const daemon = stored.daemon as Readonly<{ port?: number }> | undefined;
+  return daemon?.port ?? DEFAULT_DAEMON_PORT;
 }
 
 
@@ -1431,7 +1451,21 @@ async function stepComplete(ctx: Context, restart: ActivationRestartCheckResult)
 }
 
 async function restartVerdict(ctx: Context): Promise<ActivationRestartCheckResult> {
-  return ctx.deps.checkRestart({ selectedBackend: "postgresql", pidFilePath: daemonPidPath(ctx.homeDir), port: ctx.deps.daemonPort(ctx.homeDir) });
+  try {
+    return await ctx.deps.checkRestart({ selectedBackend: "postgresql", pidFilePath: daemonPidPath(ctx.homeDir), port: ctx.deps.daemonPort(ctx.homeDir) });
+  } catch (error) {
+    // The verdict observes; it never decides the outcome. A failure to look
+    // (unreadable stored config, a probe that threw) is the restart module's
+    // own "could not observe" row, exactly as the preview reports it.
+    return Object.freeze({
+      status: "unresolvable",
+      reason: "health-unreachable",
+      detail: "the restart check could not observe the daemon: " + (error as Error).message,
+      pid: null,
+      observedBackend: null,
+      selectedBackend: "postgresql",
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

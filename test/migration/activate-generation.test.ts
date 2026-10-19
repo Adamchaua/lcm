@@ -2,9 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ConfigValidationError, DEFAULT_DAEMON_PORT, readDaemonConfigSnapshot } from "../../src/daemon/config.js";
 import { ensurePendingMachineIdentity, finalizeMachineIdentity } from "../../src/machine-identity.js";
 import { clearProjectMapCache, hashProjectPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
-import { lcmHomeDir, projectsDir } from "../../src/runtime-paths.js";
+import { configPath, lcmHomeDir, projectsDir } from "../../src/runtime-paths.js";
 import {
   BackendPublicationCoordinator,
   backendPublicationDirectory,
@@ -124,6 +125,7 @@ const READINESS: PostgreSqlRuntimeReadiness = {
 const roots: string[] = [];
 afterEach(() => {
   clearProjectMapCache();
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -1258,6 +1260,98 @@ describe("runMigrationActivation: input validation, production defaults and the 
     const coordinator = deps.createCoordinator({ homeDir: f.homeDir, guard: f.guard, machineId: MACHINE });
     expect(coordinator.prepareMaintenanceSelection).toBeTypeOf("function");
     expect(deps.leaseTtlMs).toBe(15 * 60 * 1000);
+  });
+});
+
+describe("runMigrationActivation: the restart verdict observes without daemon secrets and never throws (candidate round 1, S1)", () => {
+  const satisfied: MigrationActivationDependencies["checkRestart"] = async () =>
+    ({ status: "satisfied", reason: "no-pid-file", detail: "fake", pid: null, observedBackend: null, selectedBackend: "postgresql" });
+
+  it("the production daemon port is the stored port, read without resolving storage secrets, at S15 and on settled re-entry after the publication selected postgresql", async () => {
+    const f = await fixture();
+    // The activation process receives its connection settings as arguments; it carries no daemon secrets.
+    vi.stubEnv("LCM_POSTGRES_URL", undefined);
+    vi.stubEnv("LCM_POSTGRES_CA_FILE", undefined);
+    const production = createMigrationActivationDependencies({ homeDir: f.homeDir });
+    const ports: number[] = [];
+    const checkRestart: MigrationActivationDependencies["checkRestart"] = async (input) => { ports.push(input.port); return satisfied(input); };
+    const first = await f.run({ daemonPort: production.daemonPort, checkRestart });
+    expectActivated(f, first, "fresh");
+    // The published selection is postgresql: the full daemon config now demands the daemon's secrets ...
+    expect(() => readDaemonConfigSnapshot(configPath(f.homeDir), {})).toThrow(ConfigValidationError);
+    // ... and the restart verdict's port read does not.
+    expect(production.daemonPort(f.homeDir)).toBe(4321);
+    const second = await f.run({ daemonPort: production.daemonPort, checkRestart });
+    expect(second).toMatchObject({ status: "activated", resumedFrom: "settled-active", restart: { status: "satisfied" } });
+    expect(ports).toEqual([4321, 4321]);
+  });
+
+  it("the production daemon port is the default when the stored config or its daemon section is absent, and a malformed config is a thrown ConfigValidationError for the verdict to map", () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "lcm-activate-generation-port-"));
+    roots.push(homeDir);
+    mkdirSync(join(homeDir, ".lcm"), { mode: 0o700 });
+    const production = createMigrationActivationDependencies({ homeDir });
+    expect(production.daemonPort(homeDir)).toBe(DEFAULT_DAEMON_PORT);
+    writeFileSync(configPath(homeDir), JSON.stringify({ storage: { backend: "postgresql" } }) + "\n", { mode: 0o600 });
+    expect(production.daemonPort(homeDir)).toBe(DEFAULT_DAEMON_PORT);
+    writeFileSync(configPath(homeDir), JSON.stringify({ storage: { backend: "postgresql" }, daemon: {} }) + "\n", { mode: 0o600 });
+    expect(production.daemonPort(homeDir)).toBe(DEFAULT_DAEMON_PORT);
+    writeFileSync(configPath(homeDir), "{", { mode: 0o600 });
+    expect(() => production.daemonPort(homeDir)).toThrow(ConfigValidationError);
+  });
+
+  it("S15: a stored config that cannot be read after the publication yields activated with the restart module's unresolvable / health-unreachable row, never a throw", async () => {
+    const f = await fixture();
+    const production = createMigrationActivationDependencies({ homeDir: f.homeDir });
+    const outcome = await f.run({
+      daemonPort: production.daemonPort,
+      checkRestart: production.checkRestart,
+      // The publication is durable; the config is then unreadable before S15 looks for the port.
+      crashPoint: (point) => { if (point === "after-drive") writeFileSync(configPath(f.homeDir), "{", { mode: 0o600 }); },
+    });
+    expect(outcome.status, JSON.stringify(outcome)).toBe("activated");
+    if (outcome.status !== "activated") return;
+    expect(outcome.resumedFrom).toBe("fresh");
+    expect(outcome.restart).toEqual({
+      status: "unresolvable",
+      reason: "health-unreachable",
+      detail: expect.stringContaining("malformed JSON"),
+      pid: null,
+      observedBackend: null,
+      selectedBackend: "postgresql",
+    });
+    expect(outcome.restart.detail).toMatch(/^the restart check could not observe the daemon: /u);
+    const manifest = f.manifestStore.read(GENERATION);
+    expect(manifest.phase).toBe("active");
+    expect(manifest.reports.some((r) => r.kind === "activation" && r.reportSha256 === outcome.report.reportSha256)).toBe(true);
+  });
+
+  it("S15: a restart probe that throws is the same unresolvable row on the post-publication-unhealthy outcome", async () => {
+    const f = await fixture();
+    f.deps.health.push({ status: "healthy", readiness: READINESS });
+    f.deps.health.push({ status: "unhealthy", reason: "schema-mismatch", detail: "fake", sqlState: null });
+    const outcome = await f.run({ checkRestart: async () => { throw new Error("probe failed"); } });
+    expect(outcome).toMatchObject({
+      status: "post-publication-unhealthy",
+      health: { status: "unhealthy" },
+      restart: { status: "unresolvable", reason: "health-unreachable", detail: "the restart check could not observe the daemon: probe failed" },
+    });
+  });
+
+  it("settled active: a stored config that cannot be read yields activated from durable state with the unresolvable restart row and the same report", async () => {
+    const f = await fixture();
+    const production = createMigrationActivationDependencies({ homeDir: f.homeDir });
+    const first = await f.run({ daemonPort: production.daemonPort });
+    expectActivated(f, first, "fresh");
+    if (first.status !== "activated") return;
+    writeFileSync(configPath(f.homeDir), "{", { mode: 0o600 });
+    const second = await f.run({ daemonPort: production.daemonPort, checkRestart: production.checkRestart });
+    expect(second).toMatchObject({
+      status: "activated",
+      resumedFrom: "settled-active",
+      report: first.report,
+      restart: { status: "unresolvable", reason: "health-unreachable", detail: expect.stringContaining("malformed JSON"), pid: null, observedBackend: null, selectedBackend: "postgresql" },
+    });
   });
 });
 
