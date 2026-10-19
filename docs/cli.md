@@ -805,6 +805,22 @@ Provider work already accepted by a remote service may continue remotely; the
 local guarantee covers LCM-owned queued/active requests, SDK retries, provider
 processes/groups, locks, and invocation-scoped promotion only.
 
+Discovery of eligible sessions also honors cancellation. It hands control back
+to the event loop at project, conversation, message-page, source-locator batch,
+and per-session locator-fallback boundaries, and again after each project scan
+finishes, so the lease heartbeat keeps running during a long scan and Ctrl+C or
+`SIGTERM` stops discovery at the next boundary rather than after the whole
+scan. Listing the project inventory before the first project starts, opening
+one project's storage, and reading one conversation's final page together with
+its summaries and context items are not interruptible and finish first. An
+interrupted scan closes the project storage it opened, reports no failure for
+the interrupted project, prints neither the "Found N uncompacted conversations"
+summary nor "Nothing to compact", and sends no `/compact` request. Failures
+recorded for earlier projects before the interruption are still reported. Every
+request to the local daemon uses a fresh loopback connection, so a connection
+the daemon already closed at its keep-alive timeout cannot cause a spurious
+"write EPIPE" transport failure.
+
 If cancellation cannot prove that the managed daemon and its owned provider
 work disappeared, LCM does not signal an unknown process or claim success. It
 stays in draining state, reports the missing proof, and fails closed. This also

@@ -127,9 +127,9 @@ The hook connector installs these Codex events:
 
 | Event | Command | Behavior |
 |---|---|---|
-| `SessionStart` | `lcm restore --client codex` | Restores project context when Codex starts, resumes, or clears a session |
+| `SessionStart` (`startup\|resume\|clear\|compact\|fork`) | `lcm restore --client codex` | Restores project context when Codex starts, resumes, clears, compacts, or forks a session |
 | `UserPromptSubmit` | `lcm user-prompt --client codex` | Searches memory and injects prompt-time hints |
-| `PostToolUse` | `lcm post-tool --client codex` | Captures bounded semantic signals from `functions.exec` and `functions.exec_command` |
+| `PostToolUse` | `lcm post-tool --client codex` | Captures bounded semantic signals from Codex shell (`Bash`) and MCP tool results |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingests transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingests transcript deltas and triggers compaction once the configured token threshold is reached |
 
@@ -139,6 +139,45 @@ Codex must trust the project `.codex/` layer for project-local hooks to load. Fo
 lcm connectors install codex --global
 lcm connectors doctor codex --global
 ```
+
+### Memory after compaction and in forked conversations
+
+Codex drops hook-injected context when it compacts a conversation, and a forked
+conversation starts from a copy of its parent's history. The `SessionStart` hook
+therefore also runs after compaction (`compact`) and when a conversation is
+forked (`fork`), and restores recent summaries, promoted project knowledge,
+passive insights, and stored project instructions.
+
+Each restoration starts with the line `<!-- lcm-restoration -->`. On `resume`,
+`fork`, and `compact`, the hook reads the session's own rollout under
+`$CODEX_HOME` (default `~/.codex`) and prints nothing when a restoration since
+the latest compaction or rollback is still in the conversation, so a resumed or
+forked conversation does not receive the same block twice. `startup` and
+`clear` always print.
+
+Existing installs keep the old `startup|resume|clear` matcher until you re-run
+`lcm connectors install codex`. Codex may ask you to re-trust the changed hook.
+
+Known limits:
+
+- Referenced (paginated-thread) forks, rollouts outside `$CODEX_HOME`, unreadable
+  rollouts, and restorations printed by earlier LCM versions (no marker line)
+  print a fresh restoration, which can duplicate an existing one once per event.
+- A restoration carried only inside Codex's compaction replacement history is
+  not detected, so the next `resume` or `fork` prints again.
+- If Codex fails to write the compaction record (or other history) to its
+  rollout, the post-compaction hook can see the pre-compaction restoration and
+  skip, and the live continuation can lack restored memory while those write
+  failures persist.
+- Memory promoted after the parent's last restoration is not injected into a
+  fork that inherited a restoration; per-prompt hints and the next compaction
+  surface it.
+- Restored summaries can lag content captured at `PreCompact`, because
+  summarization is asynchronous.
+- Guardian review and post-turn compactions restore at the next
+  `SessionStart` drain.
+- Messages copied into a fork are ingested again for the fork; this is tracked
+  in #1578.
 
 ### Codex PostToolUse capture boundary
 
@@ -162,16 +201,29 @@ EventsDb, or append sidecar events. If the structure is absent or incomplete,
 doctor prints `Codex: native exec capture functional check skipped` and does
 not claim functional health.
 
-Codex capture is deliberately narrow. Only `client: "codex"` payloads with
-`tool_name` equal to `functions.exec` or `functions.exec_command` are adapted.
-The adapter takes `tool_input.command`, or `tool_input.cmd` when `command` is
-absent, and bounds the accepted command to 2,000 characters before passing it
-through the existing event-data truncation and sensitive-data scrubbing. It
-projects only direct status fields from `tool_output` (preferred) or
-`tool_response`, using `isError`, `is_error`, `exit_code`, and `exitCode` in
-that order. Raw stdout/stderr, raw responses, nested or unknown output fields,
-and file-like fields are not persisted or interpreted as file events. A
-trimmed command beginning with `lcm store` is suppressed to avoid a feedback
+Codex capture is deliberately narrow. Current Codex reports shell commands
+(`exec_command` and the `write_stdin` polls that finish them) to hooks as the
+tool `Bash`; LCM also accepts the legacy names `functions.exec` and
+`functions.exec_command` as aliases. The adapter takes `tool_input.command`, or
+`tool_input.cmd` when `command` is absent, and bounds the accepted command to
+2,000 characters before passing it through the existing event-data truncation
+and sensitive-data scrubbing. MCP tools (`mcp__<server>__<tool>`) are recorded
+by tool name only.
+
+Codex's PostToolUse payload carries no shell exit status, only the output text,
+and LCM never parses that text. A completed git or install command is
+therefore stored as a `tool_outcome_unknown` observation (for example
+`Bash outcome unknown: git commit`) instead of a success. Unknown
+observations are kept as passive history but are never promoted, reinforced, or
+treated as the fix for an earlier error. A structured status
+(`isError`, `is_error`, `exit_code`, `exitCode`) is still honored when a payload
+supplies one. A successful MCP result is recorded as before. Codex does not run
+PostToolUse for a failed or interrupted MCP call or for an interrupted shell
+command, so those cannot be observed. See
+[Codex native PostToolUse capture](hook-protocol.md#codex-native-posttooluse-capture)
+for the full matrix. Raw stdout/stderr, raw responses, MCP arguments and
+content, and file-like fields are not persisted or interpreted as file events.
+A trimmed command beginning with `lcm store` is suppressed to avoid a feedback
 loop from LCM's own storage calls. There is no new configuration option for
 these fixed capture rules.
 

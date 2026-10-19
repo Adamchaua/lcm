@@ -67,7 +67,7 @@ function codexLcmHooks(transport: ConnectorTransport = "cli"): Record<string, Co
   return {
     SessionStart: [
       {
-        matcher: "startup|resume|clear",
+        matcher: "startup|resume|clear|compact|fork",
         hooks: [
           {
             type: "command",
