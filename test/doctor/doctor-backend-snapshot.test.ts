@@ -72,7 +72,44 @@ describe("doctor common backend snapshot", () => {
     const failure = Object.assign(new Error("PRIVATE_CA_PATH/SECRET_TRANSCRIPT"), { code: "EACCES" });
     vi.mocked(collectStats).mockRejectedValue(failure);
     const results = await run();
-    expect(results.find(row => row.name === "backend-health")?.backendDiagnostics).toEqual(backendDiagnosticFailure(failure));
+    expect(results.find(row => row.name === "backend-health")?.backendDiagnostics).toMatchObject({
+      ...backendDiagnosticFailure(failure),
+      telemetry: { statements: { status: "unavailable", scope: "aggregate" } },
+    });
     expect(JSON.stringify(results)).not.toContain("SECRET_TRANSCRIPT");
+  });
+
+  it.each([
+    ["observed", "pass"],
+    ["not-applicable", "pass"],
+    ["partial", "warn"],
+    ["reset", "warn"],
+    ["permission-denied", "warn"],
+    ["timeout", "warn"],
+    ["unavailable", "warn"],
+  ] as const)("reports query-statistics %s as a non-startup %s", async (telemetry, status) => {
+    const diagnostics = snapshot("healthy");
+    diagnostics.telemetry.statements = { status: telemetry, observedAt: 1, scope: "aggregate" };
+    const results = await run({ collectBackendSnapshot: vi.fn().mockResolvedValue(diagnostics) });
+    expect(results.find(row => row.name === "query-statistics")).toEqual({
+      name: "query-statistics",
+      category: "Storage",
+      status,
+      message: telemetry === "observed" || telemetry === "not-applicable"
+        ? `Query statistics: ${telemetry}`
+        : `Query statistics: ${telemetry}. Production certification requires observed query statistics; application operation is unaffected.`,
+    });
+  });
+
+  it("sanitizes an unknown query-statistics status", async () => {
+    const secret = "postgresql://private:secret@host/db";
+    const diagnostics = snapshot("healthy");
+    Object.assign(diagnostics.telemetry.statements, { status: secret });
+    const results = await run({ collectBackendSnapshot: vi.fn().mockResolvedValue(diagnostics) });
+    const queryStatistics = results.find(row => row.name === "query-statistics");
+    expect(queryStatistics?.message).toBe(
+      "Query statistics: unavailable. Production certification requires observed query statistics; application operation is unaffected.",
+    );
+    expect(JSON.stringify(queryStatistics)).not.toContain(secret);
   });
 });

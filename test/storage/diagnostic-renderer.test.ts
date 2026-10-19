@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { backendDiagnosticFailure, collectBackendDiagnostics, type BackendDiagnosticRuntime } from "../../src/storage/diagnostics.js";
-import { renderBackendDiagnostics } from "../../src/storage/diagnostic-renderer.js";
+import { renderBackendDiagnostics, renderQueryStatistics } from "../../src/storage/diagnostic-renderer.js";
+import { QUERY_OPERATION_IDS } from "../../src/storage/postgresql/query-operations.js";
 
 import { parseDaemonConfig } from "../../src/daemon/config.js";
 
@@ -87,5 +88,32 @@ describe("safe common diagnostic text", () => {
     expect(text).toContain("Classification: unavailable");
     expect(text).toContain("Project ID: unverified; local hash: unverified");
     expect(text).toContain("Machine identity: unverified; ID: unverified");
+  });
+  it("renders bounded query-statistics status and counts only valid call counters", () => {
+    const snapshot = backendDiagnosticFailure(undefined, "postgresql");
+    snapshot.telemetry.statements = {
+      status: "partial", observedAt: 1, scope: "aggregate",
+      operations: [
+        { operation: QUERY_OPERATION_IDS[0]!, values: { queryCallsTotal: 2 }, omitted: {} },
+        { operation: QUERY_OPERATION_IDS[1]!, values: {}, omitted: { queryCallsTotal: "no-entry" } },
+        { operation: QUERY_OPERATION_IDS[2]!, values: { queryCallsTotal: -1 }, omitted: {} },
+        { operation: QUERY_OPERATION_IDS[0]!, values: { queryCallsTotal: 3 }, omitted: {} },
+        { operation: "hostile.unknown", values: { queryCallsTotal: 4 }, omitted: {} },
+        null as never,
+        { operation: QUERY_OPERATION_IDS[3]!, values: null as never, omitted: {} },
+      ],
+    };
+    expect(renderBackendDiagnostics(snapshot)).toContain(
+      `Query statistics: partial; scope: aggregate; operations with call counters: 1 of ${QUERY_OPERATION_IDS.length}`,
+    );
+  });
+  it("renders unknown or hostile query-statistics values with fixed fallbacks", () => {
+    const secret = "postgresql://private:secret@host/db";
+    const snapshot = backendDiagnosticFailure(undefined, "postgresql");
+    Object.assign(snapshot.telemetry.statements, { status: secret, scope: secret, operations: secret });
+    const text = renderBackendDiagnostics(snapshot);
+    expect(text).toContain("Query statistics: unavailable");
+    expect(text).not.toContain(secret);
+    expect(renderQueryStatistics(null)).toBe("Query statistics: unavailable");
   });
 });

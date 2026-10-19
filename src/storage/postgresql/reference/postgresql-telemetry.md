@@ -1,12 +1,13 @@
 # PostgreSQL telemetry and redaction contract
 
 This guide is the normative contract that issues #637, #638, #639, and #640
-implement for PostgreSQL operational observations. Until those issues merge,
-the implemented surface is the existing sanitized backend snapshot described
-in [observational diagnostics](../../../../docs/cli.md#observational-diagnostics).
-Nothing in this guide changes behavior by itself: each implementing issue
-encodes the rules below in its own code and tests, and updates this guide when
-it adds a metric, label, or status.
+implement for PostgreSQL operational observations. #637 implements the query
+fingerprint family described below; the remaining families are still contracts
+for their owning issues. The implemented surface is the sanitized backend
+snapshot described in
+[observational diagnostics](../../../../docs/cli.md#observational-diagnostics).
+Each implementing issue encodes its rules in code and tests and updates this
+guide when it adds a metric, label, or status.
 
 ## Scope and principles
 
@@ -151,12 +152,11 @@ Cumulative counters are only comparable inside one epoch.
   Changes in min, max, mean, or standard deviation never imply a reset on
   their own.
 - `pg_stat_statements_info.dealloc` is a server-wide counter, while the family
-  covers only the runtime role and the current database. Its growth means
-  that some entry was evicted somewhere, not that a scoped entry was. It is
-  supporting evidence only and does not establish `partial` by itself. The
-  family is `partial` when a scoped contributing entry also disappeared, and
-  `reset` when its epoch changed, as the membership and epoch rules above
-  determine. Eviction alone never establishes either.
+  covers only the runtime role and the current database. A previously
+  contributing scoped entry disappearing establishes partial, whether or not
+  dealloc grew; an established statement-epoch change establishes reset,
+  subject to the status precedence above. Growth of
+  `pg_stat_statements_info.dealloc` alone establishes neither.
 - Server timestamps are compared only with server timestamps.
 - This contract catalogs cumulative values only and emits no rate fields. A
   rate is derived by a consumer, or by a future catalog revision, from two
@@ -179,9 +179,10 @@ membership change) and the validity of any rate derived from two observations
 need a prior observation. #637 owns a bounded comparison context
 inside the shared snapshot path:
 
-- at most one prior context per scope, with a bounded entry count;
+- at most one prior context, with no more than 64 live entries or disappearance
+  tombstones;
 - only allowlisted counters plus internal identity and epoch data;
-- invalidation on scope, publication, or mapping change; and
+- invalidation on runtime role, database, publication, or mapping change; and
 - no background collector, persistence file, exporter, or timer.
 
 #638 reuses this pattern for temporal health fields, and #640 drives sequential
@@ -199,18 +200,36 @@ epoch metadata, has status `observed` if it is otherwise complete, and has no
 computable rate. It makes no reset, decrease, or membership-change claim. The
 missing baseline is a per-field reason, never a false reset.
 
+The context is committed only after the snapshot's final publication-witness
+recheck. Concurrent observations use a compare-and-swap sequence; an older
+observation cannot overwrite a newer commit. A disappearing entry becomes a
+bounded tombstone so the disappearance is reported once. If it later reappears
+with a different `stats_since`, the family reports `reset`. The internal
+postmaster start, entry timestamps, query identifiers, and tombstones never
+leave the process. Only `statements_stats_reset` is exported as epoch metadata.
+
 ## Query fingerprints
 
 #637 owns the statement-statistics family, which reads
 `pg_stat_statements` for the LCM runtime role.
 
+The implemented family is `BackendDiagnosticSnapshot.telemetry.statements`.
+It runs after ordinary backend and outbox observations and before the final
+publication-witness recheck. It has a 750 ms local budget inside the shared
+2000 ms snapshot deadline and preserves 100 ms for publication revalidation.
+The family runs last so a timeout or telemetry failure cannot change backend
+classification, application startup, or application traffic.
+
 ### Operation identity
 
 - The exported identity is an LCM operation identifier of the form
-  `<domain>.<operation>` from a packaged operation catalog that #637 owns and
-  tests. The catalog has at most 64 entries. Only cataloged operations are
-  exported. An unknown or drifted operation is omitted (fail closed) and never
-  fails startup.
+  `<domain>.<operation>` from the packaged starter catalog in
+  `src/storage/postgresql/query-operations.ts`. The current catalog contains
+  13 operations and 14 exact repository SQL templates, covering bounded
+  conversation, summary, context, and promoted-memory lookups. It deliberately
+  does not claim search, transcript, or ingest coverage. The catalog has at
+  most 64 entries. Only cataloged operations are exported. An unknown or
+  drifted operation is omitted (fail closed) and never fails startup.
 - Source rows are filtered to `toplevel = true`, `userid` equal to the OID of
   the runtime role, and `dbid` equal to the current database. This filter runs
   before any aggregation. The runtime role's OID comes from `pg_roles` for
@@ -240,7 +259,7 @@ mechanism it chooses must:
   and
 - ship tests proving that the mapping matches real executions.
 
-One permitted mechanism is a bounded `EXPLAIN (GENERIC_PLAN, VERBOSE, FORMAT
+The implementation uses a bounded `EXPLAIN (GENERIC_PLAN, VERBOSE, FORMAT
 JSON)` of a packaged statement template. PostgreSQL shows the query identifier
 only in verbose output. This is the one exception to the rule that plan output
 is never read: the collector may receive that result transiently, solely to
@@ -249,6 +268,25 @@ nothing else from it, and it never runs on SQL that is not packaged with LCM.
 If the server computes no identifier at all, the family is `unavailable`;
 there is no text-based fallback. A cataloged operation that simply has no entry
 gets reason `no-entry` per field.
+
+Each observation performs one context read, 14 mapping probes for the current
+catalog, and one counter read. The mapping-probe cap is 16. With the runtime's
+cancellation preflight, the current catalog therefore uses at most 32 wire
+statements: two statements for each of 16 signalled calls, plus at most one
+`pg_cancel_backend` call after cancellation. Plan output is accepted only up to
+256 KiB. The counter read accepts at most 64 candidate rows, and retained
+comparison state accepts at most 64 entries. Reaching a cap reports `partial`;
+state that exceeds the comparison cap is not committed.
+
+A statement-family observation is usable only when the counter read succeeds
+and at least one operation produces an effective query identifier. A successful
+probe with no identifier makes that operation unavailable; a failed probe keeps
+its specific per-field reason. Either case yields `partial` when another
+operation remains mapped. If no operation maps, the family is `unavailable`
+when any probe successfully returned no identifier, otherwise it uses the
+highest-ranked probe failure. Cross-operation identifier collisions exclude
+every colliding operation; if no effective mapping remains, the family is
+`unavailable`. The counter query never selects statement text.
 
 ### Scope
 
@@ -289,6 +327,8 @@ family status. The collector reads
 `pg_stat_statements.track_planning`, and `track_io_timing`. An off setting omits
 the dependent fields with reason `disabled-setting`, never as zero. LCM never
 enables any of these settings.
+When the server reports no reset timestamp, `statements_stats_reset` is omitted
+with reason `no-baseline`.
 
 ### Aggregation
 
@@ -301,9 +341,8 @@ be the sum of n_i.
 
 - Calls, rows, totals, block counters, and WAL counters are sums.
 - The pooled mean is the sum of `total_exec_time` divided by N.
-- The pooled standard deviation is
-  sqrt(sum(n_i * (s_i^2 + m_i^2)) / N - mean^2), or a numerically stable
-  equivalent.
+- The pooled standard deviation uses the stable population formula
+  `sqrt(sum(n_i * (s_i^2 + (m_i - mean)^2)) / N)`.
 - LCM omits mean and standard deviation if N is 0, if any input is missing, or
   if the variance is negative or not finite.
 - After aggregation, LCM rechecks every numeric value for finiteness and
@@ -319,8 +358,24 @@ establish that the window's extrema are initialized. After a min/max-only
 reset, PostgreSQL reports 0 until the next execution, and lifetime calls do not
 prove initialization. A fresh observation may conservatively omit ambiguous
 extrema with reason `no-baseline`; a comparison context can establish
-initialization. #637 includes a fixture for this sequence: pre-reset calls,
-min/max-only reset, no execution, then resumed execution.
+initialization. An entry is initialized when it has calls and its
+`minmax_stats_since` equals `stats_since`, or when the comparison context has
+the same two epochs and either already established initialization or observes a
+higher call count. #637 includes a fixture for this sequence: pre-reset calls,
+min/max-only reset, no execution, then resumed execution. A zero-call aggregate
+omits mean, standard deviation, minimum, and maximum with `no-baseline`.
+
+Mapping probes themselves can add planning work when
+`pg_stat_statements.track_planning` is enabled. They never execute the packaged
+statement and their own planning statistics are outside the cataloged operation
+mapping.
+
+The existing runtime role needs no new grant. Collection relies on `USAGE` for
+schema `public`, `EXECUTE` on `public.pg_stat_statements(boolean)`, and `SELECT`
+on `public.pg_stat_statements_info`. The extension grants the latter two to
+`PUBLIC` by default. Revoking function execution makes only this family
+`permission-denied`; recovery restores that exact execution grant and never
+grants a monitoring role or resets statistics.
 
 ## Runtime health families
 
@@ -348,6 +403,16 @@ information.
 Queue and replay values may be scoped to a selected project through bound
 parameters, the existing snapshot pattern. Aggregate scope reports totals only,
 never a per-project breakdown.
+
+### Clocks, statements, and rows
+
+Scoped exception for the #637 statement-statistics reads. They use the existing
+#619 diagnostic runtime, whose `statement_timeout` is capped when the runtime is
+created at the smaller of the configured timeout and the shared snapshot
+deadline, never more than 2000 ms. A child signal enforces the remaining family
+budget: the smaller of 750 ms and the remaining snapshot time less the 100 ms
+publication-revalidation reserve. When that remaining budget is not positive,
+the launch guard runs no statement-statistics probe and reports `timeout`.
 
 ## Labels and cardinality
 
@@ -400,6 +465,8 @@ reaching a limit yields status `partial`.
   within the remaining shared snapshot deadline. The combined work stays
   within that deadline and the declared row, mapping-probe, and
   comparison-entry limits.
+  The #637 statement-statistics reads use the scoped exception documented in
+  [Clocks, statements, and rows](#clocks-statements-and-rows).
 - A #639 runbook that needs another role, such as a provider administrator,
   documents that requirement and sanitizes its output to role-class and
   database aliases.

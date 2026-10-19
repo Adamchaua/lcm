@@ -1249,6 +1249,7 @@ describe("runDoctor configuration validation", () => {
         pool: { origin: "diagnostic-probe", status: "ready" },
         project: { scope: "aggregate", status: "ready" }, identity: { status: "ready" },
         outbox: { status: "ready", captured: 100, unprocessed: 5, errors: 0 },
+        telemetry: { statements: { status: "observed", observedAt: 1, scope: "aggregate" } },
         remediation: "No action required.",
       };
     mockCollectEventStats.mockReturnValue({

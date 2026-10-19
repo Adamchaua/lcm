@@ -38,6 +38,59 @@ const MESSAGE_PART_COLUMNS =
   "part_id, message_id, session_id, part_type, ordinal, text_content, " +
   "tool_call_id, tool_name, tool_input, tool_output, metadata";
 
+export const QUERY_GET_CONVERSATION_BY_SESSION_ID = `SELECT ${CONVERSATION_COLUMNS}
+             FROM lcm.conversations
+             WHERE project_id = $1
+               AND session_id_sha256 = public.digest($2, 'sha256')
+               AND session_id = $2
+             ORDER BY created_at DESC, conversation_id DESC
+             LIMIT 1`;
+export const QUERY_LOCK_CONVERSATION_FOR_APPEND = `SELECT conversation_id
+               FROM lcm.conversations
+               WHERE project_id = $1
+                 AND conversation_id = $2
+               FOR UPDATE`;
+export const QUERY_GET_MAX_SEQ_FOR_APPEND = `SELECT MAX(seq) AS max_seq
+               FROM lcm.messages
+               WHERE project_id = $1
+                 AND conversation_id = $2`;
+export const QUERY_GET_MAX_SEQ = `SELECT COALESCE(MAX(seq), 0) AS max_seq
+             FROM lcm.messages
+             WHERE project_id = $1
+               AND conversation_id = $2`;
+export const QUERY_GET_MESSAGES = `SELECT ${MESSAGE_COLUMNS}
+             FROM lcm.messages
+             WHERE project_id = $1
+               AND conversation_id = $2
+               AND seq > $3
+             ORDER BY seq, message_id`;
+export const QUERY_GET_MESSAGES_LIMITED = `${QUERY_GET_MESSAGES} LIMIT $4`;
+export const QUERY_GET_LAST_MESSAGE = `SELECT ${MESSAGE_COLUMNS}
+             FROM lcm.messages
+             WHERE project_id = $1
+               AND conversation_id = $2
+             ORDER BY seq DESC, message_id DESC
+             LIMIT 1`;
+export const QUERY_GET_MESSAGE_COUNT = `SELECT COUNT(*) AS count
+             FROM lcm.messages
+             WHERE project_id = $1
+               AND conversation_id = $2`;
+export const QUERY_MARK_CONVERSATION_BOOTSTRAPPED = `UPDATE lcm.conversations
+               SET bootstrapped_at = COALESCE(
+                     bootstrapped_at,
+                     pg_catalog.statement_timestamp()
+                   ),
+                   updated_at = GREATEST(
+                     updated_at,
+                     pg_catalog.statement_timestamp()
+                   )
+               WHERE project_id = $1
+                 AND conversation_id = $2`;
+export const QUERY_LIST_CONVERSATIONS = `SELECT ${CONVERSATION_COLUMNS}
+               FROM lcm.conversations
+               WHERE project_id = $1
+               ORDER BY created_at, conversation_id`;
+
 type PostgreSqlConversationTransactionContext = PostgreSqlTransactionOptions & {
   readonly domain: "conversations";
   readonly projectId: string;
@@ -363,17 +416,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     );
     await this.scopedDirectWrite(operation, async (transaction) => {
       await transaction.query({
-        text: `UPDATE lcm.conversations
-               SET bootstrapped_at = COALESCE(
-                     bootstrapped_at,
-                     pg_catalog.statement_timestamp()
-                   ),
-                   updated_at = GREATEST(
-                     updated_at,
-                     pg_catalog.statement_timestamp()
-                   )
-               WHERE project_id = $1
-                 AND conversation_id = $2`,
+        text: QUERY_MARK_CONVERSATION_BOOTSTRAPPED,
         values: [this.projectId, conversationId],
       }, this.context(operation));
     });
@@ -383,10 +426,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     const operation = "listConversations";
     return this.serializedRead(operation, async (executor) => {
       const result = await executor.query<ConversationRow>({
-        text: `SELECT ${CONVERSATION_COLUMNS}
-               FROM lcm.conversations
-               WHERE project_id = $1
-               ORDER BY created_at, conversation_id`,
+        text: QUERY_LIST_CONVERSATIONS,
         values: [this.projectId],
       }, this.context(operation));
       return result.rows.map((row) =>
@@ -427,18 +467,11 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     for (const input of inputs) this.validateAppendMessageInput(input, operation);
     return this.contentionWrite(operation, async (transaction) => {
       await transaction.query({
-        text: `SELECT conversation_id
-               FROM lcm.conversations
-               WHERE project_id = $1
-                 AND conversation_id = $2
-               FOR UPDATE`,
+        text: QUERY_LOCK_CONVERSATION_FOR_APPEND,
         values: [this.projectId, conversationId],
       }, this.context(operation));
       const maximum = await transaction.query<MaxSeqRow>({
-        text: `SELECT MAX(seq) AS max_seq
-               FROM lcm.messages
-               WHERE project_id = $1
-                 AND conversation_id = $2`,
+        text: QUERY_GET_MAX_SEQ_FOR_APPEND,
         values: [this.projectId, conversationId],
       }, this.context(operation));
       const rawMaximum = maximum.rows[0]?.max_seq ?? null;
@@ -477,16 +510,10 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     }
     const values: unknown[] = [this.projectId, conversationId, afterSeq];
     const hasBoundedLimit = options?.limit !== undefined && options.limit >= 0;
-    const limit = hasBoundedLimit ? " LIMIT $4" : "";
     if (hasBoundedLimit) values.push(options.limit);
     return this.serializedRead(operation, async (executor) => {
       const result = await executor.query<MessageRow>({
-        text: `SELECT ${MESSAGE_COLUMNS}
-             FROM lcm.messages
-             WHERE project_id = $1
-               AND conversation_id = $2
-               AND seq > $3
-             ORDER BY seq, message_id${limit}`,
+        text: hasBoundedLimit ? QUERY_GET_MESSAGES_LIMITED : QUERY_GET_MESSAGES,
         values,
       }, this.context(operation));
       return result.rows.map((row) =>
@@ -501,12 +528,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
     return this.serializedRead(operation, async (executor) => {
       const result = await executor.query<MessageRow>({
-        text: `SELECT ${MESSAGE_COLUMNS}
-             FROM lcm.messages
-             WHERE project_id = $1
-               AND conversation_id = $2
-             ORDER BY seq DESC, message_id DESC
-             LIMIT 1`,
+        text: QUERY_GET_LAST_MESSAGE,
         values: [this.projectId, conversationId],
       }, this.context(operation));
       const row = result.rows[0];
@@ -652,10 +674,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
     return this.serializedRead(operation, async (executor) => {
       const result = await executor.query<CountRow>({
-        text: `SELECT COUNT(*) AS count
-             FROM lcm.messages
-             WHERE project_id = $1
-               AND conversation_id = $2`,
+        text: QUERY_GET_MESSAGE_COUNT,
         values: [this.projectId, conversationId],
       }, this.context(operation));
       return this.count(result.rows[0], operation);
@@ -691,10 +710,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
     return this.serializedRead(operation, async (executor) => {
       const result = await executor.query<MaxSeqRow>({
-        text: `SELECT COALESCE(MAX(seq), 0) AS max_seq
-             FROM lcm.messages
-             WHERE project_id = $1
-               AND conversation_id = $2`,
+        text: QUERY_GET_MAX_SEQ,
         values: [this.projectId, conversationId],
       }, this.context(operation));
       const value = result.rows[0]?.max_seq ?? 0;
@@ -886,13 +902,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     operation: string,
   ): Promise<ConversationRecord | null> {
     const result = await executor.query<ConversationRow>({
-      text: `SELECT ${CONVERSATION_COLUMNS}
-             FROM lcm.conversations
-             WHERE project_id = $1
-               AND session_id_sha256 = public.digest($2, 'sha256')
-               AND session_id = $2
-             ORDER BY created_at DESC, conversation_id DESC
-             LIMIT 1`,
+      text: QUERY_GET_CONVERSATION_BY_SESSION_ID,
       values: [this.projectId, sessionId],
     }, this.context(operation));
     const row = result.rows[0];
