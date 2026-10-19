@@ -5,6 +5,7 @@ import {
   chmodSync,
   closeSync,
   constants,
+  copyFileSync,
   fstatSync,
   mkdtempSync,
   openSync,
@@ -61,6 +62,46 @@ export const MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH =
   HARNESS_ALLOCATION_MARKER.length + 1 + 32;
 export const SIGNAL_CLEANUP_FAILURE_MARKER = "PostgreSQL harness cleanup failed:";
 export const SIGNAL_DIAGNOSTIC_FLUSH_TIMEOUT_MS = 5_000;
+
+export const CONTAINER_CLI_VARIABLE = "LCM_TEST_CONTAINER_CLI";
+const CONTAINER_FLAVOURS = Object.freeze(["docker", "podman"]);
+
+/**
+ * Select the container engine CLI once per harness run. Unset selects Docker;
+ * otherwise only "docker", "podman" or an absolute path to one of them is valid.
+ */
+export function resolveContainerEngine(environment = process.env) {
+  const configured = environment[CONTAINER_CLI_VARIABLE];
+  if (configured === undefined) return { cli: "docker", flavour: "docker" };
+  if (typeof configured === "string" && !configured.includes("\0")) {
+    if (CONTAINER_FLAVOURS.includes(configured)) return { cli: configured, flavour: configured };
+    if (isAbsolute(configured) && CONTAINER_FLAVOURS.includes(basename(configured))) {
+      return { cli: configured, flavour: basename(configured) };
+    }
+  }
+  throw new Error(
+    `${CONTAINER_CLI_VARIABLE} must be "docker", "podman", or an absolute path to a docker or podman executable`,
+  );
+}
+
+/** Reject Podman configurations the local harness cannot run safely, before any side effect. */
+export function assertContainerEngineSupported(engine, ci, environment = process.env) {
+  if (engine.flavour !== "podman") return;
+  if (ci) {
+    throw new Error(
+      "the Podman PostgreSQL harness supports only local mode; run it without GITHUB_ACTIONS",
+    );
+  }
+  if (String(environment.LCM_POSTGRES_TEMPLATE_ARCHIVE ?? "").trim().length > 0) {
+    throw new Error(
+      "the Podman PostgreSQL harness does not support LCM_POSTGRES_TEMPLATE_ARCHIVE; unset it",
+    );
+  }
+}
+
+export function createContainerRunner(cli) {
+  return (args, options) => runProcess(cli, args, options);
+}
 
 export function resolveSignalProbeReadinessTimeout(environment = process.env) {
   const configured = environment.LCM_TEST_POSTGRES_SIGNAL_READY_TIMEOUT_MS;
@@ -849,9 +890,16 @@ async function inspectDockerObject(type, name, dockerRunner = docker) {
   return JSON.parse(result.stdout)[0];
 }
 
+/** Read ownership labels from an inspect record; Podman reports network labels in lowercase. */
+export function inspectedLabels(type, record) {
+  if (type === "container") return record?.Config?.Labels ?? {};
+  if (type === "network") return record?.Labels ?? record?.labels ?? {};
+  return record?.Labels ?? {};
+}
+
 export async function inspectLabels(type, name, dockerRunner = docker) {
   const record = await inspectDockerObject(type, name, dockerRunner);
-  return type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
+  return inspectedLabels(type, record);
 }
 
 export function isMissingDockerObjectError(error, type, name) {
@@ -869,11 +917,24 @@ export function isMissingDockerObjectError(error, type, name) {
       ? diagnostic.slice("Error: ".length)
       : diagnostic;
   const expected = type === "container"
-    ? `No such container: ${name}`
+    ? [
+      `No such container: ${name}`,
+      `no such container "${name}"`,
+      `no container with name or ID "${name}" found: no such container`,
+      `no container with ID or name "${name}" found: no such container`,
+    ]
     : type === "network"
-      ? `network ${name} not found`
-      : `get ${name}: no such volume`;
-  return message === expected;
+      ? [
+        `network ${name} not found`,
+        `network ${name}: unable to find network with name or ID ${name}: network not found`,
+        `unable to find network with name or ID ${name}: network not found`,
+      ]
+      : [
+        `get ${name}: no such volume`,
+        `no such volume ${name}`,
+        `no volume with name "${name}" found: no such volume`,
+      ];
+  return expected.includes(message);
 }
 
 export async function removeLabeled(type, name, runId, dockerRunner = docker) {
@@ -933,7 +994,7 @@ export async function removeOwnedResource(
       if (isMissingDockerObjectError(error, type, name)) return;
       throw error;
     }
-    const labels = type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
+    const labels = inspectedLabels(type, record);
     if (!labelsMatchOwnership(labels, expectedLabels)) {
       throw new Error(`refusing to remove ${type} with changed PostgreSQL harness ownership`);
     }
@@ -1148,7 +1209,7 @@ export async function discoverHarnessRuns(dependencies = {}) {
       });
       continue;
     }
-    const labels = resource.type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
+    const labels = inspectedLabels(resource.type, record);
     const ownership = requiredOwnership(labels);
     const spec = ownership && resourceSpec(resource.type, resource.name, ownership.runId);
     if (!ownership || !spec || spec.kind !== ownership.kind) {
@@ -1466,14 +1527,15 @@ function sanitizedHarnessErrorDetails(error, secrets) {
 
 export async function cleanupHarnessResources(context, dependencies = {}) {
   const { names, runId, directory, sentinelReady, owner } = context;
+  const dockerRunner = dependencies.dockerRunner ?? docker;
   const removeResource = dependencies.removeResource
     ?? ((type, name) => {
       const spec = resourceSpec(type, name, runId);
-      if (!owner || !spec) return removeLabeled(type, name, runId);
-      return removeOwnedResource(type, name, ownershipLabels(runId, spec.kind, owner));
+      if (!owner || !spec) return removeLabeled(type, name, runId, dockerRunner);
+      return removeOwnedResource(type, name, ownershipLabels(runId, spec.kind, owner), dockerRunner);
     });
   const verifySentinel = dependencies.verifySentinel
-    ?? (() => verifyContainerSentinel(names, runId));
+    ?? (() => verifyContainerSentinel(names, runId, dockerRunner));
   const removeDirectory = dependencies.removeDirectory
     ?? ((path) => rmSync(path, { recursive: true, force: true }));
   const retryDelays = dependencies.retryDelays ?? HARNESS_CLEANUP_RETRY_DELAYS_MS;
@@ -1580,6 +1642,56 @@ export function createCiRunnerContainerArgs(context, envFile) {
   ];
 }
 
+/**
+ * Build the database container arguments. Docker mounts repository files
+ * directly. Podman receives private copies and relabels only those private
+ * sources (`Z`), so no checkout path is ever mounted or relabelled.
+ */
+export function createDatabaseContainerArgs(context) {
+  const { names, runId, owner, directory, publish, usingCachedTemplate, flavour } = context;
+  const podman = flavour === "podman";
+  const mode = podman ? "ro,Z" : "ro";
+  const initSource = podman ? join(directory, "init.sh") : initScript;
+  const cachedInitSource = podman ? join(directory, "cached-run-init.sh") : cachedRunInitScript;
+  const args = [
+    "create", "--name", names.container,
+    ...dockerLabelArgs(ownershipLabels(runId, "database", owner)),
+    "--network", names.network,
+    "--network-alias", names.alias,
+    "--network-alias", names.wrongAlias,
+    ...publish,
+    "--env", `LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`,
+    "--volume", `${names.volume}:/var/lib/postgresql`,
+    "--volume", `${directory}:/run/lcm-harness:${mode}`,
+    "--volume", `${cachedInitSource}:/run/lcm-cached-init.sh:${mode}`,
+  ];
+  if (!usingCachedTemplate) {
+    args.push(
+      "--volume", `${initSource}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:${mode}`,
+      "--env", "POSTGRES_USER=lcm_harness_admin",
+      "--env", `POSTGRES_DB=${names.controlDatabase}`,
+      "--env", "POSTGRES_PASSWORD_FILE=/run/lcm-private/admin-password",
+      "--env", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+    );
+  }
+  args.push(
+    "--entrypoint", "/bin/bash",
+    POSTGRES_IMAGE,
+    "-ceu",
+    "install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/certs /run/lcm-private; install -o postgres -g postgres -m 0600 /run/lcm-harness/server.key /var/lib/postgresql/certs/server.key; install -o postgres -g postgres -m 0644 /run/lcm-harness/server.crt /run/lcm-harness/ca.crt /var/lib/postgresql/certs/; install -o postgres -g postgres -m 0600 /run/lcm-harness/admin-password /run/lcm-harness/migrator-password /run/lcm-harness/runtime-password /run/lcm-harness/run-id /run/lcm-harness/database-name /run/lcm-private/; exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/certs/server.crt -c ssl_key_file=/var/lib/postgresql/certs/server.key -c ssl_ca_file=/var/lib/postgresql/certs/ca.crt -c shared_preload_libraries=pg_stat_statements -c listen_addresses=* -c password_encryption=scram-sha-256 -c timezone=UTC",
+  );
+  return args;
+}
+
+/** Copy the repository init scripts into the private run directory, readable by the container's postgres user. */
+function copyInitScriptsToRunDirectory(directory) {
+  for (const [source, name] of [[initScript, "init.sh"], [cachedRunInitScript, "cached-run-init.sh"]]) {
+    const target = join(directory, name);
+    copyFileSync(source, target);
+    chmodSync(target, 0o644);
+  }
+}
+
 export async function runTests(context, ci, setupDocker = docker, testProcess = runProcess) {
   const env = { ...process.env, ...context.environment };
   delete env.LCM_TEST_POSTGRES_FORK_PROBE;
@@ -1664,7 +1776,7 @@ export async function runTests(context, ci, setupDocker = docker, testProcess = 
   writeFileSync(envFile, Object.entries(createDockerRunnerEnvironment(context.environment, censusCost))
     .map(([key, value]) => `${key}=${value}`).join("\n") + "\n", { mode: 0o600 });
   await setupDocker(createCiRunnerContainerArgs(context, envFile));
-  await runSanitizedProcess("docker", ["start", "--attach", context.names.runner], {
+  await runSanitizedProcess(context.containerCli ?? "docker", ["start", "--attach", context.names.runner], {
     processRunner: (_command, args, processOptions) => setupDocker(args, processOptions),
     secrets,
     terminateOnStop: true,
@@ -1674,12 +1786,21 @@ export async function runTests(context, ci, setupDocker = docker, testProcess = 
 export async function runHarness(options = {}) {
   resolveSignalProbeReadinessTimeout(process.env);
   const ci = options.ci ?? process.env.GITHUB_ACTIONS === "true";
+  let engine;
+  try {
+    engine = resolveContainerEngine(process.env);
+    assertContainerEngineSupported(engine, ci, process.env);
+  } catch (error) {
+    process.stderr.write(`PostgreSQL harness startup failed: ${error.message}\n`);
+    throw error;
+  }
+  const containerRunner = createContainerRunner(engine.cli);
   const runId = randomBytes(16).toString("hex");
   process.stderr.write(`${HARNESS_ALLOCATION_MARKER} ${runId}\n`);
   let owner;
   try {
     await options.afterRunAllocation?.({ runId });
-    await reclaimProvenOrphans();
+    await reclaimProvenOrphans({ dockerRunner: containerRunner });
     owner = createOwnerIdentity();
   } catch (error) {
     process.stderr.write(`PostgreSQL harness startup failed: ${sanitizedHarnessErrorDetails(error, [])}\n`);
@@ -1708,7 +1829,7 @@ export async function runHarness(options = {}) {
   validateRunNames(names, runId);
   const processLifecycle = createProcessLifecycle();
   const setupProcess = processLifecycle.run;
-  const setupDocker = (args, processOptions) => setupProcess("docker", args, processOptions);
+  const setupDocker = (args, processOptions) => setupProcess(engine.cli, args, processOptions);
   let sentinelReady = false;
   const { teardown } = createHarnessCleanupOperations(
     {
@@ -1720,7 +1841,11 @@ export async function runHarness(options = {}) {
       },
       owner,
     },
-    { stop: processLifecycle.stop, secrets },
+    {
+      stop: processLifecycle.stop,
+      secrets,
+      cleanupDependencies: { dockerRunner: containerRunner },
+    },
   );
   let exitSignal;
   let signalExitPromise;
@@ -1747,6 +1872,7 @@ export async function runHarness(options = {}) {
     writeFileSync(join(directory, "migrator-password"), `${passwords.migrator}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "runtime-password"), `${passwords.runtime}\n`, { mode: 0o600 });
     await writeTlsFixtures(directory, names.alias, setupProcess);
+    if (engine.flavour === "podman") copyInitScriptsToRunDirectory(directory);
     await setupDocker([
       "network", "create",
       ...dockerLabelArgs(ownershipLabels(runId, "network", owner)),
@@ -1781,35 +1907,15 @@ export async function runHarness(options = {}) {
         setupDocker,
       );
     }
-    const publish = ci ? [] : ["--publish", "127.0.0.1::5432"];
-    const containerArgs = [
-      "create", "--name", names.container,
-      ...dockerLabelArgs(ownershipLabels(runId, "database", owner)),
-      "--network", names.network,
-      "--network-alias", names.alias,
-      "--network-alias", names.wrongAlias,
-      ...publish,
-      "--env", `LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`,
-      "--volume", `${names.volume}:/var/lib/postgresql`,
-      "--volume", `${directory}:/run/lcm-harness:ro`,
-      "--volume", `${cachedRunInitScript}:/run/lcm-cached-init.sh:ro`,
-    ];
-    if (!usingCachedTemplate) {
-      containerArgs.push(
-        "--volume", `${initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro`,
-        "--env", "POSTGRES_USER=lcm_harness_admin",
-        "--env", `POSTGRES_DB=${names.controlDatabase}`,
-        "--env", "POSTGRES_PASSWORD_FILE=/run/lcm-private/admin-password",
-        "--env", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
-      );
-    }
-    containerArgs.push(
-      "--entrypoint", "/bin/bash",
-      POSTGRES_IMAGE,
-      "-ceu",
-      "install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/certs /run/lcm-private; install -o postgres -g postgres -m 0600 /run/lcm-harness/server.key /var/lib/postgresql/certs/server.key; install -o postgres -g postgres -m 0644 /run/lcm-harness/server.crt /run/lcm-harness/ca.crt /var/lib/postgresql/certs/; install -o postgres -g postgres -m 0600 /run/lcm-harness/admin-password /run/lcm-harness/migrator-password /run/lcm-harness/runtime-password /run/lcm-harness/run-id /run/lcm-harness/database-name /run/lcm-private/; exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/certs/server.crt -c ssl_key_file=/var/lib/postgresql/certs/server.key -c ssl_ca_file=/var/lib/postgresql/certs/ca.crt -c shared_preload_libraries=pg_stat_statements -c listen_addresses=* -c password_encryption=scram-sha-256 -c timezone=UTC",
-    );
-    await setupDocker(containerArgs);
+    await setupDocker(createDatabaseContainerArgs({
+      names,
+      runId,
+      owner,
+      directory,
+      publish: ci ? [] : ["--publish", "127.0.0.1::5432"],
+      usingCachedTemplate,
+      flavour: engine.flavour,
+    }));
     await setupDocker(["start", names.container]);
     try {
       await waitForPostgreSql(
@@ -1822,7 +1928,7 @@ export async function runHarness(options = {}) {
         await setupDocker(["exec", names.container, "/bin/bash", "/run/lcm-cached-init.sh"]);
       }
     } catch (error) {
-      const logs = await docker(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
+      const logs = await containerRunner(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
       throw Object.assign(error, { stderr: `${error?.stderr ?? ""}\n${logs.stdout}\n${logs.stderr}` });
     }
     await waitForContainerSentinel(names, runId, setupDocker);
@@ -1851,6 +1957,7 @@ export async function runHarness(options = {}) {
           environment,
           secrets,
           owner,
+          containerCli: engine.cli,
           consumerProbe: options.consumerProbe,
           forkConsumerProbe: options.forkConsumerProbe,
         },
@@ -1860,7 +1967,7 @@ export async function runHarness(options = {}) {
         setupProcess,
       );
     } catch (error) {
-      const logs = await docker(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
+      const logs = await containerRunner(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
       throw Object.assign(error, { stderr: `${error?.stderr ?? ""}\n${logs.stdout}\n${logs.stderr}` });
     }
   } catch (error) {
