@@ -612,6 +612,10 @@ export type RollbackRecoveryAdmissionResult = Readonly<{
  *   publication journal with this rollback's publicationId, or one the coordinator's missing-material exit took
  *   straight from preparing to aborted without ever sealing material (recoveryReference null): that publication
  *   recorded no fence and published nothing, and the rollback prepares it again (E6).
+ * - an aborted publication of this rollback that had sealed its material (recoveryReference set): something else
+ *   aborted it after it began. The abort restored the source and released what it recorded, and the rollback
+ *   resumes it forward. This admission is not the proof of that: the rollback checks the journal's composition,
+ *   the restored source and the authority itself before it composes the publication again (#1555).
  *
  * Every other journal, including a freshly held maintenance (which has the strict first-open path), is refused.
  * The lease tuple (project, machine, publicationId, target, evidence) is matched by the lease acquisition that
@@ -662,7 +666,6 @@ export async function checkRollbackRecoveryAdmission(input: Readonly<{
       publication === null
       || publication.publicationId !== input.publicationId
       || publication.phase === "completed"
-      || (publication.phase === "aborted" && publication.recoveryReference !== null)
     ) {
       return refuse("no journal of this rollback's attempted selection or in-flight publication remains");
     }

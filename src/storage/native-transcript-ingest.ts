@@ -84,10 +84,111 @@ export class NativeTranscriptConfigurationError extends Error {
   }
 }
 
+/**
+ * Why an exact resolver could not return a stored message for one sanitized
+ * native message.
+ *
+ * - `invalid-input`: the sequence, role, session id or content were not valid
+ *   resolver input.
+ * - `session-not-found`: no stored rows exist for the native session.
+ * - `invalid-session-snapshot`: the stored session rows are malformed,
+ *   repeat a conversation, or are not contiguous from zero.
+ * - `sequence-out-of-range`: the session has no message at the sequence.
+ * - `role-mismatch`: the stored message at the sequence has another role.
+ * - `content-mismatch`: the stored message at the sequence has other content.
+ */
+const NATIVE_TRANSCRIPT_LINK_MISS_CONDITIONS = [
+  "invalid-input",
+  "session-not-found",
+  "invalid-session-snapshot",
+  "sequence-out-of-range",
+  "role-mismatch",
+  "content-mismatch",
+] as const;
+
+export type NativeTranscriptLinkMissCondition =
+  (typeof NATIVE_TRANSCRIPT_LINK_MISS_CONDITIONS)[number];
+
+/**
+ * Condition named by a {@link NativeTranscriptLinkError}.
+ *
+ * - Every {@link NativeTranscriptLinkMissCondition}: an exact lookup missed
+ *   for a message candidate; the error also names its session sequence.
+ * - `unresolved`: the lookup missed and the resolver could not explain why,
+ *   or no condition was supplied.
+ * - `unsupported-pending-after-quarantine`: a record followed quarantined
+ *   records but used a custom message mapper or produced several messages,
+ *   so its session position cannot be searched.
+ * - `ambiguous-pending-match`: more than one session sequence in the
+ *   pending window matched the message.
+ * - `unmatched-pending-window`: no session sequence in the pending window
+ *   matched the message.
+ */
+export type NativeTranscriptLinkCondition =
+  | NativeTranscriptLinkMissCondition
+  | "unresolved"
+  | "unsupported-pending-after-quarantine"
+  | "ambiguous-pending-match"
+  | "unmatched-pending-window";
+
+const NATIVE_TRANSCRIPT_LINK_CONDITIONS: readonly string[] = [
+  ...NATIVE_TRANSCRIPT_LINK_MISS_CONDITIONS,
+  "unresolved",
+  "unsupported-pending-after-quarantine",
+  "ambiguous-pending-match",
+  "unmatched-pending-window",
+];
+
+function isLinkMissCondition(
+  value: unknown,
+): value is NativeTranscriptLinkMissCondition {
+  return typeof value === "string"
+    && (NATIVE_TRANSCRIPT_LINK_MISS_CONDITIONS as readonly string[])
+      .includes(value);
+}
+
+function linkCondition(value: unknown): NativeTranscriptLinkCondition {
+  return typeof value === "string"
+    && NATIVE_TRANSCRIPT_LINK_CONDITIONS.includes(value)
+    ? value as NativeTranscriptLinkCondition
+    : "unresolved";
+}
+
+function linkOrdinal(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+export interface NativeTranscriptLinkErrorDetails {
+  readonly condition?: NativeTranscriptLinkCondition;
+  readonly sessionSequence?: number;
+}
+
+/**
+ * Raised when a native transcript message cannot be linked to its stored
+ * message. The message names only a validated condition code and validated
+ * non-negative integers, never transcript content, roles, ids or paths.
+ */
 export class NativeTranscriptLinkError extends Error {
-  constructor(readonly sourceOrdinal: number) {
-    super("native transcript message linkage failed");
+  readonly condition: NativeTranscriptLinkCondition;
+  readonly sessionSequence: number | undefined;
+
+  constructor(
+    readonly sourceOrdinal: number,
+    details: NativeTranscriptLinkErrorDetails = {},
+  ) {
+    const condition = linkCondition(details.condition);
+    const ordinal = linkOrdinal(sourceOrdinal);
+    const sequence = linkOrdinal(details.sessionSequence);
+    super(
+      `native transcript message linkage failed: ${condition}`
+      + (ordinal === undefined ? "" : ` at source ordinal ${ordinal}`)
+      + (sequence === undefined ? "" : ` (session sequence ${sequence})`),
+    );
     this.name = "NativeTranscriptLinkError";
+    this.condition = condition;
+    this.sessionSequence = sequence;
   }
 }
 
@@ -1482,6 +1583,17 @@ export interface ExactNativeTranscriptMessageResolver {
     readonly conversationId: number;
     readonly messageId: number;
   } | null>;
+  /**
+   * Optionally explain why {@link resolveExact} returned `null` for the same
+   * input. Implementations must return only a closed condition code and must
+   * not read a different repository view than `resolveExact`.
+   */
+  explainMiss?(input: {
+    readonly nativeSessionId: string;
+    readonly sessionSequence: number;
+    readonly role: MessageRole;
+    readonly content: string;
+  }): Promise<NativeTranscriptLinkMissCondition | "unresolved">;
 }
 
 /**
@@ -1507,14 +1619,18 @@ export function createExactNativeTranscriptMessageResolver(
     readonly role: MessageRole;
     readonly content: string;
   };
-  const snapshots = new Map<string, Promise<readonly ResolvedMessage[] | null>>();
+  type SessionSnapshot =
+    | { readonly kind: "empty" }
+    | { readonly kind: "invalid" }
+    | { readonly kind: "messages"; readonly messages: readonly ResolvedMessage[] };
+  const snapshots = new Map<string, Promise<SessionSnapshot>>();
   const loadSnapshot = async (
     nativeSessionId: string,
-  ): Promise<readonly ResolvedMessage[] | null> => {
+  ): Promise<SessionSnapshot> => {
     const rows = await messages.getNativeTranscriptMessageSnapshot(
       nativeSessionId,
     );
-    if (rows.length === 0) return null;
+    if (rows.length === 0) return { kind: "empty" };
     const seenConversationIds = new Set<number>();
     const sessionMessages: ResolvedMessage[] = [];
     let currentConversationId: number | undefined;
@@ -1530,15 +1646,19 @@ export function createExactNativeTranscriptMessageResolver(
         || !isMessageRole(message.role)
         || message.content.includes("\0")
       ) {
-        return null;
+        return { kind: "invalid" };
       }
       if (message.conversationId !== currentConversationId) {
-        if (seenConversationIds.has(message.conversationId)) return null;
+        if (seenConversationIds.has(message.conversationId)) {
+          return { kind: "invalid" };
+        }
         seenConversationIds.add(message.conversationId);
         currentConversationId = message.conversationId;
         expectedMessageSequence = 0;
       }
-      if (message.messageSequence !== expectedMessageSequence) return null;
+      if (message.messageSequence !== expectedMessageSequence) {
+        return { kind: "invalid" };
+      }
       expectedMessageSequence += 1;
       sessionMessages.push({
         conversationId: message.conversationId,
@@ -1547,46 +1667,72 @@ export function createExactNativeTranscriptMessageResolver(
         content: message.content,
       });
     }
-    return sessionMessages;
+    return { kind: "messages", messages: sessionMessages };
+  };
+
+  type ExactInput = Parameters<
+    ExactNativeTranscriptMessageResolver["resolveExact"]
+  >[0];
+  const classify = async (
+    input: ExactInput,
+  ): Promise<
+    | {
+      readonly condition: NativeTranscriptLinkMissCondition;
+      readonly resolved?: undefined;
+    }
+    | {
+      readonly condition?: undefined;
+      readonly resolved: {
+        readonly conversationId: number;
+        readonly messageId: number;
+      };
+    }
+  > => {
+    if (
+      !Number.isSafeInteger(input.sessionSequence)
+      || input.sessionSequence < 0
+      || !isMessageRole(input.role)
+      || input.nativeSessionId.length === 0
+      || input.nativeSessionId.includes("\0")
+      || input.content.includes("\0")
+    ) {
+      return { condition: "invalid-input" };
+    }
+    let snapshot = snapshots.get(input.nativeSessionId);
+    if (!snapshot) {
+      const loading = loadSnapshot(input.nativeSessionId);
+      const cached = loading.catch((error: unknown) => {
+        snapshots.delete(input.nativeSessionId);
+        throw error;
+      });
+      snapshots.set(input.nativeSessionId, cached);
+      snapshot = cached;
+    }
+    const sessionSnapshot = await snapshot;
+    if (sessionSnapshot.kind === "empty") {
+      return { condition: "session-not-found" };
+    }
+    if (sessionSnapshot.kind === "invalid") {
+      return { condition: "invalid-session-snapshot" };
+    }
+    const message = sessionSnapshot.messages[input.sessionSequence];
+    if (!message) return { condition: "sequence-out-of-range" };
+    if (message.role !== input.role) return { condition: "role-mismatch" };
+    if (message.content !== input.content) {
+      return { condition: "content-mismatch" };
+    }
+    return {
+      resolved: {
+        conversationId: message.conversationId,
+        messageId: message.messageId,
+      },
+    };
   };
 
   return {
-    resolveExact: async (input) => {
-      if (
-        !Number.isSafeInteger(input.sessionSequence)
-        || input.sessionSequence < 0
-        || !isMessageRole(input.role)
-        || input.nativeSessionId.length === 0
-        || input.nativeSessionId.includes("\0")
-        || input.content.includes("\0")
-      ) {
-        return null;
-      }
-      let snapshot = snapshots.get(input.nativeSessionId);
-      if (!snapshot) {
-        const loading = loadSnapshot(input.nativeSessionId);
-        const cached = loading.catch((error: unknown) => {
-          snapshots.delete(input.nativeSessionId);
-          throw error;
-        });
-        snapshots.set(input.nativeSessionId, cached);
-        snapshot = cached;
-      }
-      const sessionMessages = await snapshot;
-      if (!sessionMessages) return null;
-      const message = sessionMessages[input.sessionSequence];
-      if (
-        !message
-        || message.role !== input.role
-        || message.content !== input.content
-      ) {
-        return null;
-      }
-      return {
-        conversationId: message.conversationId,
-        messageId: message.messageId,
-      };
-    },
+    resolveExact: async (input) => (await classify(input)).resolved ?? null,
+    explainMiss: async (input) =>
+      (await classify(input)).condition ?? "unresolved",
   };
 }
 
@@ -1798,6 +1944,10 @@ function snapshotNativeTranscriptBackfillOptions(
     || typeof messageResolver !== "object"
     || typeof messageResolver.resolveExact !== "function"
     || (
+      messageResolver.explainMiss !== undefined
+      && typeof messageResolver.explainMiss !== "function"
+    )
+    || (
       callerMapper !== undefined
       && (
         callerMapper === null
@@ -1813,6 +1963,7 @@ function snapshotNativeTranscriptBackfillOptions(
     throw new NativeTranscriptConfigurationError("invalid-input");
   }
   const mapper = callerMapper ?? createNativeTranscriptMessageMapper();
+  const explainMiss = messageResolver.explainMiss;
   return Object.freeze({
     repository: Object.freeze({
       getCheckpoint: repository.getCheckpoint.bind(repository),
@@ -1838,6 +1989,7 @@ function snapshotNativeTranscriptBackfillOptions(
     hasCustomMessageMapper: callerMapper !== undefined,
     messageResolver: Object.freeze({
       resolveExact: messageResolver.resolveExact.bind(messageResolver),
+      explainMiss: explainMiss?.bind(messageResolver),
     }),
     batchSize,
     clock,
@@ -1858,6 +2010,19 @@ function assertMetadata(
   return metadata;
 }
 
+async function explainLinkMiss(
+  resolver: ExactNativeTranscriptMessageResolver,
+  lookup: Parameters<ExactNativeTranscriptMessageResolver["resolveExact"]>[0],
+): Promise<NativeTranscriptLinkCondition> {
+  if (!resolver.explainMiss) return "unresolved";
+  try {
+    const condition = await resolver.explainMiss(lookup);
+    return isLinkMissCondition(condition) ? condition : "unresolved";
+  } catch {
+    return "unresolved";
+  }
+}
+
 async function messageLinks(
   record: PreparedNativeTranscriptRecord,
   candidates: readonly (
@@ -1867,13 +2032,19 @@ async function messageLinks(
 ): Promise<CreateNativeTranscriptMessageLinkInput[]> {
   const links: CreateNativeTranscriptMessageLinkInput[] = [];
   for (const candidate of candidates) {
-    const resolved = await resolver.resolveExact({
+    const lookup = {
       nativeSessionId: record.nativeSessionId,
       sessionSequence: candidate.sessionSequence,
       role: candidate.role,
       content: candidate.content,
-    });
-    if (!resolved) throw new NativeTranscriptLinkError(record.sourceOrdinal);
+    };
+    const resolved = await resolver.resolveExact(lookup);
+    if (!resolved) {
+      throw new NativeTranscriptLinkError(candidate.sourceOrdinal, {
+        condition: await explainLinkMiss(resolver, lookup),
+        sessionSequence: candidate.sessionSequence,
+      });
+    }
     assertSafeNonnegative(resolved.conversationId);
     assertSafeNonnegative(resolved.messageId);
     links.push({
@@ -2030,7 +2201,9 @@ export async function runNativeTranscriptBackfill(
         };
       }
       if (config.hasCustomMessageMapper || candidates.length !== 1) {
-        throw new NativeTranscriptLinkError(record.sourceOrdinal);
+        throw new NativeTranscriptLinkError(record.sourceOrdinal, {
+          condition: "unsupported-pending-after-quarantine",
+        });
       }
       const lastCandidateSequence =
         nextSessionSequence + pendingQuarantinedRecords;
@@ -2052,10 +2225,18 @@ export async function runNativeTranscriptBackfill(
           content: candidate.content,
         });
         if (!resolved) continue;
-        if (match) throw new NativeTranscriptLinkError(record.sourceOrdinal);
+        if (match) {
+          throw new NativeTranscriptLinkError(record.sourceOrdinal, {
+            condition: "ambiguous-pending-match",
+          });
+        }
         match = { ...resolved, sessionSequence };
       }
-      if (!match) throw new NativeTranscriptLinkError(record.sourceOrdinal);
+      if (!match) {
+        throw new NativeTranscriptLinkError(record.sourceOrdinal, {
+          condition: "unmatched-pending-window",
+        });
+      }
       pendingQuarantinedRecords = 0;
       return {
         links: [{

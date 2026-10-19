@@ -1009,6 +1009,20 @@ function withHookClient(stdinText: string, client: unknown): string {
   return withHookOverrides(stdinText, client, undefined);
 }
 
+/** Dispatch a hook; Codex invocations additionally leave a best-effort LCM-local completion record. */
+async function dispatchObservedHook(
+  command: "restore" | "user-prompt" | "post-tool" | "pre-tool" | "session-snapshot",
+  input: string,
+  client: unknown,
+  context?: { transport?: "cli" | "mcp" },
+): Promise<{ exitCode: number; stdout: string }> {
+  const { dispatchHook } = await import("../src/hooks/dispatch.js");
+  const run = () => context === undefined ? dispatchHook(command, input) : dispatchHook(command, input, context);
+  if (client !== "codex") return run();
+  const { runObservedCodexHook } = await import("../src/hooks/codex-hook-receipts.js");
+  return runObservedCodexHook({ client, command, stdinText: input }, run);
+}
+
 async function withCustomHelp(cmd: Command, commandName: string): Promise<never> {
   const { printHelp } = await import("../src/cli-help.js");
   printHelp(commandName);
@@ -3035,9 +3049,8 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("restore"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("restore", input);
+      const r = await dispatchObservedHook("restore", input, opts.client);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3074,9 +3087,8 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("user-prompt"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("user-prompt", input, { transport: opts.transport });
+      const r = await dispatchObservedHook("user-prompt", input, opts.client, { transport: opts.transport });
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3093,9 +3105,8 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("post-tool"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("post-tool", input);
+      const r = await dispatchObservedHook("post-tool", input, opts.client);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3112,9 +3123,8 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("pre-tool"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("pre-tool", input);
+      const r = await dispatchObservedHook("pre-tool", input, opts.client);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3131,9 +3141,8 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("session-snapshot"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("session-snapshot", input);
+      const r = await dispatchObservedHook("session-snapshot", input, opts.client);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3755,6 +3764,7 @@ export async function runCli(
             console.log(`    Path: ${path}`);
           }
           if ((result as any).requiresRestart) console.log("    Restart the agent to activate.");
+          for (const notice of (result as any).notices ?? []) console.log(`    ${notice}`);
           console.log();
         }
       } catch (err: any) {
@@ -3809,7 +3819,7 @@ export async function runCli(
       }
       const { AGENTS } = await import("../src/connectors/registry.js");
       const { listConnectors, listConnectorInventory } = await import("../src/connectors/installer.js");
-      const { readConnectorTransportSnapshot } = await import("../src/config-manager.js");
+      const { readConnectorTransportSnapshot, readPreToolRecallSnapshot } = await import("../src/config-manager.js");
       const { findAgent } = await import("../src/connectors/registry.js");
       const found = agentName ? findAgent(agentName) : undefined;
       const agents = found ? [found] : agentName ? [] : AGENTS;
@@ -3850,32 +3860,28 @@ export async function runCli(
 
         if ((agent as any).id !== "codex" || agentName === undefined) continue;
 
-        const {
-          inspectCodexPostToolHook,
-          resolveCodexHooksPath,
-        } = await import("../src/connectors/codex-hooks.js");
+        const { probeCodexCliVersion } = await import("../src/connectors/installer.js");
+        const { runCodexReadinessCheck } = await import("../src/connectors/codex-readiness.js");
         const { codexPostToolFunctionalCoverage } = await import("../src/hooks/post-tool-normalization.js");
-        const inspection = inspectCodexPostToolHook(
-          resolveCodexHooksPath(opts.global ? homedir() : process.cwd()),
-        );
+        const readiness = runCodexReadinessCheck({
+          homeDir: homedir(),
+          probeVersion: () => probeCodexCliVersion(connectorCwd),
+          readStoredTransport: () => readConnectorTransportSnapshot(defaultConfigPath(), "codex"),
+          readPreToolRecall: () => readPreToolRecallSnapshot(defaultConfigPath()),
+        });
+        for (const line of readiness.lines) console.log(line);
+        failures += readiness.failures;
 
-        if (inspection.state === "installed") {
-          console.log("  ✓ Codex: PostToolUse hook installed");
-          let functional = false;
-          try {
-            functional = codexPostToolFunctionalCoverage();
-          } catch {
-            functional = false;
-          }
-          if (functional) {
-            console.log("  ✓ Codex: native exec capture functional");
-          } else {
-            console.log("  ✗ Codex: native exec capture functional");
-            failures += 1;
-          }
+        let selfTestPassed = false;
+        try {
+          selfTestPassed = codexPostToolFunctionalCoverage();
+        } catch {
+          selfTestPassed = false;
+        }
+        if (selfTestPassed) {
+          console.log("  ✓ Codex: native exec normalization self-test passed (fixtures only; not proof of runtime execution)");
         } else {
-          console.log(`  ✗ Codex: PostToolUse hook ${inspection.state}`);
-          console.log("  Codex: native exec capture functional check skipped");
+          console.log("  ✗ Codex: native exec normalization self-test failed (fixtures only)");
           failures += 1;
         }
       }
