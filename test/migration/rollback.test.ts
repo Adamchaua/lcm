@@ -3695,13 +3695,29 @@ describe("readOwnPublicationSourceFromMaterial: the rollback's sealed pre-public
     expect(source.projectMap[FIXTURE_LOCAL_PROJECT_ID]).toMatchObject({ remoteProjectId: FIXTURE_REMOTE_PROJECT_ID });
   });
 
-  it("is null for another publication's journal, and once its own publication was aborted", async () => {
+  it("is null for another publication's journal", async () => {
     const homeDir = tempHome();
-    const coordinator = await prepared(homeDir, ID);
+    await prepared(homeDir, ID);
     expect(readOwnPublicationSourceFromMaterial(homeDir, deriveRollbackPublicationId("another-generation"), FIXTURE_LOCAL_PROJECT_ID)).toBeNull();
+  });
+
+  it("reads the live files once its own publication was aborted, only as the journal witnessed them (#1555)", async () => {
+    const homeDir = tempHome();
+    const material = rollbackPublicationMaterial();
+    for (const [name, file] of [["config.json", material.source.config], ["map.json", material.source.projectMap]] as const) {
+      if (file.presence === "present") writeFileSync(join(homeDir, ".lcm", name), file.content, { mode: 0o600 });
+    }
+    const coordinator = await prepared(homeDir, ID);
     await coordinator.recoverPending({ disposition: "abort" });
-    expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "aborted" });
-    expect(readOwnPublicationSourceFromMaterial(homeDir, ID, FIXTURE_LOCAL_PROJECT_ID)).toBeNull();
+    expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "aborted", recoveryReference: expect.anything() });
+    expect(readOwnPublicationSourceFromMaterial(homeDir, ID, FIXTURE_LOCAL_PROJECT_ID)!.projectMap[FIXTURE_LOCAL_PROJECT_ID])
+      .toMatchObject({ remoteProjectId: FIXTURE_REMOTE_PROJECT_ID });
+    // Another covered project is not this rollback's composition: no source of its own.
+    expect(readOwnPublicationSourceFromMaterial(homeDir, ID, "d".repeat(64))).toBeNull();
+
+    writeFileSync(join(homeDir, ".lcm", "map.json"), "{}", { mode: 0o600 });
+    expect(() => readOwnPublicationSourceFromMaterial(homeDir, ID, FIXTURE_LOCAL_PROJECT_ID))
+      .toThrow(expect.objectContaining({ reason: "unexpected-state", message: expect.stringContaining("live project map is not the one") }));
   });
 
   it("refuses a sealed publication whose source project map was absent", async () => {
