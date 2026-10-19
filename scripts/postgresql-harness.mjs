@@ -1643,16 +1643,15 @@ export function createCiRunnerContainerArgs(context, envFile) {
 }
 
 /**
- * Build the database container arguments. Docker mounts repository files
- * directly. Podman receives private copies and relabels only those private
- * sources (`Z`), so no checkout path is ever mounted or relabelled.
+ * Build the database container arguments. Every bind source is a harness-owned
+ * path (the run directory and the scripts staged inside it), never a checkout
+ * file. Docker keeps the shared SELinux label (`z`); Podman, which runs one
+ * container per private run directory, relabels privately (`Z`).
  */
 export function createDatabaseContainerArgs(context) {
-  const { names, runId, owner, directory, publish, usingCachedTemplate, flavour } = context;
+  const { names, runId, owner, directory, stagedScripts, publish, usingCachedTemplate, flavour } = context;
   const podman = flavour === "podman";
-  const mode = podman ? "ro,Z" : "ro";
-  const initSource = podman ? join(directory, "init.sh") : initScript;
-  const cachedInitSource = podman ? join(directory, "cached-run-init.sh") : cachedRunInitScript;
+  const mode = podman ? "ro,Z" : "ro,z";
   const args = [
     "create", "--name", names.container,
     ...dockerLabelArgs(ownershipLabels(runId, "database", owner)),
@@ -1663,11 +1662,11 @@ export function createDatabaseContainerArgs(context) {
     "--env", `LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`,
     "--volume", `${names.volume}:/var/lib/postgresql`,
     "--volume", `${directory}:/run/lcm-harness:${mode}`,
-    "--volume", `${cachedInitSource}:/run/lcm-cached-init.sh:${mode}`,
+    "--volume", `${stagedScripts.cachedRunInitScript}:/run/lcm-cached-init.sh:${mode}`,
   ];
   if (!usingCachedTemplate) {
     args.push(
-      "--volume", `${initSource}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:${mode}`,
+      "--volume", `${stagedScripts.initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:${mode}`,
       "--env", "POSTGRES_USER=lcm_harness_admin",
       "--env", `POSTGRES_DB=${names.controlDatabase}`,
       "--env", "POSTGRES_PASSWORD_FILE=/run/lcm-private/admin-password",
@@ -1681,15 +1680,6 @@ export function createDatabaseContainerArgs(context) {
     "install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/certs /run/lcm-private; install -o postgres -g postgres -m 0600 /run/lcm-harness/server.key /var/lib/postgresql/certs/server.key; install -o postgres -g postgres -m 0644 /run/lcm-harness/server.crt /run/lcm-harness/ca.crt /var/lib/postgresql/certs/; install -o postgres -g postgres -m 0600 /run/lcm-harness/admin-password /run/lcm-harness/migrator-password /run/lcm-harness/runtime-password /run/lcm-harness/run-id /run/lcm-harness/database-name /run/lcm-private/; exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/certs/server.crt -c ssl_key_file=/var/lib/postgresql/certs/server.key -c ssl_ca_file=/var/lib/postgresql/certs/ca.crt -c shared_preload_libraries=pg_stat_statements -c listen_addresses=* -c password_encryption=scram-sha-256 -c timezone=UTC",
   );
   return args;
-}
-
-/** Copy the repository init scripts into the private run directory, readable by the container's postgres user. */
-export function copyInitScriptsToRunDirectory(directory) {
-  for (const [source, name] of [[initScript, "init.sh"], [cachedRunInitScript, "cached-run-init.sh"]]) {
-    const target = join(directory, name);
-    copyFileSync(source, target);
-    chmodSync(target, 0o644);
-  }
 }
 
 export async function runTests(context, ci, setupDocker = docker, testProcess = runProcess) {
@@ -1783,6 +1773,20 @@ export async function runTests(context, ci, setupDocker = docker, testProcess = 
   });
 }
 
+// Copies the database container's init scripts into the harness-owned run
+// directory so SELinux relabeling applies to the copies, not the checkout.
+export function stageHarnessScripts(directory) {
+  const staged = {
+    initScript: join(directory, "init.sh"),
+    cachedRunInitScript: join(directory, "cached-run-init.sh"),
+  };
+  copyFileSync(initScript, staged.initScript);
+  copyFileSync(cachedRunInitScript, staged.cachedRunInitScript);
+  chmodSync(staged.initScript, 0o644);
+  chmodSync(staged.cachedRunInitScript, 0o644);
+  return staged;
+}
+
 export async function runHarness(options = {}) {
   resolveSignalProbeReadinessTimeout(process.env);
   const ci = options.ci ?? process.env.GITHUB_ACTIONS === "true";
@@ -1871,8 +1875,8 @@ export async function runHarness(options = {}) {
     writeFileSync(join(directory, "admin-password"), `${passwords.admin}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "migrator-password"), `${passwords.migrator}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "runtime-password"), `${passwords.runtime}\n`, { mode: 0o600 });
+    const stagedScripts = stageHarnessScripts(directory);
     await writeTlsFixtures(directory, names.alias, setupProcess);
-    if (engine.flavour === "podman") copyInitScriptsToRunDirectory(directory);
     await setupDocker([
       "network", "create",
       ...dockerLabelArgs(ownershipLabels(runId, "network", owner)),
@@ -1911,7 +1915,7 @@ export async function runHarness(options = {}) {
       names,
       runId,
       owner,
-      directory,
+      stagedScripts,
       publish: ci ? [] : ["--publish", "127.0.0.1::5432"],
       usingCachedTemplate,
       flavour: engine.flavour,

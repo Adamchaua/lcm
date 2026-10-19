@@ -28,6 +28,8 @@ import {
 } from "./security-files.js";
 import { selectStorageBackend } from "./storage/backend.js";
 import { resolveAgentTransport } from "./connectors/registry.js";
+import { PKG_VERSION, RUNTIME_DIGEST } from "./daemon/version.js";
+import type { VerifiedRunningDaemon, VerifyRunningDaemonOptions } from "./daemon/lifecycle.js";
 
 const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 
@@ -187,6 +189,59 @@ export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): 
 
 export async function ensureCore(deps: EnsureCoreDeps = defaultDeps()): Promise<boolean> {
   return (await ensureCoreEndpoint(deps)).connected;
+}
+
+export interface VerifyCoreDeps {
+  configPath: string;
+  binaryPath: string;
+  verifyRunningDaemon: (
+    opts: VerifyRunningDaemonOptions,
+  ) => Promise<VerifiedRunningDaemon | null>;
+}
+
+function defaultVerifyDeps(): VerifyCoreDeps {
+  return {
+    configPath: defaultConfigPath(),
+    binaryPath: packageExecutable(import.meta.url, 2),
+    verifyRunningDaemon: async (opts) => {
+      const { verifyRunningDaemon } = await import("./daemon/lifecycle.js");
+      return verifyRunningDaemon(opts);
+    },
+  };
+}
+
+/**
+ * Read-only counterpart of `ensureCoreEndpoint` for hooks that must not
+ * start, repair or configure anything. It reads the existing config and
+ * returns the verified port with its token, or null when the daemon is
+ * absent, mismatched, unreadable or slower than `budgetMs`.
+ */
+export async function verifyCoreEndpoint(
+  opts: { budgetMs: number; signal?: AbortSignal },
+  deps: VerifyCoreDeps = defaultVerifyDeps(),
+): Promise<{ port: number; token: string } | null> {
+  try {
+    const observed = readBoundedRegularFileWithStat(deps.configPath, {
+      allowedRoot: dirname(deps.configPath),
+      maxBytes: MAX_CONFIG_BYTES,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      allowedModes: OWNER_ONLY_FILE_MODES,
+      requireSingleLink: true,
+    });
+    const config = parseDaemonConfig(observed.content, {}, resolveDaemonConfigEnv(process.env));
+    return await deps.verifyRunningDaemon({
+      port: config.daemon.port,
+      pidFilePath: join(dirname(deps.configPath), "daemon.pid"),
+      expectedVersion: PKG_VERSION,
+      expectedStorageBackend: config.storage.backend,
+      expectedEntrypoint: deps.binaryPath,
+      expectedRuntimeDigest: RUNTIME_DIGEST,
+      budgetMs: opts.budgetMs,
+      signal: opts.signal,
+    });
+  } catch {
+    return null;
+  }
 }
 
 export interface BootstrapDeps extends EnsureCoreDeps {

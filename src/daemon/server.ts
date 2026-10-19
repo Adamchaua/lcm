@@ -29,6 +29,7 @@ import { createDescribeHandler } from "./routes/describe.js";
 import { createStoreHandler } from "./routes/store.js";
 import { createRecentHandler } from "./routes/recent.js";
 import { createIngestHandler } from "./routes/ingest.js";
+import { createTerminalIngestQueue } from "./routes/ingest-terminal.js";
 import { createPromptSearchHandler } from "./routes/prompt-search.js";
 import { createStatusHandler } from "./routes/status.js";
 import { createSessionCompleteHandler } from "./routes/session-complete.js";
@@ -105,7 +106,9 @@ export type RouteHandler = (
   context?: RouteExecutionContext,
 ) => Promise<void>;
 export type RouteAdmission = "read" | "mutating";
-type BuiltInRoutePublicationMode = "retained" | "operation-scoped";
+// "enqueue-only" routes answer after a short synchronous hand-off to a
+// daemon-owned queue, so they wait for no publication work before replying.
+type BuiltInRoutePublicationMode = "retained" | "operation-scoped" | "enqueue-only";
 type BuiltInRouteResponseMode = "direct" | "buffered";
 type RequestLifecycleEvent = "received" | "cancelled" | "settled";
 type RegisteredRoute = Readonly<{
@@ -686,6 +689,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   let constructedWatcher: ReturnType<typeof watchProjectMap> | undefined;
   let constructedIngestInterval: ReturnType<typeof setInterval> | undefined;
   let constructedIngestScan: Promise<void> | undefined;
+  let constructedTerminalDrain: (() => Promise<void>) | undefined;
   let startupCleanupStarted = false;
   let storageFactoryClosed = false;
   const closeStorageFactory = async (): Promise<void> => {
@@ -729,6 +733,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     if (idleTimeoutMs <= 0) return;
     if (idleTimer) clearIdleTimeout(idleTimer);
     idleTimer = setIdleTimeout(() => {
+      // Accepted terminal snapshots keep the daemon alive until they settle.
+      if (terminalIngestQueue.busy()) {
+        resetIdleTimer();
+        return;
+      }
       idleTriggered = true;
       onIdle();
     }, idleTimeoutMs);
@@ -921,6 +930,20 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   // Periodic transcript ingestion scan
   const INGEST_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
   const ingestHandler = createIngestHandler(config, storageFactory);
+  const terminalIngestQueue = createTerminalIngestQueue({
+    ingest: ingestHandler,
+    publicationAdmission,
+    shutdownSignal: shutdownController.signal,
+    onDrained: resetIdleTimer,
+  });
+  constructedTerminalDrain = terminalIngestQueue.drained;
+  registerBuiltInRoute(
+    "POST",
+    "/ingest/terminal",
+    terminalIngestQueue.handler,
+    "mutating",
+    "enqueue-only",
+  );
 
   const scanForTranscripts = async (
     withPublicationAdmission: BackgroundPublicationAdmission,
@@ -1043,6 +1066,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         sendJsonIfWritable(res, 401, { error: "unauthorized" });
         return;
       }
+      if (key === "POST /ingest/terminal" && serverToken === null) {
+        sendJsonIfWritable(res, 401, { error: "unauthorized" });
+        return;
+      }
       if (serverToken) {
         const authHeader = (Array.isArray(rawAuth) ? rawAuth[0] : rawAuth) ?? "";
         if (!publicHealth && authHeader.trim() !== `Bearer ${serverToken}`) {
@@ -1055,6 +1082,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const body = req.method !== "GET" ? await readBody(req) : "";
       options?._onRequestLifecycle?.("received", requestSignal);
       if (route.admission === "mutating") {
+        if (route.publicationMode === "enqueue-only") {
+          await route.handler(req, res, body, { signal: requestSignal });
+          return;
+        }
         if (route.publicationMode === "operation-scoped") {
           assertDaemonNotShuttingDown();
           const withPublicationAdmission = publicationAdmission(requestSignal);
@@ -1173,6 +1204,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     await settleCleanup(() => invocationCoordinator.shutdown());
     await settleCleanup(() => clearInterval(ingestInterval));
     await settleCleanup(() => activeIngestScan);
+    await settleCleanup(() => terminalIngestQueue.drained());
     await settleCleanup(() => projectMapWatcher.close());
     await settleCleanup(() => passiveEventProcessor.stopAndWait());
     await settleCleanup(() => { idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout); });
@@ -1226,6 +1258,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
           await settleCleanup(() => clearInterval(ingestInterval));
           await settleCleanup(() => activeIngestScan);
+          await settleCleanup(() => terminalIngestQueue.drained());
           await settleCleanup(() => projectMapWatcher.close());
           await settleCleanup(() => passiveEventProcessor.stopAndWait());
           await settleCleanup(() => passiveEventReplication.close());
@@ -1263,6 +1296,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       await settleCleanup(() => clearInterval(ingestInterval));
     }
     await settleCleanup(() => constructedIngestScan);
+    await settleCleanup(() => constructedTerminalDrain?.());
     if (constructedWatcher) {
       const watcher = constructedWatcher;
       await settleCleanup(() => watcher.close());

@@ -24,6 +24,8 @@ import {
   sanitizeDaemonRefusalReason,
 } from "./daemon-notice.js";
 import { isDaemonRefusalReason, type DaemonRefusalReason } from "../daemon/remediation.js";
+import { LCM_RESTORATION_MARKER, readLiveCodexRestoration } from "../codex-transcript.js";
+import { normalizeTranscriptClient } from "../transcript-provider.js";
 import {
   assertHookPublicationFence,
   isBackendPublicationEvidenceMissing,
@@ -166,10 +168,39 @@ function tryAcquireSessionLock(
 export const tryAcquireSessionLockForTesting = tryAcquireSessionLock;
 export const sessionLockPathForTesting = sessionLockPath;
 
+/** Remove the lock only when it still names this process. */
+function releaseSessionLock(sessionId: string): void {
+  const lockPath = sessionLockPath(sessionId);
+  try {
+    const ownerPid = parseInt(defaultSessionLockDeps.read(lockPath, {
+      allowedRoot: tmpDir(),
+      maxBytes: 32,
+    }).trim(), 10);
+    if (ownerPid === process.pid) defaultSessionLockDeps.delete(lockPath);
+  } catch {
+    // A missing or unreadable lock has nothing of ours to release.
+  }
+}
+
 type RestoreHookInput = Record<string, unknown> & {
   session_id?: string;
   cwd?: string;
 };
+
+const TRANSCRIPT_PROOF_SOURCES: readonly unknown[] = ["resume", "fork", "compact"];
+
+/**
+ * Codex prints a leading marker so later sessions can recognize the block in
+ * their rollout. A resumed, forked or compacted session whose own rollout
+ * already holds a live restoration prints nothing.
+ */
+function codexRestorationOutput(input: RestoreHookInput, stdout: string): string {
+  if (!stdout) return "";
+  if (TRANSCRIPT_PROOF_SOURCES.includes(input.source) && readLiveCodexRestoration(input.transcript_path)) {
+    return "";
+  }
+  return `${LCM_RESTORATION_MARKER}\n${stdout}`;
+}
 
 export async function handleSessionStart(
   stdin: string,
@@ -188,7 +219,6 @@ export async function handleSessionStart(
   }
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
-  let ensureResult: EnsureResultWithRefusal;
   try {
     assertHookPublicationFence();
   } catch (error) {
@@ -206,6 +236,21 @@ export async function handleSessionStart(
     return { exitCode: 0, stdout: "" };
   }
 
+  try {
+    return await runSessionStart(input, client, daemonPort, pidFilePath, storage);
+  } finally {
+    if (sessionId) releaseSessionLock(sessionId);
+  }
+}
+
+async function runSessionStart(
+  input: RestoreHookInput,
+  client: Pick<DaemonClient, "post">,
+  daemonPort: number,
+  pidFilePath: string,
+  storage: StorageBackendSelection,
+): Promise<{ exitCode: number; stdout: string }> {
+  let ensureResult: EnsureResultWithRefusal;
   try {
     ensureResult = await ensureDaemon({
       port: daemonPort,
@@ -301,6 +346,9 @@ export async function handleSessionStart(
       stdout += `\n${fenced}`;
     }
 
+    if (normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT) === "codex") {
+      stdout = codexRestorationOutput(input, stdout);
+    }
     return { exitCode: 0, stdout };
   } catch (error) {
     if (isBackendPublicationJournalError(error)) throw error;

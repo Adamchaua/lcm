@@ -1,8 +1,11 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync, utimesSync } from "node:fs";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { mkdtempSync, renameSync, writeFileSync, mkdirSync, rmSync, symlinkSync, utimesSync } from "node:fs";
 import { basename, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import {
+  LCM_RESTORATION_MARKER,
+  readLiveCodexRestoration,
+  scanLiveCodexRestoration,
   parseCodexTranscript,
   extractCodexSessionCwd,
   extractCodexSessionMeta,
@@ -10,6 +13,19 @@ import {
   findAllCodexTranscripts,
   type CodexSessionFile,
 } from "../src/codex-transcript.js";
+
+// Test seam: runs a callback just before the module under test resolves a
+// path, so a race between its open and its containment check is deterministic.
+const fsSeam = vi.hoisted(() => ({ beforeRealpath: undefined as ((path: string) => void) | undefined }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const realpathSync = ((path: string, options?: never) => {
+    fsSeam.beforeRealpath?.(String(path));
+    return actual.realpathSync(path, options);
+  }) as typeof actual.realpathSync;
+  realpathSync.native = actual.realpathSync.native;
+  return { ...actual, realpathSync };
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -504,5 +520,290 @@ describe("findAllCodexTranscripts", () => {
     const oldTime = new Date(Date.now() - 10_000);
     utimesSync(older, oldTime, oldTime);
     expect(findAllCodexTranscripts(codexDir).map((file) => file.sessionId)).toEqual(["older", "newer"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Interrupted turns (#1561): what a rollout written around an Interrupt hook
+// exposes to the parser. Codex writes the <turn_aborted> marker before it runs
+// the hook and emits the TurnAborted event only afterwards; the marker's role
+// is user by default and developer for multi-agent v2. Only user/assistant
+// response messages are parsed (and so searchable); everything else is kept
+// only by the raw native archive.
+// ---------------------------------------------------------------------------
+
+const ABORT_MARKER = "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>";
+
+function makeRoleLine(role: "user" | "assistant" | "developer", text: string): string {
+  return role === "assistant" ? makeSessionLine("assistant", text) : JSON.stringify({
+    timestamp: "2026-01-01T00:00:00.000Z",
+    type: "response_item",
+    payload: { type: "message", role, content: [{ type: "input_text", text }] },
+  });
+}
+
+function makeTurnAbortedEvent(): string {
+  return JSON.stringify({
+    timestamp: "2026-01-01T00:00:01.000Z",
+    type: "event_msg",
+    payload: { type: "turn_aborted", turn_id: "turn-1", reason: "interrupted" },
+  });
+}
+
+describe("parseCodexTranscript around an interrupted turn", () => {
+  const parse = (...lines: string[]) => {
+    const file = join(makeTmpDir(), "rollout.jsonl");
+    writeFileSync(file, lines.join("\n") + "\n");
+    return parseCodexTranscript(file).map((m) => [m.role, m.content]);
+  };
+  const turn = [makeSessionMeta("abort-1", "/work"), makeRoleLine("user", "run the build"), makeRoleLine("assistant", "starting")];
+
+  it("before the hook: the user-role marker is parsed and there is no TurnAborted event yet", () => {
+    expect(parse(...turn, makeRoleLine("user", ABORT_MARKER))).toEqual([
+      ["user", "run the build"], ["assistant", "starting"], ["user", ABORT_MARKER],
+    ]);
+  });
+
+  it("after the hook: the TurnAborted event adds nothing to the parsed messages", () => {
+    expect(parse(...turn, makeRoleLine("user", ABORT_MARKER), makeTurnAbortedEvent())).toEqual(
+      parse(...turn, makeRoleLine("user", ABORT_MARKER)),
+    );
+  });
+
+  it("the developer-role marker variant is not parsed", () => {
+    expect(parse(...turn, makeRoleLine("developer", ABORT_MARKER), makeTurnAbortedEvent())).toEqual([
+      ["user", "run the build"], ["assistant", "starting"],
+    ]);
+  });
+
+  it("without any marker an interrupted turn looks like a completed one", () => {
+    expect(parse(...turn)).toEqual(parse(...turn, makeEventLine("task_complete")));
+  });
+
+  it("a continuation turn after the interruption is parsed after the marker", () => {
+    expect(parse(...turn, makeRoleLine("user", ABORT_MARKER), makeTurnAbortedEvent(),
+      makeRoleLine("user", "continue"), makeRoleLine("assistant", "done"))).toEqual([
+      ["user", "run the build"], ["assistant", "starting"], ["user", ABORT_MARKER],
+      ["user", "continue"], ["assistant", "done"],
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LCM restoration proof
+// ---------------------------------------------------------------------------
+
+function developerLine(text: string | Array<{ type: string; text: string }>): string {
+  return JSON.stringify({
+    type: "response_item",
+    payload: {
+      type: "message",
+      role: "developer",
+      content: text,
+    },
+  });
+}
+
+const blockText = `${LCM_RESTORATION_MARKER}\nrestored memory`;
+const block = developerLine([{ type: "input_text", text: blockText }]);
+const compacted = JSON.stringify({ type: "compacted", payload: { message: "", replacement_history: [] } });
+const rolledBack = JSON.stringify({ type: "event_msg", payload: { type: "thread_rolled_back", num_turns: 1 } });
+const scan = (lines: string[]) => scanLiveCodexRestoration(lines.join("\n"));
+
+describe("scanLiveCodexRestoration", () => {
+  it("proves a marked developer block and ignores blank lines", () => {
+    expect(scan([makeSessionMeta("t", "/p"), "", block, ""])).toBe(true);
+    expect(scan([makeSessionMeta("t", "/p")])).toBe(false);
+    expect(scan([])).toBe(false);
+  });
+
+  it("accepts leading whitespace and joined text blocks", () => {
+    expect(scan([developerLine([{ type: "input_text", text: `  \n${blockText}` }])])).toBe(true);
+    expect(scan([developerLine([
+      { type: "input_text", text: LCM_RESTORATION_MARKER },
+      { type: "input_text", text: "more" },
+    ])])).toBe(true);
+  });
+
+  it("requires the marker to end its line", () => {
+    const text = (value: string) => developerLine([{ type: "input_text", text: value }]);
+    expect(scan([text(LCM_RESTORATION_MARKER)])).toBe(true);
+    expect(scan([text(`${LCM_RESTORATION_MARKER}\nbody`)])).toBe(true);
+    expect(scan([text(`${LCM_RESTORATION_MARKER}\r\nbody`)])).toBe(true);
+    expect(scan([text(`${LCM_RESTORATION_MARKER} extra\nbody`)])).toBe(false);
+    expect(scan([text(`${LCM_RESTORATION_MARKER}x`)])).toBe(false);
+    expect(scan([text(`${LCM_RESTORATION_MARKER}\rbody`)])).toBe(false);
+  });
+
+  it("resets on a later compacted line and on a later rollback", () => {
+    expect(scan([block, compacted])).toBe(false);
+    expect(scan([block, compacted, block])).toBe(true);
+    expect(scan([block, rolledBack])).toBe(false);
+    expect(scan([block, rolledBack, block])).toBe(true);
+  });
+
+  it("ignores other event messages and quoted or non-developer markers", () => {
+    expect(scan([block, makeEventLine("token_count")])).toBe(true);
+    expect(scan([developerLine(`quoted ${LCM_RESTORATION_MARKER}`)])).toBe(false);
+    expect(scan([makeSessionLine("user", blockText), makeSessionLine("assistant", blockText)])).toBe(false);
+    expect(scan([JSON.stringify({ type: "event_msg", payload: { type: "developer", text: blockText } })])).toBe(false);
+    expect(scan([JSON.stringify({ type: "response_item", payload: { type: "function_call", role: "developer", content: blockText } })])).toBe(false);
+    expect(scan([JSON.stringify({ type: "response_item" }), JSON.stringify({ type: "event_msg" }), "null", "5", compacted])).toBe(false);
+  });
+
+  it("treats malformed JSON shapes as inert without throwing", () => {
+    const inert = [
+      "[]",
+      '"str"',
+      "5",
+      "null",
+      "true",
+      JSON.stringify({ type: "response_item", payload: null }),
+      JSON.stringify({ type: "response_item", payload: "message" }),
+      JSON.stringify({ type: "response_item", payload: [] }),
+      JSON.stringify({ type: "event_msg", payload: null }),
+      developerLine(blockText),
+      JSON.stringify({ type: "response_item", payload: { type: "message", role: "developer", content: null } }),
+      JSON.stringify({ type: "response_item", payload: { type: "message", role: "developer", content: { text: blockText } } }),
+      developerLine([null, 5, "str", [], { type: "input_text" }, { type: "input_text", text: 7 }] as never),
+    ];
+    expect(scan(inert)).toBe(false);
+    expect(scan([block, ...inert.slice(0, 9)])).toBe(true);
+    expect(scan([developerLine([null as never, { type: "input_text", text: blockText }])])).toBe(true);
+  });
+
+  it("treats an unparseable line as a reset and keeps scanning", () => {
+    expect(scan([block, "{not json"])).toBe(false);
+    expect(scan(["{not json", block])).toBe(true);
+    expect(scan([block, "{not json", block])).toBe(true);
+    expect(scan([block, "  \t ", ""])).toBe(true);
+  });
+});
+
+describe("readLiveCodexRestoration", () => {
+  function codexHomeWith(lines: string[], root = "sessions"): { home: string; path: string } {
+    const home = makeTmpDir();
+    const directory = join(home, root, "2026", "01", "01");
+    mkdirSync(directory, { recursive: true });
+    const path = join(directory, "rollout-t.jsonl");
+    writeFileSync(path, `${lines.join("\n")}\n`);
+    return { home, path };
+  }
+
+  const previousCodexHome = process.env.CODEX_HOME;
+  afterEach(() => {
+    fsSeam.beforeRealpath = undefined;
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+  });
+
+  it("reads rollouts under sessions and archived_sessions", () => {
+    const active = codexHomeWith([makeSessionMeta("t", "/p"), block]);
+    expect(readLiveCodexRestoration(active.path, { codexHome: active.home })).toBe(true);
+    const archived = codexHomeWith([block], "archived_sessions");
+    expect(readLiveCodexRestoration(archived.path, { codexHome: archived.home })).toBe(true);
+    const none = codexHomeWith([makeSessionMeta("t", "/p")]);
+    expect(readLiveCodexRestoration(none.path, { codexHome: none.home })).toBe(false);
+  });
+
+  it("honors CODEX_HOME and falls back to the home directory when it is empty", () => {
+    const { home, path } = codexHomeWith([block]);
+    process.env.CODEX_HOME = home;
+    expect(readLiveCodexRestoration(path)).toBe(true);
+    process.env.CODEX_HOME = "";
+    expect(readLiveCodexRestoration(path)).toBe(false);
+    delete process.env.CODEX_HOME;
+    expect(readLiveCodexRestoration(path)).toBe(false);
+  });
+
+  it("rejects absent, non-string, outside, symlinked, missing and non-regular paths", () => {
+    const { home, path } = codexHomeWith([block]);
+    expect(readLiveCodexRestoration(undefined, { codexHome: home })).toBe(false);
+    expect(readLiveCodexRestoration(null, { codexHome: home })).toBe(false);
+    expect(readLiveCodexRestoration("", { codexHome: home })).toBe(false);
+    expect(readLiveCodexRestoration(join(home, "missing.jsonl"), { codexHome: home })).toBe(false);
+
+    const outside = join(makeTmpDir(), "rollout-outside.jsonl");
+    writeFileSync(outside, block);
+    expect(readLiveCodexRestoration(outside, { codexHome: home })).toBe(false);
+    const link = join(home, "sessions", "link.jsonl");
+    symlinkSync(outside, link);
+    expect(readLiveCodexRestoration(link, { codexHome: home })).toBe(false);
+
+    // A symlink leaf is rejected even when it points at a rollout inside sessions.
+    const innerLink = join(home, "sessions", "inner-link.jsonl");
+    symlinkSync(path, innerLink);
+    expect(readLiveCodexRestoration(path, { codexHome: home })).toBe(true);
+    expect(readLiveCodexRestoration(innerLink, { codexHome: home })).toBe(false);
+
+    expect(readLiveCodexRestoration(join(home, "sessions", "2026"), { codexHome: home })).toBe(false);
+    expect(readLiveCodexRestoration(path, { codexHome: join(home, "elsewhere") })).toBe(false);
+  });
+
+  it("rejects a rollout swapped for an in-sessions symlink after it was opened", () => {
+    const { home, path } = codexHomeWith([block]);
+    const other = join(home, "sessions", "rollout-other.jsonl");
+    writeFileSync(other, block);
+    let swapped = false;
+    fsSeam.beforeRealpath = (target) => {
+      if (target !== path || swapped) return;
+      swapped = true;
+      rmSync(path);
+      symlinkSync(other, path);
+    };
+    expect(readLiveCodexRestoration(path, { codexHome: home })).toBe(false);
+    expect(swapped).toBe(true);
+  });
+
+  it("rejects a rollout replaced by a different file after it was opened", () => {
+    const { home, path } = codexHomeWith([block]);
+    const replacement = join(home, "sessions", "rollout-replacement.jsonl");
+    writeFileSync(replacement, block);
+    fsSeam.beforeRealpath = (target) => {
+      if (target === path) renameSync(replacement, path);
+    };
+    expect(readLiveCodexRestoration(path, { codexHome: home })).toBe(false);
+  });
+
+  it("does not treat a sibling directory sharing the sessions prefix as inside it", () => {
+    const home = makeTmpDir();
+    mkdirSync(join(home, "sessions"));
+    mkdirSync(join(home, "sessions-extra"));
+    const path = join(home, "sessions-extra", "rollout-t.jsonl");
+    writeFileSync(path, block);
+    expect(readLiveCodexRestoration(path, { codexHome: home })).toBe(false);
+  });
+
+  it("scans the tail window normally after dropping its partial first line", () => {
+    const filler = developerLine("x".repeat(400));
+    const window = (lines: string[]) => Buffer.byteLength(`${lines.join("\n")}\n`) + 20;
+
+    // A compaction above the window cannot affect a block inside it.
+    const compactedAbove = codexHomeWith([block, compacted, filler, block]);
+    expect(readLiveCodexRestoration(compactedAbove.path, {
+      codexHome: compactedAbove.home,
+      maxBytes: window([filler, block]),
+    })).toBe(true);
+
+    const rolledBackAbove = codexHomeWith([block, rolledBack, filler, block]);
+    expect(readLiveCodexRestoration(rolledBackAbove.path, {
+      codexHome: rolledBackAbove.home,
+      maxBytes: window([filler, block]),
+    })).toBe(true);
+
+    // Resets inside the window still apply.
+    const rolledBackInside = codexHomeWith([filler, block, rolledBack]);
+    expect(readLiveCodexRestoration(rolledBackInside.path, {
+      codexHome: rolledBackInside.home,
+      maxBytes: window([block, rolledBack]),
+    })).toBe(false);
+
+    // A window holding no line break contributes nothing.
+    const noBreak = codexHomeWith([filler]);
+    writeFileSync(noBreak.path, filler);
+    expect(readLiveCodexRestoration(noBreak.path, { codexHome: noBreak.home, maxBytes: 10 })).toBe(false);
+
+    // The whole file is scanned when it fits.
+    expect(readLiveCodexRestoration(compactedAbove.path, { codexHome: compactedAbove.home })).toBe(true);
   });
 });

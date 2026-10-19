@@ -27,7 +27,6 @@ import {
   SIGNAL_DIAGNOSTIC_FLUSH_TIMEOUT_MS,
   auditHarnessRunResources,
   classifyOwnerIdentity,
-  copyInitScriptsToRunDirectory,
   cleanupHarnessResources,
   completeSignalExit,
   createHarnessAllocationMarkerParser,
@@ -64,6 +63,7 @@ import {
   runSanitizedProcess,
   sanitizeHarnessText,
   signalCleanupFailed,
+  stageHarnessScripts,
   validateRunNames,
   writeHarnessDiagnostic,
 } from "../../scripts/postgresql-harness.mjs";
@@ -2926,6 +2926,34 @@ describe("PostgreSQL harness utilities", () => {
     expect(rules).toContain("test/postgresql/cached-run-init.sh text eol=lf");
   });
 
+  // runHarness has no injectable Docker seam, so inspect how it stages scripts and builds the mounts.
+  it("feeds the staged scripts, not checkout files, to the database container", () => {
+    const source = readFileSync(new URL("../../scripts/postgresql-harness.mjs", import.meta.url), "utf8");
+    expect(source).toContain("const stagedScripts = stageHarnessScripts(directory);");
+    expect(source).toMatch(/createDatabaseContainerArgs\(\{[^}]*\bstagedScripts,/u);
+  });
+
+  it("stages byte-identical, readable init scripts in the run directory", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-staged-scripts-"));
+    try {
+      const staged = stageHarnessScripts(directory);
+      expect(staged).toEqual({
+        initScript: join(directory, "init.sh"),
+        cachedRunInitScript: join(directory, "cached-run-init.sh"),
+      });
+      for (const [copy, original] of [
+        [staged.initScript, "init.sh"],
+        [staged.cachedRunInitScript, "cached-run-init.sh"],
+      ]) {
+        const source = new URL(`../postgresql/${original}`, import.meta.url);
+        expect(readFileSync(copy)).toEqual(readFileSync(source));
+        expect(statSync(copy).mode & 0o777).toBe(0o644);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("cleans every owned resource and the secret directory in order", async () => {
     const names = createRunNames("a".repeat(32));
     const events: string[] = [];
@@ -3258,6 +3286,10 @@ describe("PostgreSQL harness utilities", () => {
 
 describe("PostgreSQL harness container engine selection", () => {
   const owner = { pid: 42, birth: `linux:${testBootId}:123`, scope: testOwnerScope };
+  const stagedScripts = {
+    initScript: "/private/owned-harness/init.sh",
+    cachedRunInitScript: "/private/owned-harness/cached-run-init.sh",
+  };
   const labelArguments = (runId: string, kind: string) => Object.entries(ownershipLabels(runId, kind, owner))
     .flatMap(([key, value]) => ["--label", `${key}=${value}`]);
 
@@ -3316,7 +3348,7 @@ describe("PostgreSQL harness container engine selection", () => {
     const directory = "/private/owned-harness";
     const publish = ["--publish", "127.0.0.1::5432"];
     const args = createDatabaseContainerArgs({
-      names, runId, owner, directory, publish, usingCachedTemplate: false, flavour: "docker",
+      names, runId, owner, directory, stagedScripts, publish, usingCachedTemplate: false, flavour: "docker",
     });
     expect(args.slice(0, args.indexOf("--entrypoint"))).toEqual([
       "create", "--name", names.container,
@@ -3327,9 +3359,10 @@ describe("PostgreSQL harness container engine selection", () => {
       ...publish,
       "--env", `LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`,
       "--volume", `${names.volume}:/var/lib/postgresql`,
-      "--volume", `${directory}:/run/lcm-harness:ro`,
-      "--volume", `${process.cwd()}/test/postgresql/cached-run-init.sh:/run/lcm-cached-init.sh:ro`,
-      "--volume", `${process.cwd()}/test/postgresql/init.sh:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro`,
+      // ",z" relabels for SELinux; the sources are harness-owned copies, never checkout files.
+      "--volume", `${directory}:/run/lcm-harness:ro,z`,
+      "--volume", `${directory}/cached-run-init.sh:/run/lcm-cached-init.sh:ro,z`,
+      "--volume", `${directory}/init.sh:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro,z`,
       "--env", "POSTGRES_USER=lcm_harness_admin",
       "--env", `POSTGRES_DB=${names.controlDatabase}`,
       "--env", "POSTGRES_PASSWORD_FILE=/run/lcm-private/admin-password",
@@ -3341,26 +3374,12 @@ describe("PostgreSQL harness container engine selection", () => {
     expect(tail[4]).toContain("exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on");
   });
 
-  it("copies both init scripts into the run directory with mode 0644", () => {
-    const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-init-copy-"));
-    try {
-      copyInitScriptsToRunDirectory(directory);
-      for (const name of ["init.sh", "cached-run-init.sh"]) {
-        const target = join(directory, name);
-        expect(readFileSync(target)).toEqual(readFileSync(join(process.cwd(), "test", "postgresql", name)));
-        expect(statSync(target).mode & 0o777).toBe(0o644);
-      }
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
-
   it("mounts only private relabelled sources under Podman", () => {
     const runId = "d".repeat(32);
     const names = createRunNames(runId);
     const directory = "/private/owned-harness";
     const build = (flavour: string, usingCachedTemplate: boolean) => createDatabaseContainerArgs({
-      names, runId, owner, directory, publish: [], usingCachedTemplate, flavour,
+      names, runId, owner, directory, stagedScripts, publish: [], usingCachedTemplate, flavour,
     });
     const volumes = (args: string[]) => args.flatMap((value, index) => value === "--volume" ? [args[index + 1]] : []);
 

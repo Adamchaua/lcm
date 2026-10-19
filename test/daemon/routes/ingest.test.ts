@@ -1,4 +1,4 @@
-import { chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -552,5 +552,88 @@ describe("POST /ingest", () => {
       }),
     });
     expect(await repeated.json()).toEqual({ ingested: 0, totalTokens: 0 });
+  });
+
+  it("stores an interrupted Codex turn: user-role marker parsed, developer marker and TurnAborted event archive-only", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-ingest-aborted-"));
+    tempDirs.push(cwd);
+    const marker = "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>";
+    const item = (role: string, text: string) => JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role, content: [{ type: role === "assistant" ? "output_text" : "input_text", text }] },
+    });
+    const event = JSON.stringify({ type: "event_msg", payload: { type: "turn_aborted", turn_id: "t1", reason: "interrupted" } });
+    const meta = JSON.stringify({ type: "session_meta", payload: { id: "aborted", cwd } });
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+    const ingest = async (sessionId: string, transcriptPath: string) => {
+      const response = await fetch("http://127.0.0.1:" + daemon!.address().port + "/ingest", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, session_id: sessionId, transcript_path: transcriptPath, client: "codex" }),
+      });
+      expect(response.status).toBe(200);
+    };
+    const dbPath = projectDbPath(cwd);
+    const read = () => {
+      const db = getLcmConnection(dbPath);
+      return {
+        messages: (db.prepare("SELECT m.role AS role, m.content AS content FROM messages AS m ORDER BY m.message_id").all() as Array<{ role: string; content: string }>)
+          .map(({ role, content }) => role + ":" + content),
+        archived: (db.prepare("SELECT native_payload FROM runtime_native_transcripts ORDER BY source_ordinal").all() as Array<{ native_payload: string }>)
+          .map(({ native_payload }) => native_payload),
+      };
+    };
+    try {
+      // Before the hook runs: the user-role marker is on disk, the event is not.
+      const user = join(cwd, "user-marker.jsonl");
+      writeFileSync(user, [meta, item("user", "run the build"), item("assistant", "starting"), item("user", marker)].join("\n") + "\n");
+      await ingest("user-marker", user);
+      let state = read();
+      expect(state.messages).toEqual(["user:run the build", "assistant:starting", "user:" + marker]);
+      expect(state.archived).toHaveLength(4);
+      expect(state.archived.some((payload) => payload.includes("turn_aborted") && payload.includes('"event_msg"'))).toBe(false);
+
+      // After the hook: Codex appends the event and the user continues. A later
+      // ingest archives the event; only the continuation adds parsed messages.
+      appendFileSync(user, [event, item("user", "continue"), item("assistant", "done")].join("\n") + "\n");
+      await ingest("user-marker", user);
+      state = read();
+      expect(state.messages).toEqual([
+        "user:run the build", "assistant:starting", "user:" + marker, "user:continue", "assistant:done",
+      ]);
+      expect(state.archived).toHaveLength(7);
+      expect(state.archived.filter((payload) => payload.includes('"event_msg"') && payload.includes("turn_aborted"))).toHaveLength(1);
+    } finally { closeLcmConnection(dbPath); }
+
+    // Developer-role marker (multi-agent v2): archived raw, never parsed.
+    const developerCwd = mkdtempSync(join(tmpdir(), "lcm-ingest-aborted-dev-"));
+    tempDirs.push(developerCwd);
+    const developer = join(developerCwd, "developer-marker.jsonl");
+    writeFileSync(developer, [meta, item("user", "run the build"), item("assistant", "starting"), item("developer", marker), event].join("\n") + "\n");
+    const developerResponse = await fetch("http://127.0.0.1:" + daemon.address().port + "/ingest", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: developerCwd, session_id: "developer-marker", transcript_path: developer, client: "codex" }),
+    });
+    expect(developerResponse.status).toBe(200);
+    const developerDb = projectDbPath(developerCwd);
+    const db = getLcmConnection(developerDb);
+    try {
+      expect(db.prepare("SELECT role, content FROM messages ORDER BY message_id").all())
+        .toEqual([{ role: "user", content: "run the build" }, { role: "assistant", content: "starting" }]);
+      const archived = (db.prepare("SELECT native_payload FROM runtime_native_transcripts ORDER BY source_ordinal").all() as Array<{ native_payload: string }>)
+        .map(({ native_payload }) => native_payload);
+      expect(archived).toHaveLength(5);
+      expect(archived.some((payload) => payload.includes('"developer"') && payload.includes("turn_aborted"))).toBe(true);
+    } finally { closeLcmConnection(developerDb); }
+
+    // No marker and no event: nothing in storage distinguishes it from a completed turn.
+    const plainCwd = mkdtempSync(join(tmpdir(), "lcm-ingest-aborted-none-"));
+    tempDirs.push(plainCwd);
+    const plain = join(plainCwd, "plain.jsonl");
+    writeFileSync(plain, [meta, item("user", "run the build"), item("assistant", "starting")].join("\n") + "\n");
+    const plainResponse = await fetch("http://127.0.0.1:" + daemon.address().port + "/ingest", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: plainCwd, session_id: "plain", transcript_path: plain, client: "codex" }),
+    });
+    expect(await plainResponse.json()).toEqual({ ingested: 2, totalTokens: expect.any(Number) });
   });
 });
