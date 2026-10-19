@@ -59,7 +59,7 @@ describe("in-place Codex hook merge", () => {
     expect(mergeCodexHooksContent(first)).toBe(first);
     const partial = JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [lcm("lcm post-tool --client codex")] }], Stop: [] } });
     const result = JSON.parse(mergeCodexHooksContent(partial)).hooks;
-    expect(Object.keys(result)).toEqual(["PostToolUse", "Stop", "SessionStart", "UserPromptSubmit", "PreCompact", "Interrupt", "SessionEnd"]);
+    expect(Object.keys(result)).toEqual(["PostToolUse", "Stop", "SessionStart", "UserPromptSubmit", "PreCompact", "SubagentStart", "SubagentStop", "Interrupt", "SessionEnd"]);
     expect(result.Stop).toEqual(codexLcmHooks().Stop);
     expect(JSON.parse(mergeCodexHooksContent(first, "mcp")).hooks.UserPromptSubmit[0].hooks[0].command)
       .toBe("lcm user-prompt --client codex --transport mcp");

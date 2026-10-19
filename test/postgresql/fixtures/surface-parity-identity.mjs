@@ -678,7 +678,7 @@ export function expectedIdentityObservations(backend) {
     // compares against loadPostgreSqlMigrations() directly (never this
     // static list), so this is only the cross-backend architecture-result
     // comparison catching up to the real, current migration ledger.
-    "cli:postgres migrate": pg ? { code: 0, backend: "postgresql", applied: [], current: ["0001_migration_ledger", "0002_schema_baseline", "0003_machine_identity_key", "0004_machine_display_name", "0005_summary_context_integrity", "0006_transfer_ledger", "0007_promoted_content_digest", "0008_transfer_identity_content_digest"] } : refusal,
+    "cli:postgres migrate": pg ? { code: 0, backend: "postgresql", applied: [], current: ["0001_migration_ledger", "0002_schema_baseline", "0003_machine_identity_key", "0004_machine_display_name", "0005_summary_context_integrity", "0006_transfer_ledger", "0007_promoted_content_digest", "0008_transfer_identity_content_digest", "0009_conversation_parent_session"] } : refusal,
     "cli:events promote": { code: 0, promoted: 0, errors: 0 },
     "cli:events status": pg ? { code: 0, pending: 0, quarantined: 0, remotePending: "0" } : refusal,
     "cli:events validate": pg ? { code: 0, checked: 0, matched: 0, missing: [], mismatched: [] } : refusal,

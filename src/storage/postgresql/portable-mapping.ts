@@ -6,7 +6,8 @@ import {
 import type { PostgreSqlQueryExecutor } from "./contracts.js";
 
 type Row = Record<string, unknown>;
-type Field = readonly [property: string, column: string, kind?: "integer" | "timestamp" | "json"];
+// "optional" columns are omitted from the portable value while they are NULL.
+type Field = readonly [property: string, column: string, kind?: "integer" | "timestamp" | "json" | "optional"];
 interface Mapping { readonly table: string; readonly keys: readonly string[]; readonly fields: readonly Field[]; readonly joins?: string; }
 const fields = (names: string): readonly Field[] => names.split(" ").map((name) => {
   const [property, kind] = name.split(":");
@@ -19,7 +20,7 @@ const mappings: Record<PortableDomain, Mapping> = {
   machines: {table:"lcm.machines", keys:["machine_id"],fields:fields("identityKey machineId")},
   project: {table:"lcm.projects",keys:["project_id"],fields:[]},
   "project-aliases":{table:"lcm.project_aliases",keys:["machine_id","normalized_path"],fields:fields("path normalizedPath"),joins:machineJoin},
-  conversations:{table:"lcm.conversations",keys:["conversation_id"],fields:fields("sessionId title bootstrappedAt:timestamp createdAt:timestamp updatedAt:timestamp")},
+  conversations:{table:"lcm.conversations",keys:["conversation_id"],fields:fields("sessionId title bootstrappedAt:timestamp createdAt:timestamp updatedAt:timestamp parentSessionId:optional")},
   messages:{table:"lcm.messages",keys:["message_id"],fields:fields("seq:integer role content tokenCount:integer createdAt:timestamp")},
   "message-parts":{table:"lcm.message_parts",keys:["part_id"],fields:fields("partId sessionId partType ordinal:integer textContent isIgnored isSynthetic toolCallId toolName toolStatus toolInput toolOutput toolError toolTitle patchHash patchFiles fileMime fileName fileUrl subtaskPrompt subtaskDescription subtaskAgent stepReason stepCost stepTokensIn:integer stepTokensOut:integer snapshotHash compactionAuto metadata")},
   "large-files":{table:"lcm.large_files",keys:["file_key"],fields:fields("fileId fileName mimeType byteSize:integer storageUri explorationSummary createdAt:timestamp")},
@@ -239,6 +240,7 @@ export function decodeCanonicalRow(domain:PortableDomain,row:Row,parent:Canonica
   const value:Row = {};
   for (const [property,column,kind] of mappings[domain].fields) {
     const raw = row[column];
+    if (kind === "optional" && (raw === null || raw === undefined)) continue;
     if (raw === undefined) fail();
     value[property] = kind === "json" ? JSON.parse(text(raw)) : raw;
   }
@@ -346,6 +348,7 @@ export async function insertCanonicalRecord(executor:PostgreSqlQueryExecutor,pro
     add("transcript_id",transcript.id);
   }
   for (const [property,column,kind] of mapping.fields) {
+    if (kind === "optional" && value[property] === undefined) continue;
     const input = domain === "promoted-memories" && property === "sourceProjectId" && value[property] === null
       ? projectId : value[property];
     add(column,kind === "json" ? canonicalJson(input) : scalar(input),kind === "json" ? "?::jsonb" : undefined);
