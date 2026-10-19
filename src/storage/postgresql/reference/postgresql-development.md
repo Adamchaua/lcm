@@ -240,11 +240,11 @@ Podman when `GITHUB_ACTIONS=true`.
 
 Under Podman the harness always initializes a fresh database and rejects
 `LCM_POSTGRES_TEMPLATE_ARCHIVE`. The first run may pull the pinned PostgreSQL
-image. On SELinux hosts the harness copies its two initialization scripts into
-its private per-run directory and mounts that directory and the copies with
-the `Z` option, so only run-private files are relabeled and no checkout path is
-mounted or relabeled. The temporary directory (`TMPDIR`) must therefore be on
-a local filesystem that SELinux can label. Cleanup, ownership labels, and orphan
+image. The harness always copies its two initialization scripts into its
+private per-run directory and mounts that directory and the copies with
+`ro,Z`. On SELinux hosts `Z` relabels them, so only run-private files are
+relabeled and no checkout path is mounted or relabeled. The temporary directory
+(`TMPDIR`) must therefore be on a local filesystem that SELinux can label. Cleanup, ownership labels, and orphan
 recovery behave as they do with Docker. Inspect leftovers with the same
 commands, using `podman`:
 

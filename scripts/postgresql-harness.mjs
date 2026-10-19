@@ -1364,7 +1364,7 @@ export async function reclaimProvenOrphans(dependencies = {}) {
   if (ambiguousCount > 0) {
     const stderr = dependencies.stderr ?? process.stderr;
     stderr.write(
-      `PostgreSQL harness preserved ${ambiguousCount} ambiguous labeled Docker run${ambiguousCount === 1 ? "" : "s"}; manual reconciliation required.\n`,
+      `PostgreSQL harness preserved ${ambiguousCount} ambiguous labeled run${ambiguousCount === 1 ? "" : "s"}; manual reconciliation required.\n`,
     );
   }
   for (const run of runs) {
@@ -1472,7 +1472,7 @@ async function waitForPostgreSql(container, database, dockerRunner = docker, use
 async function hostPort(container, dockerRunner = docker) {
   const result = await dockerRunner(["port", container, "5432/tcp"]);
   const match = result.stdout.match(/127\.0\.0\.1:(\d+)$/u);
-  if (!match || match[1] === "5432") throw new Error("Docker did not allocate a safe random loopback port");
+  if (!match || match[1] === "5432") throw new Error("the container engine did not allocate a safe random loopback port");
   return Number(match[1]);
 }
 
@@ -1684,7 +1684,7 @@ export function createDatabaseContainerArgs(context) {
 }
 
 /** Copy the repository init scripts into the private run directory, readable by the container's postgres user. */
-function copyInitScriptsToRunDirectory(directory) {
+export function copyInitScriptsToRunDirectory(directory) {
   for (const [source, name] of [[initScript, "init.sh"], [cachedRunInitScript, "cached-run-init.sh"]]) {
     const target = join(directory, name);
     copyFileSync(source, target);

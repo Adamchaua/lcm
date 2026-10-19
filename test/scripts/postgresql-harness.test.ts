@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, win32 } from "node:path";
 import { Writable } from "node:stream";
@@ -27,6 +27,7 @@ import {
   SIGNAL_DIAGNOSTIC_FLUSH_TIMEOUT_MS,
   auditHarnessRunResources,
   classifyOwnerIdentity,
+  copyInitScriptsToRunDirectory,
   cleanupHarnessResources,
   completeSignalExit,
   createHarnessAllocationMarkerParser,
@@ -2777,7 +2778,7 @@ describe("PostgreSQL harness utilities", () => {
     expect(runs.map((run) => run.classification).sort()).toEqual(["ambiguous", "stale"]);
     expect(staleExists).toBe(false);
     expect(stderr.write).toHaveBeenCalledWith(
-      "PostgreSQL harness preserved 1 ambiguous labeled Docker run; manual reconciliation required.\n",
+      "PostgreSQL harness preserved 1 ambiguous labeled run; manual reconciliation required.\n",
     );
     expect(stderr.write.mock.calls.flat().join(" ")).not.toContain("permission denied");
   });
@@ -3338,6 +3339,20 @@ describe("PostgreSQL harness container engine selection", () => {
     expect(tail.slice(0, 4)).toEqual(["--entrypoint", "/bin/bash", POSTGRES_IMAGE, "-ceu"]);
     expect(tail).toHaveLength(5);
     expect(tail[4]).toContain("exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on");
+  });
+
+  it("copies both init scripts into the run directory with mode 0644", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-init-copy-"));
+    try {
+      copyInitScriptsToRunDirectory(directory);
+      for (const name of ["init.sh", "cached-run-init.sh"]) {
+        const target = join(directory, name);
+        expect(readFileSync(target)).toEqual(readFileSync(join(process.cwd(), "test", "postgresql", name)));
+        expect(statSync(target).mode & 0o777).toBe(0o644);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("mounts only private relabelled sources under Podman", () => {
