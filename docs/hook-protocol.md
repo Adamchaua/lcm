@@ -14,7 +14,9 @@ Installed hook entrypoints (`post-tool`, `pre-tool`, `restore`, `session-end`,
 `session-snapshot`, `user-prompt`, and `compact --hook`) skip the CLI's
 global legacy-root migration preflight, so a busy backend publication lock
 cannot fail a hook before its own handler runs. Interactive `lcm compact` and
-installation keep the preflight.
+installation keep the preflight, except that `lcm compact` skips it (and
+compaction) when `LCM_ENABLED=false`; see
+[Disabling LCM](configuration.md#disabling-lcm).
 
 - Hook-side legacy-root migration is attempted only through the dispatch
   bootstrap (`bootstrapLcmHome`): on every `session-snapshot` with a
@@ -508,6 +510,86 @@ Snapshot ingestion is skipped when daemon bootstrap cannot verify the configured
 | `hook_event_name` | string | `"SessionSnapshot"` or `"PreCompact"` (if provided) |
 
 **Response:** Exit code `0`.
+
+## Codex Interrupt and SessionEnd snapshots
+
+**Command:** `lcm session-snapshot --client codex --terminal`
+
+Codex runs this command on `Interrupt` (a user interrupt of a running turn) and
+`SessionEnd` (graceful session shutdown). Codex limits both events to three
+seconds, including its login shell, so the `--terminal` mode is a separate,
+read-only path. Unlike `Stop` and `PreCompact` it never bootstraps, starts or
+repairs a daemon, never rewrites hook settings, never touches the snapshot
+throttle cursor, and never compacts, promotes or marks the session complete. Its
+process-time budget is 1.5 seconds: payload read up to 200 ms (at most 1 MiB, EOF
+required), daemon verification up to 400 ms, the request until 1.35 seconds, and
+the remainder for the outcome diagnostic. `LCM_ENABLED=false` exits before the
+payload is read.
+
+**Stdin fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string | Session identifier |
+| `cwd` | string | Working directory |
+| `transcript_path` | string or null | Rollout path; must be a readable regular file, not a symbolic link |
+| `hook_event_name` | string | `"Interrupt"` or `"SessionEnd"`; any other value is logged as `TerminalSnapshot` |
+
+Other fields (for example `turn_id`, `model`, `permission_mode`, and the
+`reason` that `SessionEnd` carries) are ignored.
+
+After the preflight, the command verifies the running daemon without changing
+anything (PID file, exact loopback listener, authenticated health, version,
+storage backend, entrypoint, runtime digest, token) and passes the publication
+fence once. Any missing or mismatched evidence is a refusal, never a fallback to
+bootstrap. It then sends:
+
+```
+POST /ingest/terminal
+{ "session_id", "cwd", "transcript_path", "client": "codex", "event": "Interrupt" | "SessionEnd" }
+```
+
+Only HTTP 202 counts as accepted. Any other status is `ingest-failed`; a refused or
+unreachable connection is `daemon-unavailable`; an abort, timeout or reset after the
+request was sent is `unconfirmed`. Once 202 has been observed, a later local failure
+cannot change the outcome. The exit code is always `0`, stdout is always empty, and
+every outcome except accepted writes one line to `~/.lcm/logs/events.log` with the
+reason (`transcript-unavailable`, `invalid-input`, `daemon-unavailable`,
+`publication-refused`, `deadline-exhausted`, `ingest-failed`, `unconfirmed`).
+
+### POST /ingest/terminal
+
+Bearer-authenticated, like the other mutating routes; a daemon running without a
+token refuses it with 401. The route validates the body (`session_id`, an absolute
+existing `cwd`, a `transcript_path` that passes the ordinary transcript-path
+safety check and exists, `client: "codex"`), queues it and answers
+`202 {"accepted": true}` without waiting for publication or storage work.
+Malformed or unsafe requests receive 400; a ninth distinct (`cwd`, `session_id`),
+or a different transcript for a key that already has one waiting, receives 503; so
+does a daemon that is shutting down. It trusts any holder of the daemon token, as
+the other routes do.
+
+The queue runs one ingest at a time with the ordinary `/ingest` handler. A request
+for a key that is already running is kept as one pending request and re-run after
+the current one finishes, so the newest transcript tail is read; repeated requests
+combine. Each accepted request has an absolute 30 second cancellation deadline
+counted from acceptance, and daemon shutdown cancels it; both are best-effort
+cancellation, not a guarantee that the work stops at that instant. The daemon does
+not become idle while accepted work remains, and shutdown waits for the queue
+before it closes shared storage. The outcome of each deferred run (captured, no
+new observations, cancelled, blocked, failed or expired) is logged by the daemon
+as a short reason without request contents.
+
+If shutdown happens while a project's storage open is still pending, the shared
+storage factory can close before that open settles, so accepted work may be
+cancelled rather than committed (tracked in #1582).
+
+LCM adds no interruption marker of its own. A user-role `<turn_aborted>` marker that
+Codex wrote before the hook (only with `agent_interrupt_message_enabled` and not under
+multi-agent v2) is an ordinary parsed, searchable message. A developer-role marker
+and the `TurnAborted` event Codex emits after the hook are archived with the raw
+transcript only, the event by a later ingest. Without a marker an interrupted turn
+is indistinguishable from a completed one.
 
 ## Auto-heal
 

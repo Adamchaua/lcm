@@ -133,6 +133,8 @@ The hook connector installs these Codex events:
 | `PreToolUse` | `lcm pre-tool --client codex` | Optional, off by default (`hooks.preToolRecall`). Adds advisory memory hints before a shell command, `apply_patch` edit, or MCP tool call; see [Opt-in PreToolUse memory hints](configuration.md#opt-in-pretooluse-memory-hints-codex) |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingests transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingests transcript deltas and triggers compaction once the configured token threshold is reached |
+| `Interrupt` | `lcm session-snapshot --client codex --terminal` | Saves the transcript when you interrupt a running turn |
+| `SessionEnd` | `lcm session-snapshot --client codex --terminal` | Saves the transcript when Codex shuts a session down gracefully |
 
 Codex must trust the project `.codex/` layer for project-local hooks to load. For a global setup, run:
 
@@ -202,6 +204,100 @@ untrusted, and silent fail-open returns leave no record. Records older than 30
 days, older than the last change to `hooks.json`, or dated more than five
 minutes in the future (clock skew) are ignored. Doctor does not establish that
 hooks work at runtime.
+
+### Saving memory when a turn is interrupted or a session ends
+
+Codex asks you to review hook definitions it has not seen before. The `Interrupt`
+and `SessionEnd` hooks are new definitions, so after updating LCM, reinstall the
+connector and approve them in Codex; until then Codex does not run them.
+
+`lcm connectors doctor codex` checks these two hooks like the others (enabled,
+trusted, current definition). They leave no last-observation record, because the
+command must not spend any of its three seconds on bookkeeping; its own failures
+go to `~/.lcm/logs/events.log`, described below.
+
+`Stop` only runs when a turn completes normally. Without the two terminal hooks,
+text written during a turn you interrupt, and the tail of a session that ends
+between `Stop` events, would stay out of LCM until a later snapshot. The
+`Interrupt` and `SessionEnd` hooks save that transcript tail.
+
+What each case does today:
+
+| Situation | Saved by |
+|---|---|
+| A turn completes normally | `Stop` (unchanged) |
+| You interrupt a turn, then keep working | `Interrupt`, and again at the next `Stop` |
+| Codex exits gracefully while idle | `SessionEnd` |
+| Codex shuts down gracefully with a turn running | `Interrupt` for that turn, then `SessionEnd` |
+| Codex crashes or is killed | Not saved until a later snapshot of that session |
+| Subagent sessions, and sessions that Codex replaces or ends on a budget limit | Not covered: Codex does not run these hooks for them |
+
+Codex gives these two hooks at most three seconds, counting its login shell, and
+kills the process group at the limit. The command therefore never starts, repairs
+or configures the daemon. It checks that the daemon already running for this
+installation is the expected one (process, listener, version, storage backend,
+program and runtime digest, and your token), then hands the transcript path to it
+and exits. The daemon reads, scrubs and stores the transcript after the command
+has gone, using the same ingest as every other snapshot. Nothing is compacted,
+promoted or marked complete by these hooks; Codex's `SessionEnd` does not use
+`lcm session-end`.
+
+The command always exits with status 0 and prints nothing. If the save could not be
+handed over, it records one line in `~/.lcm/logs/events.log` (without the project
+directory) under the event name `Interrupt`, `SessionEnd` or `TerminalSnapshot`:
+
+| Logged reason | Meaning |
+|---|---|
+| `transcript-unavailable` | Codex gave no transcript, or it is not a readable regular file |
+| `invalid-input` | The hook payload was malformed, incomplete or over 1 MiB |
+| `daemon-unavailable` | No running, expected daemon could be verified in time; nothing was started |
+| `publication-refused` | Backend publication admission blocked the hand-off; nothing was sent |
+| `deadline-exhausted` | The hook ran out of its time budget before it could send |
+| `ingest-failed` | The daemon refused the request or answered with an error |
+| `unconfirmed` | The request was sent but no acknowledgment arrived in time; the daemon may or may not have received it |
+
+No line means the daemon acknowledged the request (HTTP 202). From that point the
+daemon owns the work: it keeps running the ingest even if Codex has killed the
+hook, and it stays running until accepted work finishes. Accepted work can still be
+lost if the daemon itself is stopped or killed first, or if it cannot finish within
+30 seconds of being accepted or while the daemon is shutting down. The daemon
+accepts at most eight sessions at a time and answers 503 beyond that; an `Interrupt`
+followed closely by `SessionEnd` for one session is combined so the newest
+transcript tail is read once more rather than duplicated.
+
+If shutdown happens while a project's storage open is still pending, the shared
+storage factory can close before that open settles, so accepted work may be
+cancelled rather than committed (tracked in #1582).
+
+`LCM_ENABLED=false` turns these hooks into a no-op: the command exits before it
+reads its input, contacts the daemon or writes any diagnostic.
+
+Whether a stored span ended in an interruption is only as visible as Codex makes
+it, and LCM never adds a marker of its own:
+
+- Codex writes a `<turn_aborted>` marker before it runs the hook, but only when
+  its interrupt message is enabled (`agent_interrupt_message_enabled`). Unless
+  multi-agent v2 is in use, the marker is a user-role message, so it is parsed,
+  stored with the conversation and searchable like any other text.
+- With multi-agent v2 the marker is a developer-role message, and the parser does
+  not read developer messages. It is kept only in the raw transcript archive.
+- Codex's own `TurnAborted` event is written after the hook, so it is not in the
+  transcript the hook saves. A later ingest archives it; it is never a parsed,
+  searchable message.
+- When Codex wrote no marker, the interrupted turn and a completed one cannot be
+  told apart in LCM. A continuation turn after an interruption is stored like any
+  other turn.
+
+The time limit is an engineering bound, not a guarantee: LCM budgets 1.5 seconds of
+its own process time and stops starting work after 1.35 seconds, but it cannot
+control the user's login shell or a stalled filesystem. The daemon route that
+receives the hand-off (`POST /ingest/terminal`) is meant for the hook only and
+accepts requests from any holder of the daemon token.
+
+On macOS and Windows the exact-listener check needs a subprocess with a fixed one
+second timeout, which does not fit the 400 millisecond verification window, so the
+command refuses there and logs `daemon-unavailable`; the terminal hooks save memory
+on Linux only for now.
 
 ### Memory after compaction and in forked conversations
 

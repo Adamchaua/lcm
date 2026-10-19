@@ -489,7 +489,7 @@ const HELP: Record<string, CommandHelp> = {
     examples: [
       ["lcm session-snapshot", "Ingest transcript deltas (called by Stop and PreCompact hooks)"],
     ],
-    notes: "Used by Codex Stop hooks for rolling writeback and Codex PreCompact hooks for forced pre-compaction snapshots. Also used by Claude Code Stop hooks for best-effort snapshots. Not intended for direct use.",
+    notes: "Used by Codex Stop hooks for rolling writeback and Codex PreCompact hooks for forced pre-compaction snapshots. Codex Interrupt and SessionEnd hooks run it with a three second budget: it hands the transcript to the already-running daemon and never starts or repairs one. Also used by Claude Code Stop hooks for best-effort snapshots. Not intended for direct use.",
   },
 };
 
