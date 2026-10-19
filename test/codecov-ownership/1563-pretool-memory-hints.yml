@@ -6,7 +6,9 @@ rationale: >-
   its dispatch entry stays there. The stored hooks.preToolRecall setting is
   daemon-core configuration, read by the hook projection and the connector
   installer through the configuration-security owner. Codex hook registration
-  stays connector-owned, the pre-tool recall mode of the prompt-search route
+  and the Codex readiness check that expects the opt-in PreToolUse role only
+  while the setting is enabled stay connector-owned, the pre-tool recall mode
+  of the prompt-search route
   stays route-owned, and the hidden pre-tool command and its help stay CLI-owned.
   No file was removed, moved or re-owned.
 pins:
@@ -17,6 +19,7 @@ pins:
   - ["src/config-manager.ts", "unit-configuration-security"]
   - ["src/connectors/codex-hooks.ts", "unit-connectors"]
   - ["src/connectors/installer.ts", "unit-connectors"]
+  - ["src/connectors/codex-readiness.ts", "unit-connectors"]
   - ["src/daemon/routes/prompt-search.ts", "unit-daemon-routes"]
   - ["src/cli-help.ts", "unit-cli"]
   - ["bin/lcm.ts", "unit-cli"]
