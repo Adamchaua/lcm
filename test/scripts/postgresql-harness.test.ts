@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, win32 } from "node:path";
 import { Writable } from "node:stream";
@@ -58,6 +58,7 @@ import {
   runSanitizedProcess,
   sanitizeHarnessText,
   signalCleanupFailed,
+  stageHarnessScripts,
   validateRunNames,
   writeHarnessDiagnostic,
 } from "../../scripts/postgresql-harness.mjs";
@@ -2917,6 +2918,44 @@ describe("PostgreSQL harness utilities", () => {
     expect(rules).toContain("test/postgresql/init.sh text eol=lf");
     expect(rules).toContain("test/postgresql/template-init.sh text eol=lf");
     expect(rules).toContain("test/postgresql/cached-run-init.sh text eol=lf");
+  });
+
+  // runHarness has no injectable Docker seam, so inspect the database container's declared mounts.
+  it("relabels the database container's host bind mounts for SELinux", () => {
+    const source = readFileSync(new URL("../../scripts/postgresql-harness.mjs", import.meta.url), "utf8");
+    const start = source.indexOf("const containerArgs = [");
+    const end = source.indexOf("await setupDocker(containerArgs);");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const mounts = [...source.slice(start, end).matchAll(/"--volume", `([^`]+)`/gu)].map((match) => match[1]);
+    expect(mounts).toEqual([
+      "${names.volume}:/var/lib/postgresql",
+      "${directory}:/run/lcm-harness:ro,z",
+      "${stagedScripts.cachedRunInitScript}:/run/lcm-cached-init.sh:ro,z",
+      "${stagedScripts.initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro,z",
+    ]);
+    expect(source).toContain("const stagedScripts = stageHarnessScripts(directory);");
+  });
+
+  it("stages byte-identical, readable init scripts in the run directory", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-staged-scripts-"));
+    try {
+      const staged = stageHarnessScripts(directory);
+      expect(staged).toEqual({
+        initScript: join(directory, "init.sh"),
+        cachedRunInitScript: join(directory, "cached-run-init.sh"),
+      });
+      for (const [copy, original] of [
+        [staged.initScript, "init.sh"],
+        [staged.cachedRunInitScript, "cached-run-init.sh"],
+      ]) {
+        const source = new URL(`../postgresql/${original}`, import.meta.url);
+        expect(readFileSync(copy)).toEqual(readFileSync(source));
+        expect(statSync(copy).mode & 0o777).toBe(0o644);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("cleans every owned resource and the secret directory in order", async () => {
