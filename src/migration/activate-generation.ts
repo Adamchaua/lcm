@@ -85,6 +85,14 @@ import {
 } from "./activation-report.js";
 import { checkActivationRestartAdmission, type ActivationRestartCheckResult } from "./activation-restart-check.js";
 import {
+  MigrationActivationEvidenceRefusalError,
+  readMigrationActivationEvidence,
+  recordMigrationActivationAttempt,
+  recordMigrationActivationEpoch,
+  recordMigrationActivationWitness,
+  type MigrationActivationEvidenceResolution,
+} from "./activation-evidence-store.js";
+import {
   createMigrationActivationAttempt,
   createMigrationActivationEpoch,
   createMigrationActivationWitness,
@@ -104,8 +112,10 @@ import { readMigrationCopyBindingSha256, type MigrationCopyBindingReadResult } f
 import {
   recordMigrationSelectionBinding,
   recordMigrationWitnessBinding,
+  resolveMigrationWitnessBindings,
   type MigrationSelectionBinding,
   type MigrationWitnessBinding,
+  type MigrationWitnessResolution,
 } from "./generation-binding-store.js";
 import { MigrationManifestStore, migrationManifestRevisionPath, migrationManifestGenerationDirectory } from "./manifest-store.js";
 import {
@@ -127,6 +137,8 @@ import type { MigrationVerificationReport } from "./verification-report.js";
 import { MigrationVerificationReportStore, MigrationVerificationStoreError } from "./verification-store.js";
 import {
   assertDestinationIdentityMatches,
+  buildMigrationCanonicalDelta,
+  buildMigrationCensusVector,
   captureDestinationIdentity,
   readFencedDestinationCensus,
   type MigrationVerificationDomainCensus,
@@ -186,10 +198,12 @@ import {
  * - applied / reportStored (amendment 2) are evidence-derived, never
  *   step-derived; see classifyApplied below.
  *
- * Sibling seams that are NOT merged yet (#626) are typed here structurally
- * from their source and wired at exactly one TODO point
- * (createMigrationActivationDependencies); see
- * MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS.
+ * The #626 evidence store, witness-binding resolver and census builders
+ * are wired at exactly one point, createMigrationActivationDependencies;
+ * the dependency seams below group them for deterministic fault injection.
+ * A maintenance journal entered from any backend other than sqlite is a
+ * rollback window (#626): foreign state at every read site, reported with
+ * the existing maintenance-not-held / journal-unexpected vocabulary.
  */
 
 // ---------------------------------------------------------------------------
@@ -369,23 +383,9 @@ export interface MigrationActivationCoordinator extends ActivationPublicationCoo
   ): Promise<BackendMaintenanceJournal>;
 }
 
-/** #626 activation-evidence-store.ts, typed from its source (not copied). */
-export type MigrationActivationEvidenceResolution =
-  | Readonly<{
-    state: "resolved";
-    epochs: readonly MigrationActivationEpoch[];
-    attempts: readonly MigrationActivationAttempt[];
-    witnesses: readonly MigrationActivationWitness[];
-  }>
-  | Readonly<{ state: "authoritatively-absent" }>
-  | Readonly<{ state: "unresolvable"; reason: string }>;
-
-export type MigrationActivationEvidenceRefusalReason =
-  | "evidence-unresolvable"
-  | "epoch-missing"
-  | "attempt-missing"
-  | "witness-does-not-reproduce";
-
+/** The #626 activation evidence store (activation-evidence-store.ts). The
+ * writers refuse with MigrationActivationEvidenceRefusalError, recognised
+ * by instanceof. */
 export interface MigrationActivationEvidenceSeam {
   recordMigrationActivationEpoch(input: Readonly<{ homeDir: string; epoch: MigrationActivationEpoch }>): void;
   recordMigrationActivationAttempt(
@@ -397,29 +397,18 @@ export interface MigrationActivationEvidenceSeam {
   readMigrationActivationEvidence(
     input: Readonly<{ homeDir: string; generationId: string }>,
   ): MigrationActivationEvidenceResolution;
-  /** Recognizes the seam's typed refusal (MigrationActivationEvidenceRefusalError). */
-  isRefusal(error: unknown): error is Error & { reason: MigrationActivationEvidenceRefusalReason };
 }
 
-/** #626 generation-binding-store.ts resolveMigrationWitnessBindings, typed from its source. */
-export type MigrationWitnessBindingsResolution =
-  | Readonly<{
-    state: "resolved";
-    witnesses: readonly MigrationWitnessBinding[];
-    selections: readonly MigrationSelectionBinding[];
-  }>
-  | Readonly<{ state: "authoritatively-absent" }>
-  | Readonly<{ state: "unresolvable"; reason: string }>;
-
+/** The generation binding store writers plus the #626 resolver. */
 export interface MigrationActivationBindingSeam {
   recordMigrationWitnessBinding: typeof recordMigrationWitnessBinding;
   recordMigrationSelectionBinding: typeof recordMigrationSelectionBinding;
   resolveMigrationWitnessBindings(
     input: Readonly<{ homeDir: string; generationId: string }>,
-  ): MigrationWitnessBindingsResolution;
+  ): MigrationWitnessResolution;
 }
 
-/** #626 verify-generation.ts exports buildMigrationCensusVector / buildMigrationCanonicalDelta (A10). */
+/** The verification census builders (verify-generation.ts, A10). */
 export interface MigrationActivationCensusSeam {
   buildMigrationCensusVector(domains: readonly MigrationVerificationDomainCensus[]): MigrationCensusVector;
   buildMigrationCanonicalDelta(domains: readonly MigrationVerificationDomainCensus[]): MigrationCanonicalDelta;
@@ -486,46 +475,11 @@ export interface MigrationActivationDependencies {
   readonly crashPoint?: MigrationActivationCrashPoint;
 }
 
-function pendingSeam(name: string): never {
-  throw new MigrationActivationError(
-    "unexpected-state",
-    "#626 seam " + name + " is not wired into createMigrationActivationDependencies yet",
-  );
-}
-
-/**
- * TODO(#625 wiring, after "[#626] merged"): replace every member with the
- * real export -- recordMigrationActivationEpoch / Attempt / Witness,
- * readMigrationActivationEvidence and MigrationActivationEvidenceRefusalError
- * from ./activation-evidence-store.js; resolveMigrationWitnessBindings from
- * ./generation-binding-store.js; buildMigrationCensusVector and
- * buildMigrationCanonicalDelta from ./verify-generation.js. This is the ONE
- * wiring point; nothing else in this module references #626 by name.
- */
-export const MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS: Readonly<{
-  evidence: MigrationActivationEvidenceSeam;
-  resolveMigrationWitnessBindings: MigrationActivationBindingSeam["resolveMigrationWitnessBindings"];
-  census: MigrationActivationCensusSeam;
-}> = Object.freeze({
-  evidence: Object.freeze({
-    recordMigrationActivationEpoch: () => pendingSeam("recordMigrationActivationEpoch"),
-    recordMigrationActivationAttempt: () => pendingSeam("recordMigrationActivationAttempt"),
-    recordMigrationActivationWitness: () => pendingSeam("recordMigrationActivationWitness"),
-    readMigrationActivationEvidence: () => pendingSeam("readMigrationActivationEvidence"),
-    isRefusal: (error: unknown): error is Error & { reason: MigrationActivationEvidenceRefusalReason } =>
-      error instanceof Error && error.name === "MigrationActivationEvidenceRefusalError",
-  }),
-  resolveMigrationWitnessBindings: () => pendingSeam("resolveMigrationWitnessBindings"),
-  census: Object.freeze({
-    buildMigrationCensusVector: () => pendingSeam("buildMigrationCensusVector"),
-    buildMigrationCanonicalDelta: () => pendingSeam("buildMigrationCanonicalDelta"),
-  }),
-});
-
 /**
  * Production dependencies for one home. Every boundary is built here and
- * nowhere else; the CLI never touches a coordinator, guard or runtime.
- * Dependencies are a structural injection seam for tests only.
+ * nowhere else; the CLI never touches a coordinator, guard or runtime. The
+ * #626 evidence store, binding resolver and census builders are wired here
+ * and only here. Dependencies are a structural injection seam for tests.
  */
 export function createMigrationActivationDependencies(
   input: Readonly<{ homeDir: string }>,
@@ -542,7 +496,7 @@ export function createMigrationActivationDependencies(
     readCopyBinding: readMigrationCopyBindingSha256,
     captureDestinationIdentity,
     readDestinationCensus: (session, census) => readFencedDestinationCensus(session as unknown as PostgreSqlSnapshotSession, census),
-    census: MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS.census,
+    census: { buildMigrationCensusVector, buildMigrationCanonicalDelta },
     withAppendBarrier: withBackendPublicationAppendBarrierAsync,
     checkQuiescence: checkActivationWriterQuiescence,
     checkCoverage: checkActivationProjectCoverage,
@@ -553,11 +507,16 @@ export function createMigrationActivationDependencies(
     readArtifact: readActivationArtifact,
     recordLink: (link) => recordActivationGenerationLink(link),
     readLink: (link) => readActivationGenerationLink(link),
-    evidence: MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS.evidence,
+    evidence: {
+      recordMigrationActivationEpoch,
+      recordMigrationActivationAttempt,
+      recordMigrationActivationWitness,
+      readMigrationActivationEvidence,
+    },
     bindings: {
       recordMigrationWitnessBinding,
       recordMigrationSelectionBinding,
-      resolveMigrationWitnessBindings: MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS.resolveMigrationWitnessBindings,
+      resolveMigrationWitnessBindings,
     },
     createCoordinator: ({ homeDir, guard, machineId }) => createBackendPublicationCoordinator({
       homeDir,
@@ -673,9 +632,12 @@ const APPLIED_YES_PHASES: readonly BackendPublicationJournal["phase"][] = ["conf
 function classifyApplied(ctx: Context): MigrationActivationTriState {
   let journal: BackendPublicationJournal | null;
   try {
-    // A live version-3 maintenance journal means no version-2 publication
-    // has been prepared for this generation: nothing can have been applied.
-    if (ctx.deps.readMaintenanceJournal(ctx.homeDir) !== null) return "no";
+    // A live version-3 maintenance journal entered from sqlite means no
+    // version-2 publication has been prepared for this generation: nothing
+    // can have been applied. A window entered from another backend is a
+    // rollback (#626) that superseded whatever this activation published.
+    const maintenance = ctx.deps.readMaintenanceJournal(ctx.homeDir);
+    if (maintenance !== null) return isActivationMaintenance(maintenance) ? "no" : "unknown";
     journal = ctx.deps.readPublicationJournal(ctx.homeDir);
   } catch {
     return "unknown";
@@ -1219,7 +1181,7 @@ function recordEvidenceChain(ctx: Context, step: MigrationActivationInterruption
     ctx.deps.evidence.recordMigrationActivationWitness({ homeDir: ctx.homeDir, generationId: ctx.generationId, witness: ctx.witness! });
     crash(ctx, "after-witness");
   } catch (error) {
-    if (ctx.deps.evidence.isRefusal(error)) {
+    if (error instanceof MigrationActivationEvidenceRefusalError) {
       return interrupted(ctx, step, error.reason === "evidence-unresolvable" ? "evidence-unresolvable" : "evidence-conflict", error.message);
     }
     if (error instanceof Error && error.name === "MigrationBindingConflictError") return interrupted(ctx, step, "evidence-conflict", error.message);
@@ -1247,6 +1209,17 @@ function recordEvidenceChain(ctx: Context, step: MigrationActivationInterruption
   return ok(true);
 }
 
+/** Only a window entered from sqlite belongs to an activation; a rollback
+ * enters from postgresql (#626) and is foreign to this orchestrator. */
+function isActivationMaintenance(journal: BackendMaintenanceJournal): boolean {
+  return journal.sourceBackend === "sqlite";
+}
+
+function foreignMaintenanceDetail(journal: BackendMaintenanceJournal): string {
+  return "the maintenance journal was entered from " + journal.sourceBackend + " for generation " + journal.generationId
+    + " (a rollback window), not from sqlite";
+}
+
 /** S12: version-3 selection by phase. */
 async function stepSelection(ctx: Context): Promise<Step<BackendMaintenanceJournal>> {
   let journal: BackendMaintenanceJournal | null;
@@ -1258,6 +1231,7 @@ async function stepSelection(ctx: Context): Promise<Step<BackendMaintenanceJourn
   if (journal === null || journal.generationId !== ctx.generationId) {
     return interrupted(ctx, "S12", "journal-unexpected", journal === null ? "no maintenance journal exists" : "the maintenance journal names another generation");
   }
+  if (!isActivationMaintenance(journal)) return interrupted(ctx, "S12", "journal-unexpected", foreignMaintenanceDetail(journal));
   const evidence = ctx.witness!.checksumSha256;
   try {
     if (journal.phase === "maintenance-held") {
@@ -1378,7 +1352,7 @@ async function stepComplete(ctx: Context, restart: ActivationRestartCheckResult)
   if (v2 === null || v2.publicationId !== ctx.publicationId || v2.phase !== "completed") {
     return interrupted(ctx, "S16", "readback-mismatch", "the publication journal is not this publication's completed journal");
   }
-  let bindings: MigrationWitnessBindingsResolution;
+  let bindings: MigrationWitnessResolution;
   try {
     bindings = ctx.deps.bindings.resolveMigrationWitnessBindings({ homeDir: ctx.homeDir, generationId: ctx.generationId });
   } catch (error) {
@@ -1562,6 +1536,10 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
       : refused("S0", "maintenance-unresolvable", "a backend journal could not be read: " + (error as Error).message).exit;
   }
   const ownV2 = v2 !== null && v2.publicationId === ctx.publicationId ? v2 : null;
+  if (v3 !== null && !isActivationMaintenance(v3)) {
+    const detail = foreignMaintenanceDetail(v3);
+    return ctx.effectBegun ? interrupted(ctx, "S12", "journal-unexpected", detail).exit : refused("S3", "maintenance-not-held", detail).exit;
+  }
 
   // Link resolved: everything comes from link + artifact; compose is never called (A9).
   if (ctx.link !== null) {
@@ -1774,7 +1752,7 @@ function adoptStoredAttempt(ctx: Context, v3: BackendMaintenanceJournal | null, 
   }
   let checksum: string | null = v3 !== null && v3.generationId === ctx.generationId ? v3.terminalEvidenceSha256 : null;
   if (checksum === null && ownV2 !== null) {
-    let bindings: MigrationWitnessBindingsResolution;
+    let bindings: MigrationWitnessResolution;
     try {
       bindings = ctx.deps.bindings.resolveMigrationWitnessBindings({ homeDir: ctx.homeDir, generationId: ctx.generationId });
     } catch (error) {
@@ -1881,7 +1859,11 @@ export async function previewMigrationActivation(
   }
   try {
     const v3 = deps.readMaintenanceJournal(input.homeDir);
-    checks.push({ name: "maintenance-journal", status: v3 === null ? "refuse" : v3.generationId === input.generationId ? "ok" : "refuse", detail: v3 === null ? "absent" : "phase " + v3.phase + " for generation " + v3.generationId });
+    checks.push({
+      name: "maintenance-journal",
+      status: v3 === null ? "refuse" : v3.generationId === input.generationId && isActivationMaintenance(v3) ? "ok" : "refuse",
+      detail: v3 === null ? "absent" : "phase " + v3.phase + " for generation " + v3.generationId + " entered from " + v3.sourceBackend,
+    });
     // Same shared-file rule as the orchestrator: the version-2 reader refuses a live version-3 journal.
     const v2 = v3 === null ? deps.readPublicationJournal(input.homeDir) : null;
     checks.push({

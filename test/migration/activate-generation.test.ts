@@ -26,7 +26,6 @@ import {
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage/postgresql/publication-remote-guard.js";
 import { PORTABLE_RECORD_DOMAIN_ORDER, type PortableDomain } from "../../src/storage/portable-record.js";
 import {
-  MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS,
   MigrationActivationError,
   createMigrationActivationDependencies,
   previewMigrationActivation,
@@ -37,7 +36,6 @@ import {
   type MigrationActivationOrdinaryRuntime,
   type MigrationActivationOutcome,
   type MigrationActivationTransferRuntime,
-  type MigrationWitnessBindingsResolution,
 } from "../../src/migration/activate-generation.js";
 import {
   ActivationArtifactIdentityMismatchError,
@@ -48,26 +46,28 @@ import {
   readActivationGenerationLink,
   recordActivationGenerationLink,
 } from "../../src/migration/activation-artifact-store.js";
+import {
+  MigrationActivationEvidenceRefusalError,
+  readMigrationActivationEvidence,
+  recordMigrationActivationAttempt,
+  recordMigrationActivationEpoch,
+  recordMigrationActivationWitness,
+} from "../../src/migration/activation-evidence-store.js";
 import type { ActivationLeasePublicationGuard } from "../../src/migration/activation-lease.js";
 import { deriveActivationPublicationId } from "../../src/migration/activation-publication-id.js";
-import { MigrationActivationReportError, migrationActivationReportDirectory } from "../../src/migration/activation-report.js";
+import { MigrationActivationReportError, migrationActivationReportDirectory, readMigrationActivationReport } from "../../src/migration/activation-report.js";
 import {
-  createMigrationActivationWitness,
   migrationWitnessSha256,
-  parseMigrationActivationAttempt,
-  parseMigrationActivationEpoch,
-  parseMigrationActivationWitness,
   type MigrationActivationAttempt,
   type MigrationActivationEpoch,
   type MigrationActivationWitness,
-  type MigrationCensusVector,
 } from "../../src/migration/activation-witness.js";
 import { migrationCopyTargetGeneration } from "../../src/migration/copy-source.js";
 import {
   recordMigrationSelectionBinding,
   recordMigrationWitnessBinding,
-  type MigrationSelectionBinding,
-  type MigrationWitnessBinding,
+  resolveMigrationWitnessBindings,
+  type MigrationWitnessResolution,
 } from "../../src/migration/generation-binding-store.js";
 import { MigrationManifestStore, migrationManifestRevisionPath } from "../../src/migration/manifest-store.js";
 import { MigrationProjectMapWitnessError, computeMigrationProjectMapWitnessSha256 } from "../../src/migration/project-map-witness.js";
@@ -88,12 +88,19 @@ import {
   type MigrationVerificationReport,
 } from "../../src/migration/verification-report.js";
 import { MigrationVerificationReportStore } from "../../src/migration/verification-store.js";
+import {
+  buildMigrationCanonicalDelta,
+  buildMigrationCensusVector,
+  type MigrationVerificationDomainCensus,
+} from "../../src/migration/verify-generation.js";
 
 // ---------------------------------------------------------------------------
 // Fixture: a real home with real stores, a real coordinator over the real
 // #1433 driver and the real PostgreSQL remote-guard provider, over an
-// in-memory PostgreSQL lease guard; in-memory #626 seams; fake PostgreSQL
-// runtimes for health, identity, copy binding and census.
+// in-memory PostgreSQL lease guard; the real #626 evidence store, binding
+// resolver and census builders (wrapped only for inspection and
+// deterministic fault injection); fake PostgreSQL runtimes for health,
+// identity, copy binding and the destination census rows.
 // ---------------------------------------------------------------------------
 
 const GENERATION = "generation-1";
@@ -119,12 +126,12 @@ function domainVector<T>(build: (domain: PortableDomain, index: number) => T): T
   return PORTABLE_RECORD_DOMAIN_ORDER.map(build);
 }
 
-function censusVector(seed: string): MigrationCensusVector {
-  return {
-    version: 1,
-    domains: domainVector((domain, index) => ({ domain, recordCount: index, prefixSha256: migrationWitnessSha256([seed, domain]) })),
-    contentSha256: migrationWitnessSha256([seed, "content"]),
-  };
+/** The destination census the fake snapshot reads; the real builders derive
+ * the report's census vector and canonical delta from the same rows. */
+function domainCensus(seed: string): MigrationVerificationDomainCensus[] {
+  return domainVector((domain, index) => ({
+    domain, recordCount: index, prefixSha256: migrationWitnessSha256([seed, domain]), terminalIdentitySha256: migrationWitnessSha256(["delta", domain]),
+  }));
 }
 
 function witness(backend: MigrationStorageWitness["backend"], capturedAt: string): MigrationStorageWitness {
@@ -214,64 +221,48 @@ class FakeLeaseGuard implements ActivationLeasePublicationGuard {
   }
 }
 
-/** In-memory #626 evidence store with the writers' ordering refusals. */
-function fakeEvidence() {
-  const epochs = new Map<string, MigrationActivationEpoch>();
-  const attempts = new Map<string, MigrationActivationAttempt>();
-  const witnesses = new Map<string, MigrationActivationWitness>();
-  class Refusal extends Error {
-    constructor(readonly reason: "evidence-unresolvable" | "epoch-missing" | "attempt-missing" | "witness-does-not-reproduce", message: string) {
-      super(message); this.name = "MigrationActivationEvidenceRefusalError";
-    }
-  }
-  const seam: MigrationActivationEvidenceSeam & { epochs: typeof epochs; attempts: typeof attempts; witnesses: typeof witnesses; failNext: string | null } = {
-    epochs, attempts, witnesses, failNext: null,
-    recordMigrationActivationEpoch({ epoch }) {
-      if (seam.failNext === "epoch") { seam.failNext = null; throw new Refusal("evidence-unresolvable", "injected"); }
-      epochs.set(epoch.epochId, parseMigrationActivationEpoch(epoch));
+type EvidenceSeam = MigrationActivationEvidenceSeam & Readonly<{
+  epochs: ReadonlyMap<string, MigrationActivationEpoch>;
+  attempts: ReadonlyMap<string, MigrationActivationAttempt>;
+  witnesses: ReadonlyMap<string, MigrationActivationWitness>;
+}> & { failNext: "epoch" | "read" | null };
+
+/** The real #626 evidence store under the fixture home. The Map views read
+ * the store back through the real reader; failNext injects the two rows the
+ * real store cannot be driven into deterministically (a refused first write
+ * and an unresolvable read). */
+function evidenceStore(homeDir: string): EvidenceSeam {
+  const stored = () => {
+    const read = readMigrationActivationEvidence({ homeDir, generationId: GENERATION });
+    return read.state === "resolved" ? read : { epochs: [], attempts: [], witnesses: [] };
+  };
+  const seam: EvidenceSeam = {
+    failNext: null,
+    get epochs() { return new Map(stored().epochs.map((epoch) => [epoch.epochId, epoch])); },
+    get attempts() { return new Map(stored().attempts.map((attempt) => [attempt.attemptId, attempt])); },
+    get witnesses() { return new Map(stored().witnesses.map((witness) => [witness.checksumSha256, witness])); },
+    recordMigrationActivationEpoch(input) {
+      if (seam.failNext === "epoch") { seam.failNext = null; throw new MigrationActivationEvidenceRefusalError("evidence-unresolvable", "injected"); }
+      recordMigrationActivationEpoch(input);
     },
-    recordMigrationActivationAttempt({ attempt }) {
-      if (!epochs.has(attempt.epochId)) throw new Refusal("epoch-missing", "epoch not stored");
-      attempts.set(attempt.attemptId, parseMigrationActivationAttempt(attempt));
-    },
-    recordMigrationActivationWitness({ witness }) {
-      const epoch = epochs.get(witness.epochId);
-      const attempt = attempts.get(witness.attemptId);
-      if (epoch === undefined) throw new Refusal("epoch-missing", "epoch not stored");
-      if (attempt === undefined) throw new Refusal("attempt-missing", "attempt not stored");
-      const minted = createMigrationActivationWitness({ kind: witness.kind, epoch, attempt, postEpochDelta: witness.postEpochDelta, postEpochCensus: witness.postEpochCensus, rollbackMode: witness.rollbackMode });
-      if (minted.checksumSha256 !== witness.checksumSha256) throw new Refusal("witness-does-not-reproduce", "witness does not reproduce");
-      witnesses.set(witness.checksumSha256, parseMigrationActivationWitness(witness));
-    },
-    readMigrationActivationEvidence() {
+    recordMigrationActivationAttempt,
+    recordMigrationActivationWitness,
+    readMigrationActivationEvidence(input) {
       if (seam.failNext === "read") { seam.failNext = null; return { state: "unresolvable", reason: "injected" }; }
-      if (epochs.size === 0) return { state: "authoritatively-absent" };
-      return { state: "resolved", epochs: [...epochs.values()], attempts: [...attempts.values()], witnesses: [...witnesses.values()] };
+      return readMigrationActivationEvidence(input);
     },
-    isRefusal: (error): error is Error & { reason: "evidence-unresolvable" | "epoch-missing" | "attempt-missing" | "witness-does-not-reproduce" } => error instanceof Refusal,
   };
   return seam;
 }
 
-/** Real binding writers plus an in-memory resolver that mirrors what was written. */
-function fakeBindings() {
-  const witnesses: MigrationWitnessBinding[] = [];
-  const selections: MigrationSelectionBinding[] = [];
-  const bindings: MigrationActivationDependencies["bindings"] & { resolveOverride: MigrationWitnessBindingsResolution | null } = {
+/** The real binding writers and the real #626 resolver; resolveOverride
+ * substitutes one resolution for fault injection. */
+function bindingStore() {
+  const bindings: MigrationActivationDependencies["bindings"] & { resolveOverride: MigrationWitnessResolution | null } = {
     resolveOverride: null,
-    recordMigrationWitnessBinding(input, dependencies) {
-      recordMigrationWitnessBinding(input, dependencies);
-      if (!witnesses.some((entry) => entry.witnessChecksumSha256 === input.binding.witnessChecksumSha256)) witnesses.push(input.binding);
-    },
-    recordMigrationSelectionBinding(input, dependencies) {
-      recordMigrationSelectionBinding(input, dependencies);
-      if (!selections.some((entry) => entry.kind === input.binding.kind)) selections.push(input.binding);
-    },
-    resolveMigrationWitnessBindings() {
-      if (bindings.resolveOverride !== null) return bindings.resolveOverride;
-      if (witnesses.length === 0 && selections.length === 0) return { state: "authoritatively-absent" };
-      return { state: "resolved", witnesses: [...witnesses], selections: [...selections] };
-    },
+    recordMigrationWitnessBinding,
+    recordMigrationSelectionBinding,
+    resolveMigrationWitnessBindings: (input) => bindings.resolveOverride ?? resolveMigrationWitnessBindings(input),
   };
   return bindings;
 }
@@ -282,11 +273,11 @@ type Fixture = Readonly<{
   localProjectId: string;
   publicationId: string;
   guard: FakeLeaseGuard;
-  evidence: ReturnType<typeof fakeEvidence>;
-  bindings: ReturnType<typeof fakeBindings>;
+  evidence: EvidenceSeam;
+  bindings: ReturnType<typeof bindingStore>;
   report: MigrationVerificationReport;
   manifestStore: MigrationManifestStore;
-  deps: MigrationActivationDependencies & { health: MigrationTargetHealthResult[]; identity: { sealedWitnessSha256: string; systemIdentifier: string }; transferRows: Array<{ run_id: unknown; state: unknown }>; census: { vector: MigrationCensusVector } & MigrationActivationDependencies["census"] };
+  deps: MigrationActivationDependencies & { health: MigrationTargetHealthResult[]; identity: { sealedWitnessSha256: string; systemIdentifier: string }; transferRows: Array<{ run_id: unknown; state: unknown }>; destinationCensus: MigrationVerificationDomainCensus[] };
   input: MigrationActivationInput;
   run: (overrides?: Partial<MigrationActivationDependencies>) => Promise<MigrationActivationOutcome>;
   coordinator: (observer?: BackendPublicationObserver) => BackendPublicationCoordinator;
@@ -325,8 +316,8 @@ function buildReport(homeDir: string, localProjectId: string, overrides: Partial
     destinationSchemaWitness: { version: 1, migrationsSha256: HASH_A, searchConfigurationSha256: HASH_B, collationSha256: HASH_C, sequenceStateSha256: HASH_A },
     projectMapWitnessSha256,
     queueClassificationWitness: { version: 1, queueCutoff: "0000000000000000001", queueSetSha256: HASH_A, receiptSetSha256: HASH_B, epochChecksumSha256: HASH_C },
-    censusVector: censusVector("census"),
-    canonicalDelta: { version: 1, domains: domainVector((domain, index) => ({ domain, recordCount: index, terminalIdentitySha256: migrationWitnessSha256(["delta", domain]) })) },
+    censusVector: buildMigrationCensusVector(domainCensus("census")),
+    canonicalDelta: buildMigrationCanonicalDelta(domainCensus("census")),
     classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: true })),
     sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: HASH_A },
     publicProbeSha256: migrationWitnessSha256(["probe"]),
@@ -391,16 +382,11 @@ async function fixture(options: { held?: boolean; rosterMachine?: string; extraP
     });
   }
 
-  const evidence = fakeEvidence();
-  const bindings = fakeBindings();
+  const evidence = evidenceStore(homeDir);
+  const bindings = bindingStore();
   const health: MigrationTargetHealthResult[] = [];
   const identity = { sealedWitnessSha256: DEST_IDENTITY, systemIdentifier: SYSTEM_ID };
   const transferRows: Array<{ run_id: unknown; state: unknown }> = [{ run_id: "migration-copy-" + EVIDENCE, state: "completed" }];
-  const census = {
-    vector: report.body.censusVector,
-    buildMigrationCensusVector: () => census.vector,
-    buildMigrationCanonicalDelta: () => report.body.canonicalDelta,
-  };
   const ordinary = (): MigrationActivationOrdinaryRuntime => ({
     health: async (): Promise<PostgreSqlRuntimeHealth> => ({ status: "healthy", backend: "postgresql" }),
     query: (async () => ({ rows: [] })) as unknown as MigrationActivationOrdinaryRuntime["query"],
@@ -418,13 +404,13 @@ async function fixture(options: { held?: boolean; rosterMachine?: string; extraP
     health,
     identity,
     transferRows,
-    census,
+    destinationCensus: domainCensus("census"),
     createOrdinaryRuntime: ordinary,
     createTransferRuntime: transfer,
     verifyTransferSchema: async () => undefined,
     checkTargetHealth: async () => health.shift() ?? ({ status: "healthy", readiness: { currentMigrationIds: [], expectedOwner: "lcm_migrator", runtimeRole: "lcm", managedObjectCount: 0, definitionObjectCount: 0, privilegeManifestVersion: 1 } }),
     captureDestinationIdentity: async () => ({ version: 1, ...identity }),
-    readDestinationCensus: async () => ({ census: [] }),
+    readDestinationCensus: async () => ({ census: deps.destinationCensus }),
     evidence,
     bindings,
     createCoordinator: () => coordinator(),
@@ -586,7 +572,7 @@ describe("runMigrationActivation: refusals (no effect begun)", () => {
 
   it("refuses census-drift at S8 when the recomputed census differs from the report", async () => {
     const f = await fixture();
-    f.deps.census.vector = censusVector("drifted");
+    f.deps.destinationCensus = domainCensus("drifted");
     const outcome = await f.run();
     expect(outcome).toMatchObject({ status: "refused", step: "S8", reason: "census-drift" });
   });
@@ -863,6 +849,26 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
     expect(await f.run()).toMatchObject({ status: "refused", step: "S3", reason: "maintenance-not-held" });
   });
 
+  it("a maintenance window entered from postgresql (a #626 rollback) is foreign: refused before any effect, interrupted journal-unexpected after one", async () => {
+    const f = await fixture({ held: false });
+    await f.coordinator().enterMaintenance({ publicationId: f.publicationId, generationId: GENERATION, sourceBackend: "postgresql", sourceSelectionSha256: HASH_A, queueEvidenceSha256: HASH_B, roster: [{ machineId: MACHINE, queueCutoff: "0000000000000000012", evidenceSha256: HASH_A }] });
+    expect(readBackendMaintenanceJournal(f.homeDir)).toMatchObject({ phase: "maintenance-held", sourceBackend: "postgresql" });
+    expect(await f.run()).toMatchObject({ status: "refused", step: "S3", reason: "maintenance-not-held", effectBegun: false, detail: expect.stringContaining("entered from postgresql") });
+    expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+    // After the effect began (link recorded), the same window is an interruption whose applied column cannot be read from a rollback's journal.
+    const g = await fixture();
+    await stopAt(g, "after-link");
+    const read = g.deps.readMaintenanceJournal;
+    const foreign: MigrationActivationDependencies["readMaintenanceJournal"] = (h) => { const j = read(h); return j === null ? null : { ...j, sourceBackend: "postgresql" }; };
+    expect(await g.run({ readMaintenanceJournal: foreign })).toMatchObject({ status: "interrupted", step: "S12", cause: "journal-unexpected", effectBegun: true, applied: "unknown", detail: expect.stringContaining("rollback window") });
+    // S12 re-reads the journal before selecting: a window that turned foreign in between is journal-unexpected too.
+    const h = await fixture();
+    let reads = 0;
+    const read3 = h.deps.readMaintenanceJournal;
+    expect(await h.run({ readMaintenanceJournal: (home) => { reads += 1; const j = read3(home); return reads === 2 && j !== null ? { ...j, sourceBackend: "postgresql" } : j; } }))
+      .toMatchObject({ status: "interrupted", step: "S12", cause: "journal-unexpected", detail: expect.stringContaining("rollback window") });
+  });
+
   it("maps a project-map read failure to state-unresolvable (pre) and rethrows a non-witness error", async () => {
     const f = await fixture();
     const { MigrationProjectMapWitnessError } = await import("../../src/migration/project-map-witness.js");
@@ -1020,7 +1026,13 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
     const h = await fixture();
     expect(await h.run({ evidence: { ...h.evidence, recordMigrationActivationWitness: () => { throw namedError("MigrationBindingUnresolvableError"); } } })).toMatchObject({ status: "interrupted", step: "S11", cause: "evidence-unresolvable" });
     const i = await fixture();
-    expect(await i.run({ evidence: { ...i.evidence, recordMigrationActivationWitness() { throw Object.assign(namedError("MigrationActivationEvidenceRefusalError"), { reason: "witness-does-not-reproduce" }); }, isRefusal: (e): e is never => e instanceof Error && e.name === "MigrationActivationEvidenceRefusalError" } })).toMatchObject({ status: "interrupted", step: "S11", cause: "evidence-conflict" });
+    expect(await i.run({ evidence: { ...i.evidence, recordMigrationActivationWitness() { throw new MigrationActivationEvidenceRefusalError("witness-does-not-reproduce", "x"); } } })).toMatchObject({ status: "interrupted", step: "S11", cause: "evidence-conflict" });
+    // A refusal recognised only by name is not the store's error: it escapes untyped.
+    const n = await fixture();
+    await expect(n.run({ evidence: { ...n.evidence, recordMigrationActivationWitness() { throw Object.assign(namedError("MigrationActivationEvidenceRefusalError"), { reason: "witness-does-not-reproduce" }); } } })).rejects.toMatchObject({ name: "MigrationActivationEvidenceRefusalError" });
+    // The real store's own ordering refusal: an attempt whose epoch was never written.
+    const o = await fixture();
+    expect(await o.run({ evidence: { ...o.evidence, recordMigrationActivationEpoch: () => undefined } })).toMatchObject({ status: "interrupted", step: "S11", cause: "evidence-conflict", detail: expect.stringContaining("is not stored for this generation") });
     const j = await fixture();
     await expect(j.run({ evidence: { ...j.evidence, recordMigrationActivationEpoch: () => { throw new RangeError("raw"); } } })).rejects.toBeInstanceOf(RangeError);
     const k = await fixture();
@@ -1101,11 +1113,6 @@ function corruptLink(f: Fixture): void {
   writeFileSync(activationGenerationLinkPath(f.homeDir, GENERATION), "{garbage\n", { mode: 0o600 });
 }
 
-function thrown(fn: () => unknown): unknown {
-  try { fn(); } catch (error) { return error; }
-  return null;
-}
-
 function countedStore(f: Fixture, override: { readAt?: [number, (m: MigrationManifest) => MigrationManifest | never]; updateAt?: [number, () => never] }): MigrationActivationDependencies["manifestStore"] {
   const store = f.manifestStore;
   let reads = 0;
@@ -1160,19 +1167,24 @@ describe("runMigrationActivation: input validation, production defaults and the 
     expectActivated(f, await runMigrationActivation(input, f.deps), "fresh");
   });
 
-  it("the #626 wiring point refuses every call until the sibling lands and recognizes its refusal error by name", () => {
-    const seams = MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS;
-    const pending = { name: "MigrationActivationError", reason: "unexpected-state" };
-    expect(thrown(() => seams.evidence.recordMigrationActivationEpoch({ homeDir: "/x", epoch: {} as never }))).toMatchObject(pending);
-    expect(thrown(() => seams.evidence.recordMigrationActivationAttempt({ homeDir: "/x", generationId: GENERATION, attempt: {} as never }))).toMatchObject(pending);
-    expect(thrown(() => seams.evidence.recordMigrationActivationWitness({ homeDir: "/x", generationId: GENERATION, witness: {} as never }))).toMatchObject(pending);
-    expect(thrown(() => seams.evidence.readMigrationActivationEvidence({ homeDir: "/x", generationId: GENERATION }))).toMatchObject(pending);
-    expect(thrown(() => seams.resolveMigrationWitnessBindings({ homeDir: "/x", generationId: GENERATION }))).toMatchObject(pending);
-    expect(thrown(() => seams.census.buildMigrationCensusVector([]))).toMatchObject(pending);
-    expect(thrown(() => seams.census.buildMigrationCanonicalDelta([]))).toMatchObject(pending);
-    expect(seams.evidence.isRefusal(namedError("MigrationActivationEvidenceRefusalError"))).toBe(true);
-    expect(seams.evidence.isRefusal(namedError("SomethingElse"))).toBe(false);
-    expect(seams.evidence.isRefusal("not an error")).toBe(false);
+  it("production defaults wire the real #626 evidence store, binding resolver and census builders, and activate through them", async () => {
+    const f = await fixture();
+    const deps = createMigrationActivationDependencies({ homeDir: f.homeDir });
+    expect(deps.evidence).toEqual({ recordMigrationActivationEpoch, recordMigrationActivationAttempt, recordMigrationActivationWitness, readMigrationActivationEvidence });
+    expect(deps.bindings).toEqual({ recordMigrationWitnessBinding, recordMigrationSelectionBinding, resolveMigrationWitnessBindings });
+    expect(deps.census).toEqual({ buildMigrationCensusVector, buildMigrationCanonicalDelta });
+    expect(deps.census.buildMigrationCensusVector(f.deps.destinationCensus)).toEqual(f.report.body.censusVector);
+    expect(deps.census.buildMigrationCanonicalDelta(f.deps.destinationCensus)).toEqual(f.report.body.canonicalDelta);
+    const outcome = await f.run({ evidence: deps.evidence, bindings: deps.bindings, census: deps.census });
+    expectActivated(f, outcome, "fresh");
+    if (outcome.status !== "activated") return;
+    const evidence = readMigrationActivationEvidence({ homeDir: f.homeDir, generationId: GENERATION });
+    expect(evidence).toMatchObject({ state: "resolved", epochs: [expect.anything()], attempts: [expect.anything()], witnesses: [expect.anything()] });
+    if (evidence.state !== "resolved") return;
+    const stored = readMigrationActivationReport({ homeDir: f.homeDir, generationId: GENERATION, reportSha256: outcome.report.reportSha256 });
+    expect(stored).toMatchObject({ state: "resolved", report: { body: { witnessChecksumSha256: evidence.witnesses[0]!.checksumSha256, epochId: evidence.epochs[0]!.epochId, attemptId: evidence.attempts[0]!.attemptId } } });
+    const bindings = resolveMigrationWitnessBindings({ homeDir: f.homeDir, generationId: GENERATION });
+    expect(bindings).toMatchObject({ state: "resolved", selections: [{ kind: "activation", publicationId: f.publicationId, witnessChecksumSha256: evidence.witnesses[0]!.checksumSha256 }], witnesses: [{ kind: "activation", witnessChecksumSha256: evidence.witnesses[0]!.checksumSha256 }] });
   });
 
   it("production defaults build the real boundaries: stores, runtimes, coordinator, machine identity and daemon port", async () => {
@@ -1577,6 +1589,9 @@ describe("previewMigrationActivation (A11): non-predictive and read-only", () =>
     expect(unheld["publication-journal"]).toMatchObject({ status: "ok", detail: "absent" });
     await f.coordinator().enterMaintenance({ publicationId: "other-pub", generationId: "generation-9", sourceSelectionSha256: HASH_A, queueEvidenceSha256: HASH_B, roster: [{ machineId: MACHINE, queueCutoff: "0000000000000000012", evidenceSha256: HASH_A }] });
     expect((await preview(f))["maintenance-journal"]).toMatchObject({ status: "refuse", detail: expect.stringContaining("generation-9") });
+    const rollback = await fixture({ held: false });
+    await rollback.coordinator().enterMaintenance({ publicationId: rollback.publicationId, generationId: GENERATION, sourceBackend: "postgresql", sourceSelectionSha256: HASH_A, queueEvidenceSha256: HASH_B, roster: [{ machineId: MACHINE, queueCutoff: "0000000000000000012", evidenceSha256: HASH_A }] });
+    expect((await preview(rollback))["maintenance-journal"]).toMatchObject({ status: "refuse", detail: expect.stringContaining("entered from postgresql") });
     const g = await fixture();
     await stopAt(g, "after-drive");
     const read = g.deps.readPublicationJournal;

@@ -289,13 +289,11 @@ export type {
 //
 // plan-v7.1: one entry point that activates or recovers one verified
 // generation under the local append barrier, a non-predictive preview, and
-// the production dependency builder. The #626 evidence, binding-resolver and
-// census seams are typed structurally and wired at
-// MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS until that sibling merges.
+// the production dependency builder, which wires the #626 evidence store,
+// witness-binding resolver and census builders at exactly one point.
 
 export {
   MIGRATION_ACTIVATION_LEASE_TTL_MS,
-  MIGRATION_ACTIVATION_PENDING_SIBLING_SEAMS,
   MigrationActivationError,
   createMigrationActivationDependencies,
   previewMigrationActivation,
@@ -308,8 +306,6 @@ export type {
   MigrationActivationCoordinator,
   MigrationActivationCrashPoint,
   MigrationActivationDependencies,
-  MigrationActivationEvidenceRefusalReason,
-  MigrationActivationEvidenceResolution,
   MigrationActivationEvidenceSeam,
   MigrationActivationIdentity,
   MigrationActivationInput,
@@ -325,5 +321,4 @@ export type {
   MigrationActivationSnapshot,
   MigrationActivationTransferRuntime,
   MigrationActivationTriState,
-  MigrationWitnessBindingsResolution,
 } from "./activate-generation.js";
