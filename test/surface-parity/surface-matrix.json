@@ -20,6 +20,7 @@
         "session-end",
         "user-prompt",
         "post-tool",
+        "pre-tool",
         "session-snapshot",
         "mcp",
         "install",
@@ -81,6 +82,7 @@
           "session-end",
           "user-prompt",
           "post-tool",
+          "pre-tool",
           "session-snapshot"
         ]
       },
@@ -1898,6 +1900,7 @@
           "session-end",
           "user-prompt",
           "post-tool",
+          "pre-tool",
           "session-snapshot"
         ]
       },
@@ -2580,6 +2583,58 @@
       "path": "postgres migrate"
     },
     "scenario": "admin",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/hooks/ and docs/cli.md: native hook capture uses the local SQLite outbox with either configured backend; durable project writes remain on the selected backend.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:pre-tool",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "pre-tool",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--client <client>",
+          "hidden": true,
+          "long": "--client",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "pre-tool"
+    },
+    "scenario": "hooks",
     "source": "bin/lcm.ts:runCli"
   },
   {
@@ -3521,6 +3576,20 @@
         {
           "choices": null,
           "default": null,
+          "flags": "--terminal",
+          "hidden": true,
+          "long": "--terminal",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
           "flags": "-h, --help",
           "hidden": false,
           "long": "--help",
@@ -4007,6 +4076,23 @@
       "admission": "mutating",
       "key": "POST /ingest",
       "publicationMode": "operation-scoped"
+    },
+    "scenario": "memory",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /ingest/terminal",
+    "kind": "daemon",
+    "registration": {
+      "admission": "mutating",
+      "key": "POST /ingest/terminal",
+      "publicationMode": "enqueue-only"
     },
     "scenario": "memory",
     "source": "src/daemon/server.ts:createDaemon"

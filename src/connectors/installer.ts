@@ -44,6 +44,7 @@ import { packageExecutable } from "../runtime-root.js";
 import {
   clearConnectorTransport,
   readConnectorTransport,
+  readPreToolRecallSnapshot,
   setConnectorTransport,
 } from "../config-manager.js";
 import { configPath as defaultConfigPath } from "../runtime-paths.js";
@@ -1324,6 +1325,7 @@ function installComponent(
   cwd: string,
   strictMcp = false,
   transport: ConnectorTransport = "cli",
+  preToolRecall = false,
 ): InstallResult {
   if (surface === "hook") {
     if (agent.id === "codex") {
@@ -1338,7 +1340,7 @@ function installComponent(
         const snapshot = activeMutationAuthority!.snapshots.get(path)!;
         return snapshot.state === "regular" ? snapshot.content.toString("utf-8") : "";
       };
-      const plan = planCodexHooksInstall(captured(hooksPath), captured(configPath), transport);
+      const plan = planCodexHooksInstall(captured(hooksPath), captured(configPath), transport, { preToolRecall });
       if (plan.refusal !== undefined) throw new Error(plan.refusal);
       updateRegularFileNoFollow(configPath, () => (
         plan.configContent === undefined ? undefined : Buffer.from(plan.configContent, "utf-8")
@@ -1475,9 +1477,23 @@ function legacyDefaultSurfaces(agent: Agent): readonly ConnectorSurface[] {
   return ["mcp"];
 }
 
+/**
+ * Resolve the opt-in PreToolUse hook flag once per install, before any Codex
+ * file is staged. Only a selection that writes Codex's hook file depends on
+ * daemon config; a failed read throws so installs never guess.
+ */
+function resolvePreToolRecall(
+  agent: Agent,
+  surfaces: readonly ConnectorSurface[],
+  configFile: string = defaultConfigPath(),
+): boolean {
+  return agent.id === "codex" && surfaces.includes("hook") ? readPreToolRecallSnapshot(configFile) : false;
+}
+
 function installLegacyDefault(agent: Agent, cwd: string): InstallResult {
   const targets = legacyDefaultSurfaces(agent);
-  const results = targets.map((surface) => installComponent(agent, surface, cwd, false, "cli"));
+  const preToolRecall = resolvePreToolRecall(agent, targets);
+  const results = targets.map((surface) => installComponent(agent, surface, cwd, false, "cli", preToolRecall));
   for (const surface of targets) verifySurface(agent, surface, cwd, undefined, "cli");
   const paths = results.map((result) => result.path).filter((path) => path.length > 0);
   return {
@@ -2090,6 +2106,7 @@ function installTransportBundle(
   let codexMcpMutated = false;
   try {
     phase(options, "snapshot");
+    const preToolRecall = resolvePreToolRecall(agent, targetSurfaces, configFile);
     let codexMcpPreflight: readonly CodexMcpEntry[] | undefined;
     if (runner && targetSurfaces.includes("mcp") && agent.id === "codex") codexMcpPreflight = preflightCodexMcpInstall(runner);
     phase(options, "stage");
@@ -2106,7 +2123,7 @@ function installTransportBundle(
         codexMcpMutated = installCodexMcp(runner!, codexMcpPreflight!);
         staged.push({ success: true, path: "", requiresRestart: true });
       } else {
-        staged.push(installComponent(agent, surface, cwd, true, transport));
+        staged.push(installComponent(agent, surface, cwd, true, transport, preToolRecall));
         filesMutated ||= !fileSnapshotsEqual(snapshots, snapshotOwnedFiles(paths));
       }
     }
@@ -2240,7 +2257,9 @@ export function installConnector(
       || (surface === "hook" && agent.id === "claude-code")) {
       return installComponent(agent, surface, parsed.cwd);
     }
-    return withInstallAuthority(agent, [surface], parsed.cwd, () => compensateCodexOnFailure(agent, () => installComponent(agent, surface, parsed.cwd)));
+    return withInstallAuthority(agent, [surface], parsed.cwd, () => compensateCodexOnFailure(agent, () => (
+      installComponent(agent, surface, parsed.cwd, false, "cli", resolvePreToolRecall(agent, [surface]))
+    )));
   }
   if (transportOrSurface !== undefined && transportOrSurface !== "cli" && transportOrSurface !== "mcp") {
     throw new Error(`Unsupported connector transport ${JSON.stringify(transportOrSurface)}; choose cli or mcp`);

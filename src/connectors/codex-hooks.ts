@@ -64,8 +64,20 @@ function lcmCommand(command: string, transport: ConnectorTransport = "cli"): str
   return `lcm ${command} --client codex${suffix}`;
 }
 
-export function codexLcmHooks(transport: ConnectorTransport = "cli"): Record<string, CodexHookGroup[]> {
-  return {
+/** Optional Codex hook registrations; callers resolve the value, generators never read config. */
+export interface CodexLcmHookOptions {
+  /** Register the opt-in PreToolUse memory hint hook (default off). */
+  readonly preToolRecall?: boolean;
+}
+
+/** Tools whose pending call the opt-in PreToolUse hook can derive a memory query from. */
+const PRE_TOOL_RECALL_MATCHER = "^(Bash|apply_patch|mcp__.*)$";
+
+export function codexLcmHooks(
+  transport: ConnectorTransport = "cli",
+  options: CodexLcmHookOptions = {},
+): Record<string, CodexHookGroup[]> {
+  const hooks: Record<string, CodexHookGroup[]> = {
     SessionStart: [
       {
         matcher: "startup|resume|clear|compact|fork",
@@ -153,7 +165,49 @@ export function codexLcmHooks(transport: ConnectorTransport = "cli"): Record<str
         ],
       },
     ],
+    // Codex clamps Interrupt and SessionEnd command hooks to 1..3 seconds and
+    // kills the process group at the cap, so 3 is the most these can use.
+    Interrupt: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: `${lcmCommand("session-snapshot")} --terminal`,
+            timeout: 3,
+            statusMessage: "Saving LCM memory after interruption",
+          },
+        ],
+      },
+    ],
+    SessionEnd: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: `${lcmCommand("session-snapshot")} --terminal`,
+            timeout: 3,
+            statusMessage: "Saving LCM memory before session end",
+          },
+        ],
+      },
+    ],
   };
+  if (options.preToolRecall === true) {
+    hooks.PreToolUse = [
+      {
+        matcher: PRE_TOOL_RECALL_MATCHER,
+        hooks: [
+          {
+            type: "command",
+            command: lcmCommand("pre-tool"),
+            timeout: 5,
+            statusMessage: "Checking LCM memory for this action",
+          },
+        ],
+      },
+    ];
+  }
+  return hooks;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -173,7 +227,7 @@ export function isLcmHookCommand(command: unknown): boolean {
   if (/\blcm\s+user-prompt\s+--client\s+codex(?:\s+--transport\s+(?:cli|mcp))?$/.test(command)) {
     return true;
   }
-  return /\blcm\s+(restore|post-tool|session-snapshot)\b/.test(command);
+  return /\blcm\s+(restore|post-tool|pre-tool|session-snapshot)\b/.test(command);
 }
 
 function stripLcmHooks(config: CodexHooksConfig): { config: CodexHooksConfig; removed: boolean } {
@@ -220,7 +274,7 @@ export interface CodexHooksMergePlan {
   readonly refusal?: string;
 }
 
-const LCM_HOOK_ROLE = /\blcm\s+(user-prompt|restore|post-tool|session-snapshot)\b/;
+const LCM_HOOK_ROLE = /\blcm\s+(user-prompt|restore|post-tool|pre-tool|session-snapshot)\b/;
 
 /** The LCM subcommand a managed handler runs; with its event it identifies one hook role. */
 export function codexLcmHookRole(command: unknown): string | undefined {
@@ -329,8 +383,12 @@ export function planCodexHooksMerge(
 }
 
 /** Pure content operation used by the anchored installer mutation seam. */
-export function mergeCodexHooksContent(content: string, transport: ConnectorTransport = "cli"): string {
-  const plan = planCodexHooksMerge(content, transport);
+export function mergeCodexHooksContent(
+  content: string,
+  transport: ConnectorTransport = "cli",
+  options: CodexLcmHookOptions = {},
+): string {
+  const plan = planCodexHooksMerge(content, transport, codexLcmHooks(transport, options));
   if (plan.refusal !== undefined) throw new Error(plan.refusal);
   return plan.content;
 }
@@ -393,9 +451,13 @@ export function planCodexHooksInstall(
   hooksContent: string,
   configContent: string,
   transport: ConnectorTransport = "cli",
-  options: { readonly expected?: Record<string, CodexHookGroup[]> } = {},
+  options: CodexLcmHookOptions & { readonly expected?: Record<string, CodexHookGroup[]> } = {},
 ): CodexHooksInstallPlan {
-  const merge = planCodexHooksMerge(hooksContent, transport, options.expected);
+  const merge = planCodexHooksMerge(
+    hooksContent,
+    transport,
+    options.expected ?? codexLcmHooks(transport, { preToolRecall: options.preToolRecall }),
+  );
   if (merge.refusal !== undefined) return { hooksContent, notices: [], refusal: merge.refusal };
   const feature = addCodexHooksFeature(configContent);
   const state = classifyCodexHooksFeature(configContent);
@@ -424,7 +486,9 @@ export function installCodexHooks(
   configPath: string,
   transport: ConnectorTransport = "cli",
 ): void {
-  // Legacy two-path helper; callers requiring Bug #713 guarantees use installConnector.
+  // Legacy two-path helper with no production callers (tests only); it never
+  // reads daemon config, so the opt-in PreToolUse hook is always off here.
+  // Callers requiring Bug #713 guarantees use installConnector.
   let existingConfig = "";
   try {
     existingConfig = readFileSync(configPath, "utf-8");

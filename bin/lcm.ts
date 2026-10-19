@@ -54,6 +54,7 @@ import {
 } from "../src/storage/backend-publication.js";
 import { BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC } from "../src/hooks/publication-fence.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
+import { resolveLcmConfig } from "../src/db/config.js";
 import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
 import {
   clearDaemonRemediation,
@@ -1011,7 +1012,7 @@ function withHookClient(stdinText: string, client: unknown): string {
 
 /** Dispatch a hook; Codex invocations additionally leave a best-effort LCM-local completion record. */
 async function dispatchObservedHook(
-  command: "restore" | "user-prompt" | "post-tool" | "session-snapshot",
+  command: "restore" | "user-prompt" | "post-tool" | "pre-tool" | "session-snapshot",
   input: string,
   client: unknown,
   context?: { transport?: "cli" | "mcp" },
@@ -1255,13 +1256,20 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   // admission policy. SessionStart bootstrap and installation own legacy-root
   // migration, so the global preflight must not turn publication-lock
   // contention into a hook failure before the handler runs.
+  // A bare `lcm compact` is the legacy PreCompact hook command; with
+  // LCM_ENABLED=false it is skipped by its action, so it must not run the
+  // preflight either.
   if (topLevel && (
     action === "post-tool"
+    || action === "pre-tool"
     || action === "restore"
     || action === "session-end"
     || action === "session-snapshot"
     || action === "user-prompt"
-    || (action === "compact" && actionCommand.opts<{ hook?: boolean }>().hook === true)
+    || (action === "compact" && (
+      actionCommand.opts<{ hook?: boolean }>().hook === true
+      || !resolveLcmConfig(process.env).enabled
+    ))
   )) return false;
   if (topLevel && action === "status") return false;
   if (topLevel && (action === "stats" || action === "doctor")) return false;
@@ -2646,6 +2654,14 @@ export async function runCli(
       // Hook dispatch only when --hook is explicit; all other invocations go to batch.
       const hook: boolean = opts.hook ?? false;
       if (!hook) {
+        // Older installations register the bare `lcm compact` as their PreCompact
+        // hook, and dispatchHook() is not reached without --hook; honor the
+        // documented LCM_ENABLED=false contract before any batch work.
+        if (!resolveLcmConfig(process.env).enabled) {
+          process.stderr.write("lcm compact: skipped because LCM_ENABLED=false\n");
+          process.exitCode = 0;
+          return;
+        }
         let invocationLifecycle: CompactInvocationLifecycle | undefined;
         let localWorkPromise: Promise<void> | undefined;
         let compactPort = 3737;
@@ -3110,17 +3126,47 @@ export async function runCli(
       exit(r.exitCode);
     });
 
-  // ─── session-snapshot (hook) ─────────────────────────────────────────────
+  // ─── pre-tool (hook) ───────────────────────────────────────────────────────
   program
-    .command("session-snapshot")
-    .description("Rolling ingest snapshot (called by Stop hook)")
+    .command("pre-tool")
+    .description("Dispatch the pre-tool hook (PreToolUse event)")
     .helpOption(false)
     .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
+        printHelp("pre-tool"); exit(0);
+      }
+      const input = withHookClient(await readStdin(), opts.client);
+      const r = await dispatchObservedHook("pre-tool", input, opts.client);
+      if (r.stdout) stdout.write(r.stdout);
+      exit(r.exitCode);
+    });
+
+  // ─── session-snapshot (hook) ─────────────────────────────────────────────
+  program
+    .command("session-snapshot")
+    .description("Rolling ingest snapshot (called by Stop, PreCompact, Interrupt and SessionEnd hooks)")
+    .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
+    .addOption(new Option("--terminal", "Interrupt or SessionEnd snapshot with a three second budget (internal)").hideHelp())
+    .option("-h, --help", "Show help")
+    .action(async (opts) => {
+      if (opts.help) {
+        const { printHelp } = await import("../src/cli-help.js");
         printHelp("session-snapshot"); exit(0);
+      }
+      if (opts.terminal === true) {
+        // Terminal hooks never fail the session they are saving: this path has
+        // its own catch boundary and always exits 0 with no output.
+        try {
+          const { runTerminalSnapshotCommand } = await import("../src/hooks/terminal-snapshot.js");
+          await runTerminalSnapshotCommand();
+        } catch {
+          // A failed import or an unexpected rejection must stay silent too.
+        }
+        exit(0);
       }
       const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchObservedHook("session-snapshot", input, opts.client);
@@ -3800,7 +3846,7 @@ export async function runCli(
       }
       const { AGENTS } = await import("../src/connectors/registry.js");
       const { listConnectors, listConnectorInventory } = await import("../src/connectors/installer.js");
-      const { readConnectorTransportSnapshot } = await import("../src/config-manager.js");
+      const { readConnectorTransportSnapshot, readPreToolRecallSnapshot } = await import("../src/config-manager.js");
       const { findAgent } = await import("../src/connectors/registry.js");
       const found = agentName ? findAgent(agentName) : undefined;
       const agents = found ? [found] : agentName ? [] : AGENTS;
@@ -3848,6 +3894,7 @@ export async function runCli(
           homeDir: homedir(),
           probeVersion: () => probeCodexCliVersion(connectorCwd),
           readStoredTransport: () => readConnectorTransportSnapshot(defaultConfigPath(), "codex"),
+          readPreToolRecall: () => readPreToolRecallSnapshot(defaultConfigPath()),
         });
         for (const line of readiness.lines) console.log(line);
         failures += readiness.failures;

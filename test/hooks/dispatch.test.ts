@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { HOOK_COMMANDS, type HookCommand } from "../../src/hooks/dispatch.js";
 import { REQUIRED_HOOKS } from "../../installer/install.js";
 
@@ -23,8 +23,14 @@ vi.mock("../../src/hooks/user-prompt.js", () => ({
 vi.mock("../../src/hooks/session-snapshot.js", () => ({
   handleSessionSnapshot: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
 }));
+vi.mock("../../src/hooks/terminal-snapshot.js", () => ({
+  handleTerminalSnapshot: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
+}));
 vi.mock("../../src/hooks/post-tool.js", () => ({
   handlePostToolUse: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
+}));
+vi.mock("../../src/hooks/pre-tool.js", () => ({
+  handlePreToolUse: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
 }));
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: vi.fn().mockImplementation(function () {
@@ -54,6 +60,7 @@ describe("HOOK_COMMANDS", () => {
     const commandToEvent: Record<string, string> = {
       "compact": "PreCompact",
       "post-tool": "PostToolUse",
+      "pre-tool": "PreToolUse",
       "restore": "SessionStart",
       "session-end": "SessionEnd",
       "session-snapshot": "Stop",
@@ -75,6 +82,8 @@ import { handleSessionEnd } from "../../src/hooks/session-end.js";
 import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
 import { handleSessionSnapshot } from "../../src/hooks/session-snapshot.js";
 import { handlePostToolUse } from "../../src/hooks/post-tool.js";
+import { handlePreToolUse } from "../../src/hooks/pre-tool.js";
+import { handleTerminalSnapshot } from "../../src/hooks/terminal-snapshot.js";
 import { loadHookConfig, type HookConfig } from "../../src/hooks/config.js";
 import type { StorageBackendSelection } from "../../src/storage/backend.js";
 
@@ -249,6 +258,25 @@ describe("dispatchHook", () => {
     expect(handleSessionSnapshot).not.toHaveBeenCalled();
   });
 
+  it("hands a terminal snapshot straight to its handler without bootstrap, repair or Stop-hook work", async () => {
+    vi.mocked(ensureBootstrapped).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockClear();
+    vi.mocked(validateAndFixHooks).mockClear();
+    vi.mocked(handleSessionSnapshot).mockClear();
+    vi.mocked(loadHookConfig).mockClear();
+    const terminal = { deadline: { openPhase: vi.fn(), outcomeBudgetMs: vi.fn() } };
+    const stdin = JSON.stringify({ session_id: "s1", hook_event_name: "Interrupt" });
+
+    await expect(dispatchHook("session-snapshot", stdin, { terminal })).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handleTerminalSnapshot).toHaveBeenCalledWith(stdin, terminal);
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
   it("reverifies snapshot identity even when the session was already bootstrapped", async () => {
     vi.mocked(ensureBootstrapped).mockClear();
     vi.mocked(ensureCoreEndpoint).mockClear();
@@ -413,6 +441,29 @@ describe("dispatchHook", () => {
     expect(loadHookConfig).not.toHaveBeenCalled();
   });
 
+  it("routes pre-tool straight to its handler without bootstrap, repair or config load", async () => {
+    const payload = JSON.stringify({ session_id: "test", client: "codex", tool_name: "Bash" });
+    vi.mocked(handlePreToolUse).mockClear();
+    vi.mocked(ensureBootstrapped).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockClear();
+    vi.mocked(validateAndFixHooks).mockClear();
+    vi.mocked(loadHookConfig).mockClear();
+
+    const result = await dispatchHook("pre-tool", payload);
+
+    expect(result).toEqual({ exitCode: 0, stdout: "" });
+    expect(handlePreToolUse).toHaveBeenCalledTimes(1);
+    expect(handlePreToolUse).toHaveBeenCalledWith(payload);
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it("recognizes pre-tool as a valid hook command", () => {
+    expect(isHookCommand("pre-tool")).toBe(true);
+  });
+
   it("recognizes post-tool as a valid hook command", () => {
     expect(isHookCommand("post-tool")).toBe(true);
     expect(isHookCommand("invalid")).toBe(false);
@@ -471,5 +522,82 @@ describe("dispatchHook", () => {
     vi.mocked(loadHookConfig).mockReturnValueOnce({} as unknown as HookConfig);
     await dispatchHook("post-tool", "{}");
     expect(handlePostToolUse).toHaveBeenCalledWith("{}");
+  });
+});
+
+describe("LCM_ENABLED=false", () => {
+  const handlers = {
+    compact: handlePreCompact,
+    "post-tool": handlePostToolUse,
+    "pre-tool": handlePreToolUse,
+    restore: handleSessionStart,
+    "session-end": handleSessionEnd,
+    "session-snapshot": handleSessionSnapshot,
+    "user-prompt": handleUserPromptSubmit,
+  } satisfies Record<HookCommand, unknown>;
+  const payload = JSON.stringify({ session_id: "disabled-session", prompt: "remember this" });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each(HOOK_COMMANDS)("makes %s a no-op without side effects", async (command) => {
+    vi.clearAllMocks();
+    vi.stubEnv("LCM_ENABLED", "false");
+
+    await expect(dispatchHook(command, payload)).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handlers[command]).not.toHaveBeenCalled();
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+  });
+
+  it("makes MCP-transport user prompts and Codex snapshots no-ops", async () => {
+    vi.clearAllMocks();
+    vi.stubEnv("LCM_ENABLED", "false");
+
+    await expect(dispatchHook("user-prompt", payload, { transport: "mcp" })).resolves.toEqual({ exitCode: 0, stdout: "" });
+    await expect(
+      dispatchHook("session-snapshot", JSON.stringify({ session_id: "disabled-session", client: "codex" })),
+    ).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handleUserPromptSubmit).not.toHaveBeenCalled();
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it("makes Codex subagent restore and snapshot hooks no-ops", async () => {
+    vi.clearAllMocks();
+    vi.stubEnv("LCM_ENABLED", "false");
+    const subagent = JSON.stringify({
+      session_id: "tree-root",
+      agent_id: "child-thread",
+      agent_transcript_path: "/rollouts/child.jsonl",
+      client: "codex",
+    });
+
+    await expect(dispatchHook("restore", subagent)).resolves.toEqual({ exitCode: 0, stdout: "" });
+    await expect(dispatchHook("session-snapshot", subagent)).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handleSessionStart).not.toHaveBeenCalled();
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "0", "False"])("keeps hooks enabled when LCM_ENABLED is %j", async (value) => {
+    vi.clearAllMocks();
+    if (value === undefined) vi.stubEnv("LCM_ENABLED", undefined);
+    else vi.stubEnv("LCM_ENABLED", value);
+
+    await dispatchHook("restore", payload);
+
+    expect(ensureBootstrapped).toHaveBeenCalledWith("disabled-session");
+    expect(handleSessionStart).toHaveBeenCalledOnce();
   });
 });

@@ -10,11 +10,13 @@ lcm <hook-command> < <stdin-json>
 
 ## Hook entrypoints and legacy-root migration
 
-Installed hook entrypoints (`post-tool`, `restore`, `session-end`,
+Installed hook entrypoints (`post-tool`, `pre-tool`, `restore`, `session-end`,
 `session-snapshot`, `user-prompt`, and `compact --hook`) skip the CLI's
 global legacy-root migration preflight, so a busy backend publication lock
 cannot fail a hook before its own handler runs. Interactive `lcm compact` and
-installation keep the preflight.
+installation keep the preflight, except that `lcm compact` skips it (and
+compaction) when `LCM_ENABLED=false`; see
+[Disabling LCM](configuration.md#disabling-lcm).
 
 - Hook-side legacy-root migration is attempted only through the dispatch
   bootstrap (`bootstrapLcmHome`): on every `session-snapshot` with a
@@ -452,6 +454,44 @@ The self-test is independent of installation state and of readiness; it never
 substitutes for the readiness report, and neither proves that Codex executed a
 hook.
 
+## PreToolUse Hook (Codex, opt-in)
+
+**Command:** `lcm pre-tool --client codex`
+
+Registered only when `hooks.preToolRecall` is `true` when the Codex hooks are
+installed (see [Opt-in PreToolUse memory hints](configuration.md#opt-in-pretooluse-memory-hints-codex)).
+The registration uses the matcher `^(Bash|apply_patch|mcp__.*)$`, a 5 second
+timeout, and the status message "Checking LCM memory for this action". Like
+`post-tool`, the entrypoint skips the legacy-root migration preflight and the
+dispatcher does not bootstrap or start the daemon.
+
+**Stdin fields used:** `session_id`, `cwd`, `tool_name`, `tool_input`, and the
+presence of `agent_id` or `agent_type` (subagent calls are skipped).
+
+**Response:** Exit code `0`. When a relevant memory is found, stdout is a single
+JSON document and nothing else:
+
+```json
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"..."}}
+```
+
+`additionalContext` is a one-line advisory preamble ("shell command", "file edit"
+or "MCP tool") followed by the usual `<memory-context>` block. Codex records the
+context and then runs the already-selected call unchanged. The hook never emits
+a decision, permission verdict, input rewrite, system message, or exit code `2`.
+
+Every failure path ends with empty stdout and exit `0`: invalid input, a disabled
+setting, `LCM_ENABLED=false`, a subagent call, an unsupported tool or a query with
+fewer than two useful terms, an absent LCM root, publication-lock contention,
+missing publication evidence, an unavailable or slow daemon (1.5 second wall
+deadline), and a malformed response. Any other backend publication error is
+rethrown so the CLI prints its fixed diagnostic and exits `1` with empty stdout;
+the tool call still runs.
+
+The request goes to `/prompt-search` with `recallMode: "pre-tool"`, which returns
+at most two results, never falls back to a cooled-down memory, and relaxes the
+minimum score by 0.5 for results that match every query term. Surfacing is logged like prompt recall.
+
 ## SessionSnapshot Hook
 
 **Command:** `lcm session-snapshot`
@@ -547,6 +587,86 @@ A `SubagentStop` payload without a valid `agent_id` or without
   reinforcement, so a pattern that several siblings repeat gains confidence
   faster than the same pattern repeated within one session. Promotion rules are
   unchanged.
+
+## Codex Interrupt and SessionEnd snapshots
+
+**Command:** `lcm session-snapshot --client codex --terminal`
+
+Codex runs this command on `Interrupt` (a user interrupt of a running turn) and
+`SessionEnd` (graceful session shutdown). Codex limits both events to three
+seconds, including its login shell, so the `--terminal` mode is a separate,
+read-only path. Unlike `Stop` and `PreCompact` it never bootstraps, starts or
+repairs a daemon, never rewrites hook settings, never touches the snapshot
+throttle cursor, and never compacts, promotes or marks the session complete. Its
+process-time budget is 1.5 seconds: payload read up to 200 ms (at most 1 MiB, EOF
+required), daemon verification up to 400 ms, the request until 1.35 seconds, and
+the remainder for the outcome diagnostic. `LCM_ENABLED=false` exits before the
+payload is read.
+
+**Stdin fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string | Session identifier |
+| `cwd` | string | Working directory |
+| `transcript_path` | string or null | Rollout path; must be a readable regular file, not a symbolic link |
+| `hook_event_name` | string | `"Interrupt"` or `"SessionEnd"`; any other value is logged as `TerminalSnapshot` |
+
+Other fields (for example `turn_id`, `model`, `permission_mode`, and the
+`reason` that `SessionEnd` carries) are ignored.
+
+After the preflight, the command verifies the running daemon without changing
+anything (PID file, exact loopback listener, authenticated health, version,
+storage backend, entrypoint, runtime digest, token) and passes the publication
+fence once. Any missing or mismatched evidence is a refusal, never a fallback to
+bootstrap. It then sends:
+
+```
+POST /ingest/terminal
+{ "session_id", "cwd", "transcript_path", "client": "codex", "event": "Interrupt" | "SessionEnd" }
+```
+
+Only HTTP 202 counts as accepted. Any other status is `ingest-failed`; a refused or
+unreachable connection is `daemon-unavailable`; an abort, timeout or reset after the
+request was sent is `unconfirmed`. Once 202 has been observed, a later local failure
+cannot change the outcome. The exit code is always `0`, stdout is always empty, and
+every outcome except accepted writes one line to `~/.lcm/logs/events.log` with the
+reason (`transcript-unavailable`, `invalid-input`, `daemon-unavailable`,
+`publication-refused`, `deadline-exhausted`, `ingest-failed`, `unconfirmed`).
+
+### POST /ingest/terminal
+
+Bearer-authenticated, like the other mutating routes; a daemon running without a
+token refuses it with 401. The route validates the body (`session_id`, an absolute
+existing `cwd`, a `transcript_path` that passes the ordinary transcript-path
+safety check and exists, `client: "codex"`), queues it and answers
+`202 {"accepted": true}` without waiting for publication or storage work.
+Malformed or unsafe requests receive 400; a ninth distinct (`cwd`, `session_id`),
+or a different transcript for a key that already has one waiting, receives 503; so
+does a daemon that is shutting down. It trusts any holder of the daemon token, as
+the other routes do.
+
+The queue runs one ingest at a time with the ordinary `/ingest` handler. A request
+for a key that is already running is kept as one pending request and re-run after
+the current one finishes, so the newest transcript tail is read; repeated requests
+combine. Each accepted request has an absolute 30 second cancellation deadline
+counted from acceptance, and daemon shutdown cancels it; both are best-effort
+cancellation, not a guarantee that the work stops at that instant. The daemon does
+not become idle while accepted work remains, and shutdown waits for the queue
+before it closes shared storage. The outcome of each deferred run (captured, no
+new observations, cancelled, blocked, failed or expired) is logged by the daemon
+as a short reason without request contents.
+
+If shutdown happens while a project's storage open is still pending, the shared
+storage factory can close before that open settles, so accepted work may be
+cancelled rather than committed (tracked in #1582).
+
+LCM adds no interruption marker of its own. A user-role `<turn_aborted>` marker that
+Codex wrote before the hook (only with `agent_interrupt_message_enabled` and not under
+multi-agent v2) is an ordinary parsed, searchable message. A developer-role marker
+and the `TurnAborted` event Codex emits after the hook are archived with the raw
+transcript only, the event by a later ingest. Without a marker an interrupted turn
+is indistinguishable from a completed one.
 
 ## Auto-heal
 

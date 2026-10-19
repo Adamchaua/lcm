@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
-import { lstatSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, win32 } from "node:path";
+import { isAbsolute, join, relative, win32 } from "node:path";
 import { Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -30,7 +30,9 @@ import {
   cleanupHarnessResources,
   completeSignalExit,
   createHarnessAllocationMarkerParser,
+  assertContainerEngineSupported,
   createCiRunnerContainerArgs,
+  createDatabaseContainerArgs,
   createHarnessCleanupOperations,
   createOwnerIdentity,
   createProcessLifecycle,
@@ -41,6 +43,7 @@ import {
   harnessErrorDetails,
   harnessDirectoryFromRecord,
   isValidProcessBirthFingerprint,
+  inspectedLabels,
   isMissingDockerObjectError,
   ownershipLabels,
   processIdentityEvidenceConsistent,
@@ -51,7 +54,9 @@ import {
   reclaimProvenOrphans,
   removeLabeled,
   removeOwnedResource,
+  resolveContainerEngine,
   resolveSignalProbeReadinessTimeout,
+  runHarness,
   runTests,
   resolveConfiguredTemplateArchive,
   runProcess,
@@ -62,6 +67,7 @@ import {
   validateRunNames,
   writeHarnessDiagnostic,
 } from "../../scripts/postgresql-harness.mjs";
+import { POSTGRES_TEMPLATE_MARKER } from "../../scripts/ci-environment.mjs";
 import { createTestTempDirectory } from "../../scripts/test-temp-root.mjs";
 import {
   createPostgresqlVitestConfiguration,
@@ -2772,7 +2778,7 @@ describe("PostgreSQL harness utilities", () => {
     expect(runs.map((run) => run.classification).sort()).toEqual(["ambiguous", "stale"]);
     expect(staleExists).toBe(false);
     expect(stderr.write).toHaveBeenCalledWith(
-      "PostgreSQL harness preserved 1 ambiguous labeled Docker run; manual reconciliation required.\n",
+      "PostgreSQL harness preserved 1 ambiguous labeled run; manual reconciliation required.\n",
     );
     expect(stderr.write.mock.calls.flat().join(" ")).not.toContain("permission denied");
   });
@@ -2920,21 +2926,11 @@ describe("PostgreSQL harness utilities", () => {
     expect(rules).toContain("test/postgresql/cached-run-init.sh text eol=lf");
   });
 
-  // runHarness has no injectable Docker seam, so inspect the database container's declared mounts.
-  it("relabels the database container's host bind mounts for SELinux", () => {
+  // runHarness has no injectable Docker seam, so inspect how it stages scripts and builds the mounts.
+  it("feeds the staged scripts, not checkout files, to the database container", () => {
     const source = readFileSync(new URL("../../scripts/postgresql-harness.mjs", import.meta.url), "utf8");
-    const start = source.indexOf("const containerArgs = [");
-    const end = source.indexOf("await setupDocker(containerArgs);");
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const mounts = [...source.slice(start, end).matchAll(/"--volume", `([^`]+)`/gu)].map((match) => match[1]);
-    expect(mounts).toEqual([
-      "${names.volume}:/var/lib/postgresql",
-      "${directory}:/run/lcm-harness:ro,z",
-      "${stagedScripts.cachedRunInitScript}:/run/lcm-cached-init.sh:ro,z",
-      "${stagedScripts.initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro,z",
-    ]);
     expect(source).toContain("const stagedScripts = stageHarnessScripts(directory);");
+    expect(source).toMatch(/createDatabaseContainerArgs\(\{[^}]*\bstagedScripts,/u);
   });
 
   it("stages byte-identical, readable init scripts in the run directory", () => {
@@ -3287,3 +3283,281 @@ describe("PostgreSQL harness utilities", () => {
     expect(sanitized).not.toContain(password);
   });
 });
+
+describe("PostgreSQL harness container engine selection", () => {
+  const owner = { pid: 42, birth: `linux:${testBootId}:123`, scope: testOwnerScope };
+  const stagedScripts = {
+    initScript: "/private/owned-harness/init.sh",
+    cachedRunInitScript: "/private/owned-harness/cached-run-init.sh",
+  };
+  const labelArguments = (runId: string, kind: string) => Object.entries(ownershipLabels(runId, kind, owner))
+    .flatMap(([key, value]) => ["--label", `${key}=${value}`]);
+
+  it("defaults to Docker and accepts only docker, podman or absolute executables", () => {
+    expect(resolveContainerEngine({})).toEqual({ cli: "docker", flavour: "docker" });
+    expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "docker" })).toEqual({ cli: "docker", flavour: "docker" });
+    expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "podman" })).toEqual({ cli: "podman", flavour: "podman" });
+    expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "/usr/bin/podman" }))
+      .toEqual({ cli: "/usr/bin/podman", flavour: "podman" });
+    expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "/opt/tools/docker" }))
+      .toEqual({ cli: "/opt/tools/docker", flavour: "docker" });
+    for (const rejected of [
+      "", "  ", "podman ", "bogus", "nerdctl", "./podman", "bin/podman", "/usr/bin/nerdctl", "/usr/bin/podman\0x",
+      "podman.exe", "/usr/bin/nerdctl.exe", "/usr/bin/.exe", "/usr/bin/podman.exe.bak", "/usr/bin/Podman",
+    ]) {
+      expect(() => resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: rejected }), JSON.stringify(rejected))
+        .toThrow("LCM_TEST_CONTAINER_CLI must be");
+    }
+  });
+
+  it("ignores a Windows .exe suffix on an absolute container CLI path", () => {
+    expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "/x/Podman.EXE" }))
+      .toEqual({ cli: "/x/Podman.EXE", flavour: "podman" });
+    expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "/x/docker.exe" }))
+      .toEqual({ cli: "/x/docker.exe", flavour: "docker" });
+  });
+
+  it("restricts Podman to local runs without a template archive", () => {
+    const podman = { cli: "podman", flavour: "podman" };
+    const docker = { cli: "docker", flavour: "docker" };
+    expect(() => assertContainerEngineSupported(podman, true, {})).toThrow("only local mode");
+    expect(() => assertContainerEngineSupported(podman, false, { LCM_POSTGRES_TEMPLATE_ARCHIVE: "/cache/t.tar" }))
+      .toThrow("LCM_POSTGRES_TEMPLATE_ARCHIVE");
+    expect(() => assertContainerEngineSupported(podman, false, { LCM_POSTGRES_TEMPLATE_ARCHIVE: "  " })).not.toThrow();
+    expect(() => assertContainerEngineSupported(podman, false, {})).not.toThrow();
+    expect(() => assertContainerEngineSupported(docker, true, { LCM_POSTGRES_TEMPLATE_ARCHIVE: "/cache/t.tar" }))
+      .not.toThrow();
+  });
+
+  it.each([
+    ["Podman in CI mode", { LCM_TEST_CONTAINER_CLI: "podman", GITHUB_ACTIONS: "true" }, undefined],
+    ["Podman with a template archive", { LCM_TEST_CONTAINER_CLI: "podman", LCM_POSTGRES_TEMPLATE_ARCHIVE: "/cache/t.tar" }, false],
+    ["an unknown CLI", { LCM_TEST_CONTAINER_CLI: "bogus" }, undefined],
+  ])("rejects %s before any marker, engine call or allocation", async (_label, environment, ci) => {
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.stubEnv("GITHUB_ACTIONS", "");
+    vi.stubEnv("LCM_POSTGRES_TEMPLATE_ARCHIVE", "");
+    for (const [key, value] of Object.entries(environment)) vi.stubEnv(key, value);
+    const afterRunAllocation = vi.fn();
+    try {
+      await expect(runHarness({ ci, afterRunAllocation })).rejects.toThrow();
+      expect(write.mock.calls.map(([chunk]) => String(chunk))).toEqual([
+        expect.stringContaining("PostgreSQL harness startup failed: "),
+      ]);
+      expect(write.mock.calls.join("")).not.toContain(HARNESS_ALLOCATION_MARKER);
+      expect(afterRunAllocation).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      write.mockRestore();
+    }
+  });
+
+  it.each(["docker", "podman"])(
+    "binds the real run directory into the %s database container",
+    async (flavour) => {
+      const scratch = mkdtempSync(join(tmpdir(), "lcm-postgresql-fake-cli-"));
+      const log = join(scratch, "calls.log");
+      const cli = join(scratch, flavour);
+      // A fake engine CLI: records every call, fails the database create, and reports
+      // every inspected object as missing so teardown completes without a real engine.
+      writeFileSync(cli, [
+        "#!/bin/bash",
+        "IFS=$'\\x1f'; echo \"$*\" >> '" + log + "'",
+        'case "$1:$2" in',
+        '  create:*) echo "stop at database create" >&2; exit 1;;',
+        '  container:inspect) echo "No such container: $3" >&2; exit 1;;',
+        '  network:inspect) echo "network $3 not found" >&2; exit 1;;',
+        '  volume:inspect) echo "get $3: no such volume" >&2; exit 1;;',
+        "esac",
+        "exit 0",
+        "",
+      ].join("\n"));
+      chmodSync(cli, 0o755);
+      const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      vi.stubEnv("GITHUB_ACTIONS", "");
+      vi.stubEnv("LCM_POSTGRES_TEMPLATE_ARCHIVE", "");
+      vi.stubEnv("LCM_TEST_CONTAINER_CLI", cli);
+      try {
+        await expect(runHarness({ ci: false })).rejects.toThrow();
+        const created = readFileSync(log, "utf8").split("\n").filter(Boolean)
+          .map((line) => line.split("\x1f")).filter((args) => args[0] === "create");
+        expect(created).toHaveLength(1);
+        const args = created[0];
+        const volumes = args.flatMap((value, index) => value === "--volume" ? [args[index + 1]] : []);
+        const label = flavour === "podman" ? "ro,Z" : "ro,z";
+        const runMount = volumes.find((volume) => volume.includes(":/run/lcm-harness:")) ?? "";
+        const directory = runMount.slice(0, runMount.indexOf(":/run/lcm-harness:"));
+        expect(directory).toMatch(/lcm-postgresql-harness-[A-Za-z0-9_-]+$/u);
+        expect(isAbsolute(directory)).toBe(true);
+        expect(volumes).toEqual([
+          expect.stringMatching(/^lcm-pg-data-[0-9a-f]+:\/var\/lib\/postgresql$/u),
+          `${directory}:/run/lcm-harness:${label}`,
+          `${directory}/cached-run-init.sh:/run/lcm-cached-init.sh:${label}`,
+          `${directory}/init.sh:/docker-entrypoint-initdb.d/10-lcm-harness.sh:${label}`,
+        ]);
+        expect(volumes.some((volume) => volume.startsWith("undefined"))).toBe(false);
+      } finally {
+        vi.unstubAllEnvs();
+        write.mockRestore();
+        rmSync(scratch, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("keeps the Docker database container arguments unchanged", () => {
+    const runId = "c".repeat(32);
+    const names = createRunNames(runId);
+    const directory = "/private/owned-harness";
+    const publish = ["--publish", "127.0.0.1::5432"];
+    const args = createDatabaseContainerArgs({
+      names, runId, owner, directory, stagedScripts, publish, usingCachedTemplate: false, flavour: "docker",
+    });
+    expect(args.slice(0, args.indexOf("--entrypoint"))).toEqual([
+      "create", "--name", names.container,
+      ...labelArguments(runId, "database"),
+      "--network", names.network,
+      "--network-alias", names.alias,
+      "--network-alias", names.wrongAlias,
+      ...publish,
+      "--env", `LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`,
+      "--volume", `${names.volume}:/var/lib/postgresql`,
+      // ",z" relabels for SELinux; the sources are harness-owned copies, never checkout files.
+      "--volume", `${directory}:/run/lcm-harness:ro,z`,
+      "--volume", `${directory}/cached-run-init.sh:/run/lcm-cached-init.sh:ro,z`,
+      "--volume", `${directory}/init.sh:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro,z`,
+      "--env", "POSTGRES_USER=lcm_harness_admin",
+      "--env", `POSTGRES_DB=${names.controlDatabase}`,
+      "--env", "POSTGRES_PASSWORD_FILE=/run/lcm-private/admin-password",
+      "--env", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+    ]);
+    const tail = args.slice(args.indexOf("--entrypoint"));
+    expect(tail.slice(0, 4)).toEqual(["--entrypoint", "/bin/bash", POSTGRES_IMAGE, "-ceu"]);
+    expect(tail).toHaveLength(5);
+    expect(tail[4]).toContain("exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on");
+  });
+
+  it("mounts only private relabelled sources under Podman", () => {
+    const runId = "d".repeat(32);
+    const names = createRunNames(runId);
+    const directory = "/private/owned-harness";
+    const build = (flavour: string, usingCachedTemplate: boolean) => createDatabaseContainerArgs({
+      names, runId, owner, directory, stagedScripts, publish: [], usingCachedTemplate, flavour,
+    });
+    const volumes = (args: string[]) => args.flatMap((value, index) => value === "--volume" ? [args[index + 1]] : []);
+
+    expect(volumes(build("podman", false))).toEqual([
+      `${names.volume}:/var/lib/postgresql`,
+      `${directory}:/run/lcm-harness:ro,Z`,
+      `${directory}/cached-run-init.sh:/run/lcm-cached-init.sh:ro,Z`,
+      `${directory}/init.sh:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro,Z`,
+    ]);
+    expect(build("podman", false).join("\n")).not.toContain(process.cwd());
+    expect(volumes(build("podman", true))).toEqual([
+      `${names.volume}:/var/lib/postgresql`,
+      `${directory}:/run/lcm-harness:ro,Z`,
+      `${directory}/cached-run-init.sh:/run/lcm-cached-init.sh:ro,Z`,
+    ]);
+    // Apart from the three bind sources and their modes the argv is identical.
+    const withoutVolumes = (args: string[]) => args.filter((value, index) => (
+      value !== "--volume" && args[index - 1] !== "--volume"
+    ));
+    expect(withoutVolumes(build("podman", false))).toEqual(withoutVolumes(build("docker", false)));
+  });
+
+  it("reads network labels reported in lowercase by Podman", async () => {
+    const runId = "e".repeat(32);
+    const names = createRunNames(runId);
+    const labels = ownershipLabels(runId, "network", owner);
+    expect(inspectedLabels("network", { labels })).toEqual(labels);
+    expect(inspectedLabels("network", { Labels: labels, labels: {} })).toEqual(labels);
+    expect(inspectedLabels("network", { Labels: null, labels })).toEqual(labels);
+    expect(inspectedLabels("network", {})).toEqual({});
+    expect(inspectedLabels("volume", { labels })).toEqual({});
+    expect(inspectedLabels("container", { Config: { Labels: labels } })).toEqual(labels);
+
+    const removed: string[][] = [];
+    const runner = vi.fn(async (args: string[]) => {
+      if (args[1] === "inspect") return { stdout: JSON.stringify([{ labels }]), stderr: "" };
+      removed.push(args);
+      return { stdout: "", stderr: "" };
+    });
+    await removeOwnedResource("network", names.network, labels, runner);
+    await removeLabeled("network", names.network, runId, runner);
+    expect(removed).toEqual([["network", "rm", names.network], ["network", "rm", names.network]]);
+
+    const unlabeledRunner = vi.fn(async () => ({ stdout: JSON.stringify([{ labels: {} }]), stderr: "" }));
+    await expect(removeOwnedResource("network", names.network, labels, unlabeledRunner))
+      .rejects.toThrow("changed PostgreSQL harness ownership");
+    await expect(removeLabeled("network", names.network, runId, unlabeledRunner))
+      .rejects.toThrow("refusing to remove unlabeled network");
+
+    const discover = (record: object) => discoverHarnessRuns({
+      dockerRunner: vi.fn(async (args: string[]) => {
+        if (args[1] === "ls") return { stdout: args[0] === "network" ? names.network : "", stderr: "" };
+        return { stdout: JSON.stringify([record]), stderr: "" };
+      }),
+      processProbe: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); },
+      readScope: () => testOwnerScope,
+    });
+    expect(await discover({ labels })).toMatchObject([{ runId, classification: "stale" }]);
+    expect(await discover({ labels: {} })).toMatchObject([{ classification: "ambiguous" }]);
+    expect(await discover({})).toMatchObject([{ classification: "ambiguous" }]);
+  });
+
+  it.each([
+    ["container", "no such container \"owned\""],
+    ["container", "no container with name or ID \"owned\" found: no such container"],
+    ["container", "no container with ID or name \"owned\" found: no such container"],
+    ["network", "network owned: unable to find network with name or ID owned: network not found"],
+    ["network", "unable to find network with name or ID owned: network not found"],
+    ["volume", "no such volume owned"],
+    ["volume", "no volume with name \"owned\" found: no such volume"],
+  ])("recognizes only the exact Podman %s absence diagnostic: %s", (type, diagnostic) => {
+    const failure = (stderr: string) => Object.assign(new Error("podman failed"), { code: 125, stdout: "[]\n", stderr });
+    expect(isMissingDockerObjectError(failure(`Error: ${diagnostic}\n`), type, "owned")).toBe(true);
+    expect(isMissingDockerObjectError(failure(`Error: ${diagnostic.replaceAll("owned", "other")}\n`), type, "owned")).toBe(false);
+    expect(isMissingDockerObjectError(failure(`Error: ${diagnostic}\nError: ${diagnostic}\n`), type, "owned")).toBe(false);
+    expect(isMissingDockerObjectError(failure(`Error: permission denied\nError: ${diagnostic}\n`), type, "owned")).toBe(false);
+    expect(isMissingDockerObjectError(failure(`Error: ${diagnostic} extra\n`), type, "owned")).toBe(false);
+  });
+
+  it("rejects nameless or mismatched-type Podman absence diagnostics", () => {
+    const failure = (stderr: string) => Object.assign(new Error("podman failed"), { code: 1, stdout: "", stderr });
+    expect(isMissingDockerObjectError(failure("Error: no such volume\n"), "volume", "owned")).toBe(false);
+    expect(isMissingDockerObjectError(failure("Error: no such volume owned\n"), "container", "owned")).toBe(false);
+    expect(isMissingDockerObjectError(failure("Error: no such container \"owned\"\n"), "network", "owned")).toBe(false);
+  });
+
+  it("routes default cleanup through the selected container runner", async () => {
+    const runId = "f".repeat(32);
+    const names = createRunNames(runId);
+    const calls: string[][] = [];
+    const runner = vi.fn(async (args: string[]) => {
+      calls.push(args);
+      const name = args[0] === "exec" ? args[1] : args[2];
+      throw Object.assign(new Error("podman failed"), {
+        code: 125,
+        stdout: "[]",
+        stderr: args[0] === "network"
+          ? `Error: network ${name}: unable to find network with name or ID ${name}: network not found\n`
+          : args[0] === "volume"
+            ? `Error: no such volume ${name}\n`
+            : `Error: no such container "${name}"\n`,
+      });
+    });
+    const removeDirectory = vi.fn();
+    await cleanupHarnessResources(
+      { names, runId, directory: "/private/harness", sentinelReady: true, owner },
+      { dockerRunner: runner, removeDirectory, retryDelays: [] },
+    );
+    expect(calls.map((args) => args.slice(0, 3))).toEqual([
+      ["container", "inspect", names.restore],
+      ["container", "inspect", names.runner],
+      ["exec", names.container, "psql"],
+      ["volume", "inspect", names.volume],
+      ["network", "inspect", names.network],
+    ]);
+    expect(removeDirectory).toHaveBeenCalledWith("/private/harness");
+  });
+});
+

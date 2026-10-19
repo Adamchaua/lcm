@@ -59,7 +59,7 @@ describe("in-place Codex hook merge", () => {
     expect(mergeCodexHooksContent(first)).toBe(first);
     const partial = JSON.stringify({ hooks: { PostToolUse: [{ matcher: "*", hooks: [lcm("lcm post-tool --client codex")] }], Stop: [] } });
     const result = JSON.parse(mergeCodexHooksContent(partial)).hooks;
-    expect(Object.keys(result)).toEqual(["PostToolUse", "Stop", "SessionStart", "UserPromptSubmit", "PreCompact", "SubagentStart", "SubagentStop"]);
+    expect(Object.keys(result)).toEqual(["PostToolUse", "Stop", "SessionStart", "UserPromptSubmit", "PreCompact", "SubagentStart", "SubagentStop", "Interrupt", "SessionEnd"]);
     expect(result.Stop).toEqual(codexLcmHooks().Stop);
     expect(JSON.parse(mergeCodexHooksContent(first, "mcp")).hooks.UserPromptSubmit[0].hooks[0].command)
       .toBe("lcm user-prompt --client codex --transport mcp");
@@ -152,6 +152,57 @@ describe("in-place Codex hook merge", () => {
     ]);
     const noMatcher: Record<string, CodexHookGroup[]> = { Stop: [{ hooks: [lcm("lcm restore --client codex")] }] };
     expect(JSON.parse(planCodexHooksMerge("", "cli", noMatcher).content).hooks.Stop).toEqual([{ hooks: [lcm("lcm restore --client codex")] }]);
+  });
+});
+
+describe("opt-in PreToolUse hook in the in-place merge", () => {
+  const enabled = { preToolRecall: true };
+  const mergeWith = (hooks: unknown, options: { preToolRecall?: boolean } = enabled) =>
+    JSON.parse(mergeCodexHooksContent(JSON.stringify({ hooks }), "cli", options)).hooks as Record<string, any[]>;
+  const preTool = () => codexLcmHooks("cli", enabled).PreToolUse[0];
+
+  it("identifies the pre-tool role", () => {
+    expect(codexLcmHookRole("lcm pre-tool --client codex")).toBe("pre-tool");
+  });
+
+  it("appends the group after a user's own PreToolUse group without moving it, idempotently", () => {
+    const userGroup = { matcher: "Bash", hooks: [foreign("guard")] };
+    const first = mergeWith({ PreToolUse: [userGroup] });
+    expect(first.PreToolUse).toEqual([userGroup, preTool()]);
+    const again = mergeCodexHooksContent(JSON.stringify({ hooks: first }), "cli", enabled);
+    expect(JSON.parse(again).hooks.PreToolUse).toEqual([userGroup, preTool()]);
+    expect(mergeCodexHooksContent(again, "cli", enabled)).toBe(again);
+  });
+
+  it("keeps an installed group at its slot and replaces its definition in place", () => {
+    const hooks = mergeWith({
+      PreToolUse: [
+        { hooks: [foreign("first")] },
+        { matcher: "old", hooks: [lcm("lcm pre-tool --client codex", { timeout: 99 })] },
+        { hooks: [foreign("last")] },
+      ],
+    });
+    expect(hooks.PreToolUse.map((group) => group.hooks[0].command)).toEqual(["echo first", "lcm pre-tool --client codex", "echo last"]);
+    expect(hooks.PreToolUse[1]).toEqual(preTool());
+  });
+
+  it("removes the group on disable when it is the last one and refuses when a later group would move", () => {
+    const withLcm = mergeWith({ PreToolUse: [{ hooks: [foreign("mine")] }] });
+    expect(mergeWith(withLcm, {}).PreToolUse).toEqual([{ hooks: [foreign("mine")] }]);
+    expect(mergeWith(withLcm, { preToolRecall: false }).PreToolUse).toEqual([{ hooks: [foreign("mine")] }]);
+    expect("PreToolUse" in mergeWith(mergeWith({}), {})).toBe(false);
+
+    const later = JSON.stringify({ hooks: { PreToolUse: [preTool(), { hooks: [foreign("after")] }] } });
+    expect(() => mergeCodexHooksContent(later, "cli")).toThrow("LCM cannot update PreToolUse (a later hook would change position)");
+    expect(planCodexHooksInstall(later, "").refusal).toContain("a later hook would change position");
+    expect(JSON.parse(mergeCodexHooksContent(later, "cli", enabled)).hooks.PreToolUse).toHaveLength(2);
+  });
+
+  it("threads the option through the install plan and never through the legacy helper", () => {
+    expect(JSON.parse(planCodexHooksInstall("", "", "cli").hooksContent).hooks).not.toHaveProperty("PreToolUse");
+    expect(JSON.parse(planCodexHooksInstall("", "", "cli", enabled).hooksContent).hooks.PreToolUse).toEqual([preTool()]);
+    const custom = { Stop: codexLcmHooks().Stop };
+    expect(JSON.parse(planCodexHooksInstall("", "", "cli", { preToolRecall: true, expected: custom }).hooksContent).hooks).toEqual(custom);
   });
 });
 

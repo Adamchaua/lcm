@@ -204,7 +204,7 @@ export type DaemonConfig = {
   };
   summarizer: { mock: boolean };
   security: SecurityConfig;
-  hooks: { snapshotIntervalSec: number; disableAutoCompact: boolean };
+  hooks: { snapshotIntervalSec: number; disableAutoCompact: boolean; preToolRecall: boolean };
 };
 
 export type DaemonConfigSnapshotWitness = Readonly<{
@@ -298,7 +298,7 @@ const DEFAULTS: DaemonConfigDefaults = {
   security: {
     sensitivePatterns: [],
   },
-  hooks: { snapshotIntervalSec: 60, disableAutoCompact: false },
+  hooks: { snapshotIntervalSec: 60, disableAutoCompact: false, preToolRecall: false },
 };
 
 const DENIED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -885,7 +885,7 @@ const RESTORATION_KEYS = new Set([
 ]);
 const SUMMARIZER_KEYS = new Set(["mock"]);
 const SECURITY_KEYS = new Set(["sensitivePatterns", "notify_on_filter"]);
-const HOOK_KEYS = new Set(["snapshotIntervalSec", "disableAutoCompact"]);
+const HOOK_KEYS = new Set(["snapshotIntervalSec", "disableAutoCompact", "preToolRecall"]);
 const STORAGE_KEYS = new Set(["backend", "postgresql"]);
 const POSTGRESQL_STORAGE_KEYS = new Set([
   "poolMax",
@@ -1055,6 +1055,7 @@ function validateKnownConfigSections(
     rejectUnknownKeys(hooks, "hooks", HOOK_KEYS);
     validateOptionalInteger(hooks, "snapshotIntervalSec", "hooks");
     validateOptionalBoolean(hooks, "disableAutoCompact", "hooks");
+    validateOptionalBoolean(hooks, "preToolRecall", "hooks");
   }
 }
 
