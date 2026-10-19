@@ -1242,13 +1242,19 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   // admission policy. SessionStart bootstrap and installation own legacy-root
   // migration, so the global preflight must not turn publication-lock
   // contention into a hook failure before the handler runs.
+  // A bare `lcm compact` is the legacy PreCompact hook command; with
+  // LCM_ENABLED=false it is skipped by its action, so it must not run the
+  // preflight either.
   if (topLevel && (
     action === "post-tool"
     || action === "restore"
     || action === "session-end"
     || action === "session-snapshot"
     || action === "user-prompt"
-    || (action === "compact" && actionCommand.opts<{ hook?: boolean }>().hook === true)
+    || (action === "compact" && (
+      actionCommand.opts<{ hook?: boolean }>().hook === true
+      || !resolveLcmConfig(process.env).enabled
+    ))
   )) return false;
   if (topLevel && action === "status") return false;
   if (topLevel && (action === "stats" || action === "doctor")) return false;

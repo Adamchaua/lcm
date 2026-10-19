@@ -902,6 +902,23 @@ describe("runCli lifecycle and connector boundaries", () => {
         expect(state.ensureDaemon).toHaveBeenCalled();
       },
     );
+
+    it("skips the global migration preflight for bare compact when LCM_ENABLED=false", async () => {
+      vi.stubEnv("LCM_ENABLED", "false");
+      vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+      await expect(invoke(["compact"])).resolves.toBeUndefined();
+
+      expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    });
+
+    it("keeps the global migration preflight for bare compact when LCM_ENABLED is unset", async () => {
+      vi.stubEnv("LCM_ENABLED", undefined);
+
+      await expect(invoke(["compact"])).resolves.toBeUndefined();
+
+      expect(state.migrateLegacyHome).toHaveBeenCalled();
+    });
   });
 
   it("forwards synchronous compact discovery and session events to the ninja renderer", async () => {
