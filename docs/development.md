@@ -93,7 +93,8 @@ TypeScript file; `pnpm run test:ci` reproduces that gate locally. Do not
 exclude files or skip tests to meet it. PostgreSQL integration files run only
 through `pnpm run test:postgresql`; see
 [PostgreSQL development](../src/storage/postgresql/reference/postgresql-development.md)
-for the isolated container prerequisites and lifecycle.
+for the isolated container prerequisites and lifecycle, including running the
+local harness with rootless Podman (`LCM_TEST_CONTAINER_CLI=podman`).
 
 ## Continuous integration
 
