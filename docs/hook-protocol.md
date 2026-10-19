@@ -435,27 +435,22 @@ The native `apply_patch`, `spawn_agent` (reported as
 unchanged and produce bounded file, dispatch, decision, and plan events. See
 [Codex native activity](passive-learning.md#codex-native-activity).
 
-`lcm connectors doctor codex` performs two checks for the targeted Codex
-connector. It first verifies the exact structural hook contract above. Only
-when that check passes does it run the native-exec functional probe. The probe
-checks a current `Bash` payload with a textual result (an unknown-outcome
-observation) and a legacy alias with a structured status. It is pure and
-in-memory: it exercises normalization and extraction without
-invoking the PostToolUse handler, opening an EventsDb, appending sidecar
-events, writing hook files, or creating a database. A structurally absent or
-incomplete hook never reports functional success; its functional result is
-reported as:
+`lcm connectors doctor codex` reports the readiness of every LCM Codex hook from the
+base user `hooks.json` and `config.toml` (enabled, trusted, modified, missing, and so
+on; see [Codex hook readiness](vscode-codex.md#codex-hook-readiness)). That check
+is static and writes nothing. It then runs a pure, in-memory fixture self-test of
+native-exec normalization and extraction. The self-test checks a current `Bash`
+payload with a textual result (an unknown-outcome observation) and a legacy alias
+with a structured status. It does not invoke the PostToolUse handler, open an
+EventsDb, append sidecar events, write hook files, or create a database:
 
 ```text
-Codex: native exec capture functional check skipped
+✓ Codex: native exec normalization self-test passed (fixtures only; not proof of runtime execution)
 ```
 
-When the exact structure and the pure probe both pass, doctor reports:
-
-```text
-✓ Codex: PostToolUse hook installed
-✓ Codex: native exec capture functional
-```
+The self-test is independent of installation state and of readiness; it never
+substitutes for the readiness report, and neither proves that Codex executed a
+hook.
 
 ## SessionSnapshot Hook
 

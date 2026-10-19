@@ -140,6 +140,68 @@ lcm connectors install codex --global
 lcm connectors doctor codex --global
 ```
 
+### Codex hook readiness
+
+Installing the hooks is not enough for Codex to run them. Codex keeps a
+per-hook enabled flag and a trust record in its user `config.toml`
+(`[hooks.state."<hooks.json path>:<event>:<group>:<handler>"]`), and it runs a
+user hook only while that hook is enabled and trusted. `lcm connectors doctor codex`
+(or the same command with `--global`) reads `~/.codex/hooks.json` and
+`~/.codex/config.toml` without writing and reports, for each LCM hook, whether
+Codex can actually run it. The report appears when you name the agent
+(`lcm connectors doctor codex`); a bare `lcm connectors doctor` does not run it.
+
+| Status | Meaning | What to do |
+|---|---|---|
+| ready | Enabled and trusted in the base user config. This is a static check. | Nothing |
+| missing | The hook is not in `hooks.json`. | `lcm connectors install codex --global` |
+| disabled | You disabled the hook in Codex. LCM never changes this and install preserves it. | Re-enable it in Codex `/hooks` to restore the capability |
+| untrusted | Codex has no trust record for the hook yet, so it does not run. | Review and trust it in Codex `/hooks` |
+| modified | The hook definition differs from the one you trusted, so Codex requires a new review. | Review and trust it again in Codex `/hooks` |
+| state unknown | `config.toml` is not valid TOML, or its hook state uses a form LCM cannot read. | Check Codex `/hooks` |
+| feature disabled | `[features] hooks` is `false`; no LCM lifecycle hook can run. LCM leaves your setting unchanged. | Enable the feature if you want LCM hooks |
+| hooks file unreadable | `hooks.json` is unreadable or does not match the schema Codex expects. | Fix the file or reinstall |
+| failing / degraded | A recent LCM-local observation (below) shows a nonzero exit, a thrown error, or logged hook errors. | Run `lcm doctor` and check `~/.lcm/logs/events.log` |
+
+When several statuses apply, the first of these wins: hooks file unreadable,
+feature disabled, missing, state unknown, disabled, untrusted, modified,
+failing, degraded, ready. Doctor exits non-zero for every status except ready
+and degraded. It also compares the codex CLI on `PATH` with the minimum supported
+version (0.163.0); desktop and IDE builds may differ, and an unavailable CLI is
+a warning. A hook whose installed definition no longer matches the current LCM
+definition is flagged with a reinstall hint. Reinstalling changes that
+definition, so Codex asks you to trust the hook again.
+
+Doctor checks only the base user config. Profile layers, session flags,
+managed requirements, and Codex launched with hook-trust bypass are not
+visible to it, so a ready hook is not a guarantee that Codex ran it. Doctor is
+stricter than Codex about `hooks.json`: Codex ignores an unreadable file with a
+warning, while doctor reports it.
+
+Reinstalling LCM hooks keeps your per-hook choices. Because Codex keys the
+enabled flag and trust record by position, `lcm connectors install codex`
+replaces each LCM hook in the exact position it already occupies and appends
+only hooks that are missing. It never writes `[hooks.state]`. If an update would
+move another hook (duplicate LCM hooks for one event, or a matcher change in a
+group that also holds other hooks), install stops before writing either file
+and explains how to proceed. An explicit `[features] hooks = false` is left
+as you set it, and install says so. Install ends with a reminder to open Codex
+`/hooks` and trust the LCM hooks.
+
+When Codex runs an LCM hook, LCM also persists the outcome of a completed run
+for each event under `~/.lcm/state/codex-hooks/` (outcome and time only, no
+payload). Doctor shows it as a *last persisted LCM-local observation* and
+treats it as unauthenticated: it can mark a hook failing or degraded, but never
+promotes a hook to ready. It is the last record that was persisted, not
+necessarily the latest run: to keep the PostToolUse path cheap, a run whose
+outcome matches the stored one (for example exit code 0 again) is not written
+again within 60 seconds, and runs that overlap are not ordered. Runs that Codex
+times out or kills, hooks that Codex does not run because they are disabled or
+untrusted, and silent fail-open returns leave no record. Records older than 30
+days, older than the last change to `hooks.json`, or dated more than five
+minutes in the future (clock skew) are ignored. Doctor does not establish that
+hooks work at runtime.
+
 ### Memory after compaction and in forked conversations
 
 Codex drops hook-injected context when it compacts a conversation, and a forked
@@ -193,13 +255,11 @@ matcher:
 }
 ```
 
-`lcm connectors doctor codex` (or the same command with `--global`) verifies
-that structure in the canonical Codex hook file. It then runs a pure,
-no-write functional check over representative native payloads. The check does
-not run the hook handler, write hook files, create an event database, open an
-EventsDb, or append sidecar events. If the structure is absent or incomplete,
-doctor prints `Codex: native exec capture functional check skipped` and does
-not claim functional health.
+The doctor's capture self-test runs a pure, no-write check over representative
+native payloads. It does not run the hook handler, write hook files, create an
+event database, open an EventsDb, or append sidecar events, and it reports
+`native exec normalization self-test passed (fixtures only; not proof of runtime execution)`.
+It does not show that Codex runs the hook; that is the readiness report above.
 
 Codex capture is deliberately narrow. Current Codex reports shell commands
 (`exec_command` and the `write_stdin` polls that finish them) to hooks as the

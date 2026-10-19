@@ -66,12 +66,6 @@ describe("Codex hook configuration boundaries", () => {
   it("sets the feature in empty, absent, existing, and section-delimited configs", () => {
     expect(setCodexHooksFeature("\r\n")).toBe("[features]\nhooks = true\n");
     expect(setCodexHooksFeature("model = 'x'\n")).toContain("\n\n[features]\nhooks = true\n");
-    expect(setCodexHooksFeature("[features]\nhooks = false\n[other]\nx = 1\n"))
-      .toBe("[features]\nhooks = true\n[other]\nx = 1\n");
-    expect(setCodexHooksFeature("[features] # settings\ncodex_hooks = true\nhooks = false\n"))
-      .toBe("[features] # settings\nhooks = true\n");
-    expect(setCodexHooksFeature("[features]\nhooks = false\ncodex_hooks = true\n"))
-      .toBe("[features]\nhooks = true\n");
     expect(setCodexHooksFeature("[features]\nvalue = 1\n[other]\nx = 1\n"))
       .toBe("[features]\nvalue = 1\nhooks = true\n[other]\nx = 1\n");
   });
@@ -114,12 +108,11 @@ describe("Codex hook configuration boundaries", () => {
     expect(sessionStart[0].matcher).toBe("startup|resume|clear|compact|fork");
   });
 
-  it("stamps only UserPromptSubmit and converges legacy or stamped prompt hooks", () => {
+  it("stamps only UserPromptSubmit and converges a legacy prompt hook in place", () => {
     writeFileSync(hooksPath, JSON.stringify({
       hooks: {
         UserPromptSubmit: [{ hooks: [
           { type: "command", command: "lcm user-prompt --client codex" },
-          { type: "command", command: "lcm user-prompt --client codex --transport mcp" },
           { type: "command", command: "lcm user-prompt --client codex --transport invalid" },
         ] }],
       },
@@ -127,7 +120,7 @@ describe("Codex hook configuration boundaries", () => {
     installCodexHooks(hooksPath, configPath);
     const result = JSON.parse(readFileSync(hooksPath, "utf-8"));
     const commands = result.hooks.UserPromptSubmit.flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
-    expect(commands).toEqual(["lcm user-prompt --client codex --transport invalid", "lcm user-prompt --client codex --transport cli"]);
+    expect(commands).toEqual(["lcm user-prompt --client codex --transport cli", "lcm user-prompt --client codex --transport invalid"]);
     expect(result.hooks.PostToolUse[0].hooks[0].command).toBe("lcm post-tool --client codex");
   });
 

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { ConfigValidationError, type DaemonConfig } from "../../src/daemon/config.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { StorageIdentityConfigurationError, TransportedUnboundProjectError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
@@ -105,12 +105,9 @@ const state = vi.hoisted(() => ({
   listConnectorInventory: vi.fn(() => ({ installed: state.installed, codexMcp: state.codexMcpInspection })),
   installConnector: vi.fn(() => state.installResult),
   removeConnector: vi.fn(() => state.removeResult),
-  inspectCodexPostToolHook: vi.fn(() => ({
-    path: "/home/test/.codex/hooks.json",
-    state: "installed",
-    structural: true,
-  })),
-  resolveCodexHooksPath: vi.fn(() => "/home/test/.codex/hooks.json"),
+  runCodexReadinessCheck: vi.fn((_options: unknown) => ({ lines: ["  ✓ Codex: readiness line"], failures: 0 })),
+  runObservedCodexHook: vi.fn(async (_hook: unknown, run: () => Promise<unknown>) => run()),
+  probeCodexCliVersion: vi.fn(() => ({ state: "found", raw: "codex-cli 0.163.0" })),
   codexPostToolFunctionalCoverage: vi.fn(() => true),
   registerMachine: vi.fn(),
   showMachine: vi.fn(),
@@ -330,10 +327,13 @@ vi.mock("../../src/connectors/installer.js", () => ({
   listConnectorInventory: vi.fn(() => ({ installed: state.installed, codexMcp: state.codexMcpInspection })),
   installConnector: state.installConnector,
   removeConnector: state.removeConnector,
+  probeCodexCliVersion: state.probeCodexCliVersion,
 }));
-vi.mock("../../src/connectors/codex-hooks.js", () => ({
-  inspectCodexPostToolHook: state.inspectCodexPostToolHook,
-  resolveCodexHooksPath: state.resolveCodexHooksPath,
+vi.mock("../../src/connectors/codex-readiness.js", () => ({
+  runCodexReadinessCheck: state.runCodexReadinessCheck,
+}));
+vi.mock("../../src/hooks/codex-hook-receipts.js", () => ({
+  runObservedCodexHook: state.runObservedCodexHook,
 }));
 vi.mock("../../src/hooks/post-tool-normalization.js", () => ({
   codexPostToolFunctionalCoverage: state.codexPostToolFunctionalCoverage,
@@ -504,12 +504,8 @@ beforeEach(() => {
   state.storedCodexTransport = undefined;
   state.installResult = { path: "/connector", requiresRestart: false };
   state.removeResult = true;
-  state.inspectCodexPostToolHook.mockReturnValue({
-    path: "/home/test/.codex/hooks.json",
-    state: "installed",
-    structural: true,
-  });
-  state.resolveCodexHooksPath.mockReturnValue("/home/test/.codex/hooks.json");
+  state.runCodexReadinessCheck.mockClear();
+  state.runObservedCodexHook.mockClear();
   state.codexPostToolFunctionalCoverage.mockReturnValue(true);
   state.provider = "openai";
   state.entries = [];
@@ -2749,67 +2745,94 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(migrate).not.toHaveBeenCalled();
   });
 
-  it("reports exact Codex structure and functional capture health", async () => {
+  it("prints Codex readiness, then the fixture-only self-test, for an explicit codex doctor", async () => {
     state.installed = [{ agentId: "codex", type: "hook", path: "/partial/hooks.json" }];
-    state.inspectCodexPostToolHook.mockReturnValue({
-      path: "/home/test/.codex/hooks.json",
-      state: "installed",
-      structural: true,
-    });
     state.codexPostToolFunctionalCoverage.mockReturnValue(true);
+    state.storedCodexTransport = "mcp";
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
 
     expect(await invoke(["connectors", "doctor", "codex", "--global"])).toBeUndefined();
-    expect(state.resolveCodexHooksPath).toHaveBeenCalledWith(expect.any(String));
-    expect(state.inspectCodexPostToolHook).toHaveBeenCalledWith("/home/test/.codex/hooks.json");
-    expect(state.codexPostToolFunctionalCoverage).toHaveBeenCalledOnce();
-    expect(log.mock.calls.flat().join("\n")).toContain("✓ Codex: PostToolUse hook installed");
-    expect(log.mock.calls.flat().join("\n")).toContain("✓ Codex: native exec capture functional");
+    const options = state.runCodexReadinessCheck.mock.calls[0][0] as {
+      homeDir: string;
+      probeVersion: () => unknown;
+      readStoredTransport: () => unknown;
+    };
+    expect(options.homeDir).toBe(homedir());
+    expect(options.probeVersion()).toEqual({ state: "found", raw: "codex-cli 0.163.0" });
+    expect(options.readStoredTransport()).toBe("mcp");
+    const output = log.mock.calls.flat().join("\n");
+    expect(output).toContain("✓ Codex: readiness line");
+    expect(output).toContain("✓ Codex: native exec normalization self-test passed (fixtures only; not proof of runtime execution)");
+    expect(output).not.toContain("native exec capture functional");
     expect(state.dispatchHook).not.toHaveBeenCalled();
   });
 
-  it("skips the pure functional check when Codex structure is incomplete", async () => {
+  it("does not run the Codex readiness check for a bare connectors doctor", async () => {
     state.installed = [{ agentId: "codex", type: "hook", path: "/partial/hooks.json" }];
-    state.inspectCodexPostToolHook.mockReturnValue({
-      path: "/home/test/.codex/hooks.json",
-      state: "incomplete",
-      structural: false,
-    });
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    expect(await invoke(["connectors", "doctor"])).toBeUndefined();
+    expect(state.runCodexReadinessCheck).not.toHaveBeenCalled();
+  });
+
+  it("counts readiness failures and still runs the self-test independently", async () => {
+    state.runCodexReadinessCheck.mockReturnValueOnce({ lines: ["  ✗ Codex: SessionStart hook missing"], failures: 2 });
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
 
     expect((await invoke(["connectors", "doctor", "codex"]))?.message).toBe("exit:1");
-    expect(state.codexPostToolFunctionalCoverage).not.toHaveBeenCalled();
-    expect(log.mock.calls.flat().join("\n")).toContain("Codex: native exec capture functional check skipped");
+    expect(state.codexPostToolFunctionalCoverage).toHaveBeenCalledOnce();
+    expect(log.mock.calls.flat().join("\n")).toContain("✗ Codex: SessionStart hook missing");
   });
 
-  it("aggregates a nonfunctional Codex result and exits after printing the failure", async () => {
-    state.installed = [{ agentId: "codex", type: "hook", path: "/hooks.json" }];
-    state.inspectCodexPostToolHook.mockReturnValue({
-      path: "/home/test/.codex/hooks.json",
-      state: "installed",
-      structural: true,
-    });
-    state.codexPostToolFunctionalCoverage.mockReturnValue(false);
+  it("fails the doctor when the fixture self-test fails or throws", async () => {
+    state.codexPostToolFunctionalCoverage.mockReturnValueOnce(false);
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
-
     expect((await invoke(["connectors", "doctor", "codex"]))?.message).toBe("exit:1");
-    expect(log.mock.calls.flat().join("\n")).toContain("✗ Codex: native exec capture functional");
-  });
+    expect(log.mock.calls.flat().join("\n")).toContain("✗ Codex: native exec normalization self-test failed (fixtures only)");
 
-  it("fails closed when the pure Codex functional probe throws", async () => {
-    state.installed = [{ agentId: "codex", type: "hook", path: "/hooks.json" }];
-    state.inspectCodexPostToolHook.mockReturnValue({
-      path: "/home/test/.codex/hooks.json",
-      state: "installed",
-      structural: true,
-    });
     state.codexPostToolFunctionalCoverage.mockImplementationOnce(() => {
       throw new Error("probe failed");
     });
+    expect((await invoke(["connectors", "doctor", "codex"]))?.message).toBe("exit:1");
+  });
+
+  it.each([
+    [["restore", "--client", "codex"], "restore", true],
+    [["user-prompt", "--client", "codex", "--transport", "cli"], "user-prompt", true],
+    [["post-tool", "--client", "codex"], "post-tool", true],
+    [["session-snapshot", "--client", "codex"], "session-snapshot", true],
+    [["session-end", "--client", "codex"], "session-end", false],
+    [["restore", "--client", "claude"], "restore", false],
+    [["restore"], "restore", false],
+  ] as const)("records Codex completion observations only for observed hooks %j", async (args, hook, observed) => {
+    fakeStdin.isTTY = false;
+    fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
+      if (event === "data") queueMicrotask(() => callback(Buffer.from(JSON.stringify({ session_id: "s", hook_event_name: "SessionStart" }))));
+      if (event === "end") queueMicrotask(() => callback());
+      return fakeStdin;
+    });
+
+    expect((await invoke([...args]))?.message).toBe("exit:0");
+    if (observed) {
+      expect(state.runObservedCodexHook).toHaveBeenCalledWith(
+        { client: "codex", command: hook, stdinText: expect.stringContaining("SessionStart") },
+        expect.any(Function),
+      );
+    } else {
+      expect(state.runObservedCodexHook).not.toHaveBeenCalled();
+    }
+    expect(state.dispatchHook).toHaveBeenCalledOnce();
+  });
+
+  it("prints connector install notices after the success lines", async () => {
+    state.installResult = { path: "/connector", requiresRestart: true, notices: ["first notice", "Open Codex /hooks to trust"] };
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
 
-    expect((await invoke(["connectors", "doctor", "codex"]))?.message).toBe("exit:1");
-    expect(log.mock.calls.flat().join("\n")).toContain("✗ Codex: native exec capture functional");
+    expect(await invoke(["connectors", "install", "codex", "--global"])).toBeUndefined();
+    const output = log.mock.calls.flat().join("\n");
+    expect(output).toContain("Restart the agent to activate.");
+    expect(output).toContain("    first notice");
+    expect(output).toContain("    Open Codex /hooks to trust");
   });
 
   it("covers daemon start and restart outcomes", async () => {
