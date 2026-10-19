@@ -578,9 +578,12 @@ describe("POST /prompt-search", () => {
     const db = new DatabaseSync(dbPath);
     runLcmMigrations(db);
     const store = new PromotedStore(db);
-    const firstId = store.insert({ content: "Use Bun scripts for local automation and CI wrappers", tags: ["workflow"], projectId: "p1" });
-    const secondId = store.insert({ content: "Use Bun scripts for local automation and CI wrappers with small wrappers", tags: ["workflow"], projectId: "p1" });
-    const thirdId = store.insert({ content: "Bun scripts wrap local automation and CI tasks", tags: ["workflow"], projectId: "p1" });
+    // Identical timestamps plus descending confidence make confidence the deterministic tie-breaker, so firstId always outranks secondId.
+    const firstId = store.insert({ content: "Use Bun scripts for local automation and CI wrappers", tags: ["workflow"], projectId: "p1", confidence: 0.9 });
+    const secondId = store.insert({ content: "Use Bun scripts for local automation and CI wrappers with small wrappers", tags: ["workflow"], projectId: "p1", confidence: 0.8 });
+    const thirdId = store.insert({ content: "Bun scripts wrap local automation and CI tasks", tags: ["workflow"], projectId: "p1", confidence: 0.7 });
+    const createdAt = new Date().toISOString().slice(0, 19).replace("T", " ");
+    db.prepare("UPDATE promoted SET created_at = ? WHERE id IN (?, ?, ?)").run(createdAt, firstId, secondId, thirdId);
     db.close();
 
     const config = loadDaemonConfig("/nonexistent");
