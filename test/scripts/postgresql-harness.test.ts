@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, win32 } from "node:path";
+import { join, relative, win32 } from "node:path";
 import { Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -1090,7 +1090,11 @@ describe("PostgreSQL harness utilities", () => {
     expect(first).toMatch(new RegExp(`${firstRunId}$`, "u"));
     expect(second).toMatch(new RegExp(`${secondRunId}$`, "u"));
     expect(fallback).toMatch(/vitest-lcm-postgresql-cache\/process-73$/u);
-    expect(fallback).not.toContain("shared");
+    const namespace = (cacheDir: string): string => relative(tmpdir(), cacheDir);
+    expect(namespace(first)).toBe(join("vitest-lcm-postgresql-cache", firstRunId));
+    expect(namespace(second)).toBe(join("vitest-lcm-postgresql-cache", secondRunId));
+    expect(namespace(fallback)).toBe(join("vitest-lcm-postgresql-cache", "process-73"));
+    expect(namespace(fallback)).not.toContain("shared");
   });
 
   it("runs local PostgreSQL tests without entering the Docker runner path", async () => {
