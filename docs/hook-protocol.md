@@ -570,3 +570,15 @@ this is not a new total-size or execution-time limit.
 
 Previously retained ingest errors remain in diagnostic history. This repair does
 not remove historical errors or change their retention period.
+
+A native transcript linkage failure now logs the condition code and the source
+ordinal of the failing record, for example `native transcript message linkage
+failed: content-mismatch at source ordinal 12 (session sequence 9)`. The
+session sequence appears for exact lookup misses. The codes are
+`session-not-found`, `invalid-session-snapshot`, `sequence-out-of-range`,
+`role-mismatch`, `content-mismatch`, `invalid-input`, and `unresolved` for exact
+misses, plus `unsupported-pending-after-quarantine`,
+`ambiguous-pending-match`, and `unmatched-pending-window` after quarantined
+records. The added text contains no transcript content; the error-log row still
+carries the session ID and working directory as before. Older rows keep the
+previous fixed sentence.
