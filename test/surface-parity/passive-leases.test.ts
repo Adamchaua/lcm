@@ -59,6 +59,11 @@ describe("surface parity passive replication lease exemption", () => {
       .toThrow("surface-parity-parent:passive-replication-lease-shape");
   });
 
+  it("reports a held lease whose project was exempt before as held, not vanished", () => {
+    expect(() => partitionFencedLeases([passive({ released_at: null })], { ...authority, previous: [primary] }))
+      .toThrow("surface-parity-parent:passive-replication-lease-held");
+  });
+
   it.each([
     ["unbound project", { project_id: foreignProject }],
     ["foreign machine", { resource_key: foreignMachine, owner_machine_id: foreignMachine }],

@@ -23,6 +23,7 @@ import { isolateAsyncBoundary } from '../../surface-parity/async-isolation.mjs';
 import { classifyHomeParent, parseHomeParentWitness, witnessPayload } from '../../../dist/src/home-parent-auth.js';
 import { readBoundedRegularFileWithStat } from '../../../dist/src/security-files.js';
 import { semanticDigest } from '../../surface-parity/assertions.mjs';
+import { HELD_LEASE_SETTLE_MS } from '../../surface-parity/passive-leases.mjs';
 import { assertRestartSnapshotUnchanged } from '../../surface-parity/restart-snapshot.mjs';
 import { invokeAfterConsumerAdmission } from '../../surface-parity/mcp-readiness.mjs';
 import { collectEventSidecars } from '../../../dist/src/db/event-sidecars.js';
@@ -228,12 +229,18 @@ async function readProject(id, callback) {
   });
 }
 
-function admin(action, payload = {}) {
+// Deadline for an admin action. Actions that run the parent's snapshot() ('snapshot',
+// 'prepared-projects.begin', 'prepared-projects.finish') may first wait out a held fixture
+// lease for up to settleHeldLeases' default (HELD_LEASE_SETTLE_MS = 30000) and then complete
+// a full snapshot read (15000), so they get SNAPSHOT_ADMIN_TIMEOUT_MS = 45000.
+const ADMIN_TIMEOUT_MS = 15000;
+const SNAPSHOT_ADMIN_TIMEOUT_MS = HELD_LEASE_SETTLE_MS + 15000;
+function admin(action, payload = {}, timeoutMs = ADMIN_TIMEOUT_MS) {
   const seq = ++adminSequence;
   return bounded(new Promise((resolveAdmin, reject) => {
     adminPending.set(seq, { resolve: resolveAdmin, reject });
     send({ type: 'admin', seq, action, payload });
-  }), 15000, 'admin-timeout').finally(() => adminPending.delete(seq));
+  }), timeoutMs, 'admin-timeout').finally(() => adminPending.delete(seq));
 }
 let snapshotReaders = createSurfaceSnapshotReaders();
 let snapshotCleanupFailed = false;
@@ -279,7 +286,7 @@ const context = {
   matrix, cli, request, readProject, admin, assertNoFallback, isolateAsyncWork, hasPendingPassiveWork, observePublisher, snapshotReaders, assertSnapshotUnchanged, assertLogicalSnapshotUnchanged, resetSnapshotReaders,
   canaries: ['SURFACEPRIVATE', 'surface_password_canary', 'surface_query_canary', 'SQLSTATE_PRIVATE_42501', homeDir, projectPath, ...(backend === 'postgresql' ? (() => { const url = new URL(process.env.LCM_POSTGRES_URL); return [process.env.LCM_POSTGRES_URL, decodeURIComponent(url.username), decodeURIComponent(url.password), decodeURIComponent(url.pathname.slice(1))]; })() : [])],
   snapshot: () => snapshotSurfaceState(context),
-  snapshotPostgreSql: () => admin('snapshot'),
+  snapshotPostgreSql: () => admin('snapshot', {}, SNAPSHOT_ADMIN_TIMEOUT_MS),
   unavailableStartup: () => admin('unavailable.start'),
   mcp: async (name, args) => {
     assert.ok(mcpClient, 'surface-worker:mcp-initialized');
@@ -735,7 +742,7 @@ async function prepared(caseId, runExistingSetup) {
         const before = await capture();
         assert.ok(JSON.stringify(before.authority) === JSON.stringify(authority), 'surface-prepared:prestop-authority');
         if (backend === 'postgresql') {
-          const witness = await admin('prepared-projects.begin', { caseId });
+          const witness = await admin('prepared-projects.begin', { caseId }, SNAPSHOT_ADMIN_TIMEOUT_MS);
           assert.equal(witness.snapshotDigest, semanticDigest(before.logical.postgresql), 'surface-prepared:catalog-before');
           token = witness.token;
         }
@@ -756,7 +763,7 @@ async function prepared(caseId, runExistingSetup) {
         after.journalProof = journalProof;
         if (backend === 'postgresql') {
           const result = await admin('prepared-projects.finish', { caseId, token,
-            created: bundle.created.map(item => ({ path: item.path, remote: item.parsed.remote })) });
+            created: bundle.created.map(item => ({ path: item.path, remote: item.parsed.remote })) }, SNAPSHOT_ADMIN_TIMEOUT_MS);
           assert.equal(result.snapshotDigest, semanticDigest(after.logical.postgresql), 'surface-prepared:catalog-after');
           after.catalogValidated = result.validated === true;
         }

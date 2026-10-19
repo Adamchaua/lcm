@@ -63,6 +63,13 @@ export function partitionFencedLeases(rows, authority) {
 }
 
 const HELD_ID = 'surface-parity-parent:passive-replication-lease-held';
+
+/**
+ * Default bound of settleHeldLeases. The surface-parity worker derives its
+ * 'snapshot' / 'prepared-projects.*' admin deadline from this value, so the
+ * two cannot drift.
+ */
+export const HELD_LEASE_SETTLE_MS = 30000;
 const isHeld = error => error instanceof Error && error.message === HELD_ID;
 
 /**
@@ -74,7 +81,7 @@ const isHeld = error => error instanceof Error && error.message === HELD_ID;
  * after that long is not in-flight; 250 ms keeps the polling cheap.
  */
 export async function settleHeldLeases(read, {
-  timeoutMs = 30000, intervalMs = 250, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  timeoutMs = HELD_LEASE_SETTLE_MS, intervalMs = 250, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
 } = {}) {
   const deadline = now() + timeoutMs;
   for (;;) {
