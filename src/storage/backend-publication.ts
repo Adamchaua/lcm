@@ -209,7 +209,8 @@ export type BackendMaintenanceRosterEntry = Readonly<{
 export type BackendMaintenanceJournal = Readonly<{
   version: typeof BACKEND_MAINTENANCE_VERSION;
   publicationId: string;
-  sourceBackend: "sqlite";
+  /** The backend selected when the window was entered; an aborted window leaves it selected. */
+  sourceBackend: StorageBackendName;
   targetBackend: StorageBackendName | null;
   phase: BackendMaintenancePhase;
   createdAt: string;
@@ -233,6 +234,8 @@ export type EnterBackendMaintenanceInput = Readonly<{
   now?: Date;
   /** Exact entering journal observed during crash recovery. */
   expectedChecksumSha256?: string;
+  /** The backend selected when the window is entered (an activation's is sqlite, a rollback's postgresql). Defaults to sqlite. */
+  sourceBackend?: StorageBackendName;
 }>;
 
 export type PrepareBackendMaintenanceSelectionInput = Readonly<{
@@ -1256,7 +1259,7 @@ function parseMaintenanceJournal(value: Record<string, unknown>): BackendMainten
   if (
     typeof value.publicationId !== "string"
     || !PUBLICATION_ID_PATTERN.test(value.publicationId)
-    || value.sourceBackend !== "sqlite"
+    || (value.sourceBackend !== "sqlite" && value.sourceBackend !== "postgresql")
     || !(value.targetBackend === null || value.targetBackend === "sqlite" || value.targetBackend === "postgresql")
     || !MAINTENANCE_PHASES.includes(value.phase as BackendMaintenancePhase)
     || typeof value.createdAt !== "string"
@@ -1666,7 +1669,7 @@ function assertBackendPublicationConsumerAccessUnlocked(options: {
         return fail("unresolved-publication", "backend publication is held for migration maintenance");
       }
       const selectedBackend = maintenance.phase === "maintenance-aborted"
-        ? "sqlite"
+        ? maintenance.sourceBackend
         : maintenance.targetBackend!;
       if (options.backend !== undefined && options.backend !== selectedBackend) {
         return fail("backend-mismatch", "backend does not match terminal migration maintenance state");
@@ -2604,7 +2607,7 @@ function readConsumerConfigPublicationJournal(
       if (journal.phase !== "maintenance-aborted" && journal.phase !== "selection-completed") {
         return fail("unresolved-publication", "backend publication is held for migration maintenance");
       }
-      const selectedBackend = journal.phase === "maintenance-aborted" ? "sqlite" : journal.targetBackend!;
+      const selectedBackend = journal.phase === "maintenance-aborted" ? journal.sourceBackend : journal.targetBackend!;
       if (backend !== selectedBackend) {
         return fail("backend-mismatch", "backend does not match terminal migration maintenance state");
       }
@@ -3776,6 +3779,7 @@ export class BackendPublicationCoordinator {
         || !PUBLICATION_ID_PATTERN.test(input.generationId)
         || !HASH_PATTERN.test(input.sourceSelectionSha256)
         || !HASH_PATTERN.test(input.queueEvidenceSha256)
+        || (input.sourceBackend !== undefined && input.sourceBackend !== "sqlite" && input.sourceBackend !== "postgresql")
         || (input.now !== undefined && !Number.isFinite(input.now.getTime()))
       ) {
         return fail("invalid-input", "backend maintenance input is malformed");
@@ -3784,6 +3788,7 @@ export class BackendPublicationCoordinator {
       if (maintenance?.phase === "maintenance-entering") {
         if (maintenance.publicationId !== input.publicationId
           || maintenance.generationId !== input.generationId
+          || maintenance.sourceBackend !== (input.sourceBackend ?? "sqlite")
           || maintenance.sourceSelectionSha256 !== input.sourceSelectionSha256
           || maintenance.queueEvidenceSha256 !== input.queueEvidenceSha256
           || canonicalJson(maintenance.roster) !== canonicalJson(roster)
@@ -3809,7 +3814,7 @@ export class BackendPublicationCoordinator {
       const entering = withMaintenanceChecksum({
         version: BACKEND_MAINTENANCE_VERSION,
         publicationId: input.publicationId,
-        sourceBackend: "sqlite",
+        sourceBackend: input.sourceBackend ?? "sqlite",
         targetBackend: null,
         phase: "maintenance-entering",
         createdAt: now,

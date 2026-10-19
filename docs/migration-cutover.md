@@ -413,6 +413,44 @@ after cutover therefore cannot make the historical manifest appear corrupted.
 Any later rollback workflow must perform fresh authoritative checks at its own
 effect boundary.
 
+## Activation evidence, selection bindings and replay admission
+
+Rollback decides what to unwind from durable evidence, so activation writes
+that evidence in a fixed order:
+
+1. Before the activation prepares its maintenance selection, it records, in
+   this order, its epoch, its attempt, its witness, and the binding of that
+   witness.
+2. After the maintenance selection completes, and before the coordinator
+   prepares the backend publication (the PostgreSQL configuration and the
+   project map entry that binds the project to its PostgreSQL id), it records
+   the selection binding. The binding is written **before** the publication is
+   prepared because preparing archives the maintenance journal that the
+   binding is derived from.
+3. The coordinator then publishes the backend publication durably.
+
+A crash while the publication is in flight leaves an activation that has to
+be resumed or aborted before anything else; rollback refuses to start over
+it. A completed publication without a recorded selection binding means
+PostgreSQL is live, so rollback refuses (`published-but-unbound`) until the
+activation records its binding. An installation with no activation
+evidence and no completed publication is *unactivated*: it has nothing to
+unwind, so rollback refuses it (restore the configuration to SQLite or run
+`lcm migration abort`).
+
+Replay admission (the check that routes a replayed append to SQLite or
+PostgreSQL after a cutover or a rollback) follows the durable authority in
+this order: a live maintenance of the generation that has not finished
+refuses; the generation's selection bindings decide (the latest by manifest
+revision; an activation selects PostgreSQL, a rollback selects SQLite); with
+no selection recorded, a manifest at `rolled-back` is refused
+(`unexpected-state`): no supported path leaves a rolled-back generation
+without its selection binding, and re-running the rollback restores the
+binding from its stored report, after which the binding decides; the generation's own terminal maintenance journal decides while
+the coordinator has not archived it; everything else refuses. Between the
+coordinator archiving the maintenance journal and the manifest settling,
+admission refuses until the resume completes.
+
 ## Failure classifications
 
 Callers receive a `MigrationProtocolError` with one sanitized reason:

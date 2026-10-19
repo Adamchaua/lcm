@@ -1,0 +1,987 @@
+/**
+ * Tests for src/migration/rollback-sidecars.ts.
+ *
+ * Fixtures reuse test/fixtures/portable-records.ts's buildRecords(
+ * postgresGeneration()), the same archive-record builder
+ * sqlite-portable-archive.test.ts uses, rather than hand-deriving the
+ * portable-record encoding rules a second time. Its default
+ * session-instructions domain holds two machines sharing one scopeHash,
+ * exactly as a PostgreSQL-era archive does (issue #1518): the SQLite
+ * surfaces are machine-local, so this module materializes only the rows of
+ * the machine it is given (MACHINE_A_UUID) and the other machine's rows
+ * must be ignored, not collide with them. One hand-built second row on
+ * MACHINE_A proves multi-row materialization.
+ *
+ * Per the epic's standing rule: every check names the two independent
+ * observations it compares and is proven breakable. Verification-failed
+ * red-proofs below corrupt the destination with real SQL after a real,
+ * successful materialization, then call the exported verify function
+ * directly -- never a mock standing in for corruption.
+ */
+
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+/** Every DatabaseSync the code under test (or this file) opens, so a leaked handle is observable (PR #1556 thread 4308518712). */
+const openedDatabases = vi.hoisted(() => [] as { isOpen: boolean }[]);
+vi.mock("node:sqlite", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:sqlite")>();
+  class TrackedDatabaseSync extends actual.DatabaseSync {
+    constructor(...args: ConstructorParameters<typeof actual.DatabaseSync>) {
+      super(...args);
+      openedDatabases.push(this);
+    }
+  }
+  return { ...actual, DatabaseSync: TrackedDatabaseSync };
+});
+import { runLcmMigrations } from "../../src/db/migration.js";
+import {
+  initializePortableArchive,
+  writePortableArchiveRecord,
+  readArchiveDomain,
+} from "../../src/storage/sqlite/portable-archive.js";
+import { createPortableRecord, type PortableRecord } from "../../src/storage/portable-record.js";
+import { buildRecords, postgresGeneration, MACHINE_A, MACHINE_B, MACHINE_A_UUID } from "../fixtures/portable-records.js";
+import { eventsDir, eventSequenceDbPath } from "../../src/db/events-path.js";
+import { EventsDb } from "../../src/hooks/events-db.js";
+import { closeLcmConnection } from "../../src/db/connection.js";
+import { parseDaemonConfig } from "../../src/daemon/config.js";
+import { projectId as projectIdOfCwd } from "../../src/daemon/project.js";
+import { promoteEventsForCwd } from "../../src/daemon/routes/promote-events.js";
+import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
+import { LocalHookEventSequenceAllocator, formatLocalHookMachineSequence } from "../../src/storage/local-hook-event-sequence.js";
+import {
+  materializeRollbackSidecars,
+  RollbackSidecarError,
+  requireInteger,
+  requireTimestamp,
+  verifySessionInstructionsAgainstArchive,
+  verifyPassiveEventsAgainstArchive,
+  readMachineIdByIdentityKey,
+  dispositionColumns,
+} from "../../src/migration/rollback-sidecars.js";
+
+const LOCAL_PROJECT_ID = "c".repeat(64);
+
+function readEventRow(eventsDbPath: string, eventId: string): Record<string, unknown> {
+  const db = new DatabaseSync(eventsDbPath, { readOnly: true });
+  try {
+    return { ...db.prepare("SELECT * FROM events WHERE event_uuid = ?").get(eventId) };
+  } finally {
+    db.close();
+  }
+}
+
+const dirs: string[] = [];
+afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true }); });
+
+function tempHome(): string {
+  const dir = mkdtempSync(join(tmpdir(), "lcm-rollback-sidecars-home-"));
+  dirs.push(dir);
+  return dir;
+}
+
+function tempGenerationPath(): { dir: string; path: string } {
+  const dir = mkdtempSync(join(tmpdir(), "lcm-rollback-sidecars-gen-"));
+  dirs.push(dir);
+  return { dir, path: join(dir, "db.sqlite") };
+}
+
+/** Second session-instruction row on MACHINE_A: a genuinely distinct scope. */
+function extraSessionInstructionRecord(projectIdentity: unknown): PortableRecord<"session-instructions"> {
+  return createPortableRecord({
+    domain: "session-instructions",
+    ordinal: 500,
+    value: {
+      machineIdentityKey: MACHINE_A,
+      scopeHash: "b".repeat(64),
+      clientName: "codex",
+      sessionId: "session-extra",
+      worktreePath: "/srv/repos/other",
+      cwdPath: "/srv/repos/other/src",
+      content: "second scope's instructions",
+      contentHash: "a".repeat(64),
+      updatedAt: "2026-01-02T00:00:00.000000Z",
+    },
+    context: { projectIdentity },
+  });
+}
+
+/**
+ * Builds a generation database (runtime tables + portable_archive_* tables,
+ * exactly the shape a real rollback generation has) and seeds it with one
+ * machine, two session-instructions rows and three passive-events rows
+ * (pending/applied/quarantined, from the shared fixture's default triple).
+ */
+function seedGeneration(): {
+  path: string;
+  sessionInstructionRecords: readonly PortableRecord<"session-instructions">[];
+  passiveEventRecords: readonly PortableRecord<"passive-events">[];
+} {
+  const { path } = tempGenerationPath();
+  const db = new DatabaseSync(path);
+  try {
+    runLcmMigrations(db, { fts5Available: false });
+    initializePortableArchive(db);
+    const all = buildRecords(postgresGeneration());
+    for (const record of all.get("machines")!) writePortableArchiveRecord(db, record);
+    const projectIdentity = (all.get("project")![0].value as { identity: unknown }).identity;
+    // Both machines' rows go into the archive; only MACHINE_A's are expected back.
+    const archivedInstructions = all.get("session-instructions")!;
+    const sessionInstructionRecords = [
+      ...archivedInstructions.filter((r) => (r.value as { machineIdentityKey: string }).machineIdentityKey === MACHINE_A),
+      extraSessionInstructionRecord(projectIdentity),
+    ];
+    for (const record of [...archivedInstructions, extraSessionInstructionRecord(projectIdentity)]) writePortableArchiveRecord(db, record);
+    const passiveEventRecords = all.get("passive-events")!;
+    for (const record of passiveEventRecords) writePortableArchiveRecord(db, record);
+    return { path, sessionInstructionRecords, passiveEventRecords };
+  } finally {
+    db.close();
+  }
+}
+
+function integerValue(value: unknown): bigint {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number") return BigInt(value);
+  if (typeof value === "object" && value !== null && "$integer" in value) {
+    return BigInt((value as { $integer: string }).$integer);
+  }
+  throw new Error(`unexpected integer representation: ${JSON.stringify(value)}`);
+}
+
+describe("materializeRollbackSidecars", () => {
+  it("materializes both surfaces and matches the archive field-for-field on independent readback", () => {
+    const homeDir = tempHome();
+    const { path, sessionInstructionRecords, passiveEventRecords } = seedGeneration();
+
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    expect(outcome.sessionInstructionsMaterialized, MACHINE_A_UUID).toBe(2);
+    expect(outcome.passiveEventsMaterialized).toBe(3);
+    expect(outcome.eventsDbPath).toBe(join(eventsDir(homeDir), `${LOCAL_PROJECT_ID}.db`));
+    const highest = passiveEventRecords.reduce((max, r) => {
+      const seq = integerValue((r.value as { machineSequence: unknown }).machineSequence);
+      return seq > max ? seq : max;
+    }, -1n);
+    expect(outcome.reconciledUpTo).toBe(highest.toString());
+
+    // Independent readback: a fresh connection, a fresh query, never the
+    // outcome object materializeRollbackSidecars itself returned.
+    const readback = new DatabaseSync(path, { readOnly: true });
+    try {
+      const rows = readback.prepare(
+        "SELECT scope_hash, client_name, content, content_hash FROM session_instruction_cache WHERE project_id = ? ORDER BY scope_hash",
+      ).all(LOCAL_PROJECT_ID) as { scope_hash: string; client_name: string; content: string; content_hash: string }[];
+      expect(rows).toHaveLength(2);
+      for (const record of sessionInstructionRecords) {
+        const v = record.value as { scopeHash: string; clientName: string; content: string; contentHash: string };
+        const stored = rows.find((r) => r.scope_hash === v.scopeHash);
+        expect(stored).toBeDefined();
+        expect(stored?.client_name).toBe(v.clientName);
+        expect(stored?.content).toBe(v.content);
+        expect(stored?.content_hash).toBe(v.contentHash);
+      }
+    } finally {
+      readback.close();
+    }
+
+    const eventsReadback = new DatabaseSync(outcome.eventsDbPath, { readOnly: true });
+    try {
+      const rows = eventsReadback.prepare(
+        "SELECT event_uuid, delivery_state, processed_at, quarantine_reason FROM events ORDER BY machine_sequence",
+      ).all() as { event_uuid: string; delivery_state: string; processed_at: string | null; quarantine_reason: string | null }[];
+      expect(rows).toHaveLength(3);
+      expect(rows.map((r) => r.delivery_state)).toEqual(["pending", "pending", "quarantined"]);
+      expect(rows[1].processed_at).not.toBeNull();
+      expect(rows[2].quarantine_reason).not.toBeNull();
+    } finally {
+      eventsReadback.close();
+    }
+
+    const allocator = new LocalHookEventSequenceAllocator(eventSequenceDbPath(homeDir));
+    try {
+      expect(allocator.peekNextSequence()).toBe(highest + 1n);
+    } finally {
+      allocator.close();
+    }
+  });
+
+  it("closes every database handle it opened, including the read-only one the schema validation reads through (PR #1556 thread 4308518712)", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    const before = openedDatabases.length;
+    materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const opened = openedDatabases.slice(before);
+    // The generation itself, EventsDb's bootstrap, the raw events connection, the allocator and the validation handle.
+    expect(opened.length).toBeGreaterThanOrEqual(4);
+    expect(opened.map((db) => db.isOpen)).toEqual(opened.map(() => false));
+  });
+
+  it("materializes only this machine's session instructions when another machine holds the same scope hash (#1518)", () => {
+    const homeDir = tempHome();
+    const { path, sessionInstructionRecords } = seedGeneration();
+    const archived = new DatabaseSync(path);
+    try {
+      const scopeHashes = [...readArchiveDomain(archived, "session-instructions")].map((r) => r.value.scopeHash);
+      const byMachine = [...readArchiveDomain(archived, "session-instructions")].map((r) => r.value.machineIdentityKey);
+      // Precondition: the archive really holds a row of each machine under one scope hash.
+      expect(byMachine).toContain(MACHINE_B);
+      expect(scopeHashes.filter((h) => h === (sessionInstructionRecords[0].value as { scopeHash: string }).scopeHash)).toHaveLength(2);
+    } finally {
+      archived.close();
+    }
+
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    expect(outcome.sessionInstructionsMaterialized).toBe(2);
+    const readback = new DatabaseSync(path, { readOnly: true });
+    try {
+      const rows = readback.prepare(
+        "SELECT scope_hash, client_name, session_id FROM session_instruction_cache WHERE project_id = ? ORDER BY scope_hash",
+      ).all(LOCAL_PROJECT_ID) as { scope_hash: string; client_name: string; session_id: string }[];
+      expect(rows).toHaveLength(2);
+      // The shared scope hash holds MACHINE_A's row (codex), not MACHINE_B's (claude).
+      const shared = rows.find((r) => r.scope_hash === (sessionInstructionRecords[0].value as { scopeHash: string }).scopeHash);
+      expect(shared?.client_name).toBe("codex");
+    } finally {
+      readback.close();
+    }
+  });
+
+  it("materializes, verifies and reconciles only this machine's passive events when another machine reuses its sequences (#1518)", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const db = new DatabaseSync(path);
+    try {
+      const other = "installation:second-machine";
+      writePortableArchiveRecord(db, createPortableRecord({
+        domain: "machines", ordinal: 50,
+        value: { identityKey: other, machineId: "018f7765-7b5c-7d92-8a2e-c6f6a15fcb99" }, context: null,
+      }));
+      // One event colliding with a MACHINE_A machine_sequence (UNIQUE in the
+      // events table) and one far beyond MACHINE_A's highest.
+      [0, 999].forEach((sequence, index) => {
+        writePortableArchiveRecord(db, createPortableRecord({
+          domain: "passive-events", ordinal: 50 + index,
+          value: {
+            machineIdentityKey: other, eventId: `018f7769-4c00-7f77-9b32-4a2f8f5c40${index}0`,
+            eventVersion: 1, machineSequence: sequence, eventType: "session.compacted",
+            sessionId: "session-other", sessionSequence: index, category: "intent", data: "{}", priority: 5,
+            sourceHook: "PreCompact", createdAt: "2026-01-01T00:00:00.000000Z", disposition: "pending",
+          },
+          context: { projectIdentity: { scope: "local", projectId: "a".repeat(64) } },
+        }));
+      });
+    } finally {
+      db.close();
+    }
+
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    expect(outcome.passiveEventsMaterialized).toBe(passiveEventRecords.length);
+    const highest = passiveEventRecords.reduce((max, r) => {
+      const seq = integerValue((r.value as { machineSequence: unknown }).machineSequence);
+      return seq > max ? seq : max;
+    }, -1n);
+    // The other machine's sequence 999 must not advance this machine's checkpoint.
+    expect(outcome.reconciledUpTo).toBe(highest.toString());
+    const eventsReadback = new DatabaseSync(outcome.eventsDbPath, { readOnly: true });
+    try {
+      const { n } = eventsReadback.prepare("SELECT count(*) AS n FROM events").get() as { n: number };
+      expect(n).toBe(passiveEventRecords.length);
+    } finally {
+      eventsReadback.close();
+    }
+  });
+
+  it("is idempotent across a retry: no duplication, checkpoint does not regress", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const second = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    expect(second.sessionInstructionsMaterialized).toBe(first.sessionInstructionsMaterialized);
+    expect(second.reconciledUpTo).toBe(first.reconciledUpTo);
+    // Passive events insert with ON CONFLICT(event_uuid) DO NOTHING, so a
+    // retry against an already-materialized events db reports zero newly
+    // inserted rows on the second pass -- this IS the idempotence, not a
+    // discrepancy with it.
+    expect(second.passiveEventsMaterialized).toBe(0);
+
+    const eventsReadback = new DatabaseSync(first.eventsDbPath, { readOnly: true });
+    try {
+      const { n } = eventsReadback.prepare("SELECT count(*) AS n FROM events").get() as { n: number };
+      expect(n).toBe(3);
+    } finally {
+      eventsReadback.close();
+    }
+    const sessionReadback = new DatabaseSync(path, { readOnly: true });
+    try {
+      const { n } = sessionReadback.prepare(
+        "SELECT count(*) AS n FROM session_instruction_cache WHERE project_id = ?",
+      ).get(LOCAL_PROJECT_ID) as { n: number };
+      expect(n).toBe(2);
+    } finally {
+      sessionReadback.close();
+    }
+  });
+
+  it("materializes zero passive events without reconciling or creating a checkpoint entry beyond bootstrap", () => {
+    const homeDir = tempHome();
+    const { path } = tempGenerationPath();
+    const db = new DatabaseSync(path);
+    try {
+      runLcmMigrations(db, { fts5Available: false });
+      initializePortableArchive(db);
+    } finally {
+      db.close();
+    }
+
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    expect(outcome.sessionInstructionsMaterialized, MACHINE_A_UUID).toBe(0);
+    expect(outcome.passiveEventsMaterialized).toBe(0);
+    expect(outcome.reconciledUpTo).toBeNull();
+  });
+
+  it("refuses a passive event whose machine identity key has no matching machines record", () => {
+    const homeDir = tempHome();
+    const { path } = tempGenerationPath();
+    const db = new DatabaseSync(path);
+    try {
+      runLcmMigrations(db, { fts5Available: false });
+      initializePortableArchive(db);
+      // No "machines" record at all: proves the unknown-key guard fires
+      // through the real lookup path, not a mocked map.
+      const orphanEvent = createPortableRecord({
+        domain: "passive-events",
+        ordinal: 0,
+        value: {
+          machineIdentityKey: "ghost-machine",
+          eventId: "018f7769-4c00-7f77-9b32-4a2f8f5cffff",
+          eventVersion: 1,
+          machineSequence: 0,
+          eventType: "session.compacted",
+          sessionId: "session-x",
+          sessionSequence: 0,
+          category: "intent",
+          data: "{}",
+          priority: 5,
+          sourceHook: "PreCompact",
+          createdAt: "2026-01-01T00:00:00.000000Z",
+          disposition: "pending",
+        },
+        context: { projectIdentity: { scope: "local", projectId: "a".repeat(64) } },
+      });
+      writePortableArchiveRecord(db, orphanEvent);
+    } finally {
+      db.close();
+    }
+
+    expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID }))
+      .toThrow(expect.objectContaining({ reason: "invalid-input", message: expect.stringContaining("ghost-machine") }));
+
+    // Positive control: the identical record, but with its machine
+    // present, succeeds -- proving the guard discriminates on the
+    // relationship, not on some incidental property of this fixture.
+    const { path: okPath } = tempGenerationPath();
+    const okDb = new DatabaseSync(okPath);
+    try {
+      runLcmMigrations(okDb, { fts5Available: false });
+      initializePortableArchive(okDb);
+      writePortableArchiveRecord(okDb, createPortableRecord({ domain: "machines", ordinal: 0, value: { identityKey: "ghost-machine", machineId: MACHINE_A_UUID }, context: null }));
+      writePortableArchiveRecord(okDb, createPortableRecord({
+        domain: "passive-events", ordinal: 0,
+        value: {
+          machineIdentityKey: "ghost-machine", eventId: "018f7769-4c00-7f77-9b32-4a2f8f5cffff",
+          eventVersion: 1, machineSequence: 0, eventType: "session.compacted", sessionId: "session-x",
+          sessionSequence: 0, category: "intent", data: "{}", priority: 5, sourceHook: "PreCompact",
+          createdAt: "2026-01-01T00:00:00.000000Z", disposition: "pending",
+        },
+        context: { projectIdentity: { scope: "local", projectId: "a".repeat(64) } },
+      }));
+    } finally {
+      okDb.close();
+    }
+    const okHome = tempHome();
+    expect(() => materializeRollbackSidecars({ homeDir: okHome, databasePath: okPath, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID })).not.toThrow();
+  });
+
+  it("F8: refuses a session instruction whose machine identity key has no machines record", () => {
+    const homeDir = tempHome();
+    const { path } = tempGenerationPath();
+    const db = new DatabaseSync(path);
+    try {
+      runLcmMigrations(db, { fts5Available: false });
+      initializePortableArchive(db);
+      writePortableArchiveRecord(db, createPortableRecord({
+        domain: "session-instructions", ordinal: 0,
+        value: {
+          machineIdentityKey: "ghost-machine", scopeHash: "d".repeat(64), clientName: "codex", sessionId: "s",
+          worktreePath: "/w", cwdPath: "/w", content: "x", contentHash: "e".repeat(64), updatedAt: "2026-01-02T00:00:00.000000Z",
+        },
+        context: { projectIdentity: { scope: "local", projectId: "a".repeat(64) } },
+      }));
+    } finally {
+      db.close();
+    }
+    expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID }))
+      .toThrow(expect.objectContaining({ reason: "invalid-input", message: expect.stringContaining("ghost-machine") }));
+  });
+
+  it("wraps a real events-directory creation failure as unsafe-storage", () => {
+    const homeDir = tempHome();
+    const { path } = tempGenerationPath();
+    const db = new DatabaseSync(path);
+    try {
+      runLcmMigrations(db, { fts5Available: false });
+      initializePortableArchive(db);
+    } finally {
+      db.close();
+    }
+    // Real obstruction, not a mock: a plain file occupies the exact path
+    // ensurePrivateDirectory must create as a directory, so mkdirSync
+    // genuinely fails.
+    mkdirSync(join(homeDir, ".lcm"), { recursive: true });
+    writeFileSync(join(homeDir, ".lcm", "events"), "not a directory");
+
+    expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID }))
+      .toThrow(expect.objectContaining({ reason: "unsafe-storage" }));
+  });
+
+  it("tracks the true maximum machine_sequence even when archive rows are not sequence-ordered", () => {
+    const homeDir = tempHome();
+    const { path } = tempGenerationPath();
+    const db = new DatabaseSync(path);
+    try {
+      runLcmMigrations(db, { fts5Available: false });
+      initializePortableArchive(db);
+      writePortableArchiveRecord(db, createPortableRecord({
+        domain: "machines", ordinal: 0,
+        value: { identityKey: "unordered-machine", machineId: MACHINE_A_UUID }, context: null,
+      }));
+      const sequences = [5, 2, 8];
+      sequences.forEach((sequence, index) => {
+        writePortableArchiveRecord(db, createPortableRecord({
+          domain: "passive-events", ordinal: index,
+          value: {
+            machineIdentityKey: "unordered-machine",
+            eventId: `018f7769-4c00-7f77-9b32-4a2f8f5c30${index}0`,
+            eventVersion: 1, machineSequence: sequence, eventType: "session.compacted",
+            sessionId: "session-unordered", sessionSequence: index, category: "intent",
+            data: "{}", priority: 5, sourceHook: "PreCompact",
+            createdAt: "2026-01-01T00:00:00.000000Z", disposition: "pending",
+          },
+          context: { projectIdentity: { scope: "local", projectId: "a".repeat(64) } },
+        }));
+      });
+    } finally {
+      db.close();
+    }
+
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    // The maximum (8), not merely a monotonic-order assumption: proves
+    // this is a genuine max-reduction over every archived row, not code
+    // that only works because archives happen to arrive sequence-sorted.
+    expect(outcome.reconciledUpTo).toBe("8");
+  });
+});
+
+describe("verifySessionInstructionsAgainstArchive", () => {
+  it("goes red when a stored row's content diverges from its archive row, and green when it matches", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    const db = new DatabaseSync(path);
+    try {
+      // Positive control first: the real, uncorrupted state passes.
+      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized, MACHINE_A_UUID)).not.toThrow();
+
+      db.prepare("UPDATE session_instruction_cache SET content = 'corrupted' WHERE project_id = ?").run(LOCAL_PROJECT_ID);
+      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized, MACHINE_A_UUID))
+        .toThrow(expect.objectContaining({ reason: "verification-failed" }));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("goes red when the stored row count no longer matches the reported materialized count", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    const db = new DatabaseSync(path);
+    try {
+      db.prepare("DELETE FROM session_instruction_cache WHERE project_id = ? AND scope_hash = (SELECT scope_hash FROM session_instruction_cache WHERE project_id = ? LIMIT 1)")
+        .run(LOCAL_PROJECT_ID, LOCAL_PROJECT_ID);
+      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized, MACHINE_A_UUID))
+        .toThrow(expect.objectContaining({ reason: "verification-failed" }));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("goes red when the project holds a session instruction row the archive does not account for (count check)", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const db = new DatabaseSync(path);
+    try {
+      db.prepare(
+        `INSERT INTO session_instruction_cache (project_id, scope_hash, client_name, session_id, worktree_path, cwd_path, content, content_hash, updated_at)
+         VALUES (?, ?, 'codex', 'orphan-session', '/tmp', '/tmp', 'orphan content', ?, '2026-01-01T00:00:00.000000Z')`,
+      ).run(LOCAL_PROJECT_ID, "e".repeat(64), "e".repeat(64));
+      // The reported count still equals the archive's, and every archived row matches: only the readback count sees it.
+      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized, MACHINE_A_UUID))
+        .toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining("holds") }));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("goes red when the archive holds more rows than were ever materialized, even if every materialized row still matches", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    const db = new DatabaseSync(path);
+    try {
+      // A real orphaned readback row so the count check, not the
+      // per-row "!stored" branch, is the one that fires: insert one
+      // extra row directly plus a matching claimed materializedCount,
+      // then re-add one archive row the readback does NOT have, so the
+      // per-row loop still completes (every archive row it checks has a
+      // match) before the trailing count check catches the surplus.
+      db.prepare(
+        `INSERT INTO session_instruction_cache (project_id, scope_hash, client_name, session_id, worktree_path, cwd_path, content, content_hash, updated_at)
+         VALUES (?, ?, 'codex', 'orphan-session', '/tmp', '/tmp', 'orphan content', ?, '2026-01-01T00:00:00.000000Z')`,
+      ).run(LOCAL_PROJECT_ID, "f".repeat(64), "f".repeat(64));
+      expect(() => verifySessionInstructionsAgainstArchive(db, LOCAL_PROJECT_ID, outcome.sessionInstructionsMaterialized + 1, MACHINE_A_UUID))
+        .toThrow(expect.objectContaining({ reason: "verification-failed" }));
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("verifyPassiveEventsAgainstArchive", () => {
+  it("goes red when a stored event's data diverges from its archive row, and green when it matches", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    const db = new DatabaseSync(path);
+    const eventsDb = new DatabaseSync(outcome.eventsDbPath);
+    try {
+      const machineIds = readMachineIdByIdentityKey(db);
+      expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, MACHINE_A_UUID)).not.toThrow();
+
+      eventsDb.exec("UPDATE events SET data = '{\"tampered\":true}'");
+      expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, MACHINE_A_UUID))
+        .toThrow(expect.objectContaining({ reason: "verification-failed" }));
+    } finally {
+      db.close();
+      eventsDb.close();
+    }
+  });
+
+  it("F2: preserves and separately counts a local pending row the archive does not hold", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    const db = new DatabaseSync(path);
+    const eventsDb = new DatabaseSync(outcome.eventsDbPath);
+    try {
+      const machineIds = readMachineIdByIdentityKey(db);
+      eventsDb.exec(
+        `INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook)
+         VALUES ('018f7769-4c00-7f77-9b32-4a2f8f5cbeef', 1, '${formatLocalHookMachineSequence(999n)}', 'orphan', 'orphan.event', 'intent', '{}', 'Test')`,
+      );
+      expect(verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, MACHINE_A_UUID))
+        .toEqual({ verifiedImported: passiveEventRecords.length, preservedPending: 1 });
+      // Untouched: still pending and unreplicated.
+      expect(eventsDb.prepare("SELECT delivery_state, remote_inbox_id FROM events WHERE event_uuid = ?").get("018f7769-4c00-7f77-9b32-4a2f8f5cbeef"))
+        .toEqual({ delivery_state: "pending", remote_inbox_id: null });
+    } finally {
+      db.close();
+      eventsDb.close();
+    }
+  });
+
+  it("F2: a local row absent from the archive that claims delivery (remote inbox id or acknowledgement) refuses", () => {
+    for (const delivered of [
+      "delivery_state = 'replicated', remote_inbox_id = 'inbox-1'",
+      "delivery_state = 'acknowledged', remote_inbox_id = 'inbox-1', acknowledged_at = '2026-01-03T00:00:00.000000Z'",
+    ]) {
+      const homeDir = tempHome();
+      const { path } = seedGeneration();
+      const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+      const db = new DatabaseSync(path);
+      const eventsDb = new DatabaseSync(outcome.eventsDbPath);
+      try {
+        const machineIds = readMachineIdByIdentityKey(db);
+        eventsDb.exec(
+          `INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook)
+           VALUES ('018f7769-4c00-7f77-9b32-4a2f8f5cbeef', 1, '${formatLocalHookMachineSequence(999n)}', 'orphan', 'orphan.event', 'intent', '{}', 'Test')`,
+        );
+        eventsDb.exec(`UPDATE events SET ${delivered} WHERE event_uuid = '018f7769-4c00-7f77-9b32-4a2f8f5cbeef'`);
+        expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, MACHINE_A_UUID))
+          .toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining("delivered event") }));
+      } finally {
+        db.close();
+        eventsDb.close();
+      }
+    }
+  });
+
+  it("F2: a whole materialization keeps a post-cutoff local append pending alongside the imported archive rows", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    expect(first.passiveEventsPreservedPending).toBe(0);
+    const appended = "018f7769-4c00-7f77-9b32-4a2f8f5cd00d";
+    const local = new DatabaseSync(first.eventsDbPath);
+    try {
+      local.exec(
+        `INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook)
+         VALUES ('${appended}', 1, '${formatLocalHookMachineSequence(1000n)}', 'post-cutoff', 'session.compacted', 'intent', '{}', 'PreCompact')`,
+      );
+    } finally {
+      local.close();
+    }
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    expect(outcome.passiveEventsPreservedPending).toBe(1);
+    const readback = new DatabaseSync(outcome.eventsDbPath, { readOnly: true });
+    try {
+      expect((readback.prepare("SELECT count(*) AS n FROM events").get() as { n: number }).n).toBe(passiveEventRecords.length + 1);
+      expect(readback.prepare("SELECT delivery_state, remote_inbox_id FROM events WHERE event_uuid = ?").get(appended))
+        .toEqual({ delivery_state: "pending", remote_inbox_id: null });
+    } finally {
+      readback.close();
+    }
+  });
+
+  it("F12: an archived applied event the replication worker already acknowledged materializes, stays acknowledged and is not replayed, beside pending-only extras", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const applied = passiveEventRecords.find((record) => record.value.disposition === "applied")!;
+    const appended = "018f7769-4c00-7f77-9b32-4a2f8f5cd00d";
+    const events = new EventsDb(first.eventsDbPath);
+    try {
+      expect(events.markAcknowledged(applied.value.eventId, 1n)).toBe(true);
+    } finally {
+      events.close();
+    }
+    const local = new DatabaseSync(first.eventsDbPath);
+    try {
+      local.exec(
+        `INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook)
+         VALUES ('${appended}', 1, '${formatLocalHookMachineSequence(1000n)}', 'post-cutoff', 'session.compacted', 'intent', '{}', 'PreCompact')`,
+      );
+    } finally {
+      local.close();
+    }
+    const acknowledgedBefore = readEventRow(first.eventsDbPath, applied.value.eventId);
+    expect(acknowledgedBefore).toMatchObject({ delivery_state: "acknowledged", remote_inbox_id: "1" });
+
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    expect(outcome.passiveEventsMaterialized).toBe(0);
+    expect(outcome.passiveEventsPreservedPending).toBe(1);
+    // Neither rewritten nor replayed: the whole row, acknowledgement included, is exactly as the worker left it.
+    expect(readEventRow(outcome.eventsDbPath, applied.value.eventId)).toEqual(acknowledgedBefore);
+    expect(readEventRow(outcome.eventsDbPath, appended)).toMatchObject({ delivery_state: "pending", remote_inbox_id: null });
+  });
+
+  it("F12/E2: an archived applied event whose existing row was acknowledged without ever being processed materializes and gains the applied marker", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const applied = passiveEventRecords.find((record) => record.value.disposition === "applied")!;
+    const freshlyApplied = readEventRow(first.eventsDbPath, applied.value.eventId);
+    const local = new DatabaseSync(first.eventsDbPath);
+    try {
+      // Acknowledged by the replication worker, with no processed_at of its own: only the delivery state says applied.
+      local.exec(
+        `UPDATE events SET processed_at = NULL, delivery_state = 'acknowledged', remote_inbox_id = '1',
+           acknowledged_at = '2026-01-03T00:00:00.000000Z' WHERE event_uuid = '${applied.value.eventId}'`,
+      );
+    } finally {
+      local.close();
+    }
+    const before = readEventRow(first.eventsDbPath, applied.value.eventId);
+    expect(before).toMatchObject({ delivery_state: "acknowledged", processed_at: null });
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    expect(outcome.passiveEventsMaterialized).toBe(0);
+    // Only the processing marker changes, to what the fresh insert encoded; the acknowledgement stays.
+    expect(readEventRow(outcome.eventsDbPath, applied.value.eventId)).toEqual({ ...before, processed_at: freshlyApplied.processed_at });
+  });
+
+  /**
+   * #626 E2 (round-3 S3-2). The replication worker acknowledges a local event without ever setting processed_at
+   * (EventsDb.markAcknowledged), so acknowledged + processed_at NULL is the ordinary shape of a replicated event
+   * on the PostgreSQL side. The SQLite consumer the rollback hands the project back to selects on processed_at
+   * alone (EventsDb.getUnprocessed, the passive sweep behind promoteEventsForCwd): an archive-applied event left
+   * in that shape would be applied a second time. The real consumer runs here, after the real materialization.
+   */
+  describe("E2: an archive-applied event acknowledged locally without processed_at is not selected or promoted again", () => {
+    const DECISION = '{"decision":"replay-proof decision"}';
+
+    /** A generation whose archive holds exactly one passive event, applied, promotable at tier 1. */
+    function seedAppliedOnlyGeneration(): { path: string; eventId: string } {
+      const { path } = tempGenerationPath();
+      const db = new DatabaseSync(path);
+      try {
+        runLcmMigrations(db, { fts5Available: false });
+        initializePortableArchive(db);
+        const all = buildRecords({
+          ...postgresGeneration(),
+          mutate: (domain, values) => domain === "passive-events"
+            ? values.map((value) => ({ ...value, priority: "1", category: "decision", data: DECISION }))
+            : values,
+        });
+        const applied = all.get("passive-events")!.find((record) => (record.value as { disposition: string }).disposition === "applied")!;
+        for (const record of all.get("machines")!) writePortableArchiveRecord(db, record);
+        for (const record of all.get("session-instructions")!) writePortableArchiveRecord(db, record);
+        writePortableArchiveRecord(db, applied);
+        return { path, eventId: (applied.value as { eventId: string }).eventId };
+      } finally {
+        db.close();
+      }
+    }
+
+    /** The consumer's own processed_at (EventsDb.markProcessed stamps datetime('now'), never the event's createdAt). */
+    const CONSUMER_PROCESSED_AT = "2026-03-04 05:06:07";
+
+    async function materializeThenSweep(options: { processedAt: "null" | "consumer" }) {
+      const homeDir = tempHome();
+      mkdirSync(join(homeDir, ".lcm"), { mode: 0o700 });
+      chmodSync(homeDir, 0o700);
+      const cwd = mkdtempSync(join(homeDir, "project-"));
+      const localProjectId = projectIdOfCwd(cwd);
+      const { path, eventId } = seedAppliedOnlyGeneration();
+      const previousHome = process.env.HOME;
+      process.env.HOME = homeDir;
+      const factory = new SqliteStorageBackendFactory({ resolveProject: (identity) => ({ id: identity.id, dbPath: path }) });
+      try {
+        const input = { homeDir, databasePath: path, localProjectId, machineId: MACHINE_A_UUID };
+        const first = materializeRollbackSidecars(input);
+        const freshlyApplied = readEventRow(first.eventsDbPath, eventId);
+        expect(freshlyApplied.processed_at).toEqual(expect.any(String));
+        const local = new DatabaseSync(first.eventsDbPath);
+        try {
+          local.prepare("UPDATE events SET processed_at = ? WHERE event_uuid = ?")
+            .run(options.processedAt === "null" ? null : CONSUMER_PROCESSED_AT, eventId);
+        } finally {
+          local.close();
+        }
+        // The replication worker's acknowledgement: delivery_state, remote_inbox_id and acknowledged_at, never processed_at.
+        const worker = new EventsDb(first.eventsDbPath);
+        try {
+          expect(worker.markAcknowledged(eventId, 1n)).toBe(true);
+        } finally {
+          worker.close();
+        }
+        const acknowledged = readEventRow(first.eventsDbPath, eventId);
+        expect(acknowledged).toMatchObject({
+          delivery_state: "acknowledged", remote_inbox_id: "1", processed_at: options.processedAt === "null" ? null : CONSUMER_PROCESSED_AT,
+        });
+
+        const outcome = materializeRollbackSidecars(input);
+        expect(outcome.passiveEventsMaterialized).toBe(0);
+
+        const consumer = new EventsDb(outcome.eventsDbPath);
+        let selected: string[];
+        try {
+          selected = consumer.getUnprocessed().map((event) => event.event_uuid);
+        } finally {
+          consumer.close();
+        }
+        const promotion = await promoteEventsForCwd(parseDaemonConfig("{}"), cwd, outcome.eventsDbPath, factory);
+        const generation = new DatabaseSync(path, { readOnly: true });
+        let promoted: number;
+        try {
+          promoted = (generation.prepare("SELECT count(*) AS n FROM promoted").get() as { n: number }).n;
+        } finally {
+          generation.close();
+        }
+        return { selected, promotion, promoted, before: acknowledged, after: readEventRow(outcome.eventsDbPath, eventId), freshlyApplied };
+      } finally {
+        await factory.close();
+        closeLcmConnection();
+        if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+      }
+    }
+
+    it("sets the processing marker exactly as a fresh applied insert encodes it, keeping the acknowledgement, so the real consumer selects and promotes nothing", async () => {
+      const result = await materializeThenSweep({ processedAt: "null" });
+      expect({ promotion: result.promotion, promotedMemories: result.promoted, selected: result.selected })
+        .toMatchObject({ promotion: { promoted: 0, errors: 0 }, promotedMemories: 0, selected: [] });
+      // Identity, acknowledgement and remote inbox id are exactly as the worker left them; only processed_at was reconciled.
+      expect(result.after).toEqual({ ...result.before, processed_at: result.freshlyApplied.processed_at });
+    });
+
+    it("control: a row the consumer already processed keeps its own processed_at and is not selected or promoted either", async () => {
+      const result = await materializeThenSweep({ processedAt: "consumer" });
+      expect({ promotion: result.promotion, promotedMemories: result.promoted, selected: result.selected })
+        .toMatchObject({ promotion: { promoted: 0, errors: 0 }, promotedMemories: 0, selected: [] });
+      expect(result.after).toEqual(result.before);
+      expect(result.after.processed_at).toBe(CONSUMER_PROCESSED_AT);
+    });
+  });
+
+  it("F12: an existing row whose disposition contradicts the archive refuses, in either direction", () => {
+    const contradictions: ReadonlyArray<readonly [string, string]> = [
+      ["applied", "processed_at = NULL, delivery_state = 'pending'"],
+      ["pending", "delivery_state = 'replicated', remote_inbox_id = 'inbox-1', processed_at = '2026-01-01T00:00:00.000000Z'"],
+      // Acknowledged locally (applied remotely) with no processed_at, while the archive still holds it as pending.
+      ["pending", "delivery_state = 'acknowledged', remote_inbox_id = '1', acknowledged_at = '2026-01-03T00:00:00.000000Z', processed_at = NULL"],
+      ["quarantined", "delivery_state = 'pending', quarantine_reason = NULL"],
+      ["pending", "delivery_state = 'quarantined', quarantine_reason = 'rejected'"],
+    ];
+    for (const [archived, localState] of contradictions) {
+      const homeDir = tempHome();
+      const { path, passiveEventRecords } = seedGeneration();
+      const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+      const target = passiveEventRecords.find((record) => record.value.disposition === archived)!;
+      const local = new DatabaseSync(first.eventsDbPath);
+      try {
+        local.exec(`UPDATE events SET ${localState} WHERE event_uuid = '${target.value.eventId}'`);
+      } finally {
+        local.close();
+      }
+      expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID }))
+        .toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining(target.value.eventId) }));
+    }
+  });
+
+  it("F12: an existing row whose payload differs from the archive still refuses even when its disposition matches", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const applied = passiveEventRecords.find((record) => record.value.disposition === "applied")!;
+    const events = new EventsDb(first.eventsDbPath);
+    try {
+      events.markAcknowledged(applied.value.eventId, 1n);
+    } finally {
+      events.close();
+    }
+    const local = new DatabaseSync(first.eventsDbPath);
+    try {
+      local.exec(`UPDATE events SET data = '{"other":true}' WHERE event_uuid = '${applied.value.eventId}'`);
+    } finally {
+      local.close();
+    }
+    expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID }))
+      .toThrow(expect.objectContaining({ reason: "verification-failed" }));
+  });
+
+  it("goes red when a stored event the archive holds is missing", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+    const db = new DatabaseSync(path);
+    const eventsDb = new DatabaseSync(outcome.eventsDbPath);
+    try {
+      const machineIds = readMachineIdByIdentityKey(db);
+      eventsDb.exec("DELETE FROM events WHERE rowid = (SELECT min(rowid) FROM events)");
+      expect(() => verifyPassiveEventsAgainstArchive(db, eventsDb, machineIds, MACHINE_A_UUID))
+        .toThrow(expect.objectContaining({ reason: "verification-failed" }));
+    } finally {
+      db.close();
+      eventsDb.close();
+    }
+  });
+});
+
+describe("requireInteger", () => {
+  it("accepts bigint, number, and numeric-string forms", () => {
+    expect(requireInteger(5n, "field")).toBe(5n);
+    expect(requireInteger(5, "field")).toBe(5n);
+    expect(requireInteger("5", "field")).toBe(5n);
+  });
+
+  it("goes red for a value BigInt() cannot coerce", () => {
+    expect(() => requireInteger("not-a-number", "field"))
+      .toThrow(expect.objectContaining({ reason: "invalid-input", message: expect.stringContaining("field") }));
+  });
+});
+
+describe("requireTimestamp", () => {
+  it("accepts a non-empty string as-is", () => {
+    expect(requireTimestamp("2026-01-01T00:00:00.000000Z", "field")).toBe("2026-01-01T00:00:00.000000Z");
+  });
+
+  // NOT dead-by-construction: v.updatedAt/v.createdAt from readArchiveDomain
+  // are typed PortableRawTimestamp = Date | string throughout
+  // portable-record.ts, the same shared type used for createPortableRecord's
+  // raw input. The concrete decode() implementation always normalizes TEXT
+  // columns to a string today, so no value currently exercises this branch,
+  // but the TYPE genuinely allows a Date -- a caller respecting that
+  // contract, or a future decode() variant, needs it handled correctly.
+  // This differs from a signature that is merely wider than any possible
+  // caller: the type is real, only today's one concrete producer of it
+  // happens not to use the Date half.
+  it("converts a Date to its ISO string, per PortableRawTimestamp's genuine Date|string contract", () => {
+    const date = new Date("2026-01-01T00:00:00.000Z");
+    expect(requireTimestamp(date, "field")).toBe(date.toISOString());
+  });
+
+  it("goes red for an empty string", () => {
+    expect(() => requireTimestamp("", "field"))
+      .toThrow(expect.objectContaining({ reason: "invalid-input", message: expect.stringContaining("field") }));
+  });
+});
+
+describe("dispositionColumns", () => {
+  it("maps pending to a pending delivery state with no processed_at or quarantine_reason", () => {
+    expect(dispositionColumns("pending", "2026-01-01T00:00:00.000000Z")).toEqual({
+      deliveryState: "pending", processedAt: null, quarantineReason: null,
+    });
+  });
+
+  it("maps applied to a pending delivery state with processed_at set", () => {
+    expect(dispositionColumns("applied", "2026-01-01T00:00:00.000000Z")).toEqual({
+      deliveryState: "pending", processedAt: "2026-01-01T00:00:00.000000Z", quarantineReason: null,
+    });
+  });
+
+  it("maps quarantined to a quarantined delivery state with a quarantine_reason", () => {
+    const result = dispositionColumns("quarantined", "2026-01-01T00:00:00.000000Z");
+    expect(result.deliveryState).toBe("quarantined");
+    expect(result.processedAt).toBeNull();
+    expect(result.quarantineReason).not.toBeNull();
+  });
+});
+
+describe("RollbackSidecarError", () => {
+  it("defaults its message to the reason and sets its name", () => {
+    const error = new RollbackSidecarError("unsafe-storage");
+    expect(error.message).toBe("unsafe-storage");
+    expect(error.name).toBe("RollbackSidecarError");
+  });
+});
+
+describe("readMachineIdByIdentityKey", () => {
+  it("reads identity-key to machine-id mappings straight from the archive, including null machine ids", () => {
+    const { path } = seedGeneration();
+    const db = new DatabaseSync(path);
+    try {
+      const map = readMachineIdByIdentityKey(db);
+      const direct = new Map([...readArchiveDomain(db, "machines")].map((r) => [r.value.identityKey, r.value.machineId]));
+      expect(map).toEqual(direct);
+      expect(map.size).toBeGreaterThan(0);
+    } finally {
+      db.close();
+    }
+  });
+});

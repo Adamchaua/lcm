@@ -786,7 +786,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(261);
+    expect(productionFiles).toHaveLength(269);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -816,7 +816,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(261);
+    expect(ownershipCounts.size).toBe(269);
   });
 
   test("keeps every recorded ownership decision in its intended component", () => {
