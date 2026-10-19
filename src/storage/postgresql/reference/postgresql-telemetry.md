@@ -69,8 +69,8 @@ Every telemetry family reports one status from a closed set, together with
 | `permission-denied` | The server denied the probe: SQLSTATE 42501, 28000, or 28P01, or another explicit privilege denial. |
 | `timeout` | The probe hit a deadline or was cancelled: SQLSTATE 57014, the snapshot deadline, or the caller signal. |
 | `stale` | `observedAt` is older than the family's declared freshness bound, or the values are not tied to the current epoch. |
-| `reset` | Counters restarted since the previous comparable observation. Current cumulative values are valid, and no rate is computed across the reset. |
-| `partial` | Cataloged fields or entries are missing for a reason other than the expected absences listed below: the deallocation counter advanced, a family cap was reached, a value is out of range, a sub-probe failed, or a counter decreased without an explained cause. |
+| `reset` | The comparison epoch changed since the previous observation. Current cumulative values are valid, and no rate is computable across that boundary. This does not prove that counters restarted: a server restart can preserve statement statistics. |
+| `partial` | Cataloged fields or entries are missing for a reason other than the expected absences listed below: a previously contributing scoped entry disappeared, a family cap was reached, a value is out of range, a sub-probe failed, or a counter decreased without an explained cause. |
 | `observed` | Complete and fresh, allowing the expected omissions, with no established higher-priority family fact. Each contributing entry is internally consistent. A pooled record may contain entries with different statistics windows; no common interval is required. A first observation may be observed without a baseline. Temporal comparisons follow the per-entry epoch, membership, and mapping rules in [Comparison context](#comparison-context). |
 
 Rows that belong to other roles are excluded by design and are not a
@@ -140,20 +140,30 @@ Cumulative counters are only comparable inside one epoch.
   matching entries, and eviction also removes entries. Until an entry is
   re-created it is absent; it does not show an in-place `stats_since` change. A
   cataloged operation with no entry reports `no-entry`. When a previously
-  contributing entry disappears, the contributor membership changes and
-  operation-wide rates are suppressed. Absence alone does not establish a
-  reset. A re-created entry has a new `stats_since`, and an established epoch
-  change invalidates comparison, whatever the cause.
+  contributing entry disappears, the contributor membership changes, no
+  operation-wide rate is computable, and the family is `partial`. Absence
+  alone does not establish a reset. A re-created entry has a new
+  `stats_since`, and an established epoch change invalidates comparison,
+  whatever the cause.
 - Monotonic counters never decrease inside an epoch. A decrease without an
-  epoch change suppresses rates and marks the family `partial` without
-  asserting a cause. With an epoch change the family is `reset`. Changes in
-  min, max, mean, or standard deviation never imply a reset on their own.
-- Growth in the deallocation counter means entries were evicted. It
-  establishes `partial`, independently of the absence rules above, and never
-  `reset`.
+  epoch change leaves no computable rate and marks the family `partial`
+  without asserting a cause. With an epoch change the family is `reset`.
+  Changes in min, max, mean, or standard deviation never imply a reset on
+  their own.
+- `pg_stat_statements_info.dealloc` is a server-wide counter, while the family
+  covers only the runtime role and the current database. Its growth means
+  that some entry was evicted somewhere, not that a scoped entry was. It is
+  supporting evidence only and does not establish `partial` by itself. The
+  family is `partial` when a scoped contributing entry also disappeared, and
+  `reset` when its epoch changed, as the membership and epoch rules above
+  determine. Eviction alone never establishes either.
 - Server timestamps are compared only with server timestamps.
-- A rate needs two observations from the same epoch. Otherwise LCM reports no
-  rate.
+- This contract catalogs cumulative values only and emits no rate fields. A
+  rate is derived by a consumer, or by a future catalog revision, from two
+  comparable cumulative observations in the same epoch; with any other pair
+  no rate is valid. An exported rate needs its own catalog entry: name, unit,
+  the source counters it derives from, dimensions, and an updated cardinality
+  bound.
 - LCM reports aggregates only and never synthesizes percentiles. Workload
   latency percentiles belong to #629.
 - Every number is finite and non-negative. Integer counters, including the
@@ -164,8 +174,9 @@ Cumulative counters are only comparable inside one epoch.
 
 ### Comparison context
 
-Statuses derived by comparison (`reset`, decrease and eviction `partial`) and
-all rates need a prior observation. #637 owns a bounded comparison context
+Statuses derived by comparison (`reset`, and `partial` from a decrease or a
+membership change) and the validity of any rate derived from two observations
+need a prior observation. #637 owns a bounded comparison context
 inside the shared snapshot path:
 
 - at most one prior context per scope, with a bounded entry count;
@@ -179,14 +190,14 @@ observations to certify it.
 Comparison is per entry: same role and database scope, top-level statement,
 same internal query identifier. It requires that entry's statement epoch to be
 unchanged, and the operation's contributing entries and mapping to be
-unchanged. Otherwise LCM reports no operation-wide rate; it never compares only
-the surviving contributors. A min/max-only change invalidates the extrema
+unchanged. Otherwise no operation-wide rate is computable; LCM never compares
+only the surviving contributors. A min/max-only change invalidates the extrema
 comparison and nothing else.
 
 The first observation has no prior context. It reports cumulative values and
 epoch metadata, has status `observed` if it is otherwise complete, and has no
-rate. It makes no reset, decrease, or eviction claim. The missing baseline is a
-per-field reason, never a false reset.
+computable rate. It makes no reset, decrease, or membership-change claim. The
+missing baseline is a per-field reason, never a false reset.
 
 ## Query fingerprints
 
@@ -270,7 +281,10 @@ camelCase form of the same names.
 
 Three family-level values accompany the records: `statements_dealloc_total`
 (count), `statements_stats_reset` (server timestamp), and `block_size` (bytes,
-from `current_setting('block_size')`, reported once). The collector reads
+from `current_setting('block_size')`, reported once). The first two are
+server-wide values: `statements_dealloc_total` is informational only, counts
+evictions across all roles and databases, and does not by itself degrade the
+family status. The collector reads
 `current_setting` for `pg_stat_statements.track`,
 `pg_stat_statements.track_planning`, and `track_io_timing`. An off setting omits
 the dependent fields with reason `disabled-setting`, never as zero. LCM never
@@ -326,7 +340,7 @@ information.
 
 | Family | Fields | Notes |
 |---|---|---|
-| Pool | `pool_configured_max`, `pool_total`, `pool_idle`, `pool_waiting` (connections); `pool_saturation_ratio` | The first four are existing snapshot fields with origin `daemon`, `diagnostic-probe`, or `local`. The ratio is total divided by configured maximum, omitted when the maximum is not above 0. `pool_acquire_timeouts_total` is reserved for a future catalog revision and is not an emitted field until the pool supplies a defined counter. #638 must explicitly document whether that capability is supported. Its absence is neither a zero timeout count nor evidence of timeout-free operation. `observed` means completeness of the active catalog. Adding the counter requires the catalog update and tests described above; an unavailable counter after admission to that catalog follows the normal per-field failure rules. |
+| Pool | `pool_configured_max`, `pool_total`, `pool_idle`, `pool_waiting` (connections); `pool_saturation_ratio` | The first four are existing snapshot fields with origin `daemon`, `diagnostic-probe`, or `local`. The saturation ratio is busy connections over the configured maximum, `(pool_total - pool_idle) / pool_configured_max`, because the pool total includes idle clients; it is omitted when the maximum is not above 0 or when idle exceeds total. `pool_waiting` remains a separate gauge. `pool_acquire_timeouts_total` is reserved for a future catalog revision and is not an emitted field until the pool supplies a defined counter. #638 must explicitly document whether that capability is supported. Its absence is neither a zero timeout count nor evidence of timeout-free operation. `observed` means completeness of the active catalog. Adding the counter requires the catalog update and tests described above; an unavailable counter after admission to that catalog follows the normal per-field failure rules. |
 | Migration | `migration_applied_count`, `migration_expected_count` (counts); `migration_history_status` | Status is one of `current`, `behind`, `ahead`, `drift`, `checksum-mismatch`, `unavailable`. LCM compares migration IDs and checksums against the packaged set in-process, as readiness already does. It emits only the two counts and the closed status, never ID lists, checksums, or SQL. |
 | Extensions | `pg_stat_statements`, `pg_trgm`, `pgcrypto`, `unaccent` | Each reports its name, the existing closed status, and the installed and default versions only when they match `^[0-9]+(\.[0-9]+){0,2}$`; otherwise the version is `unrecognized`. No remediation text and no installed schema. The optional set is empty for P4. |
 | Queue and replay | Existing outbox counts; `outbox_oldest_pending_age_seconds`; inbox claimed and quarantined counts; replay lag in seconds | The outbox age uses the local wall clock over local files. Inbox counts and replay lag come from server rows and use the server clock (`clock_timestamp()`). Never event IDs, payloads, or paths. |
