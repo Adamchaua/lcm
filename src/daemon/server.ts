@@ -30,6 +30,7 @@ import { createStoreHandler } from "./routes/store.js";
 import { createRecentHandler } from "./routes/recent.js";
 import { createIngestHandler } from "./routes/ingest.js";
 import { createTerminalIngestQueue } from "./routes/ingest-terminal.js";
+import { settleProjectStorageExecutions } from "./routes/storage-lifecycle.js";
 import { createPromptSearchHandler } from "./routes/prompt-search.js";
 import { createStatusHandler } from "./routes/status.js";
 import { createSessionCompleteHandler } from "./routes/session-complete.js";
@@ -696,6 +697,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     if (storageFactoryClosed) return;
     storageFactoryClosed = true;
     try {
+      await settleProjectStorageExecutions(storageFactory);
       await storageFactory.close();
     } catch (error) {
       storageFactoryClosed = false;
