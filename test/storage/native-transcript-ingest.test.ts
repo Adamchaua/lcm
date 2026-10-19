@@ -47,6 +47,7 @@ import {
   createExactNativeTranscriptMessageResolver,
   createNativeTranscriptMessageMapper,
   createNativeTranscriptScrubber,
+  inheritedNativeSourceOrdinals,
   NativeTranscriptConfigurationError,
   NativeTranscriptLinkError,
   NativeTranscriptSourceChangedError,
@@ -5440,7 +5441,6 @@ describe("Codex inherited subagent history option", () => {
   });
 
   it.each([
-    ["a custom mapper", { codexInheritedBoundary: { start: 1, paginated: true }, messageMapper: { map: () => [] } }],
     ["a non-object boundary", { codexInheritedBoundary: null }],
     ["a fractional start", { codexInheritedBoundary: { start: 1.5, paginated: true } }],
     ["a negative start", { codexInheritedBoundary: { start: -1, paginated: true } }],
@@ -5453,6 +5453,81 @@ describe("Codex inherited subagent history option", () => {
       ...extra,
     } as never)).rejects.toThrowError(NativeTranscriptConfigurationError);
     expect(repo.ingestBatch).not.toHaveBeenCalled();
+  });
+
+  it("links own messages when scrubbing renames the ordinal key, initially and on resume", async () => {
+    const content = codexMessage(0, "user", "inherited")
+      + codexMessage(1, "user", "own 1")
+      + codexMessage(2, "assistant", "own 2");
+    const repo = repository();
+    await runNativeTranscriptBackfill({
+      ...base(content, resolverFor("own 1", "own 2")),
+      repository: repo,
+      globalPatterns: ["ordinal"],
+      codexInheritedBoundary: { start: 1, paginated: true },
+    });
+    const records = repo.batches.flatMap((batch) => batch.records);
+    expect(JSON.stringify(records[1]!.nativePayload)).not.toContain('"ordinal"');
+    expect(records.map((record) => record.messageLinks.map((link) => link.messageId))).toEqual([[], [10], [11]]);
+
+    const resumed = repository(checkpoint({
+      version: 2,
+      byteOffset: Buffer.byteLength(codexMessage(0, "user", "inherited") + codexMessage(1, "user", "own 1")),
+      prefixSha256: digest(codexMessage(0, "user", "inherited") + codexMessage(1, "user", "own 1")),
+      scrubberVersion: createNativeTranscriptScrubber({ globalPatterns: ["ordinal"], projectPatterns: [] }).scrubberVersion,
+      nativeSessionId: "session-1",
+      format: { clientName: "codex", formatName: "codex-jsonl", formatVersion: "v1" },
+      source: { sizeBytes: 1, modifiedAtMs: 1, changedAtMs: 1 },
+    }));
+    await runNativeTranscriptBackfill({
+      ...base(content, resolverFor("own 1", "own 2")),
+      repository: resumed,
+      globalPatterns: ["ordinal"],
+      codexInheritedBoundary: { start: 1, paginated: true },
+    });
+    expect(resumed.batches.flatMap((batch) => batch.records).map((record) => record.messageLinks.map((link) => link.messageId)))
+      .toEqual([[11]]);
+  });
+
+  it("never asks a custom mapper about inherited records", async () => {
+    const map = vi.fn(() => []);
+    await runNativeTranscriptBackfill({
+      ...base(codexMessage(0, "user", "inherited") + codexMessage(1, "user", "own"), resolverFor()),
+      repository: repository(),
+      messageMapper: { map },
+      codexInheritedBoundary: { start: 1, paginated: true },
+    });
+    expect(map).toHaveBeenCalledTimes(1);
+  });
+
+  it("classifies raw records for the reader and omits the flag without a boundary", async () => {
+    const bytes = codexMessage(0, "user", "inherited") + codexMessage(1, "user", "own");
+    const scrubber = createNativeTranscriptScrubber({ globalPatterns: ["ordinal"], projectPatterns: [] });
+    const withBoundary = await collect(byteChunks(bytes), {
+      format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
+      scrubber,
+      codexInheritedBoundary: { start: 1, paginated: true },
+    });
+    expect(withBoundary.map((outcome) => outcome.kind === "record" ? outcome.inheritedHistory : undefined))
+      .toEqual([true, false]);
+    const without = await collect(byteChunks(bytes), { format: CODEX_NATIVE_TRANSCRIPT_FORMAT });
+    expect(without.every((outcome) => outcome.kind === "record" && !("inheritedHistory" in outcome))).toBe(true);
+    await expect(collect(byteChunks(bytes), {
+      format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
+      codexInheritedBoundary: { start: -1, paginated: true },
+    })).rejects.toThrowError(NativeTranscriptConfigurationError);
+    await expect(collect(byteChunks(bytes), {
+      codexInheritedBoundary: { start: 1, paginated: true },
+    })).rejects.toThrowError(NativeTranscriptConfigurationError);
+  });
+
+  it("lists the source ordinals of inherited records, counting quarantined lines", async () => {
+    const bytes = JSON.stringify({ type: "session_meta", payload: {} }) + "\n"
+      + codexMessage(0, "user", "inherited")
+      + "{bad\n\n"
+      + codexMessage(1, "user", "own")
+      + JSON.stringify({ type: "response_item", ordinal: 0, payload: { type: "function_call" } }) + "\n";
+    expect([...await inheritedNativeSourceOrdinals(Buffer.from(bytes), { start: 1, paginated: false })]).toEqual([1, 4]);
   });
 
   it("rejects the option for a non-Codex format", async () => {

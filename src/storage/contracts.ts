@@ -231,6 +231,19 @@ export interface NativeTranscriptMessageSnapshotRepository {
 }
 
 /**
+ * Narrow read-only provenance seam, available inside a project transaction.
+ *
+ * It reports which committed native records of one source are linked to a
+ * stored message, so an ingest decision can honor links that already exist.
+ */
+export interface NativeTranscriptProvenanceRepository {
+  /** Ascending source ordinals of the session's linked native records in one source. */
+  listLinkedSourceOrdinals(
+    input: NativeTranscriptCheckpointKey & { readonly nativeSessionId: string },
+  ): Promise<readonly number[]>;
+}
+
+/**
  * Maximum native sessions resolved per source-locator statement.
  *
  * Discovery batches its lookups so one statement stays bounded in both
@@ -458,6 +471,8 @@ export type TransactionRepositories = ProjectRepositories & Readonly<{
    * backends that run concurrent root transactions on separate connections.
    */
   promotedDecisionSerializer?: PromotedDecisionSerializer;
+  /** Transaction-scoped native link provenance; absent on backends without native storage. */
+  nativeProvenance?: NativeTranscriptProvenanceRepository;
 }>;
 
 export interface ProjectStorage extends ProjectRepositories {

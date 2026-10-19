@@ -11,7 +11,13 @@ rationale: >-
   src/storage/native-transcript-ingest.ts (inherited subagent history) are
   materially changed and keep their transcript import owner, and
   src/daemon/routes/ingest.ts (history mode choice) keeps its daemon routes
-  owner. No file is removed, moved or re-owned.
+  owner. src/storage/contracts.ts and the transaction wiring in
+  src/storage/postgresql/project-storage.ts (a read-only native provenance
+  seam) are materially changed and keep their storage abstractions owner;
+  src/storage/sqlite/native-transcript-repository.ts and
+  src/storage/sqlite/project-storage.ts keep their local persistence owner, and
+  src/storage/postgresql/native-transcript-repository.ts keeps its PostgreSQL
+  transcripts owner. No file is removed, moved or re-owned.
 pins:
   - ["src/hooks/subagent-scope.ts", "unit-hooks"]
   - ["src/hooks/restore.ts", "unit-hooks"]
@@ -24,3 +30,8 @@ pins:
   - ["src/transcript-provider.ts", "unit-transcripts-import"]
   - ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"]
   - ["src/daemon/routes/ingest.ts", "unit-daemon-routes"]
+  - ["src/storage/contracts.ts", "unit-storage-abstractions"]
+  - ["src/storage/postgresql/project-storage.ts", "unit-storage-abstractions"]
+  - ["src/storage/sqlite/native-transcript-repository.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/project-storage.ts", "unit-local-persistence"]
+  - ["src/storage/postgresql/native-transcript-repository.ts", "integration-postgresql-transcripts"]

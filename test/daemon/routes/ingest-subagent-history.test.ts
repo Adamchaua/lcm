@@ -7,6 +7,7 @@ import { createStorageBackendFactory } from "../../../src/storage/index.js";
 import { createIngestHandler } from "../../../src/daemon/routes/ingest.js";
 import { projectDbPath } from "../../../src/daemon/project.js";
 import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
+import * as codexTranscript from "../../../src/codex-transcript.js";
 
 const logs = vi.hoisted(() => ({ error: vi.fn() }));
 vi.mock("../../../src/hooks/hook-errors.js", () => ({ safeLogError: logs.error }));
@@ -34,6 +35,7 @@ async function withWorld(
     write(text: string): void;
     append(text: string): void;
     ingest(extra?: Record<string, unknown>): Promise<{ status: number; body: Record<string, unknown> }>;
+    ingestWith(patterns: string[]): Promise<{ status: number; body: Record<string, unknown> }>;
     seed(...rows: Array<[Role, string]>): Promise<void>;
     messages(): string[];
     links(): string[];
@@ -43,16 +45,22 @@ async function withWorld(
 ): Promise<void> {
   const cwd = mkdtempSync(join(tmpdir(), "subagent-history-"));
   const source = join(cwd, "child.jsonl");
-  const config = loadDaemonConfig(join(cwd, "nonexistent"), { security: { sensitivePatterns: patterns } });
-  const factory = await createStorageBackendFactory(config.storage);
-  const handler = createIngestHandler(config, factory);
-  const call = async (payload: Record<string, unknown>) => {
+  const factories: Array<{ close(): Promise<void> }> = [];
+  const handlerFor = async (sensitivePatterns: string[]) => {
+    const config = loadDaemonConfig(join(cwd, "nonexistent"), { security: { sensitivePatterns } });
+    const factory = await createStorageBackendFactory(config.storage);
+    factories.push(factory);
+    return createIngestHandler(config, factory);
+  };
+  const handler = await handlerFor(patterns);
+  const callWith = async (route: typeof handler, payload: Record<string, unknown>) => {
     let status = 0;
     let body = "";
     const res = { writeHead: (code: number) => { status = code; }, end: (text: string) => { body = text; } };
-    await handler({} as never, res as never, JSON.stringify({ cwd, client: "codex", session_id: "child-thread", ...payload }));
+    await route({} as never, res as never, JSON.stringify({ cwd, client: "codex", session_id: "child-thread", ...payload }));
     return { status, body: JSON.parse(body) as Record<string, unknown> };
   };
+  const call = (payload: Record<string, unknown>) => callWith(handler, payload);
   const query = <T>(sql: string): T[] => {
     const dbPath = projectDbPath(cwd);
     const db = getLcmConnection(dbPath);
@@ -66,6 +74,7 @@ async function withWorld(
       write: (text) => writeFileSync(source, text, { mode: 0o600 }),
       append: (text) => appendFileSync(source, text),
       ingest: (extra = {}) => call({ transcript_path: source, ...extra }),
+      ingestWith: async (other) => callWith(await handlerFor(other), { transcript_path: source }),
       seed: async (...rows) => {
         const result = await call({ messages: rows.map(([role, content]) => ({ role, content, tokenCount: 1 })) });
         expect(result.status).toBe(200);
@@ -77,7 +86,7 @@ async function withWorld(
       nativeRecords: () => query<{ n: number }>("SELECT count(*) AS n FROM runtime_native_transcripts")[0]!.n,
     });
   } finally {
-    await factory.close();
+    for (const factory of factories) await factory.close();
     rmSync(cwd, { recursive: true, force: true });
   }
 }
@@ -123,7 +132,82 @@ describe("Codex forked subagent history on ingest", () => {
       expect(world.links()).toEqual(["A"]);
       expect(await world.ingest()).toEqual({ status: 200, body: { ingested: 0, totalTokens: 0 } });
       expect(world.messages()).toEqual(["A"]);
+
+      // Growing keeps the tie on the filtered list: only an own record is linked.
+      world.append(lines(message(3, "assistant", "C")));
+      expect((await world.ingest()).body).toMatchObject({ ingested: 1 });
+      expect(world.messages()).toEqual(["A", "C"]);
+      expect(world.links()).toEqual(["A", "C"]);
     });
+  });
+
+  it("keeps a conversation on its unfiltered list when a committed link sits on inherited history", async () => {
+    await withWorld(async (world) => {
+      world.write(lines(
+        meta({ subagent_history_start_ordinal: 2, history_mode: "paginated" }),
+        message(0, "user", "A"),
+      ));
+      // The first snapshot is what a build without the filter would have stored.
+      vi.spyOn(codexTranscript, "readCodexInheritedBoundary").mockReturnValueOnce(undefined);
+      await world.ingest();
+      expect(world.messages()).toEqual(["A"]);
+      expect(world.links()).toEqual(["A"]);
+
+      world.append(lines(message(1, "assistant", "B"), message(2, "user", "A")));
+      expect((await world.ingest()).body).toMatchObject({ ingested: 2 });
+      expect(world.messages()).toEqual(["A", "B", "A"]);
+      expect(world.links()).toEqual(["A", "B", "A"]);
+      expect(await world.ingest()).toEqual({ status: 200, body: { ingested: 0, totalTokens: 0 } });
+
+      // A scrubber change rescans the source; the saved links must still agree.
+      expect(await world.ingestWith(["never-matches-anything"])).toEqual({ status: 200, body: { ingested: 0, totalTokens: 0 } });
+      expect(await world.ingestWith(["never-matches-anything"])).toEqual({ status: 200, body: { ingested: 0, totalTokens: 0 } });
+      expect(world.links()).toEqual(["A", "B", "A"]);
+      expect(logs.error).not.toHaveBeenCalled();
+    });
+  });
+
+  it("neither stores nor links a non-extending boundary rollout over existing messages", async () => {
+    await withWorld(async (world) => {
+      await world.seed(["user", "existing"]);
+      world.write(lines(meta({ subagent_history_start_ordinal: 0, history_mode: "paginated" }), tool(0)));
+      expect(await world.ingest()).toEqual({ status: 200, body: { ingested: 0, totalTokens: 0 } });
+      expect(world.messages()).toEqual(["existing"]);
+      expect(world.nativeRecords()).toBe(0);
+      expect(logs.error).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("treats a scrub pattern added after storage as a mismatch and appends nothing", async () => {
+    await withWorld(async (world) => {
+      world.write(lines(
+        meta({ subagent_history_start_ordinal: 1, history_mode: "paginated" }),
+        message(0, "user", "inherited"),
+        message(1, "user", "SENSITIVE1234"),
+      ));
+      await world.ingest();
+      expect(world.messages()).toEqual(["SENSITIVE1234"]);
+      world.append(lines(message(2, "assistant", "next")));
+      expect(await world.ingestWith(["SENSITIVE[0-9]+"])).toEqual({ status: 200, body: { ingested: 0, totalTokens: 0 } });
+      expect(world.messages()).toEqual(["SENSITIVE1234"]);
+      expect(logs.error).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("links own messages when a scrub pattern renames the ordinal key", async () => {
+    await withWorld(async (world) => {
+      world.write(lines(
+        meta({ subagent_history_start_ordinal: 1, history_mode: "paginated" }),
+        message(0, "user", "inherited"),
+        message(1, "user", "own 1"),
+      ));
+      await world.ingest();
+      expect(world.links()).toEqual(["own 1"]);
+      world.append(lines(message(2, "assistant", "own 2")));
+      expect((await world.ingest()).body).toMatchObject({ ingested: 1 });
+      expect(world.messages()).toEqual(["own 1", "own 2"]);
+      expect(world.links()).toEqual(["own 1", "own 2"]);
+    }, ["ordinal"]);
   });
 
   it("keeps a previously stored unfiltered child on its legacy list and appends exactly once", async () => {
@@ -213,6 +297,7 @@ describe("Codex forked subagent history on ingest", () => {
       expect(await world.ingest()).toEqual({ status: 200, body: { ingested: 0, totalTokens: 0 } });
       expect(world.messages()).toEqual([]);
       expect(world.nativeRecords()).toBe(2);
+      expect(logs.error).not.toHaveBeenCalled();
     });
   });
 

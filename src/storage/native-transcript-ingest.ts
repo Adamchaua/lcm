@@ -317,6 +317,12 @@ export interface PreparedNativeTranscriptRecord {
   readonly contentSha256: string;
   readonly ingestKey: string;
   readonly nativePayload: JsonObject | JsonValue[];
+  /**
+   * Set only when a Codex inherited boundary was supplied: whether the RAW
+   * record, classified before key scrubbing, is parent history a forked
+   * subagent inherited.
+   */
+  readonly inheritedHistory?: boolean;
 }
 
 export interface QuarantinedNativeTranscriptRecord {
@@ -342,6 +348,8 @@ export interface NativeTranscriptJsonlReadOptions {
   readonly clock?: () => Date;
   /** @internal Allows bounded unit tests without allocating ten MiB. */
   readonly maxRecordBytes?: number;
+  /** Classify each record against this Codex inherited-history boundary. */
+  readonly codexInheritedBoundary?: CodexInheritedBoundary;
   /**
    * Report physical progress only after this absolute byte boundary.
    * Crossing records are trimmed and rehashed from the boundary.
@@ -366,6 +374,7 @@ interface NativeTranscriptJsonlReadSnapshot {
   readonly maxRecordBytes: number;
   readonly progressStartByteOffset: number;
   readonly onProgress: NativeTranscriptJsonlReadOptions["onProgress"];
+  readonly inheritedBoundary: CodexInheritedBoundary | undefined;
 }
 
 function snapshotByteIterable(
@@ -430,6 +439,10 @@ function snapshotNativeTranscriptJsonlReadOptions(
   const onProgress = options.onProgress;
   const callerScrubber = options.scrubber;
   const callerBytes = options.bytes;
+  const inheritedBoundary = snapshotInheritedBoundary(
+    options.codexInheritedBoundary,
+    format,
+  );
   assertFormat(format);
   assertNonemptyText(nativeSessionId);
   assertSourceLocator(sourceLocator);
@@ -463,7 +476,26 @@ function snapshotNativeTranscriptJsonlReadOptions(
     maxRecordBytes,
     progressStartByteOffset,
     onProgress,
+    inheritedBoundary,
   });
+}
+
+function snapshotInheritedBoundary(
+  boundary: CodexInheritedBoundary | undefined,
+  format: NativeTranscriptFormat,
+): CodexInheritedBoundary | undefined {
+  if (boundary === undefined) return undefined;
+  if (
+    boundary === null
+    || typeof boundary !== "object"
+    || format.clientName !== CODEX_NATIVE_TRANSCRIPT_FORMAT.clientName
+    || !Number.isSafeInteger(boundary.start)
+    || boundary.start < 0
+    || typeof boundary.paginated !== "boolean"
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  return Object.freeze({ start: boundary.start, paginated: boundary.paginated });
 }
 
 function ingestKey(
@@ -786,6 +818,33 @@ export function readNativeTranscriptJsonl(
   }
 }
 
+/**
+ * Source ordinals of the records of one Codex rollout that its own bytes
+ * classify as inherited parent history. Ordinals are those the native reader
+ * assigns (every non-blank physical record, quarantined or not), so they match
+ * committed native records of the same prefix. Nothing is scrubbed or stored.
+ */
+export async function inheritedNativeSourceOrdinals(
+  bytes: Uint8Array,
+  boundary: CodexInheritedBoundary,
+): Promise<ReadonlySet<number>> {
+  const ordinals = new Set<number>();
+  const chunks = (async function* (): AsyncGenerator<Uint8Array> { yield bytes; })();
+  for await (const outcome of readNativeTranscriptJsonl({
+    bytes: chunks,
+    format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
+    nativeSessionId: "inherited-ordinal-scan",
+    sourceLocator: "inherited-ordinal-scan.jsonl",
+    scrubber: { scrubberVersion: "inherited-ordinal-scan/v1", scrubJson: (value) => value },
+    codexInheritedBoundary: boundary,
+  })) {
+    if (outcome.kind === "record" && outcome.inheritedHistory === true) {
+      ordinals.add(outcome.sourceOrdinal);
+    }
+  }
+  return ordinals;
+}
+
 async function* readNativeTranscriptJsonlSnapshot(
   config: NativeTranscriptJsonlReadSnapshot,
 ): AsyncGenerator<NativeTranscriptReadOutcome> {
@@ -843,6 +902,11 @@ async function* readNativeTranscriptJsonlSnapshot(
     try {
       const parsed = parsedContainer(decodeRecord(bytes));
       assertJsonTreeSafe(parsed);
+      // Classified from the raw record: scrubbing rewrites keys as well as
+      // values, so the scrubbed payload cannot be trusted to carry "ordinal".
+      const inheritedHistory = config.inheritedBoundary === undefined
+        ? undefined
+        : isInheritedSubagentRecord(parsed, config.inheritedBoundary);
       const nativePayload = config.scrubber.scrubJson(parsed);
       const canonicalPayload = canonicalNativeTranscriptJson(nativePayload);
       if (Buffer.byteLength(canonicalPayload, "utf8") > config.maxRecordBytes) {
@@ -871,6 +935,7 @@ async function* readNativeTranscriptJsonlSnapshot(
           occurrence,
         ),
         nativePayload,
+        ...(inheritedHistory === undefined ? {} : { inheritedHistory }),
       };
       sourceOrdinal += 1;
       return outcome;
@@ -1669,23 +1734,6 @@ function resumableByteOffset(
   return checkpoint.byteOffset as number;
 }
 
-/**
- * Wraps a mapper so records a forked Codex subagent inherited from its parent
- * map to no message candidates. The records themselves are still stored, with
- * no message links, so the session-wide message order stays that of the
- * subagent's own history.
- */
-function createInheritedHistoryMapper(
-  base: NativeTranscriptMessageMapper,
-  boundary: CodexInheritedBoundary,
-): NativeTranscriptMessageMapper {
-  return {
-    map: (format, payload, sourceOrdinal) => isInheritedSubagentRecord(payload, boundary)
-      ? []
-      : base.map(format, payload, sourceOrdinal),
-  };
-}
-
 export interface NativeTranscriptBackfillOptions {
   readonly repository: NativeTranscriptRepository;
   readonly quarantine: LocalTranscriptQuarantineRepository;
@@ -1699,8 +1747,9 @@ export interface NativeTranscriptBackfillOptions {
   readonly pipelineVersion?: string;
   readonly messageMapper?: NativeTranscriptMessageMapper;
   /**
-   * Built-in Codex option: records before this boundary map to no messages.
-   * Unlike messageMapper it keeps the default mapper's quarantine-gap recovery.
+   * Built-in Codex option: records a forked subagent inherited map to no
+   * messages (they stay stored, unlinked). Unlike a messageMapper it keeps
+   * quarantine-gap recovery.
    */
   readonly codexInheritedBoundary?: CodexInheritedBoundary;
   readonly messageResolver: ExactNativeTranscriptMessageResolver;
@@ -1741,6 +1790,7 @@ interface NativeTranscriptBackfillSnapshot {
   readonly batchSize: number;
   readonly clock: (() => Date) | undefined;
   readonly maxRecordBytes: number | undefined;
+  readonly inheritedBoundary: CodexInheritedBoundary | undefined;
 }
 
 function snapshotNativeTranscriptBackfillOptions(
@@ -1806,7 +1856,6 @@ function snapshotNativeTranscriptBackfillOptions(
   const source = options.source;
   const messageResolver = options.messageResolver;
   const callerMapper = options.messageMapper;
-  const inheritedBoundary = options.codexInheritedBoundary;
   if (
     repository === null
     || typeof repository !== "object"
@@ -1836,27 +1885,11 @@ function snapshotNativeTranscriptBackfillOptions(
   if (clientName !== format.clientName) {
     throw new NativeTranscriptConfigurationError("invalid-input");
   }
-  if (
-    inheritedBoundary !== undefined
-    && (
-      callerMapper !== undefined
-      || format.clientName !== CODEX_NATIVE_TRANSCRIPT_FORMAT.clientName
-      || inheritedBoundary === null
-      || typeof inheritedBoundary !== "object"
-      || !Number.isSafeInteger(inheritedBoundary.start)
-      || inheritedBoundary.start < 0
-      || typeof inheritedBoundary.paginated !== "boolean"
-    )
-  ) {
-    throw new NativeTranscriptConfigurationError("invalid-input");
-  }
-  const baseMapper = callerMapper ?? createNativeTranscriptMessageMapper();
-  const mapper = inheritedBoundary === undefined
-    ? baseMapper
-    : createInheritedHistoryMapper(baseMapper, {
-        start: inheritedBoundary.start,
-        paginated: inheritedBoundary.paginated,
-      });
+  const inheritedBoundary = snapshotInheritedBoundary(
+    options.codexInheritedBoundary,
+    format,
+  );
+  const mapper = callerMapper ?? createNativeTranscriptMessageMapper();
   return Object.freeze({
     repository: Object.freeze({
       getCheckpoint: repository.getCheckpoint.bind(repository),
@@ -1886,6 +1919,7 @@ function snapshotNativeTranscriptBackfillOptions(
     batchSize,
     clock,
     maxRecordBytes,
+    inheritedBoundary,
   });
 }
 
@@ -1940,6 +1974,11 @@ function mappedMessageCandidates(
   )[];
   readonly nextSessionSequence: number;
 } {
+  // Inherited parent history stays stored but unlinked, so it never takes a
+  // place in the session-wide message order of the subagent's own history.
+  if (record.inheritedHistory === true) {
+    return { candidates: [], nextSessionSequence: startingSessionSequence };
+  }
   const candidates = mapper.map(
     format,
     cloneNativePayload(record.nativePayload),
@@ -2202,6 +2241,7 @@ export async function runNativeTranscriptBackfill(
       scrubber,
       clock: config.clock,
       maxRecordBytes: config.maxRecordBytes,
+      codexInheritedBoundary: config.inheritedBoundary,
       progressStartByteOffset: committedByteOffset,
       onProgress: (progress) => {
         progressState.latest = progress;

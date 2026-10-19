@@ -446,7 +446,9 @@ A `SubagentStop` payload without a valid `agent_id` or without
   prefix) extends what is already stored. If the stored messages match neither
   reading, for example after the rollout was rewritten, LCM appends nothing for
   that subagent, writes a diagnostic to the hook error log, and leaves the rest
-  of the conversation untouched.
+  of the conversation untouched. Adding, removing or changing a sensitive
+  pattern (or a built-in scrubber change) after a subagent was stored changes
+  how its text is redacted, so it has the same effect for that subagent.
 - When one session id has several stored conversations, ingest continues to
   append to the most recent one, as it does for every other client.
 - Sibling subagents count as distinct sessions for passive pattern
