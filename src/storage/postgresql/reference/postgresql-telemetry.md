@@ -59,8 +59,9 @@ closed status in [Observation status](#observation-status) leaves the process.
 ## Observation status
 
 Every telemetry family reports one status from a closed set, together with
-`observedAt` (UTC milliseconds) and the epoch fields that apply to the family.
-The #638 gauge families have no epoch fields.
+`observedAt` (UTC milliseconds). Apart from the cataloged
+`statements_stats_reset`, epoch values are internal comparison data and never
+leave the process (see [Epochs, resets, and rates](#epochs-resets-and-rates)).
 
 | Status | Meaning |
 |---|---|
@@ -71,7 +72,7 @@ The #638 gauge families have no epoch fields.
 | `timeout` | The probe hit a deadline or was cancelled: SQLSTATE 57014, the snapshot deadline, or the caller signal. |
 | `stale` | `observedAt` is older than the family's declared freshness bound, or the values are not tied to the current epoch. |
 | `reset` | The comparison epoch changed since the previous observation. Current cumulative values are valid, and no rate is computable across that boundary. This does not prove that counters restarted: a server restart can preserve statement statistics. |
-| `partial` | Cataloged fields or entries are missing for a reason other than the expected absences listed below: a previously contributing scoped entry disappeared, a family cap was reached, a value is out of range, a sub-probe failed, or a counter decreased without an explained cause. |
+| `partial` | Cataloged fields or entries are missing for a reason other than the expected absences listed below: a previously contributing scoped entry disappeared, a family cap was reached, a value is out of range or has invalid inputs, a sub-probe failed, or a counter decreased without an explained cause. |
 | `observed` | Complete and fresh, allowing the expected omissions, with no established higher-priority family fact. Each contributing entry is internally consistent. A pooled record may contain entries with different statistics windows; no common interval is required. A first observation may be observed without a baseline. Temporal comparisons follow the per-entry epoch, membership, and mapping rules in [Comparison context](#comparison-context). |
 
 Rows that belong to other roles are excluded by design and are not a
@@ -106,10 +107,10 @@ reason:
 | `timeout` | The sub-probe hit its deadline. | Yes, to `partial`. |
 | `permission-denied` | The sub-probe was denied. | Yes, to `partial`. |
 | `out-of-range` | The value is not finite or is negative, or an integer counter is not an exact safe integer (above 2^53 - 1). | Yes, to `partial`. |
+| `invalid-input` | A derived value's inputs are finite and in range but cannot define it: a zero denominator, or counts that contradict each other, such as more idle than total connections. | Yes, to `partial`. |
 | `reset` | The value cannot be compared across a reset. | Accompanies `reset`. |
 | `disabled-setting` | The controlling server setting is off. | No. |
 | `no-entry` | No row exists for a cataloged operation, or, for the queue, no qualifying event exists. This is never reported as zero. | No. |
-| `invalid-input` | The inputs have an invalid relationship, such as a pool whose maximum is not above 0 or whose idle count exceeds its total. | Yes, to `partial`. |
 | `limit-reached` | A family cap was reached, so the exact value is unavailable. | Yes, to `partial`. |
 | `no-baseline` | No prior observation or other proof can establish the value. | No. |
 
@@ -131,6 +132,14 @@ their pull requests, and #640 certifies overhead.
 ## Epochs, resets, and rates
 
 Cumulative counters are only comparable inside one epoch.
+
+Epoch values decide comparability and the family status. The
+`pg_stat_statements_info.stats_reset` timestamp is the one exception to the
+internal-only rule: it is exported as the cataloged family-level
+`statements_stats_reset`. Every other epoch value is internal
+comparison-context data and is never emitted: `pg_postmaster_start_time()`
+and the per-entry `stats_since` and `minmax_stats_since` values have no
+catalog entry and do not count toward the cardinality bound.
 
 - The statement epoch is the tuple of `pg_postmaster_start_time()`, the
   `pg_stat_statements_info.stats_reset` timestamp, and the entry's
@@ -198,9 +207,10 @@ unchanged. Otherwise no operation-wide rate is computable; LCM never compares
 only the surviving contributors. A min/max-only change invalidates the extrema
 comparison and nothing else.
 
-The first observation has no prior context. It reports cumulative values and
-epoch metadata, has status `observed` if it is otherwise complete, and has no
-computable rate. It makes no reset, decrease, or membership-change claim. The
+The first observation has no prior context. It reports cumulative values,
+retains its internal epoch data in the comparison context, has
+status `observed` if it is otherwise complete, and has no computable rate.
+It makes no reset, decrease, or membership-change claim. The
 missing baseline is a per-field reason, never a false reset.
 
 ## Query fingerprints
@@ -371,7 +381,7 @@ or error text is emitted.
 
 | Family | Field (JSON) | Type and unit | Source | Omission reasons | Labels and finite bound |
 |---|---|---|---|---|---|
-| Pool | `pool_saturation_ratio` (`saturationRatio`) | number, unitless | `(total - idle) / configuredMax` of the origin-tagged pool counters. It is not clamped, so it can exceed 1. | `invalid-input` when the maximum is not above 0 or idle exceeds total; `unavailable` when the counters are unverified | origin, scope; 1 value |
+| Pool | `pool_saturation_ratio` (`saturationRatio`) | number, unitless | `(total - idle) / configuredMax` of the origin-tagged pool counters. It is not clamped, so it can exceed 1. | `invalid-input` when the maximum is 0 or idle exceeds total; `out-of-range` for a negative input; `unavailable` when the counters are unverified | origin, scope; 1 value |
 | Migration | `migration_applied_count` (`appliedCount`) | count | rows of an ordered ledger read capped at the packaged count plus one | `limit-reached` when the cap is reached; `unavailable` for a malformed ledger | scope; 1 value |
 | Migration | `migration_expected_count` (`expectedCount`) | count | the verified packaged migration list | the family failure reason when the family fails before the probe | scope; 1 value |
 | Migration | `migration_history_status` (`historyStatus`) | closed enum | positional comparison of ledger IDs and checksums with the packaged list | none; `unavailable` is a value | scope; 1 value |
