@@ -840,11 +840,18 @@ describe("stale memory demotion", () => {
 
 
 describe("POST /prompt-search recallMode pre-tool", () => {
-  type Hit = { hints: string[]; ids: string[]; debug?: { candidates: Array<{ id: string; cooledDown: boolean; surfacingCount: number }> } };
+  type Hit = { hints: string[]; ids: string[]; debug?: { candidates: Array<{ id: string; cooledDown: boolean; surfacingCount: number; matchedTermCount: number; queryTermCount: number; finalScore: number }> } };
 
   function seed(
     tempDir: string,
-    memories: Array<{ content: string; sessionId?: string; surfaced?: boolean }>,
+    memories: Array<{
+      content: string;
+      sessionId?: string;
+      surfaced?: boolean;
+      tags?: string[];
+      surfacings?: number;
+      ageDays?: number;
+    }>,
   ): string[] {
     const dbPath = projectDbPath(tempDir);
     mkdirSync(dirname(dbPath), { recursive: true });
@@ -855,10 +862,17 @@ describe("POST /prompt-search recallMode pre-tool", () => {
       return memories.map((memory) => {
         const id = store.insert({
           content: memory.content,
-          tags: ["decision"],
+          tags: memory.tags ?? ["decision"],
           projectId: "p1",
           ...(memory.sessionId === undefined ? {} : { sessionId: memory.sessionId }),
         });
+        if (memory.ageDays !== undefined) {
+          db.prepare("UPDATE promoted SET created_at = ? WHERE id = ?")
+            .run(new Date(Date.now() - memory.ageDays * 86_400_000).toISOString(), id);
+        }
+        for (let count = 0; count < (memory.surfacings ?? 0); count += 1) {
+          db.prepare("INSERT INTO recall_surfacing (memory_id, session_id) VALUES (?, ?)").run(id, "sess-earlier");
+        }
         if (memory.surfaced) {
           db.prepare("INSERT INTO recall_surfacing (memory_id, session_id) VALUES (?, ?)").run(id, "sess-earlier");
         }
@@ -1020,6 +1034,72 @@ describe("POST /prompt-search recallMode pre-tool", () => {
     expect(await probe(2)).toEqual({ prompt: [], preTool: [memoryId] });
     expect(await probe(4)).toEqual({ prompt: [], preTool: [] });
     expect(await probe(0.25)).toEqual({ prompt: [memoryId], preTool: [memoryId] });
+  });
+
+  it("grants the pre-tool relief only to complete query matches", async () => {
+    const tempDir = tempProject("pretool-partial");
+    const sessionId = "same";
+    const [memoryId] = seed(tempDir, [{ content: "git rebasing adventures with quokkas", sessionId }]);
+    // Four recorded uses lift a one-of-two-term match to about 1.6 (1.5 < score < 2).
+    const used = Array.from({ length: 4 }, (_unused, index) => ({
+      content: "Acted on memory number " + index,
+      tags: ["signal:memory_used", "memory_id:" + memoryId],
+    }));
+    seed(tempDir, used);
+    const query = buildPreToolRecallQuery("Bash", { command: "git status" });
+    expect(query).toBe("git status");
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    const daemon = await createDaemon(config);
+    const port = daemon.address().port;
+
+    try {
+      const base = { query: query!, cwd: tempDir, session_id: sessionId, debug: true, logSurfacing: false };
+      const preTool = await post(port, { ...base, recallMode: "pre-tool" });
+      const candidate = preTool.debug!.candidates
+        .find((entry) => entry.id === memoryId)!;
+      expect(candidate.matchedTermCount).toBe(1);
+      expect(candidate.queryTermCount).toBe(2);
+      expect(candidate.finalScore).toBeGreaterThan(1.5);
+      expect(candidate.finalScore).toBeLessThan(2);
+      expect(preTool.ids).toEqual([]);
+      expect((await post(port, base)).ids).toEqual([]);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("does not let the relief admit a stale full match clamped to a zero score", async () => {
+    const tempDir = tempProject("pretool-stale");
+    const [memoryId] = seed(tempDir, [{
+      content: "Run pnpm postgresql tests through the rootless podman socket",
+      ageDays: 200,
+      surfacings: 5,
+    }]);
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    config.restoration.promptSearchMinScore = 0.5;
+    config.restoration.allowStaleOnStrongMatch = false;
+    config.restoration.surfacingCooldownWindow = 0;
+    config.restoration.unusedSurfacingPenalty = 0;
+    config.restoration.stalePenalty = 0;
+    config.restoration.recencyHalfLifeHours = 1e9;
+    const daemon = await createDaemon(config);
+    const port = daemon.address().port;
+
+    try {
+      const base = { query: "pnpm postgresql", cwd: tempDir, debug: true, logSurfacing: false };
+      for (const recallMode of [undefined, "pre-tool"]) {
+        const result = await post(port, { ...base, recallMode });
+        const candidate = result.debug!.candidates
+          .find((entry) => entry.id === memoryId)!;
+        expect(candidate.matchedTermCount).toBe(2);
+        expect(candidate.finalScore).toBe(0);
+        expect(result.ids, String(recallMode)).toEqual([]);
+      }
+    } finally {
+      await daemon.stop();
+    }
   });
 
   describe("end to end through the real hook handler", () => {

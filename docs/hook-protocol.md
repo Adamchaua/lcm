@@ -404,7 +404,7 @@ the tool call still runs.
 
 The request goes to `/prompt-search` with `recallMode: "pre-tool"`, which returns
 at most two results, never falls back to a cooled-down memory, and relaxes the
-minimum score by 0.5. Surfacing is logged like prompt recall.
+minimum score by 0.5 for results that match every query term. Surfacing is logged like prompt recall.
 
 ## SessionSnapshot Hook
 

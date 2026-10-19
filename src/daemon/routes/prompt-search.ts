@@ -178,13 +178,26 @@ const PRE_TOOL_MAX_RESULTS = 2;
 // Recency decay keeps a full 2-term match just below the default minimum score of 2.
 const PRE_TOOL_MIN_SCORE_RELIEF = 0.5;
 
+/**
+ * A result meets the configured minimum score. A pre-tool request also admits a
+ * positive result that matches every query term and falls within the relief.
+ */
+function meetsMinScore(result: RankedPromptSearchResult, minScore: number, preTool: boolean): boolean {
+  if (result.finalScore >= minScore) return true;
+  return preTool
+    && result.queryTermCount > 0
+    && result.matchedTermCount === result.queryTermCount
+    && result.finalScore > 0
+    && result.finalScore >= minScore - PRE_TOOL_MIN_SCORE_RELIEF;
+}
+
 function applyCooldown(
   results: RankedPromptSearchResult[],
   minScore: number,
   resurfaceMargin: number,
   strictCooldown = false,
 ): RankedPromptSearchResult[] {
-  const eligible = results.filter((result) => result.finalScore >= minScore);
+  const eligible = results.filter((result) => meetsMinScore(result, minScore, strictCooldown));
   if (eligible.length === 0) return [];
   // Pre-tool hints never resurface a cooled-down memory, not even as the only result.
   if (strictCooldown) return eligible.filter((result) => !result.cooledDown);
@@ -282,9 +295,7 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
           if (configuredMaxResults === 0) return { hints: [], ids: [] };
           const maxResults = preTool ? Math.min(configuredMaxResults, PRE_TOOL_MAX_RESULTS) : configuredMaxResults;
 
-          const minScore = preTool
-            ? Math.max(0, config.restoration.promptSearchMinScore - PRE_TOOL_MIN_SCORE_RELIEF)
-            : config.restoration.promptSearchMinScore;
+          const minScore = config.restoration.promptSearchMinScore;
           const snippetLength = config.restoration.promptSnippetLength;
           const maxInjectedMemoryBytes = config.restoration.maxInjectedMemoryBytes;
           const reservedForLearningInstruction = config.restoration.reservedForLearningInstruction;

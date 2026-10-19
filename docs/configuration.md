@@ -502,10 +502,15 @@ enter Codex's own history, and Codex may spill oversized hook output (default
   `unusedSurfacingPenalty`, which can lower that memory's later prompt-recall
   score. Concurrent duplicate calls can surface the same memory twice, and
   distinct hints accumulate in the conversation history.
-- Because recency decay keeps a full two-term match just below 2, pre-tool
-  requests use `promptSearchMinScore - 0.5` (never below 0) as their minimum
-  score: 1.5 with the default of 2. A stricter configured value is still honored
-  (a value of 4 requires 3.5). Prompt recall is unchanged.
+- Recency decay keeps a full two-term match just below 2, so a pre-tool request
+  also admits a result that matches every query term and scores above 0 but
+  below `promptSearchMinScore`, down to `promptSearchMinScore - 0.5` (1.5 with
+  the default of 2). The relief applies only when every query term matches: a
+  partial match, even one boosted by recorded use, still needs the configured
+  minimum. A stricter configured value is still honored (with 4, a full match
+  needs 3.5), and a result scoring 0 (for example a stale memory when
+  `allowStaleOnStrongMatch` is off) is never admitted by the relief. Prompt
+  recall is unchanged.
 
 ### Leaf chunk tokens
 
