@@ -39,6 +39,13 @@
  * lcm is an acl-shape refusal. The daemon's own runtime profile is NOT
  * proven by activation (docs/migration-cutover.md, "After activation");
  * the last assertions make that explicit. #1607 is the later improvement.
+ *
+ * The activation runs without the daemon's storage secrets: the harness
+ * forbids LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE in the runner
+ * environment and this test asserts their absence, so the S15 and
+ * settled-active restart verdicts prove that the production port read does
+ * not resolve the daemon config's secrets after the publication selected
+ * postgresql (candidate round 1, S1).
  */
 
 import { randomBytes } from "node:crypto";
@@ -172,11 +179,19 @@ async function provisionActivationRole(db: PostgreSqlTestDatabase): Promise<Post
 /**
  * Remove the run's activation role before the harness drops the database: DROP
  * OWNED revokes its grants in this database and on the database itself, which
- * is what lets DROP ROLE succeed for a cluster-wide role.
+ * is what lets DROP ROLE succeed for a cluster-wide role. A provisioning
+ * failure after CREATE ROLE still leaves the role behind, so this also runs
+ * when provisioning did not finish; it is a no-op when the role never came
+ * to exist.
  */
 async function dropActivationRole(db: PostgreSqlTestDatabase): Promise<void> {
   const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
   try {
+    const exists = await administrator.query<{ present: boolean }>(
+      { text: "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1) AS present", values: [ACTIVATION_ROLE] },
+      { domain: "factory", operation: "activationRoleExists" },
+    );
+    if (exists.rows[0]?.present !== true) return;
     await administrator.query({ text: "DROP OWNED BY " + ACTIVATION_ROLE }, { domain: "factory", operation: "dropActivationRoleOwned" });
     await administrator.query({ text: "DROP ROLE " + ACTIVATION_ROLE }, { domain: "factory", operation: "dropActivationRole" });
   } finally {
@@ -362,7 +377,8 @@ async function prepareVerifiedInstallation(
   } finally {
     await witnessRuntime.close();
   }
-  const scratchParent = mkdtempSync(join(tmpdir(), "lcm-activation-e2e-scratch-"));
+  // Under the owned home, so the test's home cleanup removes it.
+  const scratchParent = mkdtempSync(join(home, "verify-scratch-"));
   const verified = await verifyMigrationGeneration({
     generationId: GENERATION_ID,
     targetGenerationId: migrationCopyTargetGeneration(GENERATION_ID),
@@ -396,20 +412,16 @@ async function prepareVerifiedInstallation(
 
 it("activates a real verified SQLite copy through the production dependencies: refused while a second project holds data, then activated, published, evidenced and idempotent", async () => {
   await withPostgreSqlTestDatabase("migration-activation-e2e", async (db) => {
-    const transfer = await provisionActivationRole(db);
     const home = mkdtempSync(join(tmpdir(), "migration-activation-e2e-"));
     vi.stubEnv("HOME", home);
     vi.stubEnv("USERPROFILE", home);
-    // The daemon's environment, exactly as daemon-runtime.integration.ts sets
-    // it: config.json never stores the PostgreSQL secrets, so once the
-    // publication has switched storage.backend to postgresql, reading the
-    // daemon config (which the S15/S16 restart verdict does for the daemon
-    // port) requires LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE. These are the
-    // daemon's runtime-role settings, not the activation role's.
-    const daemon = settings(db.runtimeUrl);
-    vi.stubEnv("LCM_POSTGRES_URL", daemon.url);
-    vi.stubEnv("LCM_POSTGRES_CA_FILE", daemon.caFile);
+    // No daemon secrets: the restart verdict's port read must not need them
+    // once the publication has selected postgresql (see the module comment).
+    expect(process.env.LCM_POSTGRES_URL).toBeUndefined();
+    expect(process.env.LCM_POSTGRES_CA_FILE).toBeUndefined();
     try {
+      // Inside the cleanup scope: a failure after CREATE ROLE still drops the role.
+      const transfer = await provisionActivationRole(db);
       const installation = await prepareVerifiedInstallation(db, home, transfer);
       const publicationId = deriveActivationPublicationId(GENERATION_ID);
       const deps = createMigrationActivationDependencies({ homeDir: home });
