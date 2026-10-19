@@ -373,12 +373,16 @@ or error text is emitted.
 |---|---|---|---|---|---|
 | Pool | `pool_saturation_ratio` (`saturationRatio`) | number, unitless | `(total - idle) / configuredMax` of the origin-tagged pool counters. It is not clamped, so it can exceed 1. | `invalid-input` when the maximum is not above 0 or idle exceeds total; `unavailable` when the counters are unverified | origin, scope; 1 value |
 | Migration | `migration_applied_count` (`appliedCount`) | count | rows of an ordered ledger read capped at the packaged count plus one | `limit-reached` when the cap is reached; `unavailable` for a malformed ledger | scope; 1 value |
-| Migration | `migration_expected_count` (`expectedCount`) | count | the verified packaged migration list | none | scope; 1 value |
+| Migration | `migration_expected_count` (`expectedCount`) | count | the verified packaged migration list | the family failure reason when the family fails before the probe | scope; 1 value |
 | Migration | `migration_history_status` (`historyStatus`) | closed enum | positional comparison of ledger IDs and checksums with the packaged list | none; `unavailable` is a value | scope; 1 value |
-| Extensions | `entries` (one record per extension) | `name`: the four fixed names; `status`: the existing closed readiness status; `installedVersion` and `defaultVersion`: version string | the health result's extension observations, picked into these fields only | `unavailable` for a missing, duplicate, or invalid record, named by extension | extension; exactly 4 records, at most 16 scalar fields |
+| Extensions | `entries` (one record per extension) | `name`: the four fixed names; `status`: the existing closed readiness status; `installedVersion` and `defaultVersion`: version string | the health result's extension observations, picked into these fields only | `unavailable` for a missing, duplicate, or invalid record, named by extension; the family failure reason for every extension when the family fails | extension; at most 4 records (exactly 4 when observed), at most 16 scalar fields |
 | Queue | `outbox_oldest_pending_age_seconds` (`outboxOldestPendingAgeSeconds`) | number, seconds | local wall clock minus the oldest capture time of a pending or retry local event | `no-entry` when no such event exists; `unavailable` for an unread or skipped source; `out-of-range` for an invalid or future timestamp | scope; 1 value |
 | Queue | `inbox_claimed_count` (`inboxClaimed`), `inbox_quarantined_count` (`inboxQuarantined`) | counts | server inbox rows in the `claimed` and `quarantined` states | `limit-reached`, `out-of-range`, or the probe failure reason | scope; 2 values |
 | Queue | `replay_lag_seconds` (`replayLagSeconds`) | number, seconds | server clock minus the oldest `next_attempt_at` of a due `pending` or `retry` row | `no-entry` when no row is due; `limit-reached`, `out-of-range`, or the probe failure reason | scope; 1 value |
+
+Every omittable field above, including `expectedCount`, also carries the family
+failure reason (`unavailable`, `permission-denied`, or `timeout`) when the whole
+family fails before it is observed, and then the family has no value for it.
 
 The four pool counters and the failure latch remain the existing `pool` snapshot
 fields with origin `daemon`, `diagnostic-probe`, or `local`. A version is emitted
@@ -406,7 +410,9 @@ The on-demand gauge families here establish no `disabled`, `stale`, or `reset`
 fact, keep no comparison state, and emit no rate. A sub-probe failure that
 leaves usable values makes the family `partial` with the specific reason on each
 affected field. A family with no usable value reports the strongest failure
-reason as its status.
+reason as its status. A ready local outbox quarantine count is a usable value,
+and so is an observed cap sentinel: a reached cap makes the family `partial`
+even when no other value is usable.
 
 | Family | Condition | Status | Health |
 |---|---|---|---|
@@ -420,8 +426,8 @@ reason as its status.
 | Extensions | some records missing or invalid | `partial` | `degraded` if a valid record is not `current`; otherwise `unavailable` |
 | Extensions | no usable record | `unavailable` or the failure status | `unavailable` |
 | Queue | all sub-probes usable, no cap | `observed` | `degraded` on a threshold below; otherwise `healthy` |
-| Queue | a sub-probe failed or the cap was reached with another value usable | `partial` | `degraded` only on a proven threshold; otherwise `unavailable` |
-| Queue | no usable value | strongest failure status | `unavailable` |
+| Queue | a sub-probe failed with another value usable, or the cap was reached | `partial` | `degraded` only on a proven threshold; otherwise `unavailable` |
+| Queue | no usable value and no cap | strongest failure status | `unavailable` |
 
 An observed bad condition is `degraded` health on an `observed` family, not an
 unavailable one. A family health of `degraded` raises a `healthy` snapshot
@@ -489,8 +495,9 @@ Scoped exception for the #638 runtime-health families. The Privilege boundaries
 rule that every statement has a `statement_timeout` within the remaining
 snapshot deadline does not apply to the two #638 runtime-health reads, which
 use the existing #619 diagnostic runtime:
-`statement_timeout` remains capped at runtime creation, while the shared signal
-enforces the snapshot deadline. Before either read, a remaining-time guard may
+`statement_timeout` is set at runtime creation to the smaller of the configured
+statement timeout and the snapshot duration (at most 2000 ms), while the shared
+signal enforces the snapshot deadline. Before either read, a remaining-time guard may
 skip it with `timeout`. The guard is a launch policy, not a reservation for PID
 lookup, SQL execution, or cancellation setup. This exception does not revise the
 remaining-time `statement_timeout` requirement for #637 or add a guarantee that

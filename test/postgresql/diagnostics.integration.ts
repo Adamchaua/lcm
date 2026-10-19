@@ -131,7 +131,7 @@ describe("PostgreSQL runtime health telemetry", () => {
         text: "INSERT INTO lcm.projects (identity_key, display_name) VALUES ($1, $2) RETURNING project_id",
         values: [createHash("sha256").update(label).digest("hex"), label],
       }, context)).rows[0]!.project_id;
-      const [projectA, projectB, projectC, projectH] = [await project("health-a"), await project("health-b"), await project("health-c"), await project("health-h")] as [string, string, string, string];
+      const [projectA, projectB, projectC, projectH, projectD] = [await project("health-a"), await project("health-b"), await project("health-c"), await project("health-h"), await project("health-d")] as [string, string, string, string, string];
       const machineId = (await migrator.query<{ machine_id: string }>({
         text: "INSERT INTO lcm.machines (identity_key) VALUES ($1) RETURNING machine_id",
         values: ["machine:" + "c".repeat(64)],
@@ -213,6 +213,17 @@ describe("PostgreSQL runtime health telemetry", () => {
       expect(cappedSnapshot.telemetry.queue).toMatchObject({ status: "partial", health: "unavailable" });
       expect(cappedSnapshot.telemetry.queue).not.toHaveProperty("inboxQuarantined");
       expect((await readPostgreSqlQueueHealth(database.runtime, signal, projectA)).capReached).toBe(false);
+
+      // Applied history never consumes the candidate cap: it is seeded first, so it would fill the
+      // first rows by inbox_id and hide the small active queue if it were not excluded by status.
+      await seed(projectD, "applied", 4100, ", received_at, applied_at", ", now() - interval '1 hour', now()");
+      await seed(projectD, "pending", 1, ", received_at, next_attempt_at", ", now() - interval '3 hours', now() - interval '2 hours'");
+      await seed(projectD, "claimed", 1, ", received_at, claimed_at, claimed_by", ", now() - interval '1 hour', now(), 'private-worker'");
+      await seed(projectD, "quarantined", 2, ", received_at, quarantined_at, quarantine_reason", ", now() - interval '1 hour', now(), 'private-reason'");
+      const withHistory = await readPostgreSqlQueueHealth(database.runtime, signal, projectD);
+      expect(withHistory.capReached).toBe(false);
+      expect(serverQueueReads(withHistory)).toMatchObject({ inboxClaimed: { value: 1 }, inboxQuarantined: { value: 2 } });
+      expect((serverQueueReads(withHistory).replayLagSeconds as { value: number }).value).toBeGreaterThan(7000);
 
       // Collection is read-only: ledger and inbox rows are unchanged by every read above and below.
       const beforeReads = await state();

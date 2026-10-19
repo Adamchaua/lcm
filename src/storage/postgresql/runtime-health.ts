@@ -10,8 +10,8 @@ function invalidRead(operation: string): never {
 
 /**
  * Reads at most one more ledger row than the packaged history has. The read
- * is projectless and the packaged list is verified in process, so no ID,
- * checksum, or SQL leaves this module.
+ * is projectless and the packaged list is verified in process. The caller
+ * interprets the rows, and IDs and checksums never reach the snapshot.
  */
 export async function readPostgreSqlMigrationLedger(
   executor: PostgreSqlQueryExecutor,
