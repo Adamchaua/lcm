@@ -146,7 +146,7 @@ describe("Codex hook configuration boundaries", () => {
     }]);
     const merged = JSON.parse(mergeCodexHooksContent("", "cli", { preToolRecall: true }));
     expect(Object.keys(merged.hooks).sort()).toEqual([
-      "PostToolUse", "PreCompact", "PreToolUse", "SessionStart", "Stop", "UserPromptSubmit",
+      "Interrupt", "PostToolUse", "PreCompact", "PreToolUse", "SessionEnd", "SessionStart", "Stop", "UserPromptSubmit",
     ]);
   });
 

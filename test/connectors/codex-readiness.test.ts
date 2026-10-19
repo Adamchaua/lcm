@@ -411,7 +411,7 @@ describe("inspectCodexReadiness opt-in PreToolUse role", () => {
 
     const leftover = inspectCodexReadiness(input({ hooks: withPre, config: trustedWithPre }));
     expect(leftover.rows.find((row) => row.event === "PreToolUse")).toMatchObject({ status: "ready", drift: false });
-    expect(leftover.rows).toHaveLength(6);
+    expect(leftover.rows).toHaveLength(8);
   });
 
   it("honors a deliberate disable of the installed role", () => {
