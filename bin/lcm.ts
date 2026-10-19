@@ -3128,14 +3128,26 @@ export async function runCli(
   // ─── session-snapshot (hook) ─────────────────────────────────────────────
   program
     .command("session-snapshot")
-    .description("Rolling ingest snapshot (called by Stop hook)")
+    .description("Rolling ingest snapshot (called by Stop, PreCompact, Interrupt and SessionEnd hooks)")
     .helpOption(false)
     .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
+    .addOption(new Option("--terminal", "Interrupt or SessionEnd snapshot with a three second budget (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("session-snapshot"); exit(0);
+      }
+      if (opts.terminal === true) {
+        // Terminal hooks never fail the session they are saving: this path has
+        // its own catch boundary and always exits 0 with no output.
+        try {
+          const { runTerminalSnapshotCommand } = await import("../src/hooks/terminal-snapshot.js");
+          await runTerminalSnapshotCommand();
+        } catch {
+          // A failed import or an unexpected rejection must stay silent too.
+        }
+        exit(0);
       }
       const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchObservedHook("session-snapshot", input, opts.client);

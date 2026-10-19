@@ -22,6 +22,7 @@ const DAEMON_PATHS = new Set([
   "/health",
   "/health/observe",
   "/ingest",
+  "/ingest/terminal",
   "/invocation-control",
   "/promote",
   "/promote-events",

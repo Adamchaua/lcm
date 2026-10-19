@@ -179,6 +179,12 @@ The native hooks use:
 | `PostToolUse` | `lcm post-tool --client codex` | Capture passive learning signals from tool use |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingest transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingest Codex transcript deltas and compact when the configured token threshold is reached |
+| `Interrupt` | `lcm session-snapshot --client codex --terminal` | Save the transcript when you interrupt a running turn |
+| `SessionEnd` | `lcm session-snapshot --client codex --terminal` | Save the transcript when Codex shuts a session down gracefully |
+
+The `Interrupt` and `SessionEnd` hooks only hand the transcript to the daemon that
+is already running; see [Codex hooks](docs/vscode-codex.md#saving-memory-when-a-turn-is-interrupted-or-a-session-ends)
+for what they cover.
 
 Import older Codex sessions when needed:
 

@@ -25,6 +25,8 @@ const GOLDEN = {
   promptCli: "sha256:c686e888147a6d5ab6d70a6a7f4863c3bcff608d0b3fd9fd320147efd187915e",
   promptMcp: "sha256:c58011b176453632fc6f5a0f30f97d0497892c8061413423644b6f0ec6c51ac9",
   stop: "sha256:6b95211647571f6197d0375b6230fcc37488515b048d24ad1dbc20073900ee31",
+  interrupt: "sha256:8b30c34242015a60fead632bfa0f58a9a9e7561afe958f038d2c3f72eb0a4e62",
+  sessionEnd: "sha256:ca7a4d92ea4a593150b9734c2018c5fe9d0e76eb77f6d62cfbebf6c41b0656d9",
   foreign: "sha256:9e559ad47195227680137c179e4b2ea8e191d4bc023e76f73f6e74fdb97b85bb",
 };
 
@@ -35,6 +37,8 @@ const TRUSTED_ALL: readonly StateEntry[] = [
   ["post_tool_use", 0, 0, GOLDEN.post],
   ["pre_compact", 0, 0, GOLDEN.pre],
   ["stop", 0, 0, GOLDEN.stop],
+  ["interrupt", 0, 0, GOLDEN.interrupt],
+  ["session_end", 0, 0, GOLDEN.sessionEnd],
 ];
 
 function trustToml(entries: readonly StateEntry[], extra = ""): string {
@@ -87,6 +91,8 @@ describe("computeCodexHookHash", () => {
     expect(hashOf("UserPromptSubmit")).toBe(GOLDEN.promptCli);
     expect(hashOf("UserPromptSubmit", "mcp")).toBe(GOLDEN.promptMcp);
     expect(hashOf("Stop")).toBe(GOLDEN.stop);
+    expect(hashOf("Interrupt")).toBe(GOLDEN.interrupt);
+    expect(hashOf("SessionEnd")).toBe(GOLDEN.sessionEnd);
     expect(computeCodexHookHash(
       "SessionStart",
       { matcher: "startup|resume|clear" },
@@ -132,7 +138,7 @@ describe("computeCodexHookHash", () => {
 describe("inspectCodexReadiness statuses", () => {
   it("reports every default role ready when enabled and trusted", () => {
     const report = inspectCodexReadiness(input());
-    expect(report.rows).toHaveLength(5);
+    expect(report.rows).toHaveLength(7);
     expect(report.rows.every((row) => row.status === "ready" && !row.drift)).toBe(true);
     expect(report.rows.find((row) => row.event === "SessionStart")?.key).toBe(HOOKS + ":session_start:0:0");
     expect(report.client).toEqual({ state: "compatible", raw: "codex-cli 0.163.0" });
@@ -141,12 +147,12 @@ describe("inspectCodexReadiness statuses", () => {
   it("reports absent, foreign-only and partial registrations as missing per role", () => {
     const absent = inspectCodexReadiness(input({ hooks: { state: "absent" } }));
     expect(new Set(absent.rows.map((row) => row.status))).toEqual(new Set(["missing"]));
-    expect(absent.rows).toHaveLength(5);
+    expect(absent.rows).toHaveLength(7);
 
     const foreignOnly = inspectCodexReadiness(input({
       hooks: { state: "content", content: JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: "echo other" }] }] } }), mtimeMs: 1 },
     }));
-    expect(foreignOnly.rows).toHaveLength(5);
+    expect(foreignOnly.rows).toHaveLength(7);
     expect(new Set(foreignOnly.rows.map((row) => row.status))).toEqual(new Set(["missing"]));
 
     const partial = inspectCodexReadiness(input({ hooks: hooksWith((hooks) => { delete hooks.SessionStart; }) }));
@@ -322,10 +328,12 @@ describe("inspectCodexReadiness statuses", () => {
       "PostToolUse/post-tool": "disabled",
       "PreCompact/session-snapshot": "disabled",
       "Stop/session-snapshot": "untrusted",
+      "Interrupt/session-snapshot": "untrusted",
+      "SessionEnd/session-snapshot": "untrusted",
     });
     const absentConfig = inspectCodexReadiness(input({ config: { state: "absent" } }));
     expect(new Set(absentConfig.rows.map((row) => row.status))).toEqual(new Set(["untrusted"]));
-    const accepted = inspectCodexReadiness(input({ config: { state: "content", content: trustToml(TRUSTED_ALL.slice(0, 4)) + "[hooks.state.\"" + HOOKS + ":stop:0:0\"]\nenabled = true\ntrusted_hash = \"" + GOLDEN.stop + "\"\n" } }));
+    const accepted = inspectCodexReadiness(input({ config: { state: "content", content: trustToml(TRUSTED_ALL.slice(0, 4).concat(TRUSTED_ALL.slice(5))) + "[hooks.state.\"" + HOOKS + ":stop:0:0\"]\nenabled = true\ntrusted_hash = \"" + GOLDEN.stop + "\"\n" } }));
     expect(accepted.rows.every((row) => row.status === "ready")).toBe(true);
   });
 
@@ -349,11 +357,11 @@ describe("inspectCodexReadiness statuses", () => {
 
   it("reports sibling-event handlers without ever requiring them", () => {
     const extra = inspectCodexReadiness(input({
-      hooks: hooksWith((hooks) => { hooks.SessionEnd = [{ hooks: [{ type: "command", command: "lcm session-snapshot --client codex", timeout: 2 }] }]; }),
+      hooks: hooksWith((hooks) => { hooks.SubagentStop = [{ hooks: [{ type: "command", command: "lcm session-snapshot --client codex", timeout: 2 }] }]; }),
     }));
-    expect(extra.rows).toHaveLength(6);
-    expect(extra.rows.find((row) => row.event === "SessionEnd")).toMatchObject({ status: "untrusted", drift: false });
-    expect(inspectCodexReadiness(input()).rows.some((row) => row.event === "SessionEnd")).toBe(false);
+    expect(extra.rows).toHaveLength(8);
+    expect(extra.rows.find((row) => row.event === "SubagentStop")).toMatchObject({ status: "untrusted", drift: false });
+    expect(inspectCodexReadiness(input()).rows.some((row) => row.event === "SubagentStop")).toBe(false);
   });
 
   it("uses a test-supplied expectation, including enabled opt-in roles", () => {

@@ -524,6 +524,72 @@ describe("findAllCodexTranscripts", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Interrupted turns (#1561): what a rollout written around an Interrupt hook
+// exposes to the parser. Codex writes the <turn_aborted> marker before it runs
+// the hook and emits the TurnAborted event only afterwards; the marker's role
+// is user by default and developer for multi-agent v2. Only user/assistant
+// response messages are parsed (and so searchable); everything else is kept
+// only by the raw native archive.
+// ---------------------------------------------------------------------------
+
+const ABORT_MARKER = "<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>";
+
+function makeRoleLine(role: "user" | "assistant" | "developer", text: string): string {
+  return role === "assistant" ? makeSessionLine("assistant", text) : JSON.stringify({
+    timestamp: "2026-01-01T00:00:00.000Z",
+    type: "response_item",
+    payload: { type: "message", role, content: [{ type: "input_text", text }] },
+  });
+}
+
+function makeTurnAbortedEvent(): string {
+  return JSON.stringify({
+    timestamp: "2026-01-01T00:00:01.000Z",
+    type: "event_msg",
+    payload: { type: "turn_aborted", turn_id: "turn-1", reason: "interrupted" },
+  });
+}
+
+describe("parseCodexTranscript around an interrupted turn", () => {
+  const parse = (...lines: string[]) => {
+    const file = join(makeTmpDir(), "rollout.jsonl");
+    writeFileSync(file, lines.join("\n") + "\n");
+    return parseCodexTranscript(file).map((m) => [m.role, m.content]);
+  };
+  const turn = [makeSessionMeta("abort-1", "/work"), makeRoleLine("user", "run the build"), makeRoleLine("assistant", "starting")];
+
+  it("before the hook: the user-role marker is parsed and there is no TurnAborted event yet", () => {
+    expect(parse(...turn, makeRoleLine("user", ABORT_MARKER))).toEqual([
+      ["user", "run the build"], ["assistant", "starting"], ["user", ABORT_MARKER],
+    ]);
+  });
+
+  it("after the hook: the TurnAborted event adds nothing to the parsed messages", () => {
+    expect(parse(...turn, makeRoleLine("user", ABORT_MARKER), makeTurnAbortedEvent())).toEqual(
+      parse(...turn, makeRoleLine("user", ABORT_MARKER)),
+    );
+  });
+
+  it("the developer-role marker variant is not parsed", () => {
+    expect(parse(...turn, makeRoleLine("developer", ABORT_MARKER), makeTurnAbortedEvent())).toEqual([
+      ["user", "run the build"], ["assistant", "starting"],
+    ]);
+  });
+
+  it("without any marker an interrupted turn looks like a completed one", () => {
+    expect(parse(...turn)).toEqual(parse(...turn, makeEventLine("task_complete")));
+  });
+
+  it("a continuation turn after the interruption is parsed after the marker", () => {
+    expect(parse(...turn, makeRoleLine("user", ABORT_MARKER), makeTurnAbortedEvent(),
+      makeRoleLine("user", "continue"), makeRoleLine("assistant", "done"))).toEqual([
+      ["user", "run the build"], ["assistant", "starting"], ["user", ABORT_MARKER],
+      ["user", "continue"], ["assistant", "done"],
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // LCM restoration proof
 // ---------------------------------------------------------------------------
 
