@@ -1009,7 +1009,8 @@ from an earlier pass:
   refuses with `uncovered-projects`; multi-project cutover is out of scope;
 - the destination identity, the project-map binding, the transfer-ledger copy
   binding and the destination census all match the verification report, and
-  the PostgreSQL target passes the authenticated health check.
+  the PostgreSQL target passes the authenticated health check for the
+  transfer role (see [The activation role](#the-activation-role)).
 
 A failed precondition is a **refusal**. A refusal begins no effect and leaves
 nothing to recover: fix the named condition and run again. Refusals name the
@@ -1017,6 +1018,44 @@ step (`S0` through `S8`) and a closed reason such as `maintenance-not-held`,
 `lease-conflict`, `census-drift`, `project-map-drift` or `target-unhealthy`.
 Unresolvable readings (an unreadable journal, an ambiguous lease) are refusals
 too, distinct from a definite "no".
+
+### The activation role
+
+Activation connects to PostgreSQL as the **transfer role**: the role that
+holds the reviewed runtime grants plus the
+[transfer grant script](../src/storage/postgresql/reference/postgresql-transfer-grants.sql),
+the same role the copy and the verification used. Every activation step runs
+under it, including the lease, the health checks and the census; the health
+check admits the role through the transfer readiness check, not the daemon's
+runtime readiness check. There is no second connection as the daemon's
+runtime role: PostgreSQL readiness admits exactly one grantee per database,
+and the runtime and transfer privilege profiles are exclusive on one role, so
+a database cannot admit both profiles at once. Callers therefore supply the
+transfer role's connection settings for both of activation's settings
+fields. A caller that supplies runtime-only settings is refused at `S6` with
+`target-unhealthy` before any effect begins.
+
+### After activation: the grant swap and the daemon
+
+A successful activation proves that the transfer role could publish the
+selection; it does **not** prove that the daemon can start. The daemon
+enforces its exact runtime privilege profile when it starts, and that profile
+rejects the transfer grants. Before starting the daemon on the new backend:
+
+1. apply the reviewed runtime grant scripts to the daemon's runtime role (see
+   [Provisioning a PostgreSQL database](configuration.md#provisioning-a-postgresql-database));
+2. revoke the transfer grants from the transfer role (or drop that role) so
+   the runtime role is the schema's only non-owner grantee;
+3. start (or restart) the daemon, which performs its own readiness check
+   against the runtime role and refuses to serve until it passes.
+
+Leaving the transfer grants in place makes the daemon's readiness refuse the
+database as `acl-shape` or `schema-fingerprint`; applying the runtime grants
+before revoking the transfer grants is harmless, because readiness is only
+evaluated when the daemon starts. A later improvement, #1607, teaches
+readiness to admit the canonical transfer role next to the runtime role so
+that activation can prove the daemon's own pair; until then the swap is the
+operator's step.
 
 ### What activation writes, in order
 
