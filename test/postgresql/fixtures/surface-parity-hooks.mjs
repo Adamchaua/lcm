@@ -170,7 +170,13 @@ async function runHooks(context) {
       completionCount = row === null ? 'missing' : String(row.messageCount);
       return row?.messageCount === 2;
     }, 'session-end:completion-persisted');
-  } catch { assert.fail(`surface-parity:session-end:completion-${completionCount}`); }
+  } catch {
+    if (completionCount !== 'missing') assert.fail(`surface-parity:session-end:completion-${completionCount}`);
+    const reason = /^lcm: session completion was not acknowledged \((timeout|unavailable|status-[1-5]\d\d)\)$/m.exec(endResult.stderr)?.[1];
+    assert.fail(reason === undefined
+      ? 'surface-parity:session-end:completion-missing-unreported'
+      : `surface-parity:session-end:completion-missing-unacknowledged-${reason}`);
+  }
   observations.push(record(context, 'cli:session-end', { exit: endResult.code, persisted: 2, completionRecorded: true, outbox: 'sqlite-local' }));
   await context.isolateAsyncWork();
 
