@@ -82,8 +82,13 @@ describe("Codex hook configuration boundaries", () => {
     expect(() => enableCodexHooksFeature(configPath)).toThrow();
   });
 
-  it("normalizes malformed hook files while installing", () => {
+  it("refuses a malformed hook file and normalizes valid non-object JSON while installing", () => {
     writeFileSync(hooksPath, "not json");
+    expect(() => installCodexHooks(hooksPath, configPath)).toThrow("not valid JSON");
+    expect(readFileSync(hooksPath, "utf-8")).toBe("not json");
+    expect(existsSync(configPath)).toBe(false);
+
+    writeFileSync(hooksPath, "");
     installCodexHooks(hooksPath, configPath);
     expect(hasCodexHooks(hooksPath)).toBe(true);
 
