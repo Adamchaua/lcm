@@ -147,13 +147,13 @@ describe("PostgreSQL runtime health telemetry", () => {
         sequence += count;
       };
       await seed(projectA, "pending", 1, ", received_at, next_attempt_at", ", now() - interval '3 hours', now() - interval '2 hours'");
-      await seed(projectA, "claimed", 1, ", claimed_at, claimed_by", ", now(), 'private-worker'");
-      await seed(projectA, "quarantined", 1, ", quarantined_at, quarantine_reason", ", now(), 'private-reason'");
+      await seed(projectA, "claimed", 1, ", received_at, claimed_at, claimed_by", ", now() - interval '1 hour', now(), 'private-worker'");
+      await seed(projectA, "quarantined", 1, ", received_at, quarantined_at, quarantine_reason", ", now() - interval '1 hour', now(), 'private-reason'");
       await seed(projectB, "retry", 1, ", attempt_count, received_at, next_attempt_at", ", 1, now() - interval '1 hour', now() + interval '1 hour'");
-      await seed(projectB, "quarantined", 2, ", quarantined_at, quarantine_reason", ", now(), 'private-reason'");
-      await seed(projectB, "applied", 1, ", applied_at", ", now()");
+      await seed(projectB, "quarantined", 2, ", received_at, quarantined_at, quarantine_reason", ", now() - interval '1 hour', now(), 'private-reason'");
+      await seed(projectB, "applied", 1, ", received_at, applied_at", ", now() - interval '1 hour', now()");
       const state = async (): Promise<unknown> => (await migrator.query({
-        text: "SELECT (SELECT pg_catalog.json_agg(row ORDER BY status) FROM (SELECT status, pg_catalog.count(*) AS n FROM lcm.passive_event_inbox GROUP BY status) AS row) AS inbox, (SELECT pg_catalog.json_agg(m ORDER BY id) FROM lcm.schema_migrations AS m) AS ledger",
+        text: "SELECT (SELECT pg_catalog.json_agg(counts ORDER BY status) FROM (SELECT status, pg_catalog.count(*) AS n FROM lcm.passive_event_inbox GROUP BY status) AS counts) AS inbox, (SELECT pg_catalog.json_agg(m ORDER BY id) FROM lcm.schema_migrations AS m) AS ledger",
       }, context)).rows;
 
       const signal = new AbortController().signal;
@@ -241,13 +241,17 @@ describe("PostgreSQL runtime health telemetry", () => {
       expect(behind.telemetry.migration).toMatchObject({ status: "observed", health: "degraded", historyStatus: "behind" });
       await migrator.query({ text: "INSERT INTO lcm.schema_migrations (id, checksum_sha256) VALUES ($1, $2)", values: [original.id, original.checksum_sha256] }, context);
 
-      // Denials are classified per probe without text, and the runtime's grants are never widened.
+      // Denials are classified without text, and the runtime's grants are never widened.
       await migrator.query({ text: "REVOKE SELECT ON lcm.passive_event_inbox FROM lcm_test_runtime" }, context);
       const noQueue = await collect(projectH, "e".repeat(64));
-      expect(noQueue.telemetry.queue).toMatchObject({ status: "partial", health: "unavailable" });
-      expect((noQueue.telemetry.queue as { omitted: Array<{ reason: string }> }).omitted.some(entry => entry.reason === "permission-denied")).toBe(true);
+      // Readiness covers the inbox grant, so the queue read is never launched and the family mirrors that failure.
+      expect(noQueue.classification).toBe("unavailable");
+      expect(noQueue.telemetry.queue).toMatchObject({ status: "unavailable", health: "unavailable" });
       expect(noQueue.telemetry.migration).toMatchObject({ status: "observed", health: "healthy" });
       expect(JSON.stringify(noQueue)).not.toMatch(/42501|lcm_test_runtime|passive_event_inbox/u);
+      const deniedQueue = await readPostgreSqlQueueHealth(database.runtime, signal).catch((error: unknown) => error);
+      expect(deniedQueue).toMatchObject({ sqlState: "42501" });
+      expect(backendDiagnosticFailure(deniedQueue, "postgresql").classification).toBe("permission-denied");
       await migrator.query({ text: "GRANT SELECT ON lcm.passive_event_inbox TO lcm_test_runtime" }, context);
       await migrator.query({ text: "REVOKE SELECT ON lcm.projects FROM lcm_test_runtime" }, context);
       const failure = await timed("failureSnapshotMs", () => collect(projectH, "e".repeat(64)));
@@ -261,7 +265,7 @@ describe("PostgreSQL runtime health telemetry", () => {
         const sorted = [...values].sort((left, right) => left - right);
         return [name, { min: rounded(sorted[0]!), median: rounded(sorted[Math.floor(sorted.length / 2)]!), max: rounded(sorted[sorted.length - 1]!) }];
       }));
-      console.info("LCM_638_RUNTIME_HEALTH_TIMINGS_MS", JSON.stringify({ iterations, ...summary }));
+      process.stdout.write("LCM_638_RUNTIME_HEALTH_TIMINGS_MS " + JSON.stringify({ iterations, ...summary }) + "\n");
     });
   });
 });
