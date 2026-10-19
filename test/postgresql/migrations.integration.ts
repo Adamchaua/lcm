@@ -1351,7 +1351,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         }
 
         const pending = migration(
-          "0009_runtime_forbidden",
+          "0010_runtime_forbidden",
           "CREATE TABLE lcm.runtime_migration_forbidden (id integer)",
         );
         await expect(runPostgreSqlMigrations(database.runtime, {
@@ -2075,7 +2075,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         text: "GRANT CREATE ON SCHEMA lcm TO PUBLIC",
       }, { domain: "factory", operation: "driftPublicSchemaCreate" });
       const later = migration(
-        "0009_public_acl_probe",
+        "0010_public_acl_probe",
         "CREATE TABLE lcm.public_acl_probe (id integer PRIMARY KEY);",
       );
 
@@ -2101,7 +2101,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       }, { domain: "factory", operation: "verifyRecurringPublicAclRollback" }))
         .resolves.toMatchObject({
           rows: [{
-              applied_count: "8",
+              applied_count: "9",
             probe_exists: false,
             public_create: true,
           }],
@@ -2247,7 +2247,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         await expect(database.migrator.query<{ applied_count: string }>({
           text: "SELECT count(*)::text AS applied_count FROM lcm.schema_migrations_backup",
         }, { domain: "factory", operation: "verifyLedgerRowsPreservedAfterRelkindDrift" }))
-          .resolves.toMatchObject({ rows: [{ applied_count: "8" }] });
+          .resolves.toMatchObject({ rows: [{ applied_count: "9" }] });
       } finally {
         if (replacementViewCreated) {
           await database.migrator.query({
@@ -2267,7 +2267,7 @@ describe("PostgreSQL migrations and database isolation", () => {
     await withPostgreSqlTestDatabase("managed-owner-drift", async (database) => {
       const admin = new PostgreSqlRuntime(settings(database.adminUrl));
       const later = migration(
-        "0009_managed_owner_probe",
+        "0010_managed_owner_probe",
         "CREATE TABLE lcm.managed_owner_probe (id integer PRIMARY KEY);",
       );
       try {
@@ -2361,7 +2361,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         }, { domain: "factory", operation: "verifyManagedOwnerRollback" }))
           .resolves.toMatchObject({
             rows: [{
-              applied_count: "8",
+              applied_count: "9",
               operator_preserved: true,
               probe_exists: false,
             }],
@@ -2474,7 +2474,7 @@ describe("PostgreSQL migrations and database isolation", () => {
           baselineApplied: true,
           driftedDefinitionGroupCount: 1,
           expectedObjectCount: 888,
-          existingObjectCount: 885,
+          existingObjectCount: 887,
           missingObjectCount: 1,
           operation: "preflightBaselineDefinitions",
         });
@@ -2689,8 +2689,9 @@ describe("PostgreSQL migrations and database isolation", () => {
                ORDER BY object_identity`,
         values: [snapshot.tableIdentities],
       }, { domain: "factory", operation: "verifyOrdinaryColumnInventory" });
+      // Later migrations add ordinary columns to baseline tables.
       expect(result.rows.map(({ object_identity }) => object_identity))
-        .toEqual([...snapshot.ordinaryColumnIdentities].sort());
+        .toEqual([...snapshot.ordinaryColumnIdentities, "conversations|parent_session_id"].sort());
       expect(snapshot.ordinaryColumnIdentities).toHaveLength(210);
       expect(snapshot.ordinaryColumnIdentities).toContain("recall_surfacing|surfaced_at");
     });
@@ -3219,7 +3220,6 @@ describe("PostgreSQL migrations and database isolation", () => {
         applied: migrations.slice(0, 6).map(({ id }) => id),
         current: migrations.slice(0, 6).map(({ id }) => id),
       });
-      await applyRuntimeGrantScripts(database);
       const preDigestColumn = await database.migrator.query<{ present: boolean }>({
         text: `SELECT EXISTS (
                  SELECT 1 FROM pg_catalog.pg_attribute
@@ -3323,6 +3323,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         applied: [],
         current: migrations.map(({ id }) => id),
       });
+      await applyRuntimeGrantScripts(database);
       await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
         expectedOwner: "lcm_test_migrator",
       })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
@@ -3491,7 +3492,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         operation: "preflightBaselineDefinitions",
         baselineApplied: true,
         expectedObjectCount: 888,
-        existingObjectCount: 883,
+        existingObjectCount: 885,
         missingObjectCount: 3,
         driftedDefinitionGroupCount: 3,
       });
@@ -3699,7 +3700,6 @@ describe("PostgreSQL migrations and database isolation", () => {
         applied: migrations.slice(0, 6).map(({ id }) => id),
         current: migrations.slice(0, 6).map(({ id }) => id),
       });
-      await applyRuntimeGrantScripts(database);
       const preDigestColumn = await database.migrator.query<{ present: boolean }>({
         text: `SELECT EXISTS (
                  SELECT 1 FROM pg_catalog.pg_attribute
@@ -3911,6 +3911,7 @@ describe("PostgreSQL migrations and database isolation", () => {
         applied: [],
         current: migrations.map(({ id }) => id),
       });
+      await applyRuntimeGrantScripts(database);
       await expect(verifyPostgreSqlRuntimeSchema(database.runtime, {
         expectedOwner: "lcm_test_migrator",
       })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
@@ -4271,7 +4272,7 @@ describe("PostgreSQL migrations and database isolation", () => {
   it("rolls back a pending migration that violates its target schema snapshot", async () => {
     await withPostgreSqlTestDatabase("target-schema-snapshot", async (database) => {
       const invalidTarget = migration(
-        "0009_invalid_column_snapshot",
+        "0010_invalid_column_snapshot",
         "ALTER TABLE lcm.projects ALTER COLUMN identity_key DROP NOT NULL",
       );
       await expect(runPostgreSqlMigrations(database.migrator, {
@@ -4313,7 +4314,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       const packagedSnapshots = loadPostgreSqlSchemaSnapshots();
       const baselineSnapshot = packagedSnapshots.at(-1)!;
       const addManagedObject = migration(
-        "0009_add_managed_snapshot_probe",
+        "0010_add_managed_snapshot_probe",
         "CREATE TABLE lcm.managed_snapshot_probe (id integer PRIMARY KEY)",
       );
       const futureSnapshot = {
@@ -4330,7 +4331,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       })).resolves.toMatchObject({ applied: [addManagedObject.id] });
 
       const dropManagedObject = migration(
-        "0009_drop_managed_snapshot_probe",
+        "0010_drop_managed_snapshot_probe",
         "DROP TABLE lcm.managed_snapshot_probe",
       );
       const damagedTargetSnapshot = {
@@ -4481,7 +4482,7 @@ describe("PostgreSQL migrations and database isolation", () => {
       expect(new Set(databases.map((database) => database.name)).size).toBe(3);
       await Promise.all(databases.map(async (database) => {
         const forbidden = migration(
-          "0009_runtime_forbidden",
+          "0010_runtime_forbidden",
           "CREATE TABLE lcm.runtime_forbidden (id integer);",
         );
         await expect(runPostgreSqlMigrations(database.runtime, {
@@ -4549,10 +4550,10 @@ describe("PostgreSQL transfer identity content digest upgrade", () => {
     try {
       const migrations = loadPostgreSqlMigrations();
       const snapshots = loadPostgreSqlSchemaSnapshots();
-      const priorMigrations = migrations.slice(0, migrations.length - 1);
+      const through0008 = migrations.findIndex(({ id }) => id === "0008_transfer_identity_content_digest");
       await runPostgreSqlMigrations(database.migrator, {
-        migrations: priorMigrations,
-        schemaSnapshots: snapshots.slice(0, snapshots.length - 1),
+        migrations: migrations.slice(0, through0008),
+        schemaSnapshots: snapshots.slice(0, through0008 - 1),
       });
       const options = {
         domain: "factory",
@@ -4582,11 +4583,11 @@ describe("PostgreSQL transfer identity content digest upgrade", () => {
         values: [digest],
       }, options);
       await expect(runPostgreSqlMigrations(database.migrator, {
-        migrations,
-        schemaSnapshots: snapshots,
+        migrations: migrations.slice(0, through0008 + 1),
+        schemaSnapshots: snapshots.slice(0, through0008),
       })).resolves.toEqual({
-        applied: [migrations.at(-1)!.id],
-        current: migrations.map(({ id }) => id),
+        applied: [migrations[through0008]!.id],
+        current: migrations.slice(0, through0008 + 1).map(({ id }) => id),
       });
       const backfilled = await database.migrator.query<{
         content_sha256: string;
