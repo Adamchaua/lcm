@@ -6,10 +6,13 @@
  * checkActivationWriterQuiescence legitimately handles elsewhere.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runLcmMigrations } from "../../src/db/migration.js";
+import { openSqlitePortableSource, sqlitePortableFileSha256 } from "../../src/storage/sqlite/portable-source.js";
 import {
   BackendPublicationCoordinator,
   backendPublicationCanonicalSha256,
@@ -24,7 +27,7 @@ import {
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage/postgresql/publication-remote-guard.js";
 import { createBackendPublicationDriver } from "../../src/storage/backend-publication-driver.js";
 import { PostgreSqlBackendPublicationGuardError } from "../../src/storage/postgresql/publication-guard.js";
-import { PORTABLE_RECORD_DOMAIN_ORDER } from "../../src/storage/portable-record.js";
+import { PORTABLE_RECORD_DOMAIN_ORDER, canonicalSha256 } from "../../src/storage/portable-record.js";
 import type { ActivationLeasePublicationGuard } from "../../src/migration/activation-lease.js";
 import { checkActivationWriterQuiescence } from "../../src/migration/activation-quiescence.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
@@ -35,6 +38,7 @@ import {
   type MigrationManifest,
 } from "../../src/migration/protocol.js";
 import {
+  readMigrationActivationEvidence,
   recordMigrationActivationAttempt,
   recordMigrationActivationEpoch,
   recordMigrationActivationWitness,
@@ -734,9 +738,13 @@ describe("an externally aborted rollback publication (#1555)", () => {
     mutate(body);
     writeFileSync(journalPath, JSON.stringify({ ...body, checksumSha256: backendPublicationCanonicalSha256(body) }));
   };
-  const sourceConfig = () => Buffer.from((rollbackPublicationMaterial().source.config as { content: Uint8Array }).content).toString();
-  const targetConfig = () => Buffer.from((rollbackPublicationMaterial().target.config as { content: Uint8Array }).content).toString();
+  const fileText = (file: unknown) => Buffer.from((file as { content: Uint8Array }).content).toString();
+  const sourceConfig = () => fileText(rollbackPublicationMaterial().source.config);
+  const targetConfig = () => fileText(rollbackPublicationMaterial().target.config);
+  const sourceMap = () => fileText(rollbackPublicationMaterial().source.projectMap);
+  const targetMap = () => fileText(rollbackPublicationMaterial().target.projectMap);
   const liveConfig = (t: Fixture) => readFileSync(join(t.homeDir, ".lcm", "config.json"), "utf8");
+  const liveMap = (t: Fixture) => readFileSync(join(t.homeDir, ".lcm", "map.json"), "utf8");
   const expectReconciled = (t: Fixture, outcome: Awaited<ReturnType<typeof runMigrationRollback>>, finalToken: bigint) => {
     expect(outcome.manifest.phase).toBe("rolled-back");
     expect(outcome.manifest.reports.some((report) => report.kind === "rollback")).toBe(true);
@@ -829,7 +837,7 @@ describe("an externally aborted rollback publication (#1555)", () => {
         const real = (coordinator[method] as (...args: unknown[]) => Promise<unknown>).bind(coordinator);
         (coordinator as unknown as Record<string, unknown>)[method] = async (...args: unknown[]) => { counts[method]++; return real(...args); };
       }
-      await expect(runMigrationRollback(t.input, t.dependencies(coordinator))).rejects.toThrow();
+      await expect(runMigrationRollback(t.input, t.dependencies(coordinator))).rejects.toMatchObject({ reason: "drift" });
       expect(counts).toEqual({ prepare: 0, resume: 0 });
       expect(t.lease.calls.slice(since)).not.toContain("release");
       expect(t.lease.state.row).toMatchObject({ fencingToken: 2n, releasedAt: null });
@@ -841,32 +849,134 @@ describe("an externally aborted rollback publication (#1555)", () => {
     }
   });
 
+  /**
+   * A post-write rollback: the destination already differs from the activation baseline by its record count, so the
+   * first run stores a post-write rollback witness that carries the census. A census that differs only in its prefix
+   * digest keeps the canonical delta (record counts and terminal identities) and the mode, and changes only the
+   * census the witness is sealed over.
+   */
+  const WRITTEN = census.map((entry, index) => (index === 0 ? { ...entry, recordCount: 7 } : entry));
+  const WRITTEN_OTHER_PREFIX = WRITTEN.map((entry, index) => (index === 0 ? { ...entry, prefixSha256: "f".repeat(64) } : entry));
+  /** The post-write export of the first run: a real (empty) sqlite source whose census is the written one. */
+  const postWriteSession: Partial<RollbackSessionDependencies> = {
+    createPortableSource: (async () => {
+      const dir = mkdtempSync(join(tmpdir(), "lcm-rollback-recovery-src-"));
+      dirs.push(dir);
+      const path = join(dir, "source.db");
+      const db = new DatabaseSync(path);
+      try { runLcmMigrations(db, { fts5Available: false }); } finally { db.close(); }
+      chmodSync(path, 0o600);
+      const facts = { machines: [{ identityKey: "local-machine", machineId: null }], aliases: [], sourceLocalProjectId: LOCAL };
+      return openSqlitePortableSource({
+        databasePath: path, scratchParent: dir, projectIdentity: { scope: "shared", projectId: REMOTE } as never,
+        identityFacts: facts, sourceLocalProjectId: LOCAL,
+        expectedFileSha256: sqlitePortableFileSha256(path), expectedFactsSha256: canonicalSha256(facts),
+        capturedAt: "2026-09-06T00:00:00.000000Z",
+        capturedSidecars: {
+          events: { absent: true, evidenceSha256: "f".repeat(64) },
+          instructions: { absent: true, evidenceSha256: "e".repeat(64) },
+        },
+      });
+    }) as never,
+    readDomainCensus: ((_source: unknown, domain: string) => WRITTEN.find((entry) => entry.domain === domain)!) as never,
+  };
+  /** The first run of a post-write rollback, crashed once both sqlite files are published, then aborted by someone else. */
+  const abortedPostWriteRollback = async (t: Fixture) => {
+    t.setObserved(WRITTEN);
+    await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("config-published", FILE_BACKED), {}, postWriteSession)))
+      .rejects.toThrow("crash at config-published");
+    expect(t.pending()?.kind).toBe("publish-rollback");
+    const evidence = readMigrationActivationEvidence({ homeDir: t.homeDir, generationId: GEN });
+    const witness = evidence.state === "resolved"
+      ? evidence.witnesses.find((candidate) => candidate.kind === "rollback" && candidate.checksumSha256 === t.pending()?.inputSha256)
+      : undefined;
+    expect(witness).toMatchObject({ rollbackMode: "post-write", postEpochCensus: expect.anything() });
+    await t.sharedLeaseCoordinator(undefined, FILE_BACKED).abort();
+    expect(readBackendPublicationJournal(t.homeDir)).toMatchObject({ phase: "aborted", recoveryReference: expect.anything() });
+    expect(liveConfig(t)).toBe(sourceConfig());
+  };
+
+  it("T3p: a post-write rollback whose destination still reproduces its census completes after the external abort", async () => {
+    const t = setup();
+    await abortedPostWriteRollback(t);
+
+    const outcome = await runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator(undefined, FILE_BACKED), {}, postWriteSession));
+
+    expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+    expectReconciled(t, outcome, 2n);
+    expect(liveConfig(t)).toBe(targetConfig());
+  }, 60_000);
+
+  it("T3p: a post-write destination whose census changed only in its prefix digest refuses with drift on every retry, changing nothing", async () => {
+    const t = setup();
+    await abortedPostWriteRollback(t);
+    // Same record counts and terminal identities, hence the same canonical delta and the same mode: only the census differs.
+    expect(buildMigrationCanonicalDelta(WRITTEN_OTHER_PREFIX)).toEqual(buildMigrationCanonicalDelta(WRITTEN));
+    expect(buildMigrationCensusVector(WRITTEN_OTHER_PREFIX)).not.toEqual(buildMigrationCensusVector(WRITTEN));
+    t.setObserved(WRITTEN_OTHER_PREFIX);
+    const manifestBefore = t.store.read(GEN).checksumSha256;
+    const journalBefore = readFileSync(backendPublicationJournalPath(t.homeDir), "utf8");
+
+    for (const attempt of [1, 2]) {
+      const since = t.lease.calls.length;
+      const counts = { prepare: 0, resume: 0 };
+      const coordinator = t.sharedLeaseCoordinator(undefined, FILE_BACKED);
+      for (const method of ["prepare", "resume"] as const) {
+        const real = (coordinator[method] as (...args: unknown[]) => Promise<unknown>).bind(coordinator);
+        (coordinator as unknown as Record<string, unknown>)[method] = async (...args: unknown[]) => { counts[method]++; return real(...args); };
+      }
+      await expect(runMigrationRollback(t.input, t.dependencies(coordinator, {}, postWriteSession)))
+        .rejects.toMatchObject({ reason: "drift" });
+      expect(counts, "attempt " + attempt).toEqual({ prepare: 0, resume: 0 });
+      expect(t.lease.calls.slice(since)).not.toContain("release");
+      expect(t.lease.state.row).toMatchObject({ fencingToken: 2n, releasedAt: null });
+      expect(t.store.read(GEN).checksumSha256).toBe(manifestBefore);
+      expect(t.pending()?.kind).toBe("publish-rollback");
+      expect(readFileSync(backendPublicationJournalPath(t.homeDir), "utf8")).toBe(journalBefore);
+      expect(liveConfig(t)).toBe(sourceConfig());
+    }
+  }, 60_000);
+
+  /**
+   * The forward run publishes the sqlite configuration and the unbound project map through the production driver,
+   * then the abort restores both sources and stops at abort-releasing (its fence still recorded). Only the
+   * material-absent variant removes the sealed material, which the coordinator's own cleanup would have done right
+   * before the aborted checkpoint; the test plays that part.
+   */
+  const abortStoppedAfterRestore = async (t: Fixture, variant: "material-present" | "material-absent") => {
+    await crashFirstRun(t, "config-published", FILE_BACKED);
+    expect(liveConfig(t)).toBe(targetConfig());
+    expect(liveMap(t)).toBe(targetMap());
+    await expect(t.sharedLeaseCoordinator("abort-releasing", FILE_BACKED).abort()).rejects.toThrow("crash at abort-releasing");
+    expect(readBackendPublicationJournal(t.homeDir)?.phase).toBe("abort-releasing");
+    expect(liveConfig(t)).toBe(sourceConfig());
+    expect(liveMap(t)).toBe(sourceMap());
+    expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: null });
+    if (variant === "material-absent") unlinkSync(materialPath(t));
+  };
+
   it.each(["material-present", "material-absent"] as const)("T4: an abort stopped at abort-releasing (%s) is finished through the coordinator alone, then reconciled", async (variant) => {
     const t = setup();
-    await crashFirstRun(t, "guarded");
-    await expect(t.sharedLeaseCoordinator("abort-releasing").abort()).rejects.toThrow("crash at abort-releasing");
-    expect(readBackendPublicationJournal(t.homeDir)?.phase).toBe("abort-releasing");
-    expect(t.lease.state.row).toMatchObject({ fencingToken: 1n, releasedAt: null });
+    await abortStoppedAfterRestore(t, variant);
     if (variant === "material-absent") {
-      // The coordinator's own cleanup consumed the material right before the aborted checkpoint; the test plays that part.
-      unlinkSync(materialPath(t));
       expect(readOwnPublicationSourceFromMaterial(t.homeDir, PUBLICATION_ID, LOCAL)).toMatchObject({ projectMap: { [LOCAL]: { remoteProjectId: REMOTE } } });
     }
     const since = t.lease.calls.length;
 
-    const outcome = await runMigrationRollback(t.input, t.dependencies(traced(t, t.sharedLeaseCoordinator())));
+    const outcome = await runMigrationRollback(t.input, t.dependencies(traced(t, t.sharedLeaseCoordinator(undefined, FILE_BACKED))));
 
     expect(t.opens).toEqual([{ recovery: false }, { recovery: true }]);
     expect(t.lease.calls.slice(since).filter((call) => call === "coordinator:abort")).toHaveLength(1);
     expectAbortBeforeAcquire(t, since);
     expectReconciled(t, outcome, 2n);
+    // The re-prepared publication published both sqlite files again.
+    expect(liveConfig(t)).toBe(targetConfig());
+    expect(liveMap(t)).toBe(targetMap());
   });
 
   it("T4: the production input resolver reads the live files of an abort stopped after its material was consumed, and refuses files that differ", async () => {
     const t = setup();
-    await crashFirstRun(t, "guarded");
-    await expect(t.sharedLeaseCoordinator("abort-releasing").abort()).rejects.toThrow("crash at abort-releasing");
-    unlinkSync(materialPath(t));
+    await abortStoppedAfterRestore(t, "material-absent");
     await expect(resolveWithRealOwnSourceReader(t)).resolves.toMatchObject({ input: { localProjectId: LOCAL }, target: { remoteProjectId: REMOTE } });
 
     writeFileSync(join(t.homeDir, ".lcm", "config.json"), '{"storage":{"backend":"sqlite"}}', { mode: 0o600 });
@@ -1019,7 +1129,9 @@ describe("an externally aborted rollback publication (#1555)", () => {
         writeRollbackAuthorityArtifact(t.homeDir, { ...body, epochId: "another-epoch" });
       }, { reason: "unexpected-state", message: expect.stringContaining("disagrees with the durable rollback-authority artifact") }],
       ["unresolvable", (t) => { writeFileSync(backendPublicationJournalPath(t.homeDir), "{"); }, { reason: "not-eligible", message: expect.stringContaining("authority no longer resolves") }],
-      ["artifact", (t) => { unlinkSync(artifactPath(t)); }, {}],
+      ["artifact", (t) => { unlinkSync(artifactPath(t)); }, {
+        reason: "unexpected-state", message: expect.stringContaining("its durable rollback authority artifact is absent"),
+      }],
     ];
     for (const [, tamper, expected] of scenarios) {
       const t = setup();

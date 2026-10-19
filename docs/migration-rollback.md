@@ -162,13 +162,18 @@ released but before the publication was marked aborted. The rollback itself
 stays pending in every case, and running the same rollback operation again
 completes it:
 
-1. A part-way abort is finished first, without opening any PostgreSQL session.
-2. The restored configuration and project map must be byte-for-byte the files
-   the publication recorded as its source. A file edited since then refuses the
-   run (`unexpected-state` or `not-eligible`) and changes nothing: the aborted
-   journal, the pending effect and the lease row are left as they were. A lease
-   the abort released stays released, and a lease the publication never acquired
-   is left unchanged.
+1. When the abort stopped part-way after it had already removed the sealed
+   material, the live configuration and project map are checked first: they
+   must be byte-for-byte the files the publication recorded as its source. A
+   file edited since then refuses the run (`unexpected-state` or
+   `not-eligible`) before the abort is finished and before any session is
+   opened, so the journal stays at `abort-releasing`.
+2. A part-way abort is then finished, without opening any PostgreSQL session,
+   and the restored files are checked against the same witness again. A
+   mismatch refuses the run (`unexpected-state` or `not-eligible`) and
+   changes nothing further: the aborted journal, the pending effect and the
+   lease row are left as they were. A lease the abort released stays released,
+   and a lease the publication never acquired is left unchanged.
 3. A session then takes the rollback's lease: a new lease token when the abort
    released the one the publication held, or the existing lease when the
    publication never acquired one.

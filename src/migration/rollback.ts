@@ -1093,7 +1093,7 @@ function readUnsealedPublicationSource(homeDir: string, journal: BackendPublicat
 /**
  * The configuration and project map as they were before this rollback's own publication, read from the
  * authenticated recovery material that publication sealed; null when no publication of this rollback is in the
- * live slot (or it was aborted, which restored the files). Once the publication has begun the live files and the
+ * live slot. Once the publication has begun the live files and the
  * consumer reads are the rollback's in-flight state -- the config selects sqlite, the project is unbound, and the
  * consumer read refuses an unresolved publication -- so every re-run reads its inputs from this sealed source.
  * A journal without a reference -- still at preparing, or aborted straight from it (E6/E7) -- has sealed nothing
