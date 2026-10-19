@@ -180,6 +180,7 @@ export function createSqliteRepositories(
       getMessageCount: (id) => invoke("conversations", "getMessageCount", () => conversations.getMessageCount(id)),
       getMessageCountBySessionId: (sessionId) => invoke("conversations", "getMessageCountBySessionId", () => conversations.getMessageCountBySessionId(sessionId)),
       getMaxSeq: (id) => invoke("conversations", "getMaxSeq", () => conversations.getMaxSeq(id)),
+      getTranscriptSlotSnapshot: (sessionId) => invoke("conversations", "getTranscriptSlotSnapshot", () => conversations.getTranscriptSlotSnapshot(sessionId)),
       deleteMessages: (ids) => ids.length === 0
         ? Promise.resolve(0)
         : invoke("conversations", "deleteMessages", () => conversationAtomic.deleteMessages(ids), true),

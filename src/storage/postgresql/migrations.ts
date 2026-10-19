@@ -2571,6 +2571,20 @@ export async function runPostgreSqlMigrations(
                               )
                             )
                             OR (
+                              relation.relname OPERATOR(pg_catalog.=) 'message_parts'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'project_id',
+                                    'conversation_id',
+                                    'message_id',
+                                    'part_type'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type
+                                OPERATOR(pg_catalog.=) 'SELECT'
+                            )
+                            OR (
                               relation.relname OPERATOR(pg_catalog.=) 'summaries'
                               AND attribute.attname OPERATOR(pg_catalog.=)
                                 ANY (

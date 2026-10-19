@@ -417,8 +417,10 @@ grants only:
 - column-limited `SELECT` on `conversations` columns `project_id`,
   `conversation_id`, `session_id`, `session_id_sha256`, and `created_at`, plus
   `messages` columns `project_id`, `conversation_id`, `message_id`, `seq`,
-  `role`, and `content`, which are the exact fields used by one-statement
-  native-session message linking;
+  `role`, and `content`, plus `message_parts` columns `project_id`,
+  `conversation_id`, `message_id`, and `part_type`, which are the exact
+  fields used by one-statement native-session message linking (the `part_type`
+  read tells compaction event rows from transcript messages);
 - `SELECT` and column-limited `INSERT` on `native_transcripts`, including the
   validated equal `observed_at` and `ingested_at` values;
 - `SELECT` and column-limited `INSERT` on `transcript_messages`; and

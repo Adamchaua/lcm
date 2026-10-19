@@ -507,7 +507,7 @@ schema creation, migration-ledger access, table ownership, `TRUNCATE`,
 arbitrary updates, sequence mutation, or access to unrelated domain objects.
 
 The transcript script grants schema `USAGE`; column-limited `SELECT` on the
-conversation and message fields needed for exact native-session linkage;
+conversation, message, and message-part fields needed for exact native-session linkage;
 `SELECT` and column-limited `INSERT` on `native_transcripts` and
 `transcript_messages`; and `SELECT`, identity-column `INSERT`, and
 checkpoint-field-only `UPDATE` on `ingest_checkpoints`. It does not grant

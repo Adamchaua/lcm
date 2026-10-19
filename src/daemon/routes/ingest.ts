@@ -32,7 +32,8 @@ import { normalizeTranscriptClient, parseTranscriptTextForClient, type Transcrip
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
-import type { ProjectStorage, StorageBackendFactory } from "../../storage/index.js";
+import type { ProjectStorage, StorageBackendFactory, TransactionRepositories } from "../../storage/index.js";
+import { encodeTranscriptSlotMarker } from "../../storage/contracts.js";
 import { createCommitCloseBarrier, storageRouteFailureResponse, withProjectStorage } from "./storage-lifecycle.js";
 import { isAbortError, throwIfAborted } from "../cancellation.js";
 import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
@@ -54,6 +55,74 @@ function errorCode(error: unknown): string | undefined {
     && typeof error.code === "string"
     ? error.code
     : undefined;
+}
+
+/**
+ * Store the part of a session's cumulative transcript list that is not stored
+ * yet, inside the caller's transaction.
+ *
+ * The list holds transcript messages only, so its coordinate is session-wide:
+ * stored transcript rows plus the compaction events that took one list index
+ * (consumed slot markers). Events written before markers existed are adopted
+ * here with the legacy rule, consumed when a transcript row follows them in
+ * session order, and never re-evaluated. New rows go to the newest
+ * conversation.
+ *
+ * getOrCreateConversation runs first on the transaction's repositories: on
+ * PostgreSQL its advisory transaction lock serializes every writer of the
+ * session until commit, and SQLite's immediate transaction does the same.
+ */
+export async function appendSessionTranscript(
+  repositories: Pick<TransactionRepositories, "conversations" | "redactionAdmin" | "context">,
+  sessionId: string,
+  parsed: readonly ParsedMessage[],
+  scrubber: ScrubEngine,
+): Promise<{
+  conversationId: number;
+  records: Awaited<ReturnType<TransactionRepositories["conversations"]["appendMessages"]>>;
+  totalCounts: { gitleaks: number; builtIn: number; global: number; project: number };
+} | null> {
+  const { conversations } = repositories;
+  const conversation = await conversations.getOrCreateConversation(sessionId);
+  const snapshot = await conversations.getTranscriptSlotSnapshot(sessionId);
+  let consumedCount = 0;
+  for (const event of snapshot.events) {
+    const markers = new Set(event.slotMarkers);
+    if (markers.size > 1) throw new Error("conflicting transcript slot markers");
+    const consumed = markers.size === 1 ? markers.has(true) : event.followedByTranscript;
+    if (markers.size === 0) {
+      await conversations.createMessageParts(event.messageId, [{
+        sessionId,
+        partType: "snapshot",
+        ordinal: event.nextOrdinal,
+        metadata: encodeTranscriptSlotMarker(consumed),
+      }]);
+    }
+    if (consumed) consumedCount += 1;
+  }
+  const newMessages = parsed.slice(snapshot.transcriptCount + consumedCount);
+  if (newMessages.length === 0) return null;
+
+  const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
+  const inputs = newMessages.map((m) => {
+    const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project: projectCount } = scrubber.scrubWithCounts(m.content);
+    totalCounts.gitleaks += gitleaks;
+    totalCounts.builtIn += builtIn;
+    totalCounts.global += globalCount;
+    totalCounts.project += projectCount;
+    return {
+      role: m.role as "user" | "assistant" | "system" | "tool",
+      content: scrubbedContent,
+      tokenCount: m.tokenCount,
+    };
+  });
+  const records = await conversations.appendMessages(conversation.conversationId, inputs);
+  await repositories.redactionAdmin.upsertCounts(totalCounts);
+  await repositories.context.appendContextMessages(
+    conversation.conversationId,
+    records.map((record) => record.messageId),
+  );
+  return { conversationId: conversation.conversationId, records, totalCounts };
 }
 
 function resolveMessages(input: { client?: unknown; messages?: unknown; provider?: unknown; transcript_path?: string }, cwd: string): { messages: ParsedMessage[]; nativePath?: string; client?: TranscriptClient } {
@@ -133,36 +202,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         const resolvedMessages = messages;
         return await project.transaction(async (repositories) => {
           if (resolvedMessages.length === 0) return null;
-          const row = await repositories.coordination.getSessionIngest(session_id);
-          if (row && resolvedMessages.length <= row.messageCount) return null;
-
-          const conversation = await repositories.conversations.getOrCreateConversation(session_id);
-          const storedCount = await repositories.conversations.getMessageCount(conversation.conversationId);
-          const newMessages = resolvedMessages.slice(storedCount);
-          if (newMessages.length === 0) return null;
-
-          const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
-          const inputs = newMessages.map((m, i) => {
-            const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project: projectCount } = scrubber!.scrubWithCounts(m.content);
-            totalCounts.gitleaks += gitleaks;
-            totalCounts.builtIn += builtIn;
-            totalCounts.global += globalCount;
-            totalCounts.project += projectCount;
-            return {
-              conversationId: conversation.conversationId,
-              seq: storedCount + i,
-              role: m.role as "user" | "assistant" | "system" | "tool",
-              content: scrubbedContent,
-              tokenCount: m.tokenCount,
-            };
-          });
-          const records = await repositories.conversations.createMessagesBulk(inputs);
-          await repositories.redactionAdmin.upsertCounts(totalCounts);
-          await repositories.context.appendContextMessages(
-            conversation.conversationId,
-            records.map((record) => record.messageId),
-          );
-          return { conversationId: conversation.conversationId, records, totalCounts };
+          return appendSessionTranscript(repositories, session_id, resolvedMessages, scrubber!);
         });
       }
       let accumulated: Awaited<ReturnType<typeof persist>> = null;

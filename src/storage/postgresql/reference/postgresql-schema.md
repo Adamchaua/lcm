@@ -809,8 +809,8 @@ PostgreSQL runtime. The daemon and operational CLI commands use those
 repositories after project and backend-publication admission. Migration
 cutover and rollback remain separate workflows.
 
-The transcript script grants column-limited `SELECT` on the exact conversation
-and message fields needed for native-session linkage, plus `SELECT` and
+The transcript script grants column-limited `SELECT` on the exact conversation,
+message, and message-part fields needed for native-session linkage, plus `SELECT` and
 column-limited `INSERT` on `native_transcripts` and `transcript_messages`. It
 grants `SELECT`, column-limited `INSERT`, and `UPDATE` only for checkpoint
 position, cumulative accounting, checkpoint payload, and update time on

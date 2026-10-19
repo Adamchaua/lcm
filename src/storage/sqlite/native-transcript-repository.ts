@@ -310,10 +310,10 @@ export class SqliteNativeTranscriptRepository implements NativeTranscriptReposit
   }
 
   getNativeTranscriptMessageSnapshot(nativeSessionId: string): Promise<readonly NativeTranscriptSessionMessageRecord[]> {
-    return this.execute("getNativeTranscriptMessageSnapshot", () => this.db.prepare("SELECT c.conversation_id,m.message_id,m.seq,m.role,m.content FROM conversations c JOIN messages m ON m.conversation_id=c.conversation_id WHERE c.session_id = ? ORDER BY c.created_at,c.conversation_id,m.seq,m.message_id").all(text(nativeSessionId)).map(row => {
+    return this.execute("getNativeTranscriptMessageSnapshot", () => this.db.prepare("SELECT c.conversation_id,m.message_id,m.seq,m.role,m.content,EXISTS (SELECT 1 FROM message_parts p WHERE p.message_id=m.message_id AND p.part_type='compaction') AS is_compaction_event FROM conversations c JOIN messages m ON m.conversation_id=c.conversation_id WHERE c.session_id = ? ORDER BY c.created_at,c.conversation_id,m.seq,m.message_id").all(text(nativeSessionId)).map(row => {
       const role = row.role;
       requireValue(role === "system" || role === "user" || role === "assistant" || role === "tool");
-      return { conversationId: integer(row.conversation_id), messageId: integer(row.message_id), messageSequence: integer(row.seq), role, content: text(row.content, false) };
+      return { conversationId: integer(row.conversation_id), messageId: integer(row.message_id), messageSequence: integer(row.seq), role, content: text(row.content, false), isCompactionEvent: row.is_compaction_event === 1 };
     }));
   }
 }
