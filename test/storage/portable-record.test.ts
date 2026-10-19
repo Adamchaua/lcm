@@ -778,6 +778,12 @@ describe("conversation parentSessionId value metadata", () => {
     expect(parsePortableRecord(serializePortableRecord(linked))).toEqual(linked);
   });
 
+  it("rejects a conversation value that is not a plain object", () => {
+    for (const value of [null, "conversation", []]) {
+      expect(() => createPortableRecord({ ...baseInput(), value } as never)).toThrow(PortableStreamError);
+    }
+  });
+
   it.each([
     ["an empty string", ""],
     ["a NUL character", "bad\u0000parent"],
