@@ -135,8 +135,8 @@ function scheduleBackgroundRequest(schedule: () => void): void {
   }
 }
 
-function classifyCompletionFailure(signal: AbortSignal, error: unknown): string {
-  if (signal.aborted) return "timeout";
+function classifyCompletionFailure(signal: AbortSignal | undefined, error: unknown): string {
+  if (signal?.aborted === true) return "timeout";
   const statusCode = typeof error === "object" && error !== null
     ? (error as { statusCode?: unknown }).statusCode
     : undefined;
@@ -259,11 +259,13 @@ export async function handleSessionEnd(
   scheduleBackgroundRequest(() => firePromoteRequest(daemonPort, { cwd: input.cwd }));
   scheduleBackgroundRequest(() => firePromoteEventsRequest(daemonPort, { cwd: input.cwd }));
   if (clientName === "claude") {
-    const completionSignal = AbortSignal.timeout(1000);
+    // Created only after the fence check so the one-second budget covers the request alone.
+    let completionSignal: AbortSignal | undefined;
     try {
       // The CLI explicitly exits after dispatch. Wait for the completion
       // response, with an absolute bound, without retaining publication locks.
       assertHookPublicationFence();
+      completionSignal = AbortSignal.timeout(1000);
       await client.post("/session-complete", {
         session_id: input.session_id,
         cwd: input.cwd,
