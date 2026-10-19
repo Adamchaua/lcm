@@ -619,13 +619,33 @@ describe("handlePostToolUse", () => {
       name: "functions.exec command Git event",
       tool_name: "functions.exec",
       tool_input: { command: "git branch capture-test" },
+      tool_response: { exit_code: 0 },
       expected: { type: "git_branch", category: "git", data: "git branch", priority: 2 },
     },
     {
       name: "functions.exec_command cmd environment event",
       tool_name: "functions.exec_command",
       tool_input: { cmd: "npm install capture-test" },
+      tool_response: { exit_code: 0 },
       expected: { type: "env_install", category: "env", data: "npm install capture-test", priority: 2 },
+    },
+    {
+      name: "current Bash completion with a textual result as an unknown outcome",
+      tool_name: "Bash",
+      tool_use_id: "exec-call-45",
+      tool_input: { command: "git commit -m 'RAW_COMMIT_MESSAGE'" },
+      tool_response: "RAW_OUTPUT_SECRET finished\n",
+      expected: { type: "tool_outcome_unknown", category: "tool", data: "Bash outcome unknown: git commit", priority: 3 },
+    },
+    {
+      name: "current MCP success as a tool-name-only call",
+      tool_name: "mcp__server__lookup",
+      tool_input: { query: "RAW_ARGUMENT_SECRET" },
+      tool_response: {
+        content: [{ type: "text", text: "RAW_CONTENT_SECRET" }],
+        structuredContent: { value: "RAW_STRUCTURED_SECRET" },
+      },
+      expected: { type: "mcp_call", category: "mcp", data: "mcp__server__lookup", priority: 3 },
     },
     {
       name: "functions.exec isError error event",
@@ -693,6 +713,7 @@ describe("handlePostToolUse", () => {
         ...expected,
       }),
     ]);
+    expect(JSON.stringify(rows)).not.toContain("RAW_");
   });
 
   it.each([

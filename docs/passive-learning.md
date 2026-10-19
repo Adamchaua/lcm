@@ -20,7 +20,7 @@ offsets retain their stated offset.
 
 Two hooks capture events during your session:
 
-- **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output. For Codex, the native `functions.exec` and `functions.exec_command` calls are adapted into the existing Bash event semantics, and the native `apply_patch`, `spawn_agent`, `request_user_input`, and `update_plan` tools produce the file, subagent, decision, and plan events described under [Codex native activity](#codex-native-activity).
+- **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output. For Codex, shell commands (reported as `Bash`; the legacy `functions.exec` and `functions.exec_command` names are accepted as aliases) and MCP calls are adapted into the existing event semantics. The native `apply_patch`, `spawn_agent`, `request_user_input`, and `update_plan` tools produce the file, subagent, decision, and plan events described under [Codex native activity](#codex-native-activity).
 - **UserPromptSubmit** — fires on each user prompt. Detects decisions ("always use X"), role statements ("I'm a data scientist"), and intent patterns.
 
 Events are written to a **sidecar SQLite database**
@@ -48,13 +48,15 @@ new global sequences during their transactional schema upgrade.
 
 #### Codex native command capture
 
-For shell commands, the Codex connector recognizes only PostToolUse payloads
-marked with `client: "codex"` whose `tool_name` is exactly `functions.exec` or
-`functions.exec_command`; other native tools are covered under
-[Codex native activity](#codex-native-activity). The adapter accepts the string `tool_input.command`
-first, or the string `tool_input.cmd` when `command` is not a string. Other
-command-like, path-like, and file-like fields are ignored; a blank `command`
-does not fall back to `cmd`.
+The Codex connector recognizes PostToolUse payloads marked with
+`client: "codex"` whose `tool_name` is `Bash` (the name current Codex uses for
+shell commands), the legacy aliases `functions.exec` and
+`functions.exec_command`, or an `mcp__<server>__<tool>` MCP tool; other native tools are covered
+under [Codex native activity](#codex-native-activity). For shell
+commands the adapter accepts the string `tool_input.command` first, or the
+string `tool_input.cmd` when `command` is not a string. Other command-like,
+path-like, and file-like fields are ignored; a blank `command` does not fall
+back to `cmd`.
 
 The adapter passes only bounded semantic information into the existing Bash
 extractor:
@@ -68,13 +70,29 @@ extractor:
   precedence is `isError`, `is_error`, `exit_code`, then `exitCode`; boolean
   values are used directly and finite numeric exit codes treat zero as
   success and any other value as an error. Invalid, nested, string, `NaN`, and
-  infinite values are ignored.
+  infinite values are ignored. When no status is present, which is the case for
+  the textual result current Codex sends for a shell command, the outcome is
+  unknown. Text is never parsed for a status.
+- An unknown outcome for a git or install command is stored as a
+  `tool_outcome_unknown` observation that names only the matched command (for
+  example `Bash outcome unknown: git commit`; arguments and messages are not
+  stored) rather than a git or environment event. It is never promoted,
+  reinforced, or correlated as the fix for an earlier error. Unknown outcomes
+  for other commands are not recorded.
+- A Codex MCP call is stored by tool name only. Ordinary shell completions,
+  including nonzero exits, are delivered without a status and recorded as
+  unknown. An MCP call that reports `isError: true`, a handler error, and an
+  aborted or interrupted tool produce no PostToolUse payload, so LCM records
+  nothing for them. See
+  [Codex native PostToolUse capture](hook-protocol.md#codex-native-posttooluse-capture)
+  for the full matrix, including poll attribution and the
+  intercepted `apply_patch` gap.
 - The raw Codex response, stdout, stderr, and unknown output fields are never
   copied into the normalized event. Shell text is not parsed into file events.
 - A command whose trimmed text begins with `lcm store` is suppressed so LCM's
   own storage activity cannot create a passive-learning feedback loop.
 
-Only events recognized by the existing Bash extractor are queued. The command
+Only events recognized by the Bash and MCP extractors are queued. The command
 itself is not stored as a transcript.
 
 | Category | Examples | Priority |
@@ -94,13 +112,13 @@ itself is not stored as a transcript.
 #### Codex native activity
 
 Codex runs PostToolUse only after a tool call succeeds, so each of these tools
-is captured when it completes. If a payload marks the call as failed, LCM
-records only the generic tool error. No configuration is needed.
+is captured when it completes. A payload that flags the call with `isError`
+records only the generic tool error instead. No configuration is needed.
 
 - **`apply_patch`** records each file the patch adds, deletes, or updates, with
   a type label (source, test, config, docs). An update that moves a file
-  records one event naming both paths. At most 20 distinct files are recorded
-  per patch, and a path is skipped when either end is sensitive. Patch
+  records one event naming both paths. At most 20 file observations are
+  recorded per patch, and a path is skipped when either end is sensitive. Patch
   contents and the tool response are never stored. Patches that Codex
   intercepts from a shell command are not `apply_patch` calls and are not
   captured.

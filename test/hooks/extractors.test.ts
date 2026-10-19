@@ -238,6 +238,63 @@ describe("extractPostToolEvents", () => {
     });
     expect(events[0].data.length).toBeLessThanOrEqual(2050); // soft cap with some slack
   });
+
+  describe("explicit tool outcome", () => {
+    it("lets outcome override a conflicting legacy isError for Bash", () => {
+      const base = { tool_name: "Bash", tool_input: { command: "git branch" } };
+      expect(extractPostToolEvents({ ...base, tool_output: { outcome: "succeeded", isError: true } })[0])
+        .toMatchObject({ type: "git_branch" });
+      expect(extractPostToolEvents({ ...base, tool_output: { outcome: "failed", isError: false } })[0])
+        .toMatchObject({ type: "error_tool", data: "Bash error: git branch", priority: 1 });
+      expect(extractPostToolEvents({ ...base, tool_output: { outcome: "unknown", isError: true } })[0])
+        .toMatchObject({ type: "tool_outcome_unknown", data: "Bash outcome unknown: git branch" });
+    });
+
+    it("reports unknown outcomes only for selected git and env commands, without commit messages", () => {
+      const unknown = (command: string) => extractPostToolEvents({
+        tool_name: "Bash",
+        tool_input: { command },
+        tool_output: { outcome: "unknown" },
+      });
+      expect(unknown("git commit -m 'secret message'")).toEqual([{
+        type: "tool_outcome_unknown",
+        category: "tool",
+        data: "Bash outcome unknown: git commit",
+        priority: 3,
+      }]);
+      for (const command of [
+        "git commit -m\"private note\"",
+        "git commit --message=private-note",
+      ]) {
+        const events = unknown(command);
+        expect(events).toHaveLength(1);
+        expect(events[0]?.data).toBe("Bash outcome unknown: git commit");
+        expect(events[0]?.data).not.toMatch(/private|-m|--message/u);
+      }
+      expect(unknown("npm install left-pad --token=secret")[0]?.data)
+        .toBe("Bash outcome unknown: npm install");
+      expect(unknown("npm i left-pad")[0]?.data).toBe("Bash outcome unknown: npm i");
+      expect(unknown("ls -la")).toEqual([]);
+    });
+
+    it("lets outcome override a conflicting legacy isError for MCP tools", () => {
+      const base = { tool_name: "mcp__s__t", tool_input: {} };
+      expect(extractPostToolEvents({ ...base, tool_output: { outcome: "succeeded", isError: true } }))
+        .toEqual([{ type: "mcp_call", category: "mcp", data: "mcp__s__t", priority: 3 }]);
+      expect(extractPostToolEvents({ ...base, tool_output: { outcome: "failed", isError: false } }))
+        .toEqual([{ type: "error_tool", category: "error", data: "mcp__s__t error", priority: 1 }]);
+      expect(extractPostToolEvents({ ...base, tool_output: { outcome: "unknown", isError: true } }))
+        .toEqual([{ type: "tool_outcome_unknown", category: "tool", data: "mcp__s__t outcome unknown", priority: 3 }]);
+    });
+
+    it("keeps lcm_store suppression ahead of any MCP outcome", () => {
+      expect(extractPostToolEvents({
+        tool_name: "mcp__plugin_lcm_lcm__lcm_store",
+        tool_input: {},
+        tool_output: { outcome: "failed" },
+      })).toEqual([]);
+    });
+  });
 });
 
 describe("extractUserPromptEvents", () => {
@@ -794,7 +851,6 @@ describe("extractPostToolEvents — native Codex activity", () => {
         { label: "outcome unknown", output: { outcome: "unknown" } },
         { label: "outcome succeeded over isError", output: { outcome: "succeeded", isError: true } },
         { label: "outcome unknown over isError", output: { outcome: "unknown", isError: true } },
-        { label: "non-string outcome", output: { outcome: 42 } },
       ])("captures the native activity when $label", ({ output }) => {
         const prepared = output === undefined ? input : withOutput(input, output);
         expect(summarize(extractPostToolEvents(prepared))).toEqual([expected]);
@@ -803,7 +859,6 @@ describe("extractPostToolEvents — native Codex activity", () => {
       it.each([
         { label: "isError true", output: { isError: true } },
         { label: "outcome failed with isError", output: { outcome: "failed", isError: true } },
-        { label: "non-string outcome with isError", output: { outcome: 42, isError: true } },
       ])("emits one generic error when $label", ({ output }) => {
         expect(extractPostToolEvents(withOutput(input, output))).toEqual([
           { type: "error_tool", category: "error", data: name + " error", priority: 1 },
