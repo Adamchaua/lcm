@@ -26,8 +26,10 @@ import {
   readFileSync,
   readSync,
   readdirSync,
+  realpathSync,
+  statSync,
 } from "node:fs";
-import { join, basename } from "node:path";
+import { join, basename, sep } from "node:path";
 import { homedir } from "node:os";
 import { estimateTokens } from "./transcript.js";
 import type { ParsedMessage } from "./transcript.js";
@@ -208,6 +210,127 @@ export function extractCodexSessionMeta(transcriptPath: string): CodexSessionMet
   }
 
   return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// LCM restoration proof
+// ---------------------------------------------------------------------------
+
+/** First line of every Codex SessionStart restoration LCM prints. */
+export const LCM_RESTORATION_MARKER = "<!-- lcm-restoration -->";
+
+const MAX_LIVE_RESTORATION_WINDOW_BYTES = 64 * 1024 * 1024;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** True when the text, after leading whitespace, is the marker alone on its first line. */
+function startsWithMarkerLine(text: string): boolean {
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith(LCM_RESTORATION_MARKER)) return false;
+  const rest = trimmed.slice(LCM_RESTORATION_MARKER.length);
+  return rest === "" || rest.startsWith("\n") || rest.startsWith("\r\n");
+}
+
+/** Message text from block-array content; any other shape yields "". */
+function messageText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block: unknown) => (isRecord(block) && typeof block.text === "string" ? block.text : ""))
+    .join("\n");
+}
+
+/**
+ * Decide whether rollout text still holds an LCM restoration that is live in the
+ * model context: a developer message starting with the restoration marker that
+ * follows the last compaction and the last rollback. Compaction drops hook
+ * context and rollback removes trailing turns, so either resets the proof. A
+ * line that is not valid JSON may hide either record, so it resets it too.
+ * Valid JSON of any other shape is inert: it never throws and never counts as
+ * a marker.
+ */
+export function scanLiveCodexRestoration(raw: string): boolean {
+  let live = false;
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      live = false;
+      continue;
+    }
+    if (!isRecord(obj)) continue;
+    const payload = isRecord(obj.payload) ? obj.payload : {};
+    if (obj.type === "compacted") {
+      live = false;
+    } else if (obj.type === "event_msg" && payload.type === "thread_rolled_back") {
+      live = false;
+    } else if (
+      obj.type === "response_item"
+      && payload.type === "message"
+      && payload.role === "developer"
+      && startsWithMarkerLine(messageText(payload.content))
+    ) {
+      live = true;
+    }
+  }
+  return live;
+}
+
+function isUnder(root: string, candidate: string): boolean {
+  return candidate.startsWith(`${root}${sep}`);
+}
+
+function isCodexRolloutPath(real: string, codexHome: string): boolean {
+  return ["sessions", "archived_sessions"].some((name) => {
+    try {
+      return isUnder(realpathSync(join(codexHome, name)), real);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * Prove from a session's own rollout file that a live LCM restoration exists.
+ * Opens the given path once (a symlink leaf fails to open), then requires the
+ * descriptor to be a regular file whose identity matches the path's realpath
+ * under CODEX_HOME (default ~/.codex) sessions or archived_sessions. Reads at
+ * most the last 64 MiB. Any failure or mismatch yields false.
+ */
+export function readLiveCodexRestoration(
+  transcriptPath: unknown,
+  options: { codexHome?: string; maxBytes?: number } = {},
+): boolean {
+  if (typeof transcriptPath !== "string" || !transcriptPath) return false;
+  const codexHome = options.codexHome ?? (process.env.CODEX_HOME || join(homedir(), ".codex"));
+  const maxBytes = options.maxBytes ?? MAX_LIVE_RESTORATION_WINDOW_BYTES;
+  let fd: number | undefined;
+  try {
+    fd = openSync(transcriptPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return false;
+    const real = realpathSync(transcriptPath);
+    if (!isCodexRolloutPath(real, codexHome)) return false;
+    const current = statSync(real);
+    if (current.dev !== stat.dev || current.ino !== stat.ino) return false;
+    const start = Math.max(0, stat.size - maxBytes);
+    const buffer = Buffer.alloc(stat.size - start);
+    const read = readSync(fd, buffer, 0, buffer.length, start);
+    let raw = buffer.subarray(0, read).toString("utf8");
+    if (start > 0) {
+      const newline = raw.indexOf("\n");
+      raw = newline === -1 ? "" : raw.slice(newline + 1);
+    }
+    return scanLiveCodexRestoration(raw);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 // ---------------------------------------------------------------------------

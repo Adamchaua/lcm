@@ -1061,6 +1061,23 @@ describe('installConnector — Codex native hooks', () => {
       statusMessage: 'Saving LCM memory before compaction',
     });
     expect(hooks.hooks.Stop[0].hooks[0].command).toBe('lcm session-snapshot --client codex');
+    // Codex clamps terminal hooks to three seconds and ignores matchers.
+    expect(hooks.hooks.Interrupt).toEqual([{
+      hooks: [{
+        type: 'command',
+        command: 'lcm session-snapshot --client codex --terminal',
+        timeout: 3,
+        statusMessage: 'Saving LCM memory after interruption',
+      }],
+    }]);
+    expect(hooks.hooks.SessionEnd).toEqual([{
+      hooks: [{
+        type: 'command',
+        command: 'lcm session-snapshot --client codex --terminal',
+        timeout: 3,
+        statusMessage: 'Saving LCM memory before session end',
+      }],
+    }]);
     expect(JSON.stringify(hooks)).not.toMatch(/claude/i);
 
     const skill = readFileSync(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'), 'utf-8');
@@ -1294,7 +1311,7 @@ describe('installConnector — Codex native hooks', () => {
     expect(content).toContain('use the $lcm-memory skill');
   });
 
-  it('migrates the deprecated codex_hooks feature flag when installing hooks', () => {
+  it('leaves an already-enabled deprecated codex_hooks feature flag untouched when installing hooks', () => {
     const configPath = join(tmpDir, '.codex', 'config.toml');
     mkdirSync(join(tmpDir, '.codex'), { recursive: true });
     writeFileSync(configPath, '[features]\ncodex_hooks = true\n');
@@ -1302,7 +1319,7 @@ describe('installConnector — Codex native hooks', () => {
     installConnector('codex', 'hook', tmpDir);
 
     const config = readFileSync(configPath, 'utf-8');
-    expect(config).toBe('[features]\nhooks = true\n');
+    expect(config).toBe('[features]\ncodex_hooks = true\n');
   });
 
   it('is idempotent and preserves existing Codex hooks', () => {
@@ -1341,6 +1358,27 @@ describe('installConnector — Codex native hooks', () => {
     );
     expect(lcmPreCompactGroup).toBeDefined();
     expect(lcmPreCompactGroup?.matcher).toBe('manual|auto');
+  });
+
+  it('installs and removes the terminal hooks idempotently around foreign hooks', () => {
+    const hooksPath = join(tmpDir, '.codex', 'hooks.json');
+    mkdirSync(join(tmpDir, '.codex'), { recursive: true });
+    const foreign = { hooks: [{ type: 'command', command: 'echo foreign-end' }] };
+    writeFileSync(hooksPath, JSON.stringify({ hooks: { SessionEnd: [foreign] } }));
+
+    installConnector('codex', 'hook', tmpDir);
+    installConnector('codex', 'hook', tmpDir);
+
+    const terminal = 'lcm session-snapshot --client codex --terminal';
+    const installed = JSON.parse(readFileSync(hooksPath, 'utf-8'));
+    for (const event of ['Interrupt', 'SessionEnd']) {
+      const commands = installed.hooks[event].flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
+      expect(commands.filter((command: string) => command === terminal)).toHaveLength(1);
+    }
+    expect(installed.hooks.SessionEnd[0]).toEqual(foreign);
+
+    expect(removeConnector('codex', 'hook', tmpDir)).toBe(true);
+    expect(JSON.parse(readFileSync(hooksPath, 'utf-8'))).toEqual({ hooks: { SessionEnd: [foreign] } });
   });
 
   it('lists and removes Codex hooks', () => {

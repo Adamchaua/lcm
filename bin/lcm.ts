@@ -54,6 +54,7 @@ import {
 } from "../src/storage/backend-publication.js";
 import { BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC } from "../src/hooks/publication-fence.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
+import { resolveLcmConfig } from "../src/db/config.js";
 import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
 import {
   clearDaemonRemediation,
@@ -1009,6 +1010,20 @@ function withHookClient(stdinText: string, client: unknown): string {
   return withHookOverrides(stdinText, client, undefined);
 }
 
+/** Dispatch a hook; Codex invocations additionally leave a best-effort LCM-local completion record. */
+async function dispatchObservedHook(
+  command: "restore" | "user-prompt" | "post-tool" | "session-snapshot",
+  input: string,
+  client: unknown,
+  context?: { transport?: "cli" | "mcp" },
+): Promise<{ exitCode: number; stdout: string }> {
+  const { dispatchHook } = await import("../src/hooks/dispatch.js");
+  const run = () => context === undefined ? dispatchHook(command, input) : dispatchHook(command, input, context);
+  if (client !== "codex") return run();
+  const { runObservedCodexHook } = await import("../src/hooks/codex-hook-receipts.js");
+  return runObservedCodexHook({ client, command, stdinText: input }, run);
+}
+
 async function withCustomHelp(cmd: Command, commandName: string): Promise<never> {
   const { printHelp } = await import("../src/cli-help.js");
   printHelp(commandName);
@@ -1241,13 +1256,19 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   // admission policy. SessionStart bootstrap and installation own legacy-root
   // migration, so the global preflight must not turn publication-lock
   // contention into a hook failure before the handler runs.
+  // A bare `lcm compact` is the legacy PreCompact hook command; with
+  // LCM_ENABLED=false it is skipped by its action, so it must not run the
+  // preflight either.
   if (topLevel && (
     action === "post-tool"
     || action === "restore"
     || action === "session-end"
     || action === "session-snapshot"
     || action === "user-prompt"
-    || (action === "compact" && actionCommand.opts<{ hook?: boolean }>().hook === true)
+    || (action === "compact" && (
+      actionCommand.opts<{ hook?: boolean }>().hook === true
+      || !resolveLcmConfig(process.env).enabled
+    ))
   )) return false;
   if (topLevel && action === "status") return false;
   if (topLevel && (action === "stats" || action === "doctor")) return false;
@@ -2632,6 +2653,14 @@ export async function runCli(
       // Hook dispatch only when --hook is explicit; all other invocations go to batch.
       const hook: boolean = opts.hook ?? false;
       if (!hook) {
+        // Older installations register the bare `lcm compact` as their PreCompact
+        // hook, and dispatchHook() is not reached without --hook; honor the
+        // documented LCM_ENABLED=false contract before any batch work.
+        if (!resolveLcmConfig(process.env).enabled) {
+          process.stderr.write("lcm compact: skipped because LCM_ENABLED=false\n");
+          process.exitCode = 0;
+          return;
+        }
         let invocationLifecycle: CompactInvocationLifecycle | undefined;
         let localWorkPromise: Promise<void> | undefined;
         let compactPort = 3737;
@@ -3034,9 +3063,8 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("restore"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("restore", input);
+      const r = await dispatchObservedHook("restore", input, opts.client);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3073,9 +3101,8 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("user-prompt"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("user-prompt", input, { transport: opts.transport });
+      const r = await dispatchObservedHook("user-prompt", input, opts.client, { transport: opts.transport });
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3092,9 +3119,8 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("post-tool"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("post-tool", input);
+      const r = await dispatchObservedHook("post-tool", input, opts.client);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3102,18 +3128,29 @@ export async function runCli(
   // ─── session-snapshot (hook) ─────────────────────────────────────────────
   program
     .command("session-snapshot")
-    .description("Rolling ingest snapshot (called by Stop hook)")
+    .description("Rolling ingest snapshot (called by Stop, PreCompact, Interrupt and SessionEnd hooks)")
     .helpOption(false)
     .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
+    .addOption(new Option("--terminal", "Interrupt or SessionEnd snapshot with a three second budget (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("session-snapshot"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
+      if (opts.terminal === true) {
+        // Terminal hooks never fail the session they are saving: this path has
+        // its own catch boundary and always exits 0 with no output.
+        try {
+          const { runTerminalSnapshotCommand } = await import("../src/hooks/terminal-snapshot.js");
+          await runTerminalSnapshotCommand();
+        } catch {
+          // A failed import or an unexpected rejection must stay silent too.
+        }
+        exit(0);
+      }
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("session-snapshot", input);
+      const r = await dispatchObservedHook("session-snapshot", input, opts.client);
       if (r.stdout) stdout.write(r.stdout);
       exit(r.exitCode);
     });
@@ -3735,6 +3772,7 @@ export async function runCli(
             console.log(`    Path: ${path}`);
           }
           if ((result as any).requiresRestart) console.log("    Restart the agent to activate.");
+          for (const notice of (result as any).notices ?? []) console.log(`    ${notice}`);
           console.log();
         }
       } catch (err: any) {
@@ -3830,32 +3868,27 @@ export async function runCli(
 
         if ((agent as any).id !== "codex" || agentName === undefined) continue;
 
-        const {
-          inspectCodexPostToolHook,
-          resolveCodexHooksPath,
-        } = await import("../src/connectors/codex-hooks.js");
+        const { probeCodexCliVersion } = await import("../src/connectors/installer.js");
+        const { runCodexReadinessCheck } = await import("../src/connectors/codex-readiness.js");
         const { codexPostToolFunctionalCoverage } = await import("../src/hooks/post-tool-normalization.js");
-        const inspection = inspectCodexPostToolHook(
-          resolveCodexHooksPath(opts.global ? homedir() : process.cwd()),
-        );
+        const readiness = runCodexReadinessCheck({
+          homeDir: homedir(),
+          probeVersion: () => probeCodexCliVersion(connectorCwd),
+          readStoredTransport: () => readConnectorTransportSnapshot(defaultConfigPath(), "codex"),
+        });
+        for (const line of readiness.lines) console.log(line);
+        failures += readiness.failures;
 
-        if (inspection.state === "installed") {
-          console.log("  ✓ Codex: PostToolUse hook installed");
-          let functional = false;
-          try {
-            functional = codexPostToolFunctionalCoverage();
-          } catch {
-            functional = false;
-          }
-          if (functional) {
-            console.log("  ✓ Codex: native exec capture functional");
-          } else {
-            console.log("  ✗ Codex: native exec capture functional");
-            failures += 1;
-          }
+        let selfTestPassed = false;
+        try {
+          selfTestPassed = codexPostToolFunctionalCoverage();
+        } catch {
+          selfTestPassed = false;
+        }
+        if (selfTestPassed) {
+          console.log("  ✓ Codex: native exec normalization self-test passed (fixtures only; not proof of runtime execution)");
         } else {
-          console.log(`  ✗ Codex: PostToolUse hook ${inspection.state}`);
-          console.log("  Codex: native exec capture functional check skipped");
+          console.log("  ✗ Codex: native exec normalization self-test failed (fixtures only)");
           failures += 1;
         }
       }

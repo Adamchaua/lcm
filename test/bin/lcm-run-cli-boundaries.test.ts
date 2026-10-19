@@ -865,6 +865,62 @@ describe("runCli lifecycle and connector boundaries", () => {
     expect((await invoke(["compact", "--no-promote"]))?.message).toBe("exit:1");
   });
 
+  describe("lcm compact (batch) and LCM_ENABLED", () => {
+    afterEach(() => { vi.unstubAllEnvs(); });
+
+    it.each(["--no-promote", "--all", "--dry-run"])(
+      "skips legacy bare `lcm compact %s` when LCM_ENABLED=false",
+      async flag => {
+        vi.stubEnv("LCM_ENABLED", "false");
+        const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+        await expect(invoke(["compact", flag])).resolves.toBeUndefined();
+
+        const skipLine = "lcm compact: skipped because LCM_ENABLED=false\n";
+        expect(stderr.mock.calls.filter(([chunk]) => chunk === skipLine)).toHaveLength(1);
+        expect(process.exitCode).toBe(0);
+        expect(state.batchOptions).toBeUndefined();
+        expect(state.loadConfig).not.toHaveBeenCalled();
+        expect(state.ensureDaemon).not.toHaveBeenCalled();
+        expect(state.health).not.toHaveBeenCalled();
+        expect(state.startInvocation).not.toHaveBeenCalled();
+        expect(state.post).not.toHaveBeenCalled();
+        expect(state.renderer.handleEvent).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([undefined, "0", "False"])(
+      "still runs batch compaction when LCM_ENABLED is %j",
+      async value => {
+        vi.stubEnv("LCM_ENABLED", value);
+        const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+        await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
+
+        expect(stderr).not.toHaveBeenCalledWith("lcm compact: skipped because LCM_ENABLED=false\n");
+        expect(state.batchOptions).toBeDefined();
+        expect(state.ensureDaemon).toHaveBeenCalled();
+      },
+    );
+
+    it("skips the global migration preflight for bare compact when LCM_ENABLED=false", async () => {
+      vi.stubEnv("LCM_ENABLED", "false");
+      vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+      await expect(invoke(["compact"])).resolves.toBeUndefined();
+
+      expect(state.migrateLegacyHome).not.toHaveBeenCalled();
+    });
+
+    it("keeps the global migration preflight for bare compact when LCM_ENABLED is unset", async () => {
+      vi.stubEnv("LCM_ENABLED", undefined);
+
+      await expect(invoke(["compact"])).resolves.toBeUndefined();
+
+      expect(state.migrateLegacyHome).toHaveBeenCalled();
+    });
+  });
+
   it("forwards synchronous compact discovery and session events to the ninja renderer", async () => {
     state.batchEvent = { type: "discovery-start", total: 3 };
     await expect(invoke(["compact", "--no-promote"])).resolves.toBeUndefined();
