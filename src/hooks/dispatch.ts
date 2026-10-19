@@ -5,10 +5,15 @@ import {
   rethrowBackendPublicationJournalError,
 } from "./publication-fence.js";
 import type { ConnectorTransport } from "../connectors/types.js";
+import type { TerminalHookContext } from "./terminal-snapshot.js";
 
 export const HOOK_COMMANDS = ["compact", "post-tool", "restore", "session-end", "session-snapshot", "user-prompt"] as const;
 export type HookCommand = typeof HOOK_COMMANDS[number];
-export type HookExecutionContext = Readonly<{ transport?: ConnectorTransport }>;
+export type HookExecutionContext = Readonly<{
+  transport?: ConnectorTransport;
+  /** Present only for Codex Interrupt and SessionEnd snapshots. */
+  terminal?: TerminalHookContext;
+}>;
 
 // Event names used when the dispatch-level config load is skipped by lock
 // contention; they match the names each handler logs its own contention under.
@@ -37,6 +42,12 @@ export async function dispatchHook(
   context: HookExecutionContext = {},
 ): Promise<{ exitCode: number; stdout: string }> {
   let verifiedSnapshotPort: number | undefined;
+  // Terminal snapshots only hand the transcript to an already-running, verified
+  // daemon: no bootstrap, hook repair, cursor or throttle work precedes this.
+  if (command === "session-snapshot" && context.terminal !== undefined) {
+    const { handleTerminalSnapshot } = await import("./terminal-snapshot.js");
+    return handleTerminalSnapshot(stdinText, context.terminal);
+  }
   // Early return for post-tool — runs on EVERY tool call, must skip bootstrap for performance
   if (command === "post-tool") {
     const { handlePostToolUse } = await import("./post-tool.js");

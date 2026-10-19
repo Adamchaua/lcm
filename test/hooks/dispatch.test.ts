@@ -23,6 +23,9 @@ vi.mock("../../src/hooks/user-prompt.js", () => ({
 vi.mock("../../src/hooks/session-snapshot.js", () => ({
   handleSessionSnapshot: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
 }));
+vi.mock("../../src/hooks/terminal-snapshot.js", () => ({
+  handleTerminalSnapshot: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
+}));
 vi.mock("../../src/hooks/post-tool.js", () => ({
   handlePostToolUse: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
 }));
@@ -75,6 +78,7 @@ import { handleSessionEnd } from "../../src/hooks/session-end.js";
 import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
 import { handleSessionSnapshot } from "../../src/hooks/session-snapshot.js";
 import { handlePostToolUse } from "../../src/hooks/post-tool.js";
+import { handleTerminalSnapshot } from "../../src/hooks/terminal-snapshot.js";
 import { loadHookConfig, type HookConfig } from "../../src/hooks/config.js";
 import type { StorageBackendSelection } from "../../src/storage/backend.js";
 
@@ -247,6 +251,25 @@ describe("dispatchHook", () => {
     else vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: false, port: 3737 });
     await expect(dispatchHook("session-snapshot", JSON.stringify({ session_id: "s1" }))).resolves.toEqual({ exitCode: 0, stdout: "" });
     expect(handleSessionSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("hands a terminal snapshot straight to its handler without bootstrap, repair or Stop-hook work", async () => {
+    vi.mocked(ensureBootstrapped).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockClear();
+    vi.mocked(validateAndFixHooks).mockClear();
+    vi.mocked(handleSessionSnapshot).mockClear();
+    vi.mocked(loadHookConfig).mockClear();
+    const terminal = { deadline: { openPhase: vi.fn(), outcomeBudgetMs: vi.fn() } };
+    const stdin = JSON.stringify({ session_id: "s1", hook_event_name: "Interrupt" });
+
+    await expect(dispatchHook("session-snapshot", stdin, { terminal })).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handleTerminalSnapshot).toHaveBeenCalledWith(stdin, terminal);
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
   });
 
   it("reverifies snapshot identity even when the session was already bootstrapped", async () => {

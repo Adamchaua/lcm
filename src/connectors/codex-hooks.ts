@@ -128,6 +128,32 @@ function codexLcmHooks(transport: ConnectorTransport = "cli"): Record<string, Co
         ],
       },
     ],
+    // Codex clamps Interrupt and SessionEnd command hooks to 1..3 seconds and
+    // kills the process group at the cap, so 3 is the most these can use.
+    Interrupt: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: `${lcmCommand("session-snapshot")} --terminal`,
+            timeout: 3,
+            statusMessage: "Saving LCM memory after interruption",
+          },
+        ],
+      },
+    ],
+    SessionEnd: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: `${lcmCommand("session-snapshot")} --terminal`,
+            timeout: 3,
+            statusMessage: "Saving LCM memory before session end",
+          },
+        ],
+      },
+    ],
   };
 }
 

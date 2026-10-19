@@ -36,6 +36,7 @@ const state = vi.hoisted(() => ({
   observe: vi.fn(async (): Promise<unknown> => null),
   readAuthToken: vi.fn(() => state.authToken),
   dispatchHook: vi.fn(async () => ({ stdout: "hook-output", exitCode: 0 })),
+  runTerminalSnapshot: vi.fn(async () => undefined),
   loadConfig: vi.fn(() => ({
     daemon: state.daemonPort === undefined ? undefined : { port: state.daemonPort },
     storage: { backend: state.storageBackend },
@@ -281,6 +282,7 @@ vi.mock("../../src/cli-help.js", () => ({
   printHelp: state.printHelp,
 }));
 vi.mock("../../src/hooks/dispatch.js", () => ({ dispatchHook: state.dispatchHook }));
+vi.mock("../../src/hooks/terminal-snapshot.js", () => ({ runTerminalSnapshotCommand: state.runTerminalSnapshot }));
 vi.mock("../../src/mcp/server.js", () => ({ startMcpServer: state.startMcpServer }));
 vi.mock("../../src/batch-compact.js", (): { batchCompact: ReturnType<typeof vi.fn> } => ({ batchCompact: vi.fn(async (options: { onProgress?: (patch: unknown) => void }): Promise<typeof state.batchResult> => {
   options.onProgress?.(state.batchProgressLast ? { lastResult: { ok: true } } : {});
@@ -2412,6 +2414,19 @@ describe("runCli orchestration actions", () => {
     ["session-snapshot"], ["compact", "--hook", "--client", "claude"],
   ])("dispatches hook action %#", async (...args) => {
     expect((await invoke(args))?.message).toBe("exit:0");
+  });
+
+  it("runs the hidden --terminal snapshot through its own entry and always exits 0 with no output", async () => {
+    const write = vi.spyOn(process.stdout, "write");
+    state.dispatchHook.mockClear();
+    state.runTerminalSnapshot.mockClear();
+
+    expect((await invoke(["session-snapshot", "--client", "codex", "--terminal"]))?.message).toBe("exit:0");
+
+    expect(state.runTerminalSnapshot).toHaveBeenCalledOnce();
+    expect(state.dispatchHook).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    write.mockRestore();
   });
 
   it("dispatches PreCompact without resolving PostgreSQL storage secrets", async () => {

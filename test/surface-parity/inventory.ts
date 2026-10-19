@@ -77,6 +77,7 @@ const DAEMON_SCENARIOS: Record<string, string> = {
   "POST /store": "memory",
   "POST /recent": "memory",
   "POST /ingest": "memory",
+  "POST /ingest/terminal": "memory",
   "POST /prompt-search": "memory",
   "POST /session-complete": "compaction",
   "POST /promote-events": "events",
