@@ -5375,3 +5375,93 @@ describe("native transcript scrubbing residual verification", () => {
     ]);
   });
 });
+
+describe("Codex inherited subagent history option", () => {
+  const codexMessage = (ordinal: number | undefined, role: "user" | "assistant", text: string): string =>
+    JSON.stringify({
+      type: "response_item",
+      ...(ordinal === undefined ? {} : { ordinal }),
+      payload: {
+        type: "message",
+        role,
+        content: [{ type: role === "user" ? "input_text" : "output_text", text }],
+      },
+    }) + "\n";
+  const quarantineFor = (clientName: string) => ({
+    clientName,
+    quarantine: vi.fn(),
+    get: vi.fn(),
+    list: vi.fn(),
+    close: vi.fn(),
+  });
+  const resolverFor = (...contents: string[]) => createExactNativeTranscriptMessageResolver({
+    getNativeTranscriptMessageSnapshot: vi.fn(async () => contents.map((content, index) => ({
+      messageId: 10 + index,
+      conversationId: 7,
+      messageSequence: index,
+      role: index % 2 === 0 ? "user" as const : "assistant" as const,
+      content,
+    }))),
+  });
+  const base = (content: string, resolver: ReturnType<typeof resolverFor>) => ({
+    quarantine: quarantineFor("codex"),
+    source: source(content),
+    machineId: "machine",
+    format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
+    nativeSessionId: "session-1",
+    sourceLocator: "sessions/session.jsonl",
+    messageResolver: resolver,
+  });
+
+  it("stores inherited records unlinked and numbers links by the child's own messages", async () => {
+    const repo = repository();
+    const content = codexMessage(0, "user", "inherited")
+      + "{not json\n"
+      + codexMessage(1, "user", "own 1")
+      + codexMessage(2, "assistant", "own 2")
+      + codexMessage(undefined, "user", "unnumbered");
+    await runNativeTranscriptBackfill({
+      ...base(content, resolverFor("own 1", "own 2", "unnumbered")),
+      repository: repo,
+      codexInheritedBoundary: { start: 1, paginated: true },
+    });
+    const linked = repo.batches.flatMap((batch) => batch.records)
+      .map((record) => [record.sourceOrdinal, record.messageLinks.map((link) => link.messageId)]);
+    expect(linked).toEqual([[0, []], [2, [10]], [3, [11]], [4, []]]);
+  });
+
+  it("keeps the default mapper's behavior without the option", async () => {
+    const repo = repository();
+    await runNativeTranscriptBackfill({
+      ...base(codexMessage(0, "user", "first") + codexMessage(1, "assistant", "second"), resolverFor("first", "second")),
+      repository: repo,
+    });
+    expect(repo.batches.flatMap((batch) => batch.records).map((record) => record.messageLinks.length)).toEqual([1, 1]);
+  });
+
+  it.each([
+    ["a custom mapper", { codexInheritedBoundary: { start: 1, paginated: true }, messageMapper: { map: () => [] } }],
+    ["a non-object boundary", { codexInheritedBoundary: null }],
+    ["a fractional start", { codexInheritedBoundary: { start: 1.5, paginated: true } }],
+    ["a negative start", { codexInheritedBoundary: { start: -1, paginated: true } }],
+    ["a non-boolean mode", { codexInheritedBoundary: { start: 1, paginated: "yes" } }],
+  ])("rejects %s", async (_name, extra) => {
+    const repo = repository();
+    await expect(runNativeTranscriptBackfill({
+      ...base("", resolverFor()),
+      repository: repo,
+      ...extra,
+    } as never)).rejects.toThrowError(NativeTranscriptConfigurationError);
+    expect(repo.ingestBatch).not.toHaveBeenCalled();
+  });
+
+  it("rejects the option for a non-Codex format", async () => {
+    await expect(runNativeTranscriptBackfill({
+      ...base("", resolverFor()),
+      quarantine: quarantineFor("claude-code"),
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      repository: repository(),
+      codexInheritedBoundary: { start: 1, paginated: true },
+    })).rejects.toThrowError(NativeTranscriptConfigurationError);
+  });
+});

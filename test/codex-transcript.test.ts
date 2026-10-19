@@ -4,6 +4,9 @@ import { basename, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import {
   parseCodexTranscript,
+  parseCodexTranscriptText,
+  readCodexInheritedBoundary,
+  isInheritedSubagentRecord,
   extractCodexSessionCwd,
   extractCodexSessionMeta,
   findCodexSessionFiles,
@@ -504,5 +507,88 @@ describe("findAllCodexTranscripts", () => {
     const oldTime = new Date(Date.now() - 10_000);
     utimesSync(older, oldTime, oldTime);
     expect(findAllCodexTranscripts(codexDir).map((file) => file.sessionId)).toEqual(["older", "newer"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Inherited subagent history
+// ---------------------------------------------------------------------------
+
+describe("inherited subagent history", () => {
+  const meta = (payload: Record<string, unknown>): string => JSON.stringify({ type: "session_meta", payload });
+  const record = (ordinal: unknown, role: "user" | "assistant", text: string): string => JSON.stringify({
+    type: "response_item",
+    ...(ordinal === undefined ? {} : { ordinal }),
+    payload: { type: "message", role, content: [{ type: role === "user" ? "input_text" : "output_text", text }] },
+  });
+  const join_ = (...lines: string[]): string => lines.join("\n") + "\n";
+
+  it.each([
+    ["a paginated start", { subagent_history_start_ordinal: 3, history_mode: "paginated" }, { start: 3, paginated: true }],
+    ["a zero start", { subagent_history_start_ordinal: 0, history_mode: "paginated" }, { start: 0, paginated: true }],
+    ["a legacy mode", { subagent_history_start_ordinal: 3, history_mode: "legacy" }, { start: 3, paginated: false }],
+    ["a missing mode", { subagent_history_start_ordinal: 3 }, { start: 3, paginated: false }],
+    ["a mode that is not exactly paginated", { subagent_history_start_ordinal: 3, history_mode: "Paginated" }, { start: 3, paginated: false }],
+  ])("reads %s", (_name, payload, expected) => {
+    expect(readCodexInheritedBoundary(join_("", "  ", meta(payload)))).toEqual(expected);
+    expect(readCodexInheritedBoundary(meta(payload))).toEqual(expected);
+  });
+
+  it.each([
+    ["no start", { history_mode: "paginated" }],
+    ["a string start", { subagent_history_start_ordinal: "3" }],
+    ["a negative start", { subagent_history_start_ordinal: -1 }],
+    ["a fractional start", { subagent_history_start_ordinal: 1.5 }],
+    ["an unsafe start", { subagent_history_start_ordinal: 2 ** 60 }],
+    ["a null start", { subagent_history_start_ordinal: null }],
+  ])("ignores %s", (_name, payload) => {
+    expect(readCodexInheritedBoundary(meta(payload))).toBeUndefined();
+  });
+
+  it("reads only the first non-blank record", () => {
+    const good = meta({ subagent_history_start_ordinal: 2 });
+    expect(readCodexInheritedBoundary("")).toBeUndefined();
+    expect(readCodexInheritedBoundary("\n  \n")).toBeUndefined();
+    expect(readCodexInheritedBoundary(join_(record(0, "user", "x"), good))).toBeUndefined();
+    expect(readCodexInheritedBoundary(join_("{broken", good))).toBeUndefined();
+    expect(readCodexInheritedBoundary(join_("[]", good))).toBeUndefined();
+    expect(readCodexInheritedBoundary(join_("null", good))).toBeUndefined();
+    expect(readCodexInheritedBoundary(JSON.stringify({ type: "session_meta", payload: "x" }))).toBeUndefined();
+    expect(readCodexInheritedBoundary(JSON.stringify({ type: "session_meta", payload: [] }))).toBeUndefined();
+    expect(readCodexInheritedBoundary(join_(meta({}), good))).toBeUndefined();
+  });
+
+  it("classifies records by numeric ordinal only", () => {
+    const paginated = { start: 2, paginated: true };
+    const legacy = { start: 2, paginated: false };
+    expect(isInheritedSubagentRecord({ ordinal: 1 }, undefined)).toBe(false);
+    expect(isInheritedSubagentRecord({ ordinal: 1 }, paginated)).toBe(true);
+    expect(isInheritedSubagentRecord({ ordinal: 2 }, paginated)).toBe(false);
+    expect(isInheritedSubagentRecord({ ordinal: 3 }, paginated)).toBe(false);
+    expect(isInheritedSubagentRecord({ ordinal: 1 }, legacy)).toBe(true);
+    for (const malformed of [{}, { ordinal: "0" }, { ordinal: -1 }, { ordinal: 0.5 }, { ordinal: null }, null, [], "x"]) {
+      expect(isInheritedSubagentRecord(malformed, paginated)).toBe(true);
+      expect(isInheritedSubagentRecord(malformed, legacy)).toBe(false);
+    }
+  });
+
+  it("drops the inherited prefix only when asked, keeping the boundary ordinal", () => {
+    const raw = join_(
+      meta({ subagent_history_start_ordinal: 2, history_mode: "paginated" }),
+      record(0, "user", "parent 1"),
+      record(1, "assistant", "parent 2"),
+      record(2, "user", "own 1"),
+      record(3, "assistant", "own 2"),
+    );
+    expect(parseCodexTranscriptText(raw).map((m) => m.content)).toEqual(["parent 1", "parent 2", "own 1", "own 2"]);
+    expect(parseCodexTranscriptText(raw, {}).map((m) => m.content)).toHaveLength(4);
+    expect(parseCodexTranscriptText(raw, { excludeInheritedSubagentHistory: true }).map((m) => m.content))
+      .toEqual(["own 1", "own 2"]);
+    expect(parseCodexTranscriptText(raw, { excludeInheritedSubagentHistory: false })).toHaveLength(4);
+  });
+
+  it("leaves a rollout without a boundary unchanged even when asked", () => {
+    const raw = join_(meta({ id: "root" }), record(0, "user", "one"), record(undefined, "assistant", "two"));
+    expect(parseCodexTranscriptText(raw, { excludeInheritedSubagentHistory: true })).toEqual(parseCodexTranscriptText(raw));
   });
 });

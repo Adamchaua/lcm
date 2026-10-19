@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
+import { isInheritedSubagentRecord, type CodexInheritedBoundary } from "../codex-transcript.js";
 import { NATIVE_PATTERNS, ScrubEngine } from "../scrub.js";
 import type { MessageRole } from "../store/conversation-store.js";
 import type {
@@ -1668,6 +1669,23 @@ function resumableByteOffset(
   return checkpoint.byteOffset as number;
 }
 
+/**
+ * Wraps a mapper so records a forked Codex subagent inherited from its parent
+ * map to no message candidates. The records themselves are still stored, with
+ * no message links, so the session-wide message order stays that of the
+ * subagent's own history.
+ */
+function createInheritedHistoryMapper(
+  base: NativeTranscriptMessageMapper,
+  boundary: CodexInheritedBoundary,
+): NativeTranscriptMessageMapper {
+  return {
+    map: (format, payload, sourceOrdinal) => isInheritedSubagentRecord(payload, boundary)
+      ? []
+      : base.map(format, payload, sourceOrdinal),
+  };
+}
+
 export interface NativeTranscriptBackfillOptions {
   readonly repository: NativeTranscriptRepository;
   readonly quarantine: LocalTranscriptQuarantineRepository;
@@ -1680,6 +1698,11 @@ export interface NativeTranscriptBackfillOptions {
   readonly projectPatterns: readonly string[];
   readonly pipelineVersion?: string;
   readonly messageMapper?: NativeTranscriptMessageMapper;
+  /**
+   * Built-in Codex option: records before this boundary map to no messages.
+   * Unlike messageMapper it keeps the default mapper's quarantine-gap recovery.
+   */
+  readonly codexInheritedBoundary?: CodexInheritedBoundary;
   readonly messageResolver: ExactNativeTranscriptMessageResolver;
   readonly batchSize?: number;
   readonly clock?: () => Date;
@@ -1783,6 +1806,7 @@ function snapshotNativeTranscriptBackfillOptions(
   const source = options.source;
   const messageResolver = options.messageResolver;
   const callerMapper = options.messageMapper;
+  const inheritedBoundary = options.codexInheritedBoundary;
   if (
     repository === null
     || typeof repository !== "object"
@@ -1812,7 +1836,27 @@ function snapshotNativeTranscriptBackfillOptions(
   if (clientName !== format.clientName) {
     throw new NativeTranscriptConfigurationError("invalid-input");
   }
-  const mapper = callerMapper ?? createNativeTranscriptMessageMapper();
+  if (
+    inheritedBoundary !== undefined
+    && (
+      callerMapper !== undefined
+      || format.clientName !== CODEX_NATIVE_TRANSCRIPT_FORMAT.clientName
+      || inheritedBoundary === null
+      || typeof inheritedBoundary !== "object"
+      || !Number.isSafeInteger(inheritedBoundary.start)
+      || inheritedBoundary.start < 0
+      || typeof inheritedBoundary.paginated !== "boolean"
+    )
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  const baseMapper = callerMapper ?? createNativeTranscriptMessageMapper();
+  const mapper = inheritedBoundary === undefined
+    ? baseMapper
+    : createInheritedHistoryMapper(baseMapper, {
+        start: inheritedBoundary.start,
+        paginated: inheritedBoundary.paginated,
+      });
   return Object.freeze({
     repository: Object.freeze({
       getCheckpoint: repository.getCheckpoint.bind(repository),

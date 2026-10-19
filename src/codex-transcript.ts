@@ -106,9 +106,76 @@ export function parseCodexTranscript(transcriptPath: string): ParsedMessage[] {
   return parseCodexTranscriptText(raw);
 }
 
+/**
+ * Where a forked Codex subagent's own history starts. Records persisted before
+ * `start` (by their top-level ordinal) are the parent's inherited context.
+ */
+export interface CodexInheritedBoundary {
+  readonly start: number;
+  /** Only a paginated rollout reliably stamps every persisted record with an ordinal. */
+  readonly paginated: boolean;
+}
+
+function isCodexOrdinal(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Read the inherited-history boundary from already-bound transcript bytes.
+ * Codex writes a subagent's own session_meta as the first record, so only the
+ * first non-blank record is consulted; a later session_meta is ignored.
+ */
+export function readCodexInheritedBoundary(raw: string): CodexInheritedBoundary | undefined {
+  let offset = 0;
+  while (offset <= raw.length) {
+    const newline = raw.indexOf("\n", offset);
+    const end = newline === -1 ? raw.length : newline;
+    const trimmed = raw.slice(offset, end).trim();
+    offset = end + 1;
+    if (!trimmed) continue;
+    let first: unknown;
+    try {
+      first = JSON.parse(trimmed);
+    } catch {
+      return undefined;
+    }
+    if (!isRecord(first) || first.type !== "session_meta" || !isRecord(first.payload)) return undefined;
+    const start = first.payload.subagent_history_start_ordinal;
+    if (!isCodexOrdinal(start)) return undefined;
+    return { start, paginated: first.payload.history_mode === "paginated" };
+  }
+  return undefined;
+}
+
+/**
+ * True when a parsed record belongs to the parent history a forked subagent
+ * inherited. The boundary ordinal itself is the subagent's first own record.
+ * Only numeric fields are consulted, so scrubbing cannot change the outcome.
+ */
+export function isInheritedSubagentRecord(
+  record: unknown,
+  boundary: CodexInheritedBoundary | undefined,
+): boolean {
+  if (boundary === undefined) return false;
+  const ordinal = isRecord(record) ? record.ordinal : undefined;
+  return isCodexOrdinal(ordinal) ? ordinal < boundary.start : boundary.paginated;
+}
+
+export interface CodexParseOptions {
+  /** Drop the parent history a forked subagent inherited. */
+  readonly excludeInheritedSubagentHistory?: boolean;
+}
+
 /** Parse already-bound transcript bytes without reopening a pathname. */
-export function parseCodexTranscriptText(raw: string): ParsedMessage[] {
+export function parseCodexTranscriptText(raw: string, options: CodexParseOptions = {}): ParsedMessage[] {
   const messages: ParsedMessage[] = [];
+  const boundary = options.excludeInheritedSubagentHistory === true
+    ? readCodexInheritedBoundary(raw)
+    : undefined;
 
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
@@ -123,6 +190,7 @@ export function parseCodexTranscriptText(raw: string): ParsedMessage[] {
 
     // Only response_item lines carry user/assistant messages
     if (obj.type !== "response_item") continue;
+    if (isInheritedSubagentRecord(obj, boundary)) continue;
 
     const payload = obj.payload as CodexResponseItemPayload | undefined;
     if (!payload || payload.type !== "message") continue;

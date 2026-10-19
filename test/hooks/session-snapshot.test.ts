@@ -211,6 +211,16 @@ describe("handleSessionSnapshot", () => {
       expect(deps.writeFileSync).not.toHaveBeenCalledWith(expect.stringContaining("snap-tree-root"), expect.anything());
     });
 
+    it("scopes a child by agent_id when the tree session_id is not a string", async () => {
+      const deps = makeDeps();
+      const { handleSessionSnapshot } = await import("../../src/hooks/session-snapshot.js");
+      await handleSessionSnapshot(JSON.stringify({ ...child, session_id: 42 }), deps);
+      expect(deps.post).toHaveBeenCalledWith("/ingest", expect.objectContaining({ session_id: "child-thread" }));
+      deps.post = vi.fn();
+      await handleSessionSnapshot(JSON.stringify({ ...child, client: "claude", session_id: 42 }), deps);
+      expect(deps.post).not.toHaveBeenCalled();
+    });
+
     it("leaves a non-Codex payload carrying agent_id on its session_id", async () => {
       const deps = makeDeps();
       const { handleSessionSnapshot } = await import("../../src/hooks/session-snapshot.js");

@@ -6,8 +6,12 @@ rationale: >-
   change. src/hooks/restore.ts, session-snapshot.ts, post-tool.ts,
   user-prompt.ts and dispatch.ts are materially changed and keep that owner.
   src/connectors/codex-hooks.ts (SubagentStart and SubagentStop registration)
-  is materially changed and keeps its connectors owner. No file is removed,
-  moved or re-owned.
+  is materially changed and keeps its connectors owner.
+  src/codex-transcript.ts, src/transcript-provider.ts and
+  src/storage/native-transcript-ingest.ts (inherited subagent history) are
+  materially changed and keep their transcript import owner, and
+  src/daemon/routes/ingest.ts (history mode choice) keeps its daemon routes
+  owner. No file is removed, moved or re-owned.
 pins:
   - ["src/hooks/subagent-scope.ts", "unit-hooks"]
   - ["src/hooks/restore.ts", "unit-hooks"]
@@ -16,3 +20,7 @@ pins:
   - ["src/hooks/user-prompt.ts", "unit-hooks"]
   - ["src/hooks/dispatch.ts", "unit-hooks"]
   - ["src/connectors/codex-hooks.ts", "unit-connectors"]
+  - ["src/codex-transcript.ts", "unit-transcripts-import"]
+  - ["src/transcript-provider.ts", "unit-transcripts-import"]
+  - ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"]
+  - ["src/daemon/routes/ingest.ts", "unit-daemon-routes"]

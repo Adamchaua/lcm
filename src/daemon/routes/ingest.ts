@@ -29,6 +29,7 @@ import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { ParsedMessage } from "../../transcript.js";
 import { normalizeTranscriptClient, parseTranscriptTextForClient, type TranscriptClient } from "../../transcript-provider.js";
+import { readCodexInheritedBoundary, type CodexInheritedBoundary } from "../../codex-transcript.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
@@ -36,6 +37,28 @@ import type { ProjectStorage, StorageBackendFactory } from "../../storage/index.
 import { createCommitCloseBarrier, storageRouteFailureResponse, withProjectStorage } from "./storage-lifecycle.js";
 import { isAbortError, throwIfAborted } from "../cancellation.js";
 import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
+
+/** Which parse of a forked Codex subagent's rollout the stored conversation follows. */
+type SubagentHistory = "filtered" | "unfiltered" | "mismatch";
+
+/**
+ * Pick the first candidate transcript of which the already-stored (scrubbed)
+ * messages are an exact prefix. Because the stored rows are always a prefix of
+ * the chosen list, appending the list's remaining items and numbering native
+ * links by that list's order stay consistent from one snapshot to the next.
+ */
+function chooseSubagentHistory(
+  stored: readonly { readonly role: string; readonly content: string }[],
+  candidates: readonly (readonly [Exclude<SubagentHistory, "mismatch">, readonly ParsedMessage[]])[],
+  scrubber: ScrubEngine,
+): SubagentHistory {
+  for (const [history, messages] of candidates) {
+    if (stored.length <= messages.length && stored.every((row, index) => (
+      row.role === messages[index]!.role && row.content === scrubber.scrub(messages[index]!.content)
+    ))) return history;
+  }
+  return "mismatch";
+}
 
 function isParsedMessage(value: unknown): value is ParsedMessage {
   if (!value || typeof value !== "object") return false;
@@ -129,17 +152,43 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         : undefined;
 
       const signal = context?.signal ?? new AbortController().signal;
-      async function persist(project: ProjectStorage, messages: ParsedMessage[], scrubber: ScrubEngine | undefined) {
+      async function persist(
+        project: ProjectStorage,
+        messages: ParsedMessage[],
+        scrubber: ScrubEngine | undefined,
+        filteredMessages: ParsedMessage[] | undefined,
+      ) {
         const resolvedMessages = messages;
         return await project.transaction(async (repositories) => {
-          if (resolvedMessages.length === 0) return null;
-          const row = await repositories.coordination.getSessionIngest(session_id);
-          if (row && resolvedMessages.length <= row.messageCount) return null;
+          if (resolvedMessages.length === 0) {
+            return { persisted: null, history: filteredMessages === undefined ? undefined : "filtered" as const };
+          }
+          // A forked subagent's history mode needs the stored rows, so it never
+          // takes the session-count shortcut below.
+          if (filteredMessages === undefined) {
+            const row = await repositories.coordination.getSessionIngest(session_id);
+            if (row && resolvedMessages.length <= row.messageCount) return { persisted: null, history: undefined };
+          }
 
           const conversation = await repositories.conversations.getOrCreateConversation(session_id);
-          const storedCount = await repositories.conversations.getMessageCount(conversation.conversationId);
-          const newMessages = resolvedMessages.slice(storedCount);
-          if (newMessages.length === 0) return null;
+          let history: SubagentHistory | undefined;
+          let chosen = resolvedMessages;
+          let storedCount: number;
+          if (filteredMessages === undefined) {
+            storedCount = await repositories.conversations.getMessageCount(conversation.conversationId);
+          } else {
+            const stored = await repositories.conversations.getMessages(conversation.conversationId);
+            storedCount = stored.length;
+            history = chooseSubagentHistory(
+              stored,
+              [["filtered", filteredMessages], ["unfiltered", resolvedMessages]],
+              scrubber!,
+            );
+            if (history === "mismatch") return { persisted: null, history };
+            if (history === "filtered") chosen = filteredMessages;
+          }
+          const newMessages = chosen.slice(storedCount);
+          if (newMessages.length === 0) return { persisted: null, history };
 
           const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
           const inputs = newMessages.map((m, i) => {
@@ -162,11 +211,12 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
             conversation.conversationId,
             records.map((record) => record.messageId),
           );
-          return { conversationId: conversation.conversationId, records, totalCounts };
+          return { persisted: { conversationId: conversation.conversationId, records, totalCounts }, history };
         });
       }
-      let accumulated: Awaited<ReturnType<typeof persist>> = null;
-      let ingest: (NonNullable<Awaited<ReturnType<typeof persist>>> & { totalTokens: number }) | null = null;
+      type PersistedIngest = NonNullable<Awaited<ReturnType<typeof persist>>["persisted"]>;
+      let accumulated: PersistedIngest | null = null;
+      let ingest: (PersistedIngest & { totalTokens: number }) | null = null;
       let sourceWitness: { byteLength: number; sha256: string } | undefined;
       let retryFailure: NativeTranscriptSourceChangedError | undefined;
       for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -188,6 +238,8 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         };
         try {
           let messages = resolvedMessages;
+          let inheritedBoundary: CodexInheritedBoundary | undefined;
+          let filteredMessages: ParsedMessage[] | undefined;
           if (importNative !== undefined) {
             snapshot = await createFileNativeTranscriptSource(dirname(importNative), basename(importNative)).openSnapshot();
             closeSnapshot = snapshot.close.bind(snapshot);
@@ -210,7 +262,15 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
             await snapshot.assertUnchanged();
             const bytes = Buffer.concat(chunks);
             sourceWitness = { byteLength: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") };
-            messages = parseTranscriptTextForClient(bytes.toString("utf8"), resolved.client!);
+            const raw = bytes.toString("utf8");
+            messages = parseTranscriptTextForClient(raw, resolved.client!);
+            if (resolved.client === "codex") {
+              // The boundary is read from the same bound bytes as the parse.
+              inheritedBoundary = readCodexInheritedBoundary(raw);
+              if (inheritedBoundary !== undefined) {
+                filteredMessages = parseTranscriptTextForClient(raw, "codex", { excludeInheritedSubagentHistory: true });
+              }
+            }
           }
           throwIfAborted(signal);
           const scrubber = await createScrubber(messages);
@@ -231,7 +291,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                 }
                 await snapshot?.assertUnchanged();
                 throwIfAborted(signal);
-                const persisted = await persist(project, messages, scrubber);
+                const { persisted, history } = await persist(project, messages, scrubber, filteredMessages);
                 if (persisted) {
                   accumulated = accumulated === null ? persisted : {
                     conversationId: persisted.conversationId,
@@ -245,7 +305,15 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                   };
                 }
                 throwIfAborted(signal);
-                if (importNative !== undefined) {
+                if (history === "mismatch") {
+                  // Neither parse extends what is stored for this child, so
+                  // appending or linking could misnumber it. Leave it as is.
+                  await safeLogError(
+                    "ingest",
+                    new Error("subagent transcript matches neither the filtered nor the unfiltered stored history"),
+                    { cwd, sessionId: session_id },
+                  );
+                } else if (importNative !== undefined) {
                   const native = project.nativeTranscripts!;
                   const format = resolved.client === "codex"
                     ? CODEX_NATIVE_TRANSCRIPT_FORMAT
@@ -266,6 +334,9 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                       globalPatterns: config.security?.sensitivePatterns ?? [],
                       projectPatterns,
                       quarantine,
+                      ...(history === "filtered" && inheritedBoundary !== undefined
+                        ? { codexInheritedBoundary: inheritedBoundary }
+                        : {}),
                     });
                   } catch (error) {
                     backfillFailed = true;

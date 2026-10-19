@@ -433,6 +433,22 @@ A `SubagentStop` payload without a valid `agent_id` or without
   some delivery paths, so prompt-time recall inside a subagent is not
   guaranteed. `SubagentStart` is the dependable point where it receives
   memory.
+- A subagent forked from its parent starts with the parent's history in its
+  rollout. When the rollout's first record is a `session_meta` with a numeric
+  `subagent_history_start_ordinal`, LCM skips the records that precede it, so
+  the parent's messages are not stored again under the subagent. Only rollouts
+  that Codex stamps with per-record ordinals (`history_mode: "paginated"`) are
+  filtered completely; in other rollouts only records that carry an explicit
+  ordinal below the boundary are skipped, and a forked subagent without them
+  keeps the inherited history. `lcm import --codex` applies the same rule.
+- A subagent conversation stored before this change keeps its inherited
+  history: each ingest follows whichever reading (with or without the inherited
+  prefix) extends what is already stored. If the stored messages match neither
+  reading, for example after the rollout was rewritten, LCM appends nothing for
+  that subagent, writes a diagnostic to the hook error log, and leaves the rest
+  of the conversation untouched.
+- When one session id has several stored conversations, ingest continues to
+  append to the most recent one, as it does for every other client.
 - Sibling subagents count as distinct sessions for passive pattern
   reinforcement, so a pattern that several siblings repeat gains confidence
   faster than the same pattern repeated within one session. Promotion rules are
