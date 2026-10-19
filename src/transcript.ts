@@ -60,7 +60,13 @@ export function readTranscriptFileText(transcriptPath: string): string | undefin
   } catch {
     return undefined;
   } finally {
-    if (fd !== undefined) closeSync(fd);
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // descriptor cleanup failure is not a parse failure
+      }
+    }
   }
 }
 
