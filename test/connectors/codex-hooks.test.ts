@@ -102,6 +102,18 @@ describe("Codex hook configuration boundaries", () => {
     expect(hasCodexHooks(hooksPath)).toBe(true);
   });
 
+  it("installs the SessionStart matcher for compact and fork over a legacy matcher", () => {
+    writeFileSync(hooksPath, JSON.stringify({
+      hooks: {
+        SessionStart: [{ matcher: "startup|resume|clear", hooks: [{ type: "command", command: "lcm restore --client codex" }] }],
+      },
+    }));
+    installCodexHooks(hooksPath, configPath);
+    const sessionStart = JSON.parse(readFileSync(hooksPath, "utf-8")).hooks.SessionStart;
+    expect(sessionStart).toHaveLength(1);
+    expect(sessionStart[0].matcher).toBe("startup|resume|clear|compact|fork");
+  });
+
   it("stamps only UserPromptSubmit and converges legacy or stamped prompt hooks", () => {
     writeFileSync(hooksPath, JSON.stringify({
       hooks: {
