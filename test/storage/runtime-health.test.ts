@@ -3,7 +3,7 @@ import {
   QUEUE_CANDIDATE_LIMIT, RUNTIME_HEALTH_ACTIONS, extensionVersion, extensionsAction, extensionsTelemetry,
   failUnfinishedTelemetry, failedServerQueueReads, isRecord, localPendingAgeRead, migrationAction, migrationTelemetry,
   ownValue, pickExtensions, poolAction, poolFacts, poolSaturationRatio, poolTelemetry, queueAction, queueTelemetry,
-  safeCount, safeNumber, serverQueueReads, telemetryDegraded, telemetryFailureStatus, telemetryFillers,
+  TELEMETRY_FIELDS, safeCount, safeNumber, serverQueueReads, telemetryDegraded, telemetryFailureStatus, telemetryFillers,
   type QueueReads, type TelemetryFamilyName,
 } from "../../src/storage/runtime-health.js";
 
@@ -291,6 +291,19 @@ describe("queue interpretation", () => {
     expect(queueTelemetry({ ...failedServerQueueReads("unavailable"), outboxOldestPendingAgeSeconds: { reason: "unavailable" } } as QueueReads, undefined, 1)).toMatchObject({ status: "unavailable" });
     const outOfRange = { inboxClaimed: { reason: "out-of-range" }, inboxQuarantined: { reason: "out-of-range" }, replayLagSeconds: { reason: "out-of-range" }, outboxOldestPendingAgeSeconds: { reason: "out-of-range" } } as QueueReads;
     expect(queueTelemetry(outOfRange, undefined, 1)).toMatchObject({ status: "unavailable" });
+  });
+  it("counts a verified local quarantine and a cap sentinel as usable queue evidence", () => {
+    const nothing = { ...failedServerQueueReads("timeout"), outboxOldestPendingAgeSeconds: { reason: "out-of-range" } } as QueueReads;
+    expect(queueTelemetry(nothing, 0, 1)).toMatchObject({ status: "partial", health: "unavailable", remediation: ACTIONS.unavailable });
+    expect(queueTelemetry(nothing, 2, 1)).toMatchObject({ status: "partial", health: "degraded", remediation: ACTIONS.quarantine });
+    const capped = { ...serverQueueReads({ capReached: true, claimed: "1", quarantined: "1", lagSeconds: "1" }), outboxOldestPendingAgeSeconds: { reason: "unavailable" } } as QueueReads;
+    expect(queueTelemetry(capped, undefined, 1)).toEqual({
+      status: "partial", observedAt: 1, health: "unavailable", remediation: ACTIONS.unavailable,
+      omitted: [
+        { field: "outboxOldestPendingAgeSeconds", reason: "unavailable" }, { field: "inboxClaimed", reason: "limit-reached" },
+        { field: "inboxQuarantined", reason: "limit-reached" }, { field: "replayLagSeconds", reason: "limit-reached" },
+      ].sort((left, right) => TELEMETRY_FIELDS.queue.indexOf(left.field as never) - TELEMETRY_FIELDS.queue.indexOf(right.field as never)),
+    });
   });
   it("selects queue guidance with quarantine precedence", () => {
     expect(queueAction("degraded", {})).toBe(ACTIONS.unavailable);

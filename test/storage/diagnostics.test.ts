@@ -783,3 +783,57 @@ describe('runtime health sanitization canaries', () => {
   });
 });
 
+describe('verified local quarantine and cap sentinel establish a partial queue family', () => {
+  const futureAge = '2999-01-01 00:00:00';
+  const readQueueFor = (mode: string) => mode === 'cap'
+    ? vi.fn(async()=>({capReached:true,claimed:'4097',quarantined:'4097',lagSeconds:'9999'}))
+    : vi.fn(async()=>{throw typedFailure(({unavailable:'08006','permission-denied':'42501',timeout:'57014'} as Record<string,string>)[mode]!);});
+  it.each(['unavailable','permission-denied','timeout','cap'] as const)('keeps a ready local quarantine count usable when the server read is %s', async mode => {
+    const {dependencies}=fixture(); dependencies.readQueue=readQueueFor(mode);
+    dependencies.readOutbox=async()=>({...outbox,deliveryQuarantined:2,oldestPendingAt:futureAge});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    const queue=result.telemetry.queue as {omitted:{field:string;reason:string}[]};
+    expect(queue).toMatchObject({status:'partial',health:'degraded',remediation:RUNTIME_HEALTH_ACTIONS.quarantine});
+    expect(queue.omitted).toContainEqual({field:'outboxOldestPendingAgeSeconds',reason:'out-of-range'});
+    expect(queue.omitted).toContainEqual({field:'inboxQuarantined',reason:mode==='cap'?'limit-reached':mode});
+    expect(queue).not.toHaveProperty('inboxQuarantined');
+    expect(result.classification).toBe('degraded');
+    const { renderBackendDiagnostics } = await import('../../src/storage/diagnostic-renderer.js');
+    const text=renderBackendDiagnostics(result);
+    expect(text).toContain('Telemetry queue: partial; health: degraded');
+    expect(text).toContain('Telemetry queue action: '+RUNTIME_HEALTH_ACTIONS.quarantine);
+  });
+  it('treats a ready local zero as usable but not degraded', async () => {
+    const {dependencies}=fixture(); dependencies.readQueue=readQueueFor('unavailable');
+    dependencies.readOutbox=async()=>({...outbox,deliveryQuarantined:0,oldestPendingAt:futureAge});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.queue).toMatchObject({status:'partial',health:'unavailable',remediation:RUNTIME_HEALTH_ACTIONS.unavailable});
+    expect(result.classification).toBe('healthy');
+  });
+  it('lets an unready outbox contribute no quarantine evidence', async () => {
+    const {dependencies}=fixture(); dependencies.readQueue=readQueueFor('unavailable');
+    dependencies.readOutbox=async()=>({...outbox,scanErrors:1,deliveryQuarantined:2,oldestPendingAt:futureAge});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.queue).toMatchObject({status:'unavailable',health:'unavailable',remediation:RUNTIME_HEALTH_ACTIONS.unavailable});
+    expect(result.classification).toBe('unavailable');
+  });
+  it('reports a reached cap as partial for a selected project without a local binding', async () => {
+    const {dependencies}=fixture(); dependencies.readQueue=readQueueFor('cap');
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,projectId:machineId});
+    expect(result.telemetry.queue).toMatchObject({status:'partial',health:'unavailable',omitted:[
+      {field:'outboxOldestPendingAgeSeconds',reason:'unavailable'},{field:'inboxClaimed',reason:'limit-reached'},
+      {field:'inboxQuarantined',reason:'limit-reached'},{field:'replayLagSeconds',reason:'limit-reached'}]});
+    for (const field of ['inboxClaimed','inboxQuarantined','replayLagSeconds']) expect(result.telemetry.queue).not.toHaveProperty(field);
+    expect(JSON.stringify(result.telemetry.queue)).not.toContain('4097');
+    expect(dependencies.readOutbox).not.toHaveBeenCalled();
+  });
+  it('reports a reached cap as partial when the local read then fails', async () => {
+    const {dependencies}=fixture(); dependencies.readQueue=readQueueFor('cap');
+    dependencies.readOutbox=vi.fn(async()=>{throw Object.assign(new Error('private path'),{code:'EACCES'});});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('permission-denied');
+    expect(result.telemetry.queue).toMatchObject({status:'partial',health:'unavailable',omitted:expect.arrayContaining([
+      {field:'outboxOldestPendingAgeSeconds',reason:'permission-denied'},{field:'inboxQuarantined',reason:'limit-reached'}])});
+    expect(JSON.stringify(result)).not.toContain('4097');
+  });
+});

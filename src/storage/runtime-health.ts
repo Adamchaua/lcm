@@ -356,7 +356,10 @@ export function queueAction(health: TelemetryHealth, facts: QueueFacts): string 
   return selectAction(health, evidence.quarantined ? RUNTIME_HEALTH_ACTIONS.quarantine
     : evidence.backlog ? RUNTIME_HEALTH_ACTIONS.backlog : RUNTIME_HEALTH_ACTIONS.unavailable);
 }
-/** localQuarantined is the ready local outbox quarantine count, when that outbox was verified. */
+/**
+ * localQuarantined is the ready local outbox quarantine count, when that outbox was verified. It is
+ * usable evidence, and an observed cap sentinel is a partial observation even when no value is usable.
+ */
 export function queueTelemetry(reads: QueueReads, localQuarantined: number | undefined, observedAt: number): QueueTelemetry {
   const values: Partial<Record<keyof QueueReads, number>> = {};
   const omitted: TelemetryOmission[] = [];
@@ -365,7 +368,8 @@ export function queueTelemetry(reads: QueueReads, localQuarantined: number | und
     if ("value" in read) values[field] = read.value;
     else omitted.push({ field, reason: read.reason });
   }
-  const usable = Object.keys(values).length + omitted.filter(entry => entry.reason === "no-entry").length;
+  const usable = Object.keys(values).length + omitted.filter(entry => entry.reason === "no-entry").length
+    + (localQuarantined === undefined ? 0 : 1) + (omitted.some(entry => entry.reason === "limit-reached") ? 1 : 0);
   const status = deriveStatus(omitted, usable);
   const facts: QueueFacts = { ...values, localQuarantined };
   const evidence = queueEvidence(facts);

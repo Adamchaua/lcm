@@ -148,6 +148,14 @@ describe("runtime health telemetry text", () => {
     expect(lineOf(text, "Telemetry queue:")).toContain("partial; health: unavailable");
     expect(text).not.toContain("PRIVATE");
   });
+  it("ignores inherited telemetry properties", () => {
+    const inherited = postgres();
+    inherited.telemetry.queue = Object.create({ status: "observed", health: "degraded", inboxQuarantined: 5, omitted: [{ field: "inboxClaimed", reason: "timeout" }] });
+    inherited.telemetry.extensions = Object.create({ status: "observed", health: "healthy", entries: [] });
+    const inheritedText = renderBackendDiagnostics(inherited);
+    expect(lineOf(inheritedText, "Telemetry queue:")).toBe("Telemetry queue: unavailable; health: unavailable; outbox oldest pending age seconds: unverified; inbox claimed: unverified; inbox quarantined: unverified; replay lag seconds: unverified; omitted: none");
+    expect(lineOf(inheritedText, "Telemetry extensions:")).toContain("unavailable; health: unavailable; entries: none");
+  });
   it("ignores the wire remediation and derives guidance from validated values", () => {
     const snapshot = postgres();
     const wire = [A.migrationBehind, A.quarantine, "No action required.", "PRIVATE free text"];
