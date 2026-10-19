@@ -447,11 +447,42 @@ project ID was selected; an absent ID is not evidence of a missing project.
 | Snapshot state | Meaning and next action |
 |---|---|
 | `healthy` | All required readiness observations verified. |
-| `degraded` | Readiness verified, but the observed pool still reports a recovery failure condition. Inspect the backend service and repeat the diagnostic after recovery. |
+| `degraded` | Readiness verified, but the observed pool still reports a recovery failure condition, or a [runtime health family](#runtime-health-families) is degraded. Inspect the backend service and repeat the diagnostic after recovery. |
 | `unavailable` | Storage could not be safely read or a required observation could not be verified. Check configuration, service readiness, and the fixed guidance in the output. |
 | `permission-denied` | A trusted local or database permission failure prevented observation. Restore the intended access or runtime grants, then retry. |
 | `timeout` | Collection reached its deadline or the caller cancelled it. Check service responsiveness and retry. |
 | `stale-publication` | Publication evidence is unresolved or inconsistent, or authenticated evidence changed during collection. Preserve the evidence and follow the [publication recovery guidance](backend-publication.md#journal-less-publication-evidence). |
+
+### Runtime health families
+
+On a PostgreSQL backend the snapshot also carries four runtime health families
+under `telemetry`: `pool`, `migration`, `extensions`, and `queue`. Each reports a status
+(`observed`, `partial`, `unavailable`, `permission-denied`, or `timeout`), the time it
+was observed, a health of `healthy`, `degraded`, or `unavailable`, the fields it could
+not observe with a reason, and one fixed next action. SQLite reports all four
+as `not-applicable`. A family that could not be observed is `unavailable`, which is
+different from an observed unhealthy condition, and a partial observation never
+claims `healthy`. A degraded family raises a `healthy` snapshot to `degraded` and
+never changes any other classification.
+
+| Family | What it reports | Degraded when | Next action |
+|---|---|---|---|
+| `pool` | Saturation ratio: busy connections over the configured maximum | The daemon pool ratio is 1 or more with waiting connections, or the pool failure latch is set. The pool of a CLI diagnostic probe cannot establish daemon saturation. | Reduce concurrent database load or raise `storage.postgresql.poolMax`, then run `lcm doctor`. For the failure latch: check backend connectivity, then run `lcm doctor` again. |
+| `migration` | Applied and expected migration counts and a history status | The history is `behind`, `ahead`, `drift`, or `checksum-mismatch` | Behind: run `lcm postgres migrate` with the migration role, then run `lcm doctor`. Ahead: upgrade LCM to a release that includes every applied migration, then run `lcm doctor`. Drift or mismatch: restore the packaged PostgreSQL schema history; never edit applied migrations. |
+| `extensions` | Status and numeric versions of `pg_stat_statements`, `pg_trgm`, `pgcrypto`, and `unaccent` | Any extension is not `current` | Have a database administrator install or update the required PostgreSQL extensions and verify their schema and preload configuration, then run `lcm doctor`. |
+| `queue` | Age of the oldest pending local event, inbox claimed and quarantined counts, and replay lag | An inbox or ready local outbox quarantine count is above 0, or the local pending age or the replay lag exceeds 900 seconds | Inspect with `lcm events quarantine` and replay with `lcm events replay <event-id>`. For a backlog: check daemon delivery with `lcm events status`, then run `lcm doctor`. |
+
+The local pending age uses this machine's clock. The inbox counts and replay lag
+come from the database and use its clock. A selected project without an observed
+local binding reports only the database values, so its queue family is
+`partial`. A reached read cap, a failed probe, or an unreadable local source omits
+only the affected fields with a reason. The families keep no history, so they
+report no rate and no reset, and they do not count connection acquire timeouts.
+A missing value is never a zero. The snapshot contains no migration ID, checksum,
+event ID, payload, schema name, or error text. Text output shows one line per
+family and one fixed action, and `lcm doctor` only prints these actions.
+The guide for [PostgreSQL telemetry](../src/storage/postgresql/reference/postgresql-telemetry.md#runtime-health-families)
+lists every field, bound, and threshold.
 
 Backend snapshot collection has a default deadline of 2000 milliseconds and
 honors caller cancellation. SQLite project and event-sidecar reads share one

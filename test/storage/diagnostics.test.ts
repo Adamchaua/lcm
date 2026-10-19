@@ -58,14 +58,16 @@ import type { PostgreSqlDiagnosticMetrics } from '../../src/storage/postgresql/d
 
 const machineId = '01912345-1234-7123-8123-123456789abc';
 const metrics: PostgreSqlDiagnosticMetrics = { projects:1,conversations:2,compactedConversations:1,messages:4,summaries:2,maxDepth:1,rawTokens:200,summaryTokens:100,ratio:2,promotedCount:1,redactionCounts:{builtIn:1,global:2,project:3,total:6},recallStats:{memoriesSurfaced:3,memoriesActedUpon:1,recallPrecision:1/3} };
-const outbox = {captured:3,unprocessed:2,errors:0,lastCapture:null,deliveryPending:1,deliveryClaimed:0,deliveryRetry:0,deliveryReplicated:0,deliveryAcknowledged:0,deliveryAwaitingRemotePrune:0,deliveryQuarantined:0,oldestDeliveryAt:null};
+const outbox = {captured:3,unprocessed:2,errors:0,lastCapture:null,deliveryPending:1,deliveryClaimed:0,deliveryRetry:0,deliveryReplicated:0,deliveryAcknowledged:0,deliveryAwaitingRemotePrune:0,deliveryQuarantined:0,oldestDeliveryAt:null,oldestPendingAt:null};
+const ledger = {expected:[{id:'0001_a',sha256:'a'},{id:'0002_b',sha256:'b'}],rows:[{id:'0001_a',checksum_sha256:'a'},{id:'0002_b',checksum_sha256:'b'}]};
+const queueRead = {capReached:false,claimed:'0',quarantined:'0',lagSeconds:null};
 function fixture() {
   const config = parseDaemonConfig('{}');
   config.storage = {backend:'postgresql',postgresql:{url:'postgresql://secret:secret@secret.example/secret',caFile:'/secret/ca',migrationRole:'secret-role',poolMax:5,connectionTimeoutMs:10000,idleTimeoutMs:30000,statementTimeoutMs:60000}};
   const observation: BackendDiagnosticObservation = {config,witness:'a',machineId,mapContent:null};
-  const health = {status:'healthy',backend:'postgresql',tls:true,serverMajorVersion:18,serverEncoding:'UTF8',timezone:'UTC',role:'secret-role',extensions:['pg_stat_statements','pg_trgm','pgcrypto','unaccent'].map(name => ({name,status:'current'})),searchConfiguration:{ready:true}} as PostgreSqlRuntimeHealth;
+  const health = {status:'healthy',backend:'postgresql',tls:true,serverMajorVersion:18,serverEncoding:'UTF8',timezone:'UTC',role:'secret-role',extensions:['pg_stat_statements','pg_trgm','pgcrypto','unaccent'].map(name => ({name,status:'current',installedVersion:'1.0',defaultVersion:'1.0'})),searchConfiguration:{ready:true}} as PostgreSqlRuntimeHealth;
   const runtime: BackendDiagnosticRuntime = {query:vi.fn(),health:vi.fn(async()=>health),poolDiagnostics:vi.fn(()=>({configuredMax:5,total:1,idle:1,waiting:0,failed:false})),close:vi.fn(async()=>{})};
-  const dependencies: BackendDiagnosticDependencies = {observePublication:vi.fn(()=>observation),createRuntime:vi.fn(()=>runtime),verifySchema:vi.fn(async()=>({} as never)),readMetrics:vi.fn(async()=>metrics),readOutbox:vi.fn(async()=>outbox)};
+  const dependencies: BackendDiagnosticDependencies = {observePublication:vi.fn(()=>observation),createRuntime:vi.fn(()=>runtime),verifySchema:vi.fn(async()=>({} as never)),readMetrics:vi.fn(async()=>metrics),readOutbox:vi.fn(async()=>outbox),readMigrationHistory:vi.fn(async()=>ledger),readQueue:vi.fn(async()=>queueRead)};
   return {observation,runtime,dependencies,health};
 }
 describe('bounded authenticated probe', () => {
@@ -468,3 +470,316 @@ it.each(['absent','throws','invalid'] as const)('keeps unavailable borrowed tele
   expect(result.pool.total).toBeUndefined();
   expect(JSON.stringify(result)).not.toContain('private');
 });
+
+
+import { performance as monotonicClock } from 'node:perf_hooks';
+import { RUNTIME_HEALTH_ACTIONS, PROBE_MIN_REMAINING_MS } from '../../src/storage/runtime-health.js';
+
+const statusesOf = (snapshot: Awaited<ReturnType<typeof collectBackendDiagnostics>>) => Object.values(snapshot.telemetry).map(family => family.status);
+const sqliteFixture = () => { const parts = fixture(); parts.observation.config.storage = {backend:'sqlite'}; return parts; };
+const typedFailure = (code: string) => new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'factory',operation:'test'},code,false);
+
+describe('runtime health telemetry on a healthy PostgreSQL probe', () => {
+  it('observes all four families and reads in the documented order', async () => {
+    const {dependencies,runtime}=fixture();
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('healthy');
+    expect(result.telemetry.pool).toMatchObject({status:'observed',health:'healthy',saturationRatio:0,omitted:[]});
+    expect(result.telemetry.migration).toMatchObject({status:'observed',health:'healthy',historyStatus:'current',appliedCount:2,expectedCount:2});
+    expect(result.telemetry.extensions).toMatchObject({status:'observed',health:'healthy',entries:[{name:'pg_stat_statements',status:'current',installedVersion:'1.0',defaultVersion:'1.0'},expect.anything(),expect.anything(),expect.anything()]});
+    expect(result.telemetry.queue).toMatchObject({status:'observed',health:'healthy',inboxClaimed:0,inboxQuarantined:0});
+    for (const family of Object.values(result.telemetry)) expect(Number.isSafeInteger((family as {observedAt:number}).observedAt)).toBe(true);
+    const order = (fn: unknown) => vi.mocked(fn as () => unknown).mock.invocationCallOrder[0];
+    expect(order(dependencies.readMigrationHistory)).toBeLessThan(order(dependencies.readMetrics));
+    expect(order(dependencies.verifySchema)).toBeLessThan(order(dependencies.readQueue));
+    expect(dependencies.readMigrationHistory).toHaveBeenCalledExactlyOnceWith(runtime,expect.any(AbortSignal));
+    expect(dependencies.readQueue).toHaveBeenCalledExactlyOnceWith(runtime,expect.any(AbortSignal),undefined);
+    expect(runtime.close).toHaveBeenCalledTimes(1);
+  });
+  it('binds the admitted selected project for the server queue read', async () => {
+    const {dependencies,observation}=fixture(); const id='a'.repeat(64);
+    observation.mapContent=JSON.stringify({[id]:{canonical:'/diagnostic/project',aliases:[],remoteProjectId:machineId}});
+    await collectBackendDiagnostics({_dependencies:dependencies,cwd:'/diagnostic/project'});
+    expect(dependencies.readQueue).toHaveBeenCalledWith(expect.anything(),expect.any(AbortSignal),machineId);
+  });
+  it('captures the daemon pool before any await and degrades on saturation with waiters', async () => {
+    const {dependencies}=fixture();
+    const factory={backend:'postgresql',getDiagnosticPool:()=>({configuredMax:2,total:2,idle:0,waiting:1,failed:false})} as never;
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:factory});
+    expect(result.telemetry.pool).toMatchObject({status:'observed',health:'degraded',saturationRatio:1,remediation:RUNTIME_HEALTH_ACTIONS.poolSaturated});
+    expect(result.classification).toBe('degraded');
+    expect(result.remediation).toBe('Run lcm doctor to recheck backend readiness.'.replace('lcm doctor','\u0060lcm doctor\u0060'));
+  });
+  it('marks an invalid pool relationship partial', async () => {
+    const {dependencies,runtime}=fixture(); runtime.poolDiagnostics=()=>({configuredMax:0,total:0,idle:0,waiting:0,failed:false});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.pool).toMatchObject({status:'partial',health:'unavailable',omitted:[{field:'saturationRatio',reason:'invalid-input'}]});
+    expect(result.classification).toBe('healthy');
+  });
+});
+
+describe('runtime health telemetry never overrides the existing classification', () => {
+  it('folds a degraded family into a healthy classification only', async () => {
+    const {dependencies}=fixture();
+    dependencies.readMigrationHistory=vi.fn(async()=>({...ledger,rows:[ledger.rows[0]]}));
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.migration).toMatchObject({status:'observed',health:'degraded',historyStatus:'behind',appliedCount:1,remediation:RUNTIME_HEALTH_ACTIONS.migrationBehind});
+    expect(result.classification).toBe('degraded');
+  });
+  it('keeps unavailable when the outbox is not ready even if a family is degraded', async () => {
+    const {dependencies}=fixture();
+    dependencies.readMigrationHistory=vi.fn(async()=>({...ledger,rows:[]}));
+    dependencies.readOutbox=async()=>({...outbox,scanErrors:1});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.migration).toMatchObject({health:'degraded',historyStatus:'behind',appliedCount:0});
+    expect(result.classification).toBe('unavailable');
+  });
+  it('keeps unavailable and reports degraded extensions when the readiness check already failed', async () => {
+    const {dependencies,health}=fixture();
+    (health as {extensions:unknown}).extensions=[{name:'pg_stat_statements',status:'not-preloaded',installedVersion:'1.0',defaultVersion:'1.0'},...['pg_trgm','pgcrypto','unaccent'].map(name=>({name,status:'current',installedVersion:'1.0',defaultVersion:'1.0'}))];
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('unavailable');
+    expect(result.telemetry.extensions).toMatchObject({status:'observed',health:'degraded',remediation:RUNTIME_HEALTH_ACTIONS.extensions});
+  });
+  it('degrades on an inbox quarantine', async () => {
+    const {dependencies}=fixture(); dependencies.readQueue=vi.fn(async()=>({...queueRead,quarantined:'2'}));
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.queue).toMatchObject({status:'observed',health:'degraded',inboxQuarantined:2,remediation:RUNTIME_HEALTH_ACTIONS.quarantine});
+    expect(result.classification).toBe('degraded');
+  });
+  it('degrades on a ready local quarantine count', async () => {
+    const {dependencies}=fixture(); dependencies.readOutbox=async()=>({...outbox,deliveryQuarantined:3});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.queue).toMatchObject({health:'degraded',remediation:RUNTIME_HEALTH_ACTIONS.quarantine});
+    expect(result.classification).toBe('degraded');
+  });
+  it('derives local pending age from the raw outbox and degrades above 900 seconds', async () => {
+    vi.spyOn(Date,'now').mockReturnValue(Date.UTC(2026,1,3,12,0,0));
+    const {dependencies}=fixture(); dependencies.readOutbox=async()=>({...outbox,oldestPendingAt:'2026-02-03 11:00:00'});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.queue).toMatchObject({status:'observed',health:'degraded',outboxOldestPendingAgeSeconds:3600,remediation:RUNTIME_HEALTH_ACTIONS.backlog});
+    expect(result.outbox).not.toHaveProperty('oldestPendingAt');
+    expect(JSON.stringify(result)).not.toContain('2026-02-03 11:00:00');
+    expect(result.classification).toBe('degraded');
+  });
+  it.each([
+    ['unread source', undefined, 'unavailable'],
+    ['invalid timestamp', 'garbage', 'out-of-range'],
+    ['future timestamp', '2099-01-01 00:00:00', 'out-of-range'],
+  ] as const)('omits local pending age for an %s', async (_name, value, reason) => {
+    const {dependencies}=fixture(); dependencies.readOutbox=async()=>({...outbox,oldestPendingAt:value});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.queue).toMatchObject({status:'partial',health:'unavailable',omitted:expect.arrayContaining([{field:'outboxOldestPendingAgeSeconds',reason}])});
+    expect(result.classification).toBe('healthy');
+  });
+  it('omits local age when the outbox scan is unavailable and keeps server observations', async () => {
+    const {dependencies}=fixture(); dependencies.readOutbox=async()=>({...outbox,scanSkipped:1});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.queue).toMatchObject({status:'partial',inboxClaimed:0,omitted:expect.arrayContaining([{field:'outboxOldestPendingAgeSeconds',reason:'unavailable'}])});
+  });
+  it('keeps the selected remote scope server-only when no local binding exists', async () => {
+    const {dependencies}=fixture();
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,projectId:machineId});
+    expect(result.telemetry.queue).toMatchObject({status:'partial',inboxClaimed:0,inboxQuarantined:0,omitted:expect.arrayContaining([{field:'outboxOldestPendingAgeSeconds',reason:'unavailable'}])});
+    expect(result.classification).toBe('unavailable');
+    expect(dependencies.readQueue).toHaveBeenCalledWith(expect.anything(),expect.any(AbortSignal),machineId);
+  });
+});
+
+describe('runtime health telemetry lifecycle', () => {
+  it('derives pool and extensions before the health-status throw and fails the unrun families', async () => {
+    const {dependencies,health}=fixture(); const error=typedFailure('42501');
+    Object.assign(health,{status:'unavailable',error});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('permission-denied');
+    expect(result.telemetry.pool).toMatchObject({status:'observed'});
+    expect(result.telemetry.extensions).toMatchObject({status:'observed',health:'healthy'});
+    expect(result.telemetry.migration).toMatchObject({status:'permission-denied',health:'unavailable'});
+    expect(result.telemetry.queue).toMatchObject({status:'permission-denied',health:'unavailable'});
+    expect(dependencies.readMigrationHistory).not.toHaveBeenCalled();
+    expect(dependencies.readQueue).not.toHaveBeenCalled();
+  });
+  it('keeps extensions when reading the probe pool throws', async () => {
+    const {dependencies,runtime}=fixture(); runtime.poolDiagnostics=()=>{throw new Error('private pool');};
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('unavailable');
+    expect(result.telemetry.extensions).toMatchObject({status:'observed'});
+    expect(statusesOf(result).filter(status=>status==='unavailable')).toHaveLength(3);
+    expect(JSON.stringify(result)).not.toContain('private');
+  });
+  it.each([['42501','permission-denied'],['57014','timeout'],['08006','unavailable']] as const)('isolates a migration probe failure %s', async (code, status) => {
+    const {dependencies}=fixture(); dependencies.readMigrationHistory=vi.fn(async()=>{throw typedFailure(code);});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.migration).toMatchObject({status,health:'unavailable',historyStatus:'unavailable'});
+    expect(result.telemetry.queue).toMatchObject({status:'observed'});
+    expect(result.classification).toBe('healthy');
+    expect(JSON.stringify(result)).not.toContain(code);
+  });
+  it.each([['42501','permission-denied'],['57014','timeout'],['08006','unavailable']] as const)('isolates a queue probe failure %s next to local data', async (code, status) => {
+    const {dependencies}=fixture(); dependencies.readQueue=vi.fn(async()=>{throw typedFailure(code);});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.queue).toMatchObject({status:'partial',health:'unavailable'});
+    expect((result.telemetry.queue as {omitted:{field:string;reason:string}[]}).omitted).toEqual([
+      {field:'inboxClaimed',reason:status},{field:'inboxQuarantined',reason:status},{field:'replayLagSeconds',reason:status},{field:'outboxOldestPendingAgeSeconds',reason:'no-entry'}].sort((a,b)=>['outboxOldestPendingAgeSeconds','inboxClaimed','inboxQuarantined','replayLagSeconds'].indexOf(a.field)-['outboxOldestPendingAgeSeconds','inboxClaimed','inboxQuarantined','replayLagSeconds'].indexOf(b.field)));
+    expect(result.classification).toBe('healthy');
+  });
+  it('reports a reached queue cap as partial without exact totals', async () => {
+    const {dependencies}=fixture(); dependencies.readQueue=vi.fn(async()=>({capReached:true,claimed:'4097',quarantined:'4097',lagSeconds:'9999'}));
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.queue).toMatchObject({status:'partial',health:'unavailable'});
+    expect(result.telemetry.queue).not.toHaveProperty('inboxQuarantined');
+    expect(JSON.stringify(result.telemetry.queue)).not.toContain('4097');
+    expect(result.classification).toBe('healthy');
+  });
+  it('keeps migration drift visible when schema verification then fails', async () => {
+    const {dependencies}=fixture();
+    dependencies.readMigrationHistory=vi.fn(async()=>({...ledger,rows:[ledger.rows[0],{id:'0003_x',checksum_sha256:'x'}]}));
+    dependencies.verifySchema=vi.fn(async()=>{throw typedFailure('08006');});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('unavailable');
+    expect(result.telemetry.migration).toMatchObject({health:'degraded',historyStatus:'drift'});
+    expect(result.telemetry.queue).toMatchObject({status:'unavailable'});
+    expect(dependencies.readQueue).not.toHaveBeenCalled();
+  });
+  it('does not read the queue when metrics admission fails', async () => {
+    const {dependencies}=fixture(); dependencies.readMetrics=vi.fn(async()=>{throw typedFailure('57014');});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('timeout');
+    expect(result.telemetry.migration).toMatchObject({status:'observed'});
+    expect(result.telemetry.queue).toMatchObject({status:'timeout'});
+    expect(dependencies.readQueue).not.toHaveBeenCalled();
+  });
+  it('keeps usable inbox counts when the local scan then fails', async () => {
+    const {dependencies}=fixture(); dependencies.readOutbox=vi.fn(async()=>{throw Object.assign(new Error('private path'),{code:'EACCES'});});
+    dependencies.readQueue=vi.fn(async()=>({...queueRead,claimed:'3'}));
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('permission-denied');
+    expect(result.telemetry.queue).toMatchObject({status:'partial',inboxClaimed:3,inboxQuarantined:0,omitted:expect.arrayContaining([{field:'outboxOldestPendingAgeSeconds',reason:'permission-denied'}])});
+    expect(result.telemetry.migration).toMatchObject({status:'observed'});
+    expect(JSON.stringify(result)).not.toContain('private');
+  });
+  it('reports every family as timeout when the caller cancels during the migration probe', async () => {
+    const {dependencies}=fixture(); const controller=new AbortController();
+    dependencies.readMigrationHistory=vi.fn(async()=>{controller.abort();throw new Error('private');});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,signal:controller.signal});
+    expect(result.classification).toBe('timeout');
+    expect(statusesOf(result)).toEqual(['timeout','timeout','timeout','timeout']);
+    expect(dependencies.verifySchema).not.toHaveBeenCalled();
+  });
+  it('discards every telemetry family when publication changes', async () => {
+    const {dependencies,observation}=fixture(); dependencies.observePublication=vi.fn().mockReturnValueOnce(observation).mockReturnValue({...observation,witness:'b'});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('stale-publication');
+    expect(statusesOf(result)).toEqual(['unavailable','unavailable','unavailable','unavailable']);
+    expect(JSON.stringify(result.telemetry)).not.toMatch(/historyStatus":"current|pg_trgm":|saturationRatio":0/);
+    expect((result.telemetry.extensions as {entries:unknown[]}).entries).toEqual([]);
+  });
+});
+
+describe('runtime health timeout snapshot', () => {
+  it('retains only the authenticated pool at its capture time', async () => {
+    vi.useFakeTimers({toFake:['Date']});
+    try {
+      vi.setSystemTime(1_000);
+      const {dependencies,runtime}=fixture();
+      runtime.health=()=>{vi.setSystemTime(5_000);return new Promise(()=>{});};
+      const factory={backend:'postgresql',getDiagnosticPool:()=>({configuredMax:8,total:4,idle:2,waiting:1,failed:false})} as never;
+      const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:factory,_deadlineMs:10});
+      expect(result.classification).toBe('timeout');
+      expect(result.telemetry.pool).toMatchObject({status:'observed',observedAt:1_000,saturationRatio:0.25});
+      for (const family of [result.telemetry.migration,result.telemetry.extensions,result.telemetry.queue]) expect(family).toMatchObject({status:'timeout',observedAt:5_000});
+    } finally { vi.useRealTimers(); }
+  });
+  it('reports every family as timeout without an authenticated pool', async () => {
+    const {dependencies,runtime}=fixture(); runtime.health=()=>new Promise(()=>{});
+    expect(statusesOf(await collectBackendDiagnostics({_dependencies:dependencies,_deadlineMs:10}))).toEqual(['timeout','timeout','timeout','timeout']);
+  });
+  it('retains an unverified borrowed pool as an unavailable family', async () => {
+    const {dependencies,runtime}=fixture(); runtime.health=()=>new Promise(()=>{});
+    const factory={backend:'postgresql',getDiagnosticPool:()=>undefined} as never;
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:factory,_deadlineMs:10});
+    expect(result.telemetry.pool).toMatchObject({status:'unavailable'});
+    expect(result.telemetry.queue).toMatchObject({status:'timeout'});
+  });
+});
+
+describe('runtime health probe launch guard', () => {
+  const clockFixture = (health: PostgreSqlRuntimeHealth) => {
+    let now = 1_000;
+    vi.spyOn(monotonicClock,'now').mockImplementation(()=>now);
+    return {advance:(ms:number)=>{now+=ms;}};
+  };
+  it('launches both probes when exactly the minimum time remains', async () => {
+    const {dependencies,runtime,health}=fixture(); const clock=clockFixture(health);
+    runtime.health=async()=>{clock.advance(2000-PROBE_MIN_REMAINING_MS);return health;};
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(dependencies.readMigrationHistory).toHaveBeenCalledTimes(1);
+    expect(dependencies.readQueue).toHaveBeenCalledTimes(1);
+    expect(result.telemetry.migration).toMatchObject({status:'observed'});
+  });
+  it('skips both probes below the minimum and reports timeout without launching them', async () => {
+    const {dependencies,runtime,health}=fixture(); const clock=clockFixture(health);
+    runtime.health=async()=>{clock.advance(2000-PROBE_MIN_REMAINING_MS+1);return health;};
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(dependencies.readMigrationHistory).not.toHaveBeenCalled();
+    expect(dependencies.readQueue).not.toHaveBeenCalled();
+    expect(result.telemetry.migration).toMatchObject({status:'timeout',health:'unavailable'});
+    expect(result.telemetry.queue).toMatchObject({status:'partial'});
+    expect(result.classification).toBe('healthy');
+  });
+  it('skips only the queue probe when time runs short after the migration probe', async () => {
+    const {dependencies,health}=fixture(); const clock=clockFixture(health);
+    dependencies.readMetrics=vi.fn(async()=>{clock.advance(2000-PROBE_MIN_REMAINING_MS+1);return metrics;});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(dependencies.readMigrationHistory).toHaveBeenCalledTimes(1);
+    expect(dependencies.readQueue).not.toHaveBeenCalled();
+    expect(result.telemetry.migration).toMatchObject({status:'observed'});
+    expect(result.telemetry.queue).toMatchObject({status:'partial',omitted:expect.arrayContaining([{field:'inboxClaimed',reason:'timeout'}])});
+  });
+});
+
+describe('runtime health telemetry for other backends', () => {
+  it.each(['normal','stalled','failing','published-change'] as const)('keeps four not-applicable SQLite families on the %s path', async path => {
+    const {dependencies,observation}=sqliteFixture();
+    if (path==='published-change') dependencies.observePublication=vi.fn().mockReturnValueOnce(observation).mockReturnValue({...observation,witness:'b'});
+    const collectSqlite = path==='stalled' ? vi.fn(()=>new Promise<void>(()=>{})) : path==='failing' ? vi.fn(async()=>{throw new Error('private');}) : vi.fn(async()=>{});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,collectSqlite,...(path==='stalled'?{_deadlineMs:10}:{})});
+    expect(statusesOf(result)).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable']);
+    for (const family of Object.values(result.telemetry)) expect(family).not.toHaveProperty('health');
+    expect(dependencies.readMigrationHistory).not.toHaveBeenCalled();
+    expect(dependencies.readQueue).not.toHaveBeenCalled();
+  });
+  it('keeps SQLite not-applicable for early failure and pre-aborted snapshots', async () => {
+    const {dependencies}=fixture(); const controller=new AbortController(); controller.abort();
+    const mismatch=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:{backend:'sqlite'} as never});
+    expect(mismatch.backend).toBe('sqlite');
+    expect(statusesOf(mismatch)).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable']);
+    const {dependencies:sqliteDeps}=sqliteFixture();
+    expect(statusesOf(await collectBackendDiagnostics({_dependencies:sqliteDeps,signal:controller.signal}))).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable']);
+    expect(statusesOf(backendDiagnosticFailure(new Error('x'),'sqlite'))).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable']);
+  });
+  it('mirrors failures for an unknown backend and never reports it as not-applicable', () => {
+    expect(statusesOf(backendDiagnosticFailure(new Error('x')))).toEqual(['unavailable','unavailable','unavailable','unavailable']);
+    expect(statusesOf(backendDiagnosticFailure(Object.assign(new Error('x'),{code:'EACCES'})))).toEqual(['permission-denied','permission-denied','permission-denied','permission-denied']);
+    expect(statusesOf(backendDiagnosticFailure(Object.assign(new Error('x'),{code:'DIAGNOSTIC_SQLITE_TIMEOUT'}),'postgresql'))).toEqual(['timeout','timeout','timeout','timeout']);
+  });
+});
+
+describe('runtime health sanitization canaries', () => {
+  const canaries = ['CANARY-638-"quote"\\\\n-ledger','CANARY-638-schema/path','CANARY-638-remediation sk-ant-638','CANARY-638-version','CANARY-638-checksum','CANARY-638-error','CANARY-638-timestamp'];
+  const forms = (value: string): string[] => [value, JSON.stringify(value).slice(1,-1), encodeURIComponent(value), Buffer.from(value).toString('base64'), Buffer.from(value).toString('hex')];
+  it('never emits seeded values from any new source in JSON or rendered text', async () => {
+    const {dependencies,health}=fixture();
+    (health as {extensions:unknown}).extensions=['pg_stat_statements','pg_trgm','pgcrypto','unaccent'].map(name=>({name,status:'current',installedVersion:canaries[3],defaultVersion:canaries[3],installedSchema:canaries[1],remediation:canaries[2],available:true}));
+    dependencies.readMigrationHistory=vi.fn(async()=>({...ledger,rows:[{id:canaries[0],checksum_sha256:canaries[4]},{id:'0002_b',checksum_sha256:'b'}]}));
+    dependencies.readQueue=vi.fn(async()=>{throw new Error(canaries[5]);});
+    dependencies.readOutbox=async()=>({...outbox,oldestPendingAt:canaries[6]});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    const { renderBackendDiagnostics } = await import('../../src/storage/diagnostic-renderer.js');
+    const surfaces=[JSON.stringify(result),renderBackendDiagnostics(result)];
+    for (const canary of canaries) for (const form of forms(canary)) for (const surface of surfaces) expect(surface).not.toContain(form);
+    expect(result.telemetry.migration).toMatchObject({historyStatus:'drift'});
+    expect(JSON.stringify(result.telemetry.extensions)).toContain('unrecognized');
+  });
+});
+

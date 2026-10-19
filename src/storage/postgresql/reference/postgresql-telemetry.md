@@ -60,6 +60,7 @@ closed status in [Observation status](#observation-status) leaves the process.
 
 Every telemetry family reports one status from a closed set, together with
 `observedAt` (UTC milliseconds) and the epoch fields that apply to the family.
+The #638 gauge families have no epoch fields.
 
 | Status | Meaning |
 |---|---|
@@ -107,7 +108,9 @@ reason:
 | `out-of-range` | The value is not finite or is negative, or an integer counter is not an exact safe integer (above 2^53 - 1). | Yes, to `partial`. |
 | `reset` | The value cannot be compared across a reset. | Accompanies `reset`. |
 | `disabled-setting` | The controlling server setting is off. | No. |
-| `no-entry` | No row exists for a cataloged operation. This is never reported as zero. | No. |
+| `no-entry` | No row exists for a cataloged operation, or, for the queue, no qualifying event exists. This is never reported as zero. | No. |
+| `invalid-input` | The inputs have an invalid relationship, such as a pool whose maximum is not above 0 or whose idle count exceeds its total. | Yes, to `partial`. |
+| `limit-reached` | A family cap was reached, so the exact value is unavailable. | Yes, to `partial`. |
 | `no-baseline` | No prior observation or other proof can establish the value. | No. |
 
 In this table, "Yes, to `partial`" means that the omission establishes
@@ -184,8 +187,9 @@ inside the shared snapshot path:
 - invalidation on scope, publication, or mapping change; and
 - no background collector, persistence file, exporter, or timer.
 
-#638 reuses this pattern for temporal health fields, and #640 drives sequential
-observations to certify it.
+The #638 runtime health families are on-demand gauges. They keep no comparison
+state and never report `reset`, `stale`, or a rate. #640 drives sequential
+observations to certify the comparison context.
 
 Comparison is per entry: same role and database scope, top-level statement,
 same internal query identifier. It requires that entry's statement epoch to be
@@ -324,30 +328,173 @@ min/max-only reset, no execution, then resumed execution.
 
 ## Runtime health families
 
-#638 extends the existing snapshot fields with the families below, and owns
-the thresholds and remediation text. Collection uses the snapshot's existing
-path: the diagnostic-probe runtime or the daemon pool counters, as recorded in
-the pool origin. It is bounded, cancellable, and cannot starve runtime pools.
+#638 adds four families to the backend snapshot, nested under `telemetry`:
+`pool`, `migration`, `extensions`, and `queue`. #637 adds the sibling
+`telemetry.statements` family separately. The families use the snapshot's
+existing path: the diagnostic-probe runtime, or the daemon pool counters, as
+recorded in the pool origin. They are bounded, cancellable, and cannot starve
+runtime pools. #638 owns their thresholds and remediation text.
 
-This table specifies required signals. Existing fields retain the #619 snapshot
-schema. New extension status and version fields and the inbox and replay
-fields described only in prose are not yet complete catalog entries and must
-not be emitted on that basis. Before emitting them, #638 must update this guide
-with each field's exact name, type, unit (or unitless), source, permitted
-dimensions, omission reasons, and finite family bound, together with its tests.
-The same requirement applies to any other new field that lacks this catalog
-information.
+### Structure
 
-| Family | Fields | Notes |
+Every family carries:
+
+- `status`, one value of the closed set in [Observation status](#observation-status);
+- `observedAt`, the UTC milliseconds at which LCM completed or captured that
+  family's observation. It is never an underlying event timestamp, and every
+  status carries it;
+- `omitted`, a list of `{field, reason}` records. The field comes from the
+  family's catalog below and the reason from the closed reason table, so the
+  list has at most one record for each catalog field; and
+- for every status except `not-applicable`, `health` and `remediation`.
+
+`health` is `healthy`, `degraded`, or `unavailable`. A family that proves a bad
+condition is `degraded` even when another field is omitted. A family is
+`healthy` only when its status is `observed` and no threshold is crossed. Every
+other family is `unavailable`, so a missing or partial observation never claims
+`healthy`. `remediation` is one fixed string from the [remediation
+table](#thresholds-and-remediation). The renderer ignores the value in a
+snapshot and selects the same fixed string from the validated family values.
+
+SQLite reports all four families as `not-applicable`, without health or
+remediation, on every path, including timeout and failure snapshots. A failure
+snapshot of a PostgreSQL or unknown backend mirrors its failure
+(`permission-denied`, `timeout`, or `unavailable`) in all four families and is
+never `not-applicable`. A snapshot from an older daemon that has no `telemetry`
+renders each family as `unavailable`.
+
+### Field catalog
+
+JSON uses the camelCase name. Every number is finite and non-negative, and
+every count is an exact safe integer. No ID, checksum, SQL, schema name, path,
+or error text is emitted.
+
+| Family | Field (JSON) | Type and unit | Source | Omission reasons | Labels and finite bound |
+|---|---|---|---|---|---|
+| Pool | `pool_saturation_ratio` (`saturationRatio`) | number, unitless | `(total - idle) / configuredMax` of the origin-tagged pool counters. It is not clamped, so it can exceed 1. | `invalid-input` when the maximum is not above 0 or idle exceeds total; `unavailable` when the counters are unverified | origin, scope; 1 value |
+| Migration | `migration_applied_count` (`appliedCount`) | count | rows of an ordered ledger read capped at the packaged count plus one | `limit-reached` when the cap is reached; `unavailable` for a malformed ledger | scope; 1 value |
+| Migration | `migration_expected_count` (`expectedCount`) | count | the verified packaged migration list | none | scope; 1 value |
+| Migration | `migration_history_status` (`historyStatus`) | closed enum | positional comparison of ledger IDs and checksums with the packaged list | none; `unavailable` is a value | scope; 1 value |
+| Extensions | `entries` (one record per extension) | `name`: the four fixed names; `status`: the existing closed readiness status; `installedVersion` and `defaultVersion`: version string | the health result's extension observations, picked into these fields only | `unavailable` for a missing, duplicate, or invalid record, named by extension | extension; exactly 4 records, at most 16 scalar fields |
+| Queue | `outbox_oldest_pending_age_seconds` (`outboxOldestPendingAgeSeconds`) | number, seconds | local wall clock minus the oldest capture time of a pending or retry local event | `no-entry` when no such event exists; `unavailable` for an unread or skipped source; `out-of-range` for an invalid or future timestamp | scope; 1 value |
+| Queue | `inbox_claimed_count` (`inboxClaimed`), `inbox_quarantined_count` (`inboxQuarantined`) | counts | server inbox rows in the `claimed` and `quarantined` states | `limit-reached`, `out-of-range`, or the probe failure reason | scope; 2 values |
+| Queue | `replay_lag_seconds` (`replayLagSeconds`) | number, seconds | server clock minus the oldest `next_attempt_at` of a due `pending` or `retry` row | `no-entry` when no row is due; `limit-reached`, `out-of-range`, or the probe failure reason | scope; 1 value |
+
+The four pool counters and the failure latch remain the existing `pool` snapshot
+fields with origin `daemon`, `diagnostic-probe`, or `local`. A version is emitted
+only when it matches `^[0-9]+(\.[0-9]+){0,2}$`, and a missing or other version
+is `unrecognized`. `no-entry` for the queue means that no qualifying event exists;
+it is never reported as zero, and an unread source is `unavailable` instead.
+
+`migration_history_status` is `current`, `behind` (including an empty ledger),
+`ahead`, `drift`, `checksum-mismatch`, or `unavailable`. Drift outranks a checksum
+mismatch, which outranks a count mismatch. Reaching the cap proves `ahead` (or
+drift or a mismatch in the inspected prefix) without an exact total.
+
+Per-project values need a selected scope. The server counts use a bound
+parameter for the admitted selected UUID, and the aggregate scope reports totals
+only, never a per-project breakdown. Selected scope without an observed local
+binding leaves the local age `unavailable`. The queue family then reports only the
+server values and is `partial`. "Progress" here means the current queue state and
+overdue scheduling lag, not a persisted progress series or a cumulative replay
+rate.
+
+### Status derivation
+
+Each family applies the status ladder only to established family-level facts.
+The on-demand gauge families here establish no `disabled`, `stale`, or `reset`
+fact, keep no comparison state, and emit no rate. A sub-probe failure that
+leaves usable values makes the family `partial` with the specific reason on each
+affected field. A family with no usable value reports the strongest failure
+reason as its status.
+
+| Family | Condition | Status | Health |
+|---|---|---|---|
+| Pool | counters verified, relationship valid | `observed` | `degraded` at a daemon-origin ratio of 1 or more with waiting above 0, or with the failure latch; otherwise `healthy` |
+| Pool | maximum is 0 or idle exceeds total | `partial` | `degraded` only by the failure latch; otherwise `unavailable` |
+| Pool | counters unverified | `unavailable` | `unavailable` |
+| Migration | full ledger within the cap | `observed` | `healthy` for `current`; otherwise `degraded` |
+| Migration | cap reached | `partial` | `degraded` (`ahead`, `drift`, or `checksum-mismatch`) |
+| Migration | malformed ledger or probe failure | `unavailable` or the failure status | `unavailable` |
+| Extensions | four validated records | `observed` | `degraded` if any is not `current`; otherwise `healthy` |
+| Extensions | some records missing or invalid | `partial` | `degraded` if a valid record is not `current`; otherwise `unavailable` |
+| Extensions | no usable record | `unavailable` or the failure status | `unavailable` |
+| Queue | all sub-probes usable, no cap | `observed` | `degraded` on a threshold below; otherwise `healthy` |
+| Queue | a sub-probe failed or the cap was reached with another value usable | `partial` | `degraded` only on a proven threshold; otherwise `unavailable` |
+| Queue | no usable value | strongest failure status | `unavailable` |
+
+An observed bad condition is `degraded` health on an `observed` family, not an
+unavailable one. A family health of `degraded` raises a `healthy` snapshot
+classification to `degraded` and nothing else. It never changes `unavailable`,
+`permission-denied`, `timeout`, `stale-publication`, or an existing `degraded`
+classification. Existing readiness checks still decide the top-level
+classification, and the families are sequential observations, not one atomic
+database snapshot.
+
+### Thresholds and remediation
+
+| Condition | Health | Fixed remediation |
 |---|---|---|
-| Pool | `pool_configured_max`, `pool_total`, `pool_idle`, `pool_waiting` (connections); `pool_saturation_ratio` | The first four are existing snapshot fields with origin `daemon`, `diagnostic-probe`, or `local`. The saturation ratio is busy connections over the configured maximum, `(pool_total - pool_idle) / pool_configured_max`, because the pool total includes idle clients; it is omitted when the maximum is not above 0 or when idle exceeds total. `pool_waiting` remains a separate gauge. `pool_acquire_timeouts_total` is reserved for a future catalog revision and is not an emitted field until the pool supplies a defined counter. #638 must explicitly document whether that capability is supported. Its absence is neither a zero timeout count nor evidence of timeout-free operation. `observed` means completeness of the active catalog. Adding the counter requires the catalog update and tests described above; an unavailable counter after admission to that catalog follows the normal per-field failure rules. |
-| Migration | `migration_applied_count`, `migration_expected_count` (counts); `migration_history_status` | Status is one of `current`, `behind`, `ahead`, `drift`, `checksum-mismatch`, `unavailable`. LCM compares migration IDs and checksums against the packaged set in-process, as readiness already does. It emits only the two counts and the closed status, never ID lists, checksums, or SQL. |
-| Extensions | `pg_stat_statements`, `pg_trgm`, `pgcrypto`, `unaccent` | Each reports its name, the existing closed status, and the installed and default versions only when they match `^[0-9]+(\.[0-9]+){0,2}$`; otherwise the version is `unrecognized`. No remediation text and no installed schema. The optional set is empty for P4. |
-| Queue and replay | Existing outbox counts; `outbox_oldest_pending_age_seconds`; inbox claimed and quarantined counts; replay lag in seconds | The outbox age uses the local wall clock over local files. Inbox counts and replay lag come from server rows and use the server clock (`clock_timestamp()`). Never event IDs, payloads, or paths. |
+| Pool: daemon origin only, saturation ratio of 1 or more and waiting above 0 | `degraded` | Reduce concurrent database load or raise `storage.postgresql.poolMax`, then run `lcm doctor`. |
+| Pool: failure latch | `degraded` | Check backend connectivity, then run `lcm doctor` again. |
+| Migration: `behind` | `degraded` | Run `lcm postgres migrate` with the migration role, then run `lcm doctor`. |
+| Migration: `ahead` | `degraded` | Upgrade LCM to a release that includes every applied migration, then run `lcm doctor`. |
+| Migration: `drift` or `checksum-mismatch` | `degraded` | Restore the packaged PostgreSQL schema history; never edit applied migrations. |
+| Extensions: any record is not `current` | `degraded` | Have a database administrator install or update the required PostgreSQL extensions and verify their schema and preload configuration, then run `lcm doctor`. |
+| Queue: inbox quarantined above 0, or a ready local outbox with quarantined above 0 | `degraded` | Inspect with `lcm events quarantine` and replay with `lcm events replay <event-id>`. |
+| Queue: local pending age or replay lag above 900 seconds | `degraded` | Check daemon delivery with `lcm events status`, then run `lcm doctor`. |
+| Any healthy family | `healthy` | No action required. |
+| Any other family | `unavailable` | Run `lcm doctor` and review the storage configuration. |
 
-Queue and replay values may be scoped to a selected project through bound
-parameters, the existing snapshot pattern. Aggregate scope reports totals only,
-never a per-project breakdown.
+Quarantine guidance takes precedence over backlog guidance. Exactly 900 seconds
+is healthy. The 900 second limit is an advisory backlog interpretation of
+roughly three replication sweeps, not a correctness deadline. Pool saturation
+applies only to the daemon origin, because the diagnostic-probe pool of a CLI
+`lcm doctor` run cannot establish daemon saturation. `lcm doctor` stays
+observational: it prints this text and executes nothing.
+
+The queue is not a delivery-loss measurement. The acceptance terms resolve as
+follows. Age is the two queue gauges. Saturation is the pool ratio with the
+waiting gauge. The thresholds are the table above. No rate is emitted, because
+these families have no cumulative counters. They establish no reset. Loss is
+visible only as the quarantine counts. `pool_acquire_timeouts_total` is not
+supported, because the pool supplies no defined counter. Its absence is neither
+a zero timeout count nor evidence of timeout-free operation.
+
+### Clocks, statements, and rows
+
+- The local outbox age uses the local wall clock over local files. The inbox
+  counts and the replay lag come from server rows, and the lag uses the server
+  `clock_timestamp()` read once per statement, so the due filter and the
+  subtraction share one instant.
+- The migration read is one statement over the ordered ledger with a bound limit
+  of the packaged count plus one. Its result is compared in process with the
+  verified packaged list, which is finite packaged work that the signal cannot
+  interrupt. Readiness loads that list again.
+- The queue read is one statement. It materializes at most 4096 candidate
+  inbox rows in the `pending`, `retry`, `claimed`, and `quarantined` states, plus one
+  sentinel row, before it aggregates them. If the sentinel appears, the exact
+  totals and the lag are omitted with `limit-reached`, the family is `partial`, and
+  an incomplete queue is never healthy. The cap bounds the rows materialized and
+  transferred, not every tuple PostgreSQL visits, which the deadline bounds.
+- The extensions family reuses the health result and runs no statement. Local
+  pending age adds a column to the existing sidecar read.
+- The two new reads are two application statements and two of the runtime's
+  existing process ID lookups for signalled queries, and a cancellation can open
+  one more connection. The reads run one at a time, so they use one data
+  connection, and the pool maximum is unchanged. Neither read passes project
+  options, which would enter the runtime's writer admission transaction.
+
+The two #638 runtime-health reads use the existing #619 diagnostic runtime:
+`statement_timeout` remains capped at runtime creation, while the shared signal
+enforces the snapshot deadline. Before either read, a remaining-time guard may
+skip it with `timeout`. The guard is a launch policy, not a reservation for PID
+lookup, SQL execution, or cancellation setup. This exception does not revise the
+remaining-time `statement_timeout` requirement for #637 or add a guarantee that
+asynchronous resource cleanup has completed when the snapshot DTO returns. The
+guard skips a read when less than 100 ms of the snapshot deadline remains. That
+floor is provisional and was calibrated from PostgreSQL 18 harness measurements
+recorded in the #638 pull request.
 
 ## Labels and cardinality
 
@@ -399,7 +546,8 @@ reaching a limit yields status `partial`.
   cancellable through the caller's signal and has a `statement_timeout`
   within the remaining shared snapshot deadline. The combined work stays
   within that deadline and the declared row, mapping-probe, and
-  comparison-entry limits.
+  comparison-entry limits. The two #638 runtime-health reads follow the scoped
+  exception in [Clocks, statements, and rows](#clocks-statements-and-rows).
 - A #639 runbook that needs another role, such as a provider administrator,
   documents that requirement and sanitizes its output to role-class and
   database aliases.

@@ -72,7 +72,9 @@ describe("doctor common backend snapshot", () => {
     const failure = Object.assign(new Error("PRIVATE_CA_PATH/SECRET_TRANSCRIPT"), { code: "EACCES" });
     vi.mocked(collectStats).mockRejectedValue(failure);
     const results = await run();
-    expect(results.find(row => row.name === "backend-health")?.backendDiagnostics).toEqual(backendDiagnosticFailure(failure));
+    // Family timestamps are observation times, so compare the DTOs without them.
+    const untimed = (value: unknown): unknown => JSON.parse(JSON.stringify(value), (key, entry) => key === "observedAt" ? 0 : entry);
+    expect(untimed(results.find(row => row.name === "backend-health")?.backendDiagnostics)).toEqual(untimed(backendDiagnosticFailure(failure)));
     expect(JSON.stringify(results)).not.toContain("SECRET_TRANSCRIPT");
   });
 });
