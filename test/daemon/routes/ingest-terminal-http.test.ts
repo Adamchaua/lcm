@@ -98,7 +98,7 @@ async function withTerminalDaemon(
       publicationConfigPath: configPath,
       ...(settings.token === false ? {} : { tokenPath, _testIdentity: identity }),
       onIdle: idle,
-      _scanForTranscripts: (admission, signal) => scanOperation(admission, signal),
+      _scanForTranscripts: (admission, _signal) => scanOperation(admission),
       _createStorageBackendFactory: async (...args) => {
         const factory = await createStorageBackendFactory(...args);
         const open = factory.openProject.bind(factory);
@@ -228,13 +228,18 @@ describe("POST /ingest/terminal", () => {
       expect((await fixture.post(body(fixture, { event: "Interrupt" }))).status).toBe(202);
       await bounded(fixture.gates.openEntered.promise);
       // The first run has already read the transcript; the session then continues.
+      // The ordinary ingest notices the changed source and re-reads it itself,
+      // so that first run stores the newest tail (two opens). The queued request
+      // still re-runs afterwards and finds nothing new (a third open).
       appendFileSync(fixture.transcript, [codexLine("user", "second question"), codexLine("assistant", "second answer")].join("\n") + "\n");
       expect((await fixture.post(body(fixture))).status).toBe(202);
       fixture.gates.open.open();
       await vi.waitFor(() => expect(fixture.messageCount()).toBe(4), { timeout: 5_000 });
+      // Stopping the daemon cancels a run that has not finished, so wait for all three.
+      await vi.waitFor(() => expect(fixture.events.filter((event) => event === "project.close:end")).toHaveLength(3), { timeout: 5_000 });
       await bounded(fixture.daemon.stop());
       expect(fixture.messageCount()).toBe(4);
-      expect(fixture.events.filter((event) => event === "open:start")).toHaveLength(2);
+      expect(fixture.events.filter((event) => event === "open:start")).toHaveLength(3);
     });
   });
 

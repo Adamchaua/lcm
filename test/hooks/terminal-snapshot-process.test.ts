@@ -3,7 +3,7 @@ import { buildSync } from "esbuild";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:net";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { TERMINAL_STDIN_MAX_BYTES } from "../../src/cli/terminal-stdin.js";
@@ -37,10 +37,46 @@ server.listen(0, "127.0.0.1", () => console.log(server.address().port));
 `;
 const UPTIME_PROBE = `
 const { writeFileSync } = require("node:fs");
-process.on("exit", () => writeFileSync(process.env.UPTIME_OUT, String(process.uptime() * 1000)));
+process.on("exit", () => {
+  writeFileSync(process.env.UPTIME_OUT + ".home", require("node:os").homedir());
+  writeFileSync(process.env.UPTIME_OUT, String(process.uptime() * 1000));
+});
 `;
 
 type Result = { code: number | null; stdout: string; stderr: string; wallMs: number; nodeMs: number };
+
+const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+const readOrUndefined = (path: string): string | undefined => {
+  try { return readFileSync(path, "utf-8"); } catch { return undefined; }
+};
+
+/** What the child saw and left behind, appended to any failed assertion about a run. */
+function describeRun(home: string, result: Result): string {
+  const lcm = join(home, ".lcm");
+  const log = join(lcm, "logs", "events.log");
+  const requests = readOrUndefined(join(home, "fixture-requests.jsonl"));
+  const state = (name: string): string => `${name}: ${existsSync(join(lcm, name)) ? "present" : "missing"}`;
+  return [
+    `exit code: ${String(result.code)}; node uptime ms: ${result.nodeMs}; wall ms: ${Math.round(result.wallMs)}`,
+    `stdout: ${JSON.stringify(result.stdout)}`,
+    `stderr: ${JSON.stringify(result.stderr)}`,
+    `expected home: ${home}`,
+    `home seen by the child: ${readOrUndefined(join(home, "uptime.txt.home")) ?? "missing"}`,
+    `hook error log path: ${log}`,
+    `hook error log: ${readOrUndefined(log) ?? "missing"}`,
+    `daemon state: ${["config.json", "daemon.token", "daemon.pid"].map(state).join("; ")}`,
+    `fixture requests: ${requests === undefined ? "no fixture" : requests.split("\n").filter(Boolean).length}`,
+  ].join("\n");
+}
+
+function diagnose(home: string, result: Result, assertions: () => void): void {
+  try {
+    assertions();
+  } catch (error) {
+    if (error instanceof Error) error.message += `\n--- child diagnostics ---\n${describeRun(home, result)}`;
+    throw error;
+  }
+}
 
 describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --terminal", () => {
   let root: string;
@@ -125,14 +161,18 @@ describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --t
   ): Promise<Result> {
     const uptimeOut = join(home, "uptime.txt");
     const started = performance.now();
-    // Codex runs hook commands through a login shell with a 3 second cap.
-    const child = spawn("/bin/sh", ["-lc", `"${process.execPath}" --require "${probe}" "${runtime}" session-snapshot --client codex --terminal`], {
+    // Codex runs hook commands through a login shell with a 3 second cap. The
+    // host's login profile may export anything, so `env -i` rebuilds the child's
+    // environment from this allowlist after the profile has run.
+    const env: Record<string, string> = {
+      PATH: "/usr/bin:/bin", HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: join(home, "config"),
+      XDG_STATE_HOME: join(home, "state"), XDG_CACHE_HOME: join(home, "cache"), TMPDIR: home,
+      NODE_NO_WARNINGS: "1", UPTIME_OUT: uptimeOut, ...input.env,
+    };
+    const assignments = Object.entries(env).map(([name, value]) => `${name}=${shellQuote(value)}`).join(" ");
+    const child = spawn("/bin/sh", ["-lc", `/usr/bin/env -i ${assignments} "${process.execPath}" --require "${probe}" "${runtime}" session-snapshot --client codex --terminal`], {
       cwd: home,
-      env: {
-        PATH: "/usr/bin:/bin", HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: join(home, "config"),
-        XDG_STATE_HOME: join(home, "state"), XDG_CACHE_HOME: join(home, "cache"), TMPDIR: home,
-        NODE_NO_WARNINGS: "1", UPTIME_OUT: uptimeOut, ...input.env,
-      },
+      env,
       stdio: ["pipe", "pipe", "pipe"],
     });
     children.push(child);
@@ -175,13 +215,15 @@ describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --t
 
     const result = await run(home, { stdin: payload(home, transcript, "Interrupt") });
 
-    expectSilentSuccess(result);
-    const requests = readFileSync(fixture.out, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
-    expect(requests).toEqual([{
-      authorized: true,
-      body: { session_id: "process-session", cwd: home, transcript_path: transcript, client: "codex", event: "Interrupt" },
-    }]);
-    expect(logged(log)).toEqual([]);
+    diagnose(home, result, () => {
+      expectSilentSuccess(result);
+      const requests = readFileSync(fixture.out, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(requests).toEqual([{
+        authorized: true,
+        body: { session_id: "process-session", cwd: home, transcript_path: transcript, client: "codex", event: "Interrupt" },
+      }]);
+      expect(logged(log)).toEqual([]);
+    });
   });
 
   it("logs unconfirmed and still leaves within the Node budget when the daemon never acknowledges", async () => {
@@ -191,9 +233,11 @@ describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --t
 
     const result = await run(home, { stdin: payload(home, transcript) });
 
-    expectSilentSuccess(result);
-    expect(logged(log).map(({ hook, error }) => [hook, error])).toEqual([["SessionEnd", "unconfirmed"]]);
-    expect(result.nodeMs).toBeGreaterThan(1000);
+    diagnose(home, result, () => {
+      expectSilentSuccess(result);
+      expect(logged(log).map(({ hook, error }) => [hook, error])).toEqual([["SessionEnd", "unconfirmed"]]);
+      expect(result.nodeMs).toBeGreaterThan(1000);
+    });
   });
 
   it("refuses at once, without starting anything, when no daemon is running", async () => {
@@ -202,10 +246,12 @@ describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --t
 
     const result = await run(home, { stdin: payload(home, transcript) });
 
-    expectSilentSuccess(result);
-    expect(logged(log).map(({ hook, error, cwd }) => [hook, error, cwd])).toEqual([["SessionEnd", "daemon-unavailable", undefined]]);
-    expect(readFileSync(join(lcm, "config.json"), "utf-8")).toBe(config);
-    expect(() => readFileSync(join(lcm, "daemon.pid"))).toThrow();
+    diagnose(home, result, () => {
+      expectSilentSuccess(result);
+      expect(logged(log).map(({ hook, error, cwd }) => [hook, error, cwd])).toEqual([["SessionEnd", "daemon-unavailable", undefined]]);
+      expect(readFileSync(join(lcm, "config.json"), "utf-8")).toBe(config);
+      expect(() => readFileSync(join(lcm, "daemon.pid"))).toThrow();
+    });
   });
 
   it("gives up on a daemon whose health check hangs within the verification cap", async () => {
@@ -215,9 +261,11 @@ describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --t
 
     const result = await run(home, { stdin: payload(home, transcript) });
 
-    expectSilentSuccess(result);
-    expect(logged(log).map(({ error }) => error)).toEqual(["daemon-unavailable"]);
-    expect(result.nodeMs).toBeLessThan(1000);
+    diagnose(home, result, () => {
+      expectSilentSuccess(result);
+      expect(logged(log).map(({ error }) => error)).toEqual(["daemon-unavailable"]);
+      expect(result.nodeMs).toBeLessThan(1000);
+    });
   });
 
   it("stops reading a payload that never reaches EOF after the stdin cap", async () => {
@@ -225,9 +273,11 @@ describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --t
 
     const result = await run(home, { stdin: "open" });
 
-    expectSilentSuccess(result);
-    expect(logged(log).map(({ error }) => error)).toEqual(["deadline-exhausted"]);
-    expect(result.nodeMs).toBeLessThan(1000);
+    diagnose(home, result, () => {
+      expectSilentSuccess(result);
+      expect(logged(log).map(({ error }) => error)).toEqual(["deadline-exhausted"]);
+      expect(result.nodeMs).toBeLessThan(1000);
+    });
   });
 
   it("refuses an oversize payload without parsing it", async () => {
@@ -235,8 +285,10 @@ describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --t
 
     const result = await run(home, { stdin: Buffer.alloc(TERMINAL_STDIN_MAX_BYTES + 1, "x") });
 
-    expectSilentSuccess(result);
-    expect(logged(log).map(({ error }) => error)).toEqual(["invalid-input"]);
+    diagnose(home, result, () => {
+      expectSilentSuccess(result);
+      expect(logged(log).map(({ error }) => error)).toEqual(["invalid-input"]);
+    });
   });
 
   it("does nothing at all, not even reading stdin, when LCM_ENABLED is false", async () => {
@@ -244,9 +296,11 @@ describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --t
 
     const result = await run(home, { stdin: "open", env: { LCM_ENABLED: "false" } });
 
-    expectSilentSuccess(result);
-    expect(logged(log)).toEqual([]);
-    expect(result.nodeMs).toBeLessThan(1000);
+    diagnose(home, result, () => {
+      expectSilentSuccess(result);
+      expect(logged(log)).toEqual([]);
+      expect(result.nodeMs).toBeLessThan(1000);
+    });
   });
 });
 
