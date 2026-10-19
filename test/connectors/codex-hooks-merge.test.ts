@@ -67,11 +67,11 @@ describe("in-place Codex hook merge", () => {
 
   it("updates a group matcher in place only for an LCM-only group", () => {
     const only = merged({ SessionStart: [{ matcher: "startup", label: "keep", hooks: [lcm("lcm restore --client codex")] }] });
-    expect(only.SessionStart[0]).toMatchObject({ matcher: "startup|resume|clear", label: "keep" });
+    expect(only.SessionStart[0]).toMatchObject({ matcher: "startup|resume|clear|compact|fork", label: "keep" });
     const removed = merged({ PostToolUse: [{ matcher: "Bash", hooks: [lcm("lcm post-tool --client codex")] }], UserPromptSubmit: [{ matcher: "x", hooks: [lcm("lcm user-prompt --client codex")] }] });
     expect(removed.UserPromptSubmit[0]).not.toHaveProperty("matcher");
     expect(removed.PostToolUse[0].matcher).toBe("*");
-    const equal = merged({ SessionStart: [{ matcher: "startup|resume|clear", hooks: [foreign("x"), lcm("lcm restore --client codex")] }] });
+    const equal = merged({ SessionStart: [{ matcher: "startup|resume|clear|compact|fork", hooks: [foreign("x"), lcm("lcm restore --client codex")] }] });
     expect(equal.SessionStart[0].hooks[0].command).toBe("echo x");
   });
 

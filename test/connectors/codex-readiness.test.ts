@@ -20,7 +20,8 @@ const HOOKS = "/home/u/.codex/hooks.json";
 const GOLDEN = {
   post: "sha256:7bca176693d94844cb28344ff833bfc7c8a8057419e2952d51d6af9729bd9a12",
   pre: "sha256:0b5fb357ddca9022046ac17ac0fba04f96027bec5d0c1a0813748764dbfbd108",
-  session: "sha256:a8b15750a2208c3b5267b74a26eadbab24503ab3f31ae48e7dc45c7e75b18da7",
+  session: "sha256:9bea3dc130dcc86cd86060e3dbbb60f5b990611580887b626c18832f560bf12b",
+  sessionLegacy: "sha256:a8b15750a2208c3b5267b74a26eadbab24503ab3f31ae48e7dc45c7e75b18da7",
   promptCli: "sha256:c686e888147a6d5ab6d70a6a7f4863c3bcff608d0b3fd9fd320147efd187915e",
   promptMcp: "sha256:c58011b176453632fc6f5a0f30f97d0497892c8061413423644b6f0ec6c51ac9",
   stop: "sha256:6b95211647571f6197d0375b6230fcc37488515b048d24ad1dbc20073900ee31",
@@ -86,6 +87,12 @@ describe("computeCodexHookHash", () => {
     expect(hashOf("UserPromptSubmit")).toBe(GOLDEN.promptCli);
     expect(hashOf("UserPromptSubmit", "mcp")).toBe(GOLDEN.promptMcp);
     expect(hashOf("Stop")).toBe(GOLDEN.stop);
+    expect(computeCodexHookHash(
+      "SessionStart",
+      { matcher: "startup|resume|clear" },
+      { type: "command", command: "lcm restore --client codex", timeout: 30, statusMessage: "Loading LCM memory" },
+      "linux",
+    )).toBe(GOLDEN.sessionLegacy);
     expect(computeCodexHookHash("SessionStart", { matcher: "startup" }, { type: "command", command: "echo other" }, "linux"))
       .toBe(GOLDEN.foreign);
     expect(lcm.Stop).toHaveLength(1);
