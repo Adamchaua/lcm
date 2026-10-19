@@ -65,45 +65,54 @@ Every telemetry family reports one status from a closed set, together with
 |---|---|
 | `not-applicable` | The backend is SQLite, or the family does not apply. |
 | `disabled` | The source exists but server configuration turned it off. For the statement family this means `pg_stat_statements.track = none` only. |
-| `unavailable` | The source is absent or the probe failed: extension missing or not preloaded, connection failure, malformed result, or no query identifier is computable at all. |
+| `unavailable` | The family source is absent, or a family-wide probe failure prevents a usable observation: missing or unloaded extension, connection failure, malformed result, or no computable query identifier. Explicit privilege denial and deadline or cancellation use their specific statuses instead. |
 | `permission-denied` | The server denied the probe: SQLSTATE 42501, 28000, or 28P01, or another explicit privilege denial. |
 | `timeout` | The probe hit a deadline or was cancelled: SQLSTATE 57014, the snapshot deadline, or the caller signal. |
 | `stale` | `observedAt` is older than the family's declared freshness bound, or the values are not tied to the current epoch. |
 | `reset` | Counters restarted since the previous comparable observation. Current cumulative values are valid, and no rate is computed across the reset. |
 | `partial` | Cataloged fields or entries are missing for a reason other than the expected absences listed below: the deallocation counter advanced, a family cap was reached, a value is out of range, a sub-probe failed, or a counter decreased without an explained cause. |
-| `observed` | The family is complete, fresh, and within one epoch. |
+| `observed` | Complete and fresh, allowing the expected omissions, with no established higher-priority family fact. Each contributing entry is internally consistent. A pooled record may contain entries with different statistics windows; no common interval is required. A first observation may be observed without a baseline. Temporal comparisons follow the per-entry epoch, membership, and mapping rules in [Comparison context](#comparison-context). |
 
-Timeout and permission denial are specific cases. They take priority over the
-generic "the probe failed" meaning of `unavailable`. Rows that belong to other
-roles are excluded by design and are not a permission condition.
-`track_planning` and `track_io_timing` being off omit only the dependent fields
-(reason `disabled-setting`); they never change the family status.
+Rows that belong to other roles are excluded by design and are not a
+permission condition. `pg_stat_statements.track_planning` and
+`track_io_timing` being off omit only the dependent fields (reason
+`disabled-setting`); they never change the family status.
 
-When several facts apply, the family status is the first that applies, among
-facts actually established:
+When several family-level facts apply, the family status is the first that
+applies, among facts actually established:
 
 ```text
-not-applicable > disabled > unavailable > permission-denied > timeout >
+not-applicable > disabled > permission-denied > timeout > unavailable >
 stale > reset > partial > observed
 ```
 
-Inability to observe outranks qualifiers about observed values. Stale values
-cannot be compared, so `stale` outranks `reset`. Reset and partial can occur
-together; reset is the stronger constraint on interpretation.
+Apply this ladder only to established family-level facts. Permission-denied,
+timeout, and unavailable describe failures that prevent a usable observation
+of the family. If a sub-probe fails while usable family observations remain,
+retain its specific reason on each affected field and establish `partial`,
+rather than promoting that field failure to a family-wide failure. A
+`stale` or `reset` fact still outranks `partial`. Stale values cannot be
+compared, so `stale` outranks `reset`. Reset and partial can occur together;
+reset is the stronger constraint on interpretation. Per-field reasons remain
+present under whichever family status wins.
 
-Lower-precedence facts survive per field. A family lists each omitted field
-from its closed field catalog with one reason:
+A family lists each omitted field from its closed field catalog with one
+reason:
 
 | Reason | Meaning | Lowers family status? |
 |---|---|---|
 | `unavailable` | The field's source or sub-probe failed. | Yes, to `partial`. |
 | `timeout` | The sub-probe hit its deadline. | Yes, to `partial`. |
 | `permission-denied` | The sub-probe was denied. | Yes, to `partial`. |
-| `out-of-range` | The value is not finite, is negative, or exceeds the safe integer range. | Yes, to `partial`. |
+| `out-of-range` | The value is not finite or is negative, or an integer counter is not an exact safe integer (above 2^53 - 1). | Yes, to `partial`. |
 | `reset` | The value cannot be compared across a reset. | Accompanies `reset`. |
 | `disabled-setting` | The controlling server setting is off. | No. |
 | `no-entry` | No row exists for a cataloged operation. This is never reported as zero. | No. |
 | `no-baseline` | No prior observation or other proof can establish the value. | No. |
+
+In this table, "Yes, to `partial`" means that the omission establishes
+`partial` unless a higher-priority family fact applies. The expected omissions
+(`disabled-setting`, `no-entry`, and `no-baseline`) do not establish `partial`.
 
 An unknown telemetry status renders as `unavailable`. Telemetry families are
 new nested sections of the same snapshot; the existing readiness and
@@ -126,25 +135,32 @@ Cumulative counters are only comparable inside one epoch.
   and standard deviation.
 - The min/max epoch is the entry's `minmax_stats_since`. It governs only the
   execution-time minimum and maximum. A min/max-only reset is not a full reset.
-- `stats_reset` advances only on a full reset. Per-user, per-database, and
-  per-query resets, and eviction followed by re-creation, appear only as a
-  changed entry `stats_since`. Any changed entry epoch invalidates comparison,
-  whatever the cause.
+- `pg_stat_statements_info.stats_reset` advances when all statement statistics
+  are discarded. A targeted reset that is not min/max-only discards the
+  matching entries, and eviction also removes entries. Until an entry is
+  re-created it is absent; it does not show an in-place `stats_since` change. A
+  cataloged operation with no entry reports `no-entry`. When a previously
+  contributing entry disappears, the contributor membership changes and
+  operation-wide rates are suppressed. Absence alone does not establish a
+  reset. A re-created entry has a new `stats_since`, and an established epoch
+  change invalidates comparison, whatever the cause.
 - Monotonic counters never decrease inside an epoch. A decrease without an
   epoch change suppresses rates and marks the family `partial` without
   asserting a cause. With an epoch change the family is `reset`. Changes in
   min, max, mean, or standard deviation never imply a reset on their own.
-- Growth in the deallocation counter means entries were evicted. The family is
-  `partial`, never `reset`.
+- Growth in the deallocation counter means entries were evicted. It
+  establishes `partial`, independently of the absence rules above, and never
+  `reset`.
 - Server timestamps are compared only with server timestamps.
 - A rate needs two observations from the same epoch. Otherwise LCM reports no
   rate.
 - LCM reports aggregates only and never synthesizes percentiles. Workload
   latency percentiles belong to #629.
-- Every number is finite and non-negative, and every integer is at most
-  2^53 - 1. A field that violates this rule is omitted with reason
-  `out-of-range`, never rounded or clamped. This includes the numeric WAL byte
-  total.
+- Every number is finite and non-negative. Integer counters, including the
+  numeric WAL byte total, must also be exact safe integers (at most
+  2^53 - 1); floating-point durations, means, deviations, and ratios need not
+  be integral. A field that violates this rule is omitted with reason
+  `out-of-range`, never rounded or clamped.
 
 ### Comparison context
 
@@ -255,9 +271,10 @@ camelCase form of the same names.
 Three family-level values accompany the records: `statements_dealloc_total`
 (count), `statements_stats_reset` (server timestamp), and `block_size` (bytes,
 from `current_setting('block_size')`, reported once). The collector reads
-`current_setting` for `pg_stat_statements.track`, `track_planning`, and
-`track_io_timing`. An off setting omits the dependent fields with reason
-`disabled-setting`, never as zero. LCM never enables any of these settings.
+`current_setting` for `pg_stat_statements.track`,
+`pg_stat_statements.track_planning`, and `track_io_timing`. An off setting omits
+the dependent fields with reason `disabled-setting`, never as zero. LCM never
+enables any of these settings.
 
 ### Aggregation
 
@@ -275,9 +292,11 @@ be the sum of n_i.
   equivalent.
 - LCM omits mean and standard deviation if N is 0, if any input is missing, or
   if the variance is negative or not finite.
-- After aggregation, LCM rechecks every sum and derived value against the
-  finite, non-negative, safe-integer rule. Every omission carries a per-field
-  reason.
+- After aggregation, LCM rechecks every numeric value for finiteness and
+  non-negativity. Integer counter fields, including WAL bytes, must also
+  remain exact safe integers; floating-point durations, means, deviations,
+  and ratios are not required to be integral. Every omission carries a
+  per-field reason.
 
 PostgreSQL has four source min/max columns; only the execution-time minimum
 and maximum are cataloged. The pooled minimum is the smallest and the pooled
@@ -296,9 +315,18 @@ the thresholds and remediation text. Collection uses the snapshot's existing
 path: the diagnostic-probe runtime or the daemon pool counters, as recorded in
 the pool origin. It is bounded, cancellable, and cannot starve runtime pools.
 
+This table specifies required signals. Existing fields retain the #619 snapshot
+schema. New extension status and version fields and the inbox and replay
+fields described only in prose are not yet complete catalog entries and must
+not be emitted on that basis. Before emitting them, #638 must update this guide
+with each field's exact name, type, unit (or unitless), source, permitted
+dimensions, omission reasons, and finite family bound, together with its tests.
+The same requirement applies to any other new field that lacks this catalog
+information.
+
 | Family | Fields | Notes |
 |---|---|---|
-| Pool | `pool_configured_max`, `pool_total`, `pool_idle`, `pool_waiting` (connections); `pool_saturation_ratio` | The first four are existing snapshot fields with origin `daemon`, `diagnostic-probe`, or `local`. The ratio is total divided by configured maximum, omitted when the maximum is not above 0. `pool_acquire_timeouts_total` (count) enters this family's catalog only when the pool exposes such a counter; until then it is not part of the family, so its absence never lowers the family status. |
+| Pool | `pool_configured_max`, `pool_total`, `pool_idle`, `pool_waiting` (connections); `pool_saturation_ratio` | The first four are existing snapshot fields with origin `daemon`, `diagnostic-probe`, or `local`. The ratio is total divided by configured maximum, omitted when the maximum is not above 0. `pool_acquire_timeouts_total` is reserved for a future catalog revision and is not an emitted field until the pool supplies a defined counter. #638 must explicitly document whether that capability is supported. Its absence is neither a zero timeout count nor evidence of timeout-free operation. `observed` means completeness of the active catalog. Adding the counter requires the catalog update and tests described above; an unavailable counter after admission to that catalog follows the normal per-field failure rules. |
 | Migration | `migration_applied_count`, `migration_expected_count` (counts); `migration_history_status` | Status is one of `current`, `behind`, `ahead`, `drift`, `checksum-mismatch`, `unavailable`. LCM compares migration IDs and checksums against the packaged set in-process, as readiness already does. It emits only the two counts and the closed status, never ID lists, checksums, or SQL. |
 | Extensions | `pg_stat_statements`, `pg_trgm`, `pgcrypto`, `unaccent` | Each reports its name, the existing closed status, and the installed and default versions only when they match `^[0-9]+(\.[0-9]+){0,2}$`; otherwise the version is `unrecognized`. No remediation text and no installed schema. The optional set is empty for P4. |
 | Queue and replay | Existing outbox counts; `outbox_oldest_pending_age_seconds`; inbox claimed and quarantined counts; replay lag in seconds | The outbox age uses the local wall clock over local files. Inbox counts and replay lag come from server rows and use the server clock (`clock_timestamp()`). Never event IDs, payloads, or paths. |
@@ -309,11 +337,11 @@ never a per-project breakdown.
 
 ## Labels and cardinality
 
-Label keys and values are fixed when the package is built.
+Label keys and values are fixed when the package is built. The family is the
+structural snapshot section identifier, not a dimension on emitted values.
 
 | Label | Permitted values |
 |---|---|
-| `family` | The telemetry family catalog. |
 | `operation` | The #637 operation catalog, at most 64 entries. |
 | `extension` | `pg_stat_statements`, `pg_trgm`, `pgcrypto`, `unaccent`. |
 | `origin` | `daemon`, `diagnostic-probe`, `local`. |
@@ -351,8 +379,13 @@ reaching a limit yields status `partial`.
   needs it.
 - LCM never calls `pg_stat_statements_reset` or any `pg_stat_reset*` function
   and never uses `ANALYZE` inside `EXPLAIN`.
-- Each family uses one bounded statement, with a `statement_timeout` inside the
-  remaining deadline, cancellable through the caller's signal.
+- Each family declares a finite maximum number of statements, including its
+  statistics reads, role and setting lookups, and any packaged-template
+  mapping probes. Combine reads where practical. Every statement is
+  cancellable through the caller's signal and has a `statement_timeout`
+  within the remaining shared snapshot deadline. The combined work stays
+  within that deadline and the declared row, mapping-probe, and
+  comparison-entry limits.
 - A #639 runbook that needs another role, such as a provider administrator,
   documents that requirement and sanitizes its output to role-class and
   database aliases.
