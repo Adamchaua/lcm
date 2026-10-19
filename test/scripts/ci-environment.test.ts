@@ -24,6 +24,7 @@ import {
   assertSecureInventoryPlatform,
   cacheMetadata,
   compareInventoryNames,
+  containerEngineEnvironment,
   expectedRepoDigest,
   nodeModulesInventoryDigest,
   runProcess,
@@ -486,5 +487,41 @@ describe("CI environment cache metadata", () => {
     await expect(validateArchiveChecksum(archive)).rejects.toThrow(
       "cached archive checksum is invalid",
     );
+  });
+});
+
+describe("container engine selection", () => {
+  const socketStat = (isSocket: boolean) => () => ({ isSocket: () => isSocket });
+
+  it("keeps the runner-provided engine in GitHub Actions", () => {
+    const environment = { GITHUB_ACTIONS: "true", DOCKER_HOST: "unix:///var/run/docker.sock" };
+    expect(containerEngineEnvironment(environment, socketStat(false))).toBe(environment);
+  });
+
+  it("points local runs at the user's rootless Podman socket", () => {
+    const inspected: string[] = [];
+    const environment = containerEngineEnvironment(
+      { XDG_RUNTIME_DIR: "/run/user/1000", DOCKER_HOST: "unix:///var/run/docker.sock", KEEP: "1" },
+      (path: string) => {
+        inspected.push(path);
+        return { isSocket: () => true };
+      },
+    );
+    expect(inspected).toEqual(["/run/user/1000/podman/podman.sock"]);
+    expect(environment).toEqual({
+      XDG_RUNTIME_DIR: "/run/user/1000",
+      DOCKER_HOST: "unix:///run/user/1000/podman/podman.sock",
+      KEEP: "1",
+    });
+  });
+
+  it("fails before any container operation without a rootless Podman socket", () => {
+    expect(() => containerEngineEnvironment({}, socketStat(true))).toThrow("XDG_RUNTIME_DIR must be an absolute path");
+    expect(() => containerEngineEnvironment({ XDG_RUNTIME_DIR: "relative" }, socketStat(true)))
+      .toThrow("XDG_RUNTIME_DIR must be an absolute path");
+    expect(() => containerEngineEnvironment({ XDG_RUNTIME_DIR: "/run/user/1000" }, () => undefined))
+      .toThrow("/run/user/1000/podman/podman.sock is not a socket");
+    expect(() => containerEngineEnvironment({ XDG_RUNTIME_DIR: "/run/user/1000" }, socketStat(false)))
+      .toThrow("systemctl --user enable --now podman.socket");
   });
 });

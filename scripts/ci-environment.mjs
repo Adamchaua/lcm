@@ -11,6 +11,7 @@ import {
   readSync,
   readdirSync,
   readlinkSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -471,7 +472,22 @@ export function runProcess(command, args, options = {}) {
 }
 
 async function docker(args) {
-  return runProcess("docker", args);
+  return runProcess("docker", args, { env: containerEngineEnvironment(process.env) });
+}
+
+// GitHub Actions keeps its runner-provided Docker engine. Every other run drives
+// the Docker CLI against the invoking user's rootless Podman API socket.
+export function containerEngineEnvironment(environment, inspect = statSync) {
+  if (environment.GITHUB_ACTIONS === "true") return environment;
+  const runtimeDirectory = environment.XDG_RUNTIME_DIR;
+  if (!runtimeDirectory || !isAbsolute(runtimeDirectory)) {
+    throw new Error("local container harnesses require rootless Podman; XDG_RUNTIME_DIR must be an absolute path");
+  }
+  const socket = join(runtimeDirectory, "podman", "podman.sock");
+  if (!inspect(socket, { throwIfNoEntry: false })?.isSocket()) {
+    throw new Error(`local container harnesses require rootless Podman; ${socket} is not a socket (run: systemctl --user enable --now podman.socket)`);
+  }
+  return { ...environment, DOCKER_HOST: `unix://${socket}` };
 }
 
 async function verifyLocalImages() {
