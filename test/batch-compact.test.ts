@@ -2623,6 +2623,7 @@ describe("batch compaction discovery", () => {
     ["EPIPE", () => Object.assign(new Error(FAILURE_POISON), { code: "EPIPE" }), "daemon connection lost; outcome unknown; rerun after lcm doctor", true],
     ["ETIMEDOUT", () => Object.assign(new Error(FAILURE_POISON), { code: "ETIMEDOUT" }), "daemon connection lost; outcome unknown; rerun after lcm doctor", true],
     ["request timeout", () => new Error("Daemon request timed out"), "daemon connection lost; outcome unknown; rerun after lcm doctor", true],
+    ["HTTP error body that reads as a timeout", () => Object.assign(new Error("Daemon request timed out"), { statusCode: 500 }), "daemon compaction failed (HTTP 500); run lcm doctor", true],
     ["intentional abort", () => createAbortError(new Error(FAILURE_POISON)), "compaction request cancelled", false],
     ["unbound project", () => Object.assign(new TransportedUnboundProjectError(FAILURE_POISON), { statusCode: 409 }), "no PostgreSQL binding; run lcm project create or lcm project link <id>", false],
     ["SyntaxError", () => new SyntaxError(FAILURE_POISON), "malformed compact response", false],

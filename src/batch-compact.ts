@@ -540,15 +540,15 @@ function classifySessionFailure(error: unknown): string {
   if (error instanceof TransportedUnboundProjectError) {
     return "no PostgreSQL binding; run lcm project create or lcm project link <id>";
   }
-  if (isDaemonTransportFailure(error)) {
-    return "daemon connection lost; outcome unknown; rerun after lcm doctor";
-  }
   const statusCode = (error as { statusCode?: unknown }).statusCode;
   if (typeof statusCode === "number" && Number.isSafeInteger(statusCode) && statusCode >= 400 && statusCode <= 599) {
     if (statusCode === 401 || statusCode === 403) return `daemon auth rejected (HTTP ${statusCode}); run lcm doctor`;
     if (statusCode === 503) return "daemon unavailable (HTTP 503); run lcm doctor";
     if (statusCode < 500) return `daemon rejected compact request (HTTP ${statusCode})`;
     return `daemon compaction failed (HTTP ${statusCode}); run lcm doctor`;
+  }
+  if (isDaemonTransportFailure(error)) {
+    return "daemon connection lost; outcome unknown; rerun after lcm doctor";
   }
   if (error instanceof SyntaxError) return "malformed compact response";
   return "compaction request failed";
