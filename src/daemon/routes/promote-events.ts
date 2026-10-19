@@ -47,6 +47,9 @@ const MISSING_CWD_CONFIRMATION_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_REINFORCED_PATTERN_OCCURRENCES = 3;
 const MIN_REINFORCED_PATTERN_SESSIONS = 2;
 const AUTO_PROMOTABLE_PATTERN_CATEGORIES = new Set(["file", "mcp", "skill", "subagent"]);
+// Observations whose tool outcome is unavailable are stored but never promoted,
+// reinforced or correlated as the fix for an earlier error.
+const NON_PROMOTABLE_EVENT_TYPES = new Set(["tool_outcome_unknown"]);
 const EMPTY_REINFORCEMENT: PatternReinforcementStats = { totalCount: 0, distinctSessions: 0 };
 const sidecarPromotionLocks = new Map<string, Promise<void>>();
 
@@ -124,6 +127,7 @@ function correlateErrors(events: EventRow[]): void {
       for (let j = i + 1; j < sessionEvents.length && (sessionEvents[j].seq - event.seq) <= CORRELATION_WINDOW; j++) {
         const candidate = sessionEvents[j];
         if (candidate.category === "error") continue; // skip other errors
+        if (NON_PROMOTABLE_EVENT_TYPES.has(candidate.type)) continue;
         const candidatePrefix = candidate.data.split(/\s+/).slice(0, 3).join(" ").toLowerCase();
 
         // Match on command prefix overlap — guard against empty match token (data without colon)
@@ -988,7 +992,7 @@ async function promoteEventsBatch(
               const candidateSourceProjectId = project.backend === "postgresql"
                 ? undefined
                 : project.projectId;
-              const existing = await project.lexicalSearch.searchPromoted(
+              const existing = NON_PROMOTABLE_EVENT_TYPES.has(event.type) ? [] : await project.lexicalSearch.searchPromoted(
                 scrubbedData,
                 1,
                 undefined,
@@ -1029,7 +1033,7 @@ async function promoteEventsBatch(
               return { promoted: priorReceipt.outcome === "applied" };
             }
             if (event.priority === 3 && !reinforced) {
-              const existing = await repositories.lexicalSearch.searchPromoted(
+              const existing = NON_PROMOTABLE_EVENT_TYPES.has(event.type) ? [] : await repositories.lexicalSearch.searchPromoted(
                 scrubbedData,
                 1,
                 undefined,

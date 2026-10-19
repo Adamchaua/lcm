@@ -8,11 +8,15 @@ export interface ExtractedEvent {
   tags?: string[];
 }
 
+export type ToolOutcome = "succeeded" | "failed" | "unknown";
+
 export interface PostToolInput {
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_response?: unknown;
-  tool_output?: { isError?: boolean };
+  // `outcome` is the only status signal when present; `isError` applies to
+  // outcome-less (non-Codex) input.
+  tool_output?: { isError?: boolean; outcome?: ToolOutcome };
 }
 
 const SENSITIVE_PATHS = [".env", ".ssh/", "credentials", "secrets/", ".npmrc", ".netrc"];
@@ -38,6 +42,10 @@ function truncate(s: string): string {
   return s.length > DATA_SOFT_CAP ? s.slice(0, DATA_SOFT_CAP) + "..." : s;
 }
 
+function commandPrefix(command: string): string {
+  return command.split(/\s+/).slice(0, 3).join(" ");
+}
+
 function isSensitivePath(path: string): boolean {
   const lower = path.toLowerCase();
   return SENSITIVE_PATHS.some(p => lower.includes(p));
@@ -52,12 +60,30 @@ function classifyFile(path: string): string {
 
 function extractBashEvents(input: PostToolInput): ExtractedEvent[] {
   const command = String(input.tool_input.command ?? "");
-  const isError = input.tool_output?.isError === true;
+  const outcome = input.tool_output?.outcome;
+  const isError = outcome === undefined
+    ? input.tool_output?.isError === true
+    : outcome === "failed";
 
   // Error detection (priority 1)
   if (isError) {
-    const prefix = command.split(/\s+/).slice(0, 3).join(" ");
-    return [{ type: "error_tool", category: "error", data: truncate(`Bash error: ${prefix}`), priority: 1 }];
+    return [{ type: "error_tool", category: "error", data: truncate(`Bash error: ${commandPrefix(command)}`), priority: 1 }];
+  }
+
+  // Completed without a status: record that the result is unknown instead of
+  // presenting the command as a success.
+  if (outcome === "unknown") {
+    // Only the matched selector is recorded, never further command tokens.
+    const selector = GIT_COMMANDS.find(gc => command.startsWith(gc)) ??
+      ENV_COMMANDS.find(ec => command.startsWith(ec));
+    return selector === undefined
+      ? []
+      : [{
+        type: "tool_outcome_unknown",
+        category: "tool",
+        data: `Bash outcome unknown: ${selector.trim()}`,
+        priority: 3,
+      }];
   }
 
   // Git operations (priority 2)
@@ -162,6 +188,18 @@ export function extractPostToolEvents(input: PostToolInput): ExtractedEvent[] {
 
   // MCP tools (priority 3) — tool name only, no args
   if (tool_name.startsWith("mcp__")) {
+    const outcome = input.tool_output?.outcome;
+    if (outcome === "failed") {
+      return [{ type: "error_tool", category: "error", data: truncate(`${tool_name} error`), priority: 1 }];
+    }
+    if (outcome === "unknown") {
+      return [{
+        type: "tool_outcome_unknown",
+        category: "tool",
+        data: truncate(`${tool_name} outcome unknown`),
+        priority: 3,
+      }];
+    }
     return [{ type: "mcp_call", category: "mcp", data: tool_name, priority: 3 }];
   }
 
