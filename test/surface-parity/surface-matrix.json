@@ -20,6 +20,7 @@
         "session-end",
         "user-prompt",
         "post-tool",
+        "pre-tool",
         "session-snapshot",
         "mcp",
         "install",
@@ -81,6 +82,7 @@
           "session-end",
           "user-prompt",
           "post-tool",
+          "pre-tool",
           "session-snapshot"
         ]
       },
@@ -1898,6 +1900,7 @@
           "session-end",
           "user-prompt",
           "post-tool",
+          "pre-tool",
           "session-snapshot"
         ]
       },
@@ -2580,6 +2583,58 @@
       "path": "postgres migrate"
     },
     "scenario": "admin",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/hooks/ and docs/cli.md: native hook capture uses the local SQLite outbox with either configured backend; durable project writes remain on the selected backend.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:pre-tool",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "pre-tool",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--client <client>",
+          "hidden": true,
+          "long": "--client",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "pre-tool"
+    },
+    "scenario": "hooks",
     "source": "bin/lcm.ts:runCli"
   },
   {
@@ -5315,10 +5370,10 @@
     "id": "portable-domain:context-items",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "context-items",
       "ordinal": 11,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5339,10 +5394,10 @@
     "id": "portable-domain:conversations",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "conversations",
       "ordinal": 3,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5363,10 +5418,10 @@
     "id": "portable-domain:large-files",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "large-files",
       "ordinal": 6,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5387,10 +5442,10 @@
     "id": "portable-domain:machines",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "machines",
       "ordinal": 0,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5411,10 +5466,10 @@
     "id": "portable-domain:message-parts",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "message-parts",
       "ordinal": 5,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5435,10 +5490,10 @@
     "id": "portable-domain:messages",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "messages",
       "ordinal": 4,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5459,10 +5514,10 @@
     "id": "portable-domain:native-transcript-checkpoints",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "native-transcript-checkpoints",
       "ordinal": 20,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5483,10 +5538,10 @@
     "id": "portable-domain:native-transcript-message-links",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "native-transcript-message-links",
       "ordinal": 19,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5507,10 +5562,10 @@
     "id": "portable-domain:native-transcripts",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "native-transcripts",
       "ordinal": 18,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5531,10 +5586,10 @@
     "id": "portable-domain:passive-events",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "passive-events",
       "ordinal": 21,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5555,10 +5610,10 @@
     "id": "portable-domain:project",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "project",
       "ordinal": 1,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5579,10 +5634,10 @@
     "id": "portable-domain:project-aliases",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "project-aliases",
       "ordinal": 2,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5603,10 +5658,10 @@
     "id": "portable-domain:promoted-memories",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "promoted-memories",
       "ordinal": 12,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5627,10 +5682,10 @@
     "id": "portable-domain:promoted-memory-tags",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "promoted-memory-tags",
       "ordinal": 13,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5651,10 +5706,10 @@
     "id": "portable-domain:recall-surfacings",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "recall-surfacings",
       "ordinal": 14,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5675,10 +5730,10 @@
     "id": "portable-domain:redaction-counters",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "redaction-counters",
       "ordinal": 15,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5699,10 +5754,10 @@
     "id": "portable-domain:session-ingest",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "session-ingest",
       "ordinal": 16,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5723,10 +5778,10 @@
     "id": "portable-domain:session-instructions",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "session-instructions",
       "ordinal": 17,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5747,10 +5802,10 @@
     "id": "portable-domain:summaries",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "summaries",
       "ordinal": 7,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5771,10 +5826,10 @@
     "id": "portable-domain:summary-file-links",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "summary-file-links",
       "ordinal": 8,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5795,10 +5850,10 @@
     "id": "portable-domain:summary-message-links",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "summary-message-links",
       "ordinal": 9,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5819,10 +5874,10 @@
     "id": "portable-domain:summary-parent-links",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "summary-parent-links",
       "ordinal": 10,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"

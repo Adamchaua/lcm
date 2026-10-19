@@ -81,6 +81,7 @@ const conversationRow = {
   bootstrapped_at: null,
   created_at: "2026-01-01T00:00:00.000Z",
   updated_at: new Date("2026-01-02T00:00:00.000Z"),
+  parent_session_id: null,
 };
 
 const messageRow = {
@@ -134,6 +135,7 @@ describe("PostgreSQL conversation repository", () => {
     await expect(repository.getOrCreateConversation("session-a", "ignored"))
       .resolves.toMatchObject({ conversationId: 41 });
     await expect(repository.markConversationBootstrapped(41)).resolves.toBeUndefined();
+    await expect(repository.setParentSessionIdIfNull(41, "parent-a")).resolves.toBeUndefined();
     await expect(repository.listConversations()).resolves.toHaveLength(1);
     await expect(repository.createMessage({
       conversationId: 41,
@@ -204,6 +206,12 @@ describe("PostgreSQL conversation repository", () => {
       expect(config.text).not.toContain("session-a");
       expect(config.text).not.toContain("hello");
     }
+    const parentUpdate = db.query.mock.calls.find(
+      ([config]) => config.text.includes("SET parent_session_id"),
+    )?.[0];
+    expect(parentUpdate).toMatchObject({ values: [projectId, 41, "parent-a"] });
+    expect(parentUpdate.text).toContain("AND parent_session_id IS NULL");
+    expect(parentUpdate.text).not.toContain("updated_at");
     const sessionLookup = db.query.mock.calls.find(
       ([config]) => config.text.includes("session_id_sha256"),
     )?.[0];
@@ -918,6 +926,23 @@ describe("PostgreSQL conversation repository", () => {
     ]);
   });
 
+  it("sets the parent on the active transaction scope through a savepoint", async () => {
+    const statements: string[] = [];
+    const query = vi.fn(async (config: QueryConfig<unknown[]>) => {
+      statements.push(config.text);
+      return result([]);
+    });
+    const repository = new PostgreSqlConversationRepository(scopedExecutor(query), projectId);
+
+    await expect(repository.setParentSessionIdIfNull(41, "parent-a")).resolves.toBeUndefined();
+    expect(statements).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("SET parent_session_id = $3"),
+      "RELEASE SAVEPOINT lcm_conversation_repository_1",
+    ]);
+    expect(query.mock.calls[1][0]).toMatchObject({ values: [projectId, 41, "parent-a"] });
+  });
+
   it("serializes bootstrap and part writes behind a failing scoped mapped write", async () => {
     const unsafeMessage = {
       ...messageRow,
@@ -1195,6 +1220,10 @@ describe("PostgreSQL conversation repository", () => {
 
   it.each([
     ["getConversation", () => repositoryForInputs().getConversation(1.5), "conversation_id"],
+    ["setParentSessionIdIfNull id", () =>
+      repositoryForInputs().setParentSessionIdIfNull(1.5, "parent"), "conversation_id"],
+    ["setParentSessionIdIfNull NUL", () =>
+      repositoryForInputs().setParentSessionIdIfNull(1, "bad\0parent"), "parent_session_id"],
     ["markConversationBootstrapped", () =>
       repositoryForInputs().markConversationBootstrapped(Number.POSITIVE_INFINITY), "conversation_id"],
     ["createMessage conversation", () => repositoryForInputs().createMessage({

@@ -459,16 +459,20 @@ describe("handleSessionEnd", () => {
     Object.assign(new Error("deadline expired"), { name: "AbortError" }),
     new SyntaxError("invalid response JSON"),
   ])("keeps ordinary completion failure nonfatal: %s", async error => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const client = createMockClient({ ingested: 2 });
     vi.mocked(client.post).mockResolvedValueOnce({ ingested: 2 }).mockRejectedValueOnce(error);
-    await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client))
-      .resolves.toEqual({ exitCode: 0, stdout: "" });
-    expect(client.post).toHaveBeenCalledWith("/session-complete", expect.any(Object), {
-      signal: expect.any(AbortSignal),
-    });
+    try {
+      await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client))
+        .resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(client.post).toHaveBeenCalledWith("/session-complete", expect.any(Object), {
+        signal: expect.any(AbortSignal),
+      });
+    } finally { stderr.mockRestore(); }
   });
 
   it.each(["contention", "journal"])("preserves fresh completion fence %s policy", async kind => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const client = createMockClient({ ingested: 2 });
     const error = kind === "contention"
       ? new PrivateMutationLockContentionError("fixture publication busy")
@@ -485,7 +489,7 @@ describe("handleSessionEnd", () => {
       else await expect(pending).resolves.toEqual({ exitCode: 0, stdout: "" });
       expect(admissionCount).toBe(3);
       expect(vi.mocked(client.post).mock.calls.some(([path]) => path === "/session-complete")).toBe(false);
-    } finally { fence.mockRestore(); }
+    } finally { fence.mockRestore(); stderr.mockRestore(); }
   });
 
   it("rethrows a local journal error from the completion request seam", async () => {
@@ -493,6 +497,101 @@ describe("handleSessionEnd", () => {
     const error = new BackendPublicationJournalError("malformed-journal", "fixture journal malformed");
     vi.mocked(client.post).mockResolvedValueOnce({ ingested: 2 }).mockRejectedValueOnce(error);
     await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client)).rejects.toBe(error);
+  });
+
+  describe("unacknowledged completion diagnostic", () => {
+    const diagnostic = (reason: string) => "lcm: session completion was not acknowledged (" + reason + ")\n";
+    const input = '{"session_id":"s1","cwd":"/tmp"}';
+    const completionFailure = (error: unknown): DaemonClient => {
+      const client = createMockClient({ ingested: 2 });
+      vi.mocked(client.post).mockResolvedValueOnce({ ingested: 2 }).mockRejectedValueOnce(error);
+      return client;
+    };
+    const diagnostics = (stderr: { mock: { calls: unknown[][] } }) =>
+      stderr.mock.calls.map(([chunk]) => chunk).filter(chunk => String(chunk).startsWith("lcm: session completion"));
+
+    it("classifies the retained completion deadline from the real signal", async () => {
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const client = createMockClient({ ingested: 2 });
+      vi.mocked(client.post).mockImplementation(async <T>(path: string, _body: unknown, options?: { signal?: AbortSignal }): Promise<T> => {
+        if (path === "/ingest") return { ingested: 2 } as T;
+        const signal = options!.signal!;
+        await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+        // Deliberately carries a status and secret-looking text: only the
+        // retained deadline signal may decide the reason.
+        throw Object.assign(new Error("secret /private/path token"), { statusCode: 503 });
+      });
+      try {
+        await expect(handleSessionEnd(input, client)).resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(diagnostics(stderr)).toEqual([diagnostic("timeout")]);
+      } finally { stderr.mockRestore(); }
+    });
+
+    it.each([
+      ["status-503", Object.assign(new Error("secret /private/path"), { statusCode: 503 })],
+      ["status-100", Object.assign(new Error("x"), { statusCode: 100 })],
+      ["status-599", Object.assign(new Error("x"), { statusCode: 599 })],
+      ["unavailable", Object.assign(new Error("x"), { statusCode: 99 })],
+      ["unavailable", Object.assign(new Error("x"), { statusCode: 600 })],
+      ["unavailable", Object.assign(new Error("x"), { statusCode: 503.5 })],
+      ["unavailable", Object.assign(new Error("x"), { statusCode: "503" })],
+      ["unavailable", new Error("transport failed with secret")],
+      ["unavailable", Object.assign(new Error("late"), { name: "AbortError" })],
+      ["unavailable", "string rejection"],
+      ["unavailable", null],
+    ])("reports %s for a non-deadline completion failure", async (reason, error) => {
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        await expect(handleSessionEnd(input, completionFailure(error)))
+          .resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(diagnostics(stderr)).toEqual([diagnostic(reason)]);
+      } finally { stderr.mockRestore(); }
+    });
+
+    it("reports unavailable when fence contention prevents the request", async () => {
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const client = createMockClient({ ingested: 2 });
+      const actualFence = publicationFence.assertHookPublicationFence;
+      let admissionCount = 0;
+      const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+        if (++admissionCount === 3) throw new PrivateMutationLockContentionError("fixture publication busy");
+        actualFence();
+      });
+      try {
+        await expect(handleSessionEnd(input, client)).resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(vi.mocked(client.post).mock.calls.some(([path]) => path === "/session-complete")).toBe(false);
+        expect(diagnostics(stderr)).toEqual([diagnostic("unavailable")]);
+      } finally { fence.mockRestore(); stderr.mockRestore(); }
+    });
+
+    it("writes no diagnostic for a journal error", async () => {
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const error = new BackendPublicationJournalError("malformed-journal", "fixture journal malformed");
+      try {
+        await expect(handleSessionEnd(input, completionFailure(error))).rejects.toBe(error);
+        expect(diagnostics(stderr)).toEqual([]);
+      } finally { stderr.mockRestore(); }
+    });
+
+    it("writes no diagnostic for an acknowledged completion or a Codex session", async () => {
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        await expect(handleSessionEnd(input, createMockClient({ ingested: 2 })))
+          .resolves.toEqual({ exitCode: 0, stdout: "" });
+        await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp","client":"codex"}', createMockClient({ ingested: 2 })))
+          .resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(diagnostics(stderr)).toEqual([]);
+      } finally { stderr.mockRestore(); }
+    });
+
+    it("keeps exit code and stdout when the diagnostic writer throws", async () => {
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => { throw new Error("EPIPE"); });
+      try {
+        await expect(handleSessionEnd(input, completionFailure(new Error("transport failed"))))
+          .resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(diagnostics(stderr)).toEqual([diagnostic("unavailable")]);
+      } finally { stderr.mockRestore(); }
+    });
   });
 
   describe("independent background scheduling failures", () => {

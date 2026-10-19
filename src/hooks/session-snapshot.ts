@@ -9,6 +9,7 @@ import {
   assertHookRootEstablished,
   isBackendPublicationJournalError,
 } from "./publication-fence.js";
+import { resolveHookSessionScope } from "./subagent-scope.js";
 
 export interface SnapshotDeps {
   statSync: (path: string) => { mtimeMs: number } | null;
@@ -32,8 +33,21 @@ export async function handleSessionSnapshot(
 ): Promise<{ exitCode: number; stdout: string }> {
   try {
     const input = JSON.parse(stdin || "{}");
-    const { session_id, cwd, transcript_path } = input;
-    if (!session_id || !cwd || !transcript_path) {
+    const { cwd } = input;
+    const scope = resolveHookSessionScope(input);
+    const session_id = scope.sessionId;
+    const isSubagentStop = input.hook_event_name === "SubagentStop";
+    // A SubagentStop transcript_path is the parent's rollout (or null); the
+    // child's own rollout is agent_transcript_path. Select first, then
+    // validate, and never read the parent's rollout for a child.
+    const transcript_path = isSubagentStop ? input.agent_transcript_path : input.transcript_path;
+    if (
+      !session_id
+      || !cwd
+      || typeof transcript_path !== "string"
+      || !transcript_path
+      || (isSubagentStop && !scope.isSubagent)
+    ) {
       return { exitCode: 0, stdout: "" };
     }
     const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
@@ -54,7 +68,7 @@ export async function handleSessionSnapshot(
       const config = loadDaemonConfig(defaultConfigPath());
       intervalSec = config.hooks?.snapshotIntervalSec ?? 60;
     }
-    const forceSnapshot = input.hook_event_name === "PreCompact";
+    const forceSnapshot = input.hook_event_name === "PreCompact" || isSubagentStop;
 
     // Throttle: stat cursor mtime, skip if within interval. PreCompact is a
     // boundary event, so force a final ingest attempt before Codex compacts.

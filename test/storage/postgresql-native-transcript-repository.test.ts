@@ -430,6 +430,34 @@ describe("PostgreSQL native transcript repository", () => {
     })).rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
   });
 
+  it("lists only linked source ordinals of one session and source, in a scoped transaction too", async () => {
+    const query = vi.fn(async (config: QueryConfig<unknown[]>) => {
+      expect(config.text).toContain("INNER JOIN lcm.transcript_messages AS link");
+      expect(config.text).toContain("transcript.native_session_id_sha256 =");
+      expect(config.text).toContain("transcript.source_locator = $4");
+      expect(config.values).toEqual([projectId, machineId, "codex", "sessions/a.jsonl", "session-a"]);
+      return result([{ source_ordinal: "1" }, { source_ordinal: 4n }]);
+    });
+    const input = { machineId, clientName: "codex", sourceLocator: "sessions/a.jsonl", nativeSessionId: "session-a" };
+    await expect(new PostgreSqlNativeTranscriptRepository(executor(query), projectId)
+      .listLinkedSourceOrdinals(input)).resolves.toEqual([1, 4]);
+    await expect(new PostgreSqlNativeTranscriptRepository(scopedExecutor(query), projectId)
+      .listLinkedSourceOrdinals(input)).resolves.toEqual([1, 4]);
+  });
+
+  it("refuses malformed provenance requests and rows", async () => {
+    const db = executor(() => result([{ source_ordinal: -1 }]));
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+    const input = { machineId, clientName: "codex", sourceLocator: "sessions/a.jsonl", nativeSessionId: "session-a" };
+    await expect(repository.listLinkedSourceOrdinals({ ...input, nativeSessionId: " " }))
+      .rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+    await expect(repository.listLinkedSourceOrdinals({ ...input, sourceLocator: "../outside" }))
+      .rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+    expect(db.query).not.toHaveBeenCalled();
+    await expect(repository.listLinkedSourceOrdinals(input))
+      .rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+  });
+
   it("aggregates message links set-wise across every transcript read", async () => {
     const db = executor(successfulQuery);
     const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);

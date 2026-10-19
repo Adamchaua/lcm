@@ -15,6 +15,7 @@ import {
   type NativeTranscriptCheckpointRecord,
   type NativeTranscriptMessageLinkRecord,
   type NativeTranscriptMessageSnapshotRepository,
+  type NativeTranscriptProvenanceRepository,
   type NativeTranscriptRecord,
   type NativeTranscriptRepository,
   type NativeTranscriptSessionMessageRecord,
@@ -103,6 +104,10 @@ type SourceLocatorRow = QueryResultRow & {
   native_session_id: unknown;
   source_locator: unknown;
   locator_count: unknown;
+};
+
+type LinkedSourceOrdinalRow = QueryResultRow & {
+  source_ordinal: unknown;
 };
 
 type TranscriptRow = QueryResultRow & {
@@ -930,6 +935,7 @@ type CheckpointLockDisposition =
 export class PostgreSqlNativeTranscriptRepository
 implements
   NativeTranscriptMessageSnapshotRepository,
+  NativeTranscriptProvenanceRepository,
   NativeTranscriptRepository {
   private readonly projectId: string;
 
@@ -1193,6 +1199,50 @@ implements
              GROUP BY transcript.transcript_id, selected_link.source_ordinal
              ORDER BY selected_link.source_ordinal, transcript.transcript_id`,
       values: [this.projectId, conversationId, messageId],
+    });
+  }
+
+  async listLinkedSourceOrdinals(
+    input: NativeTranscriptCheckpointKey & { readonly nativeSessionId: string },
+  ): Promise<readonly number[]> {
+    const operation = "listLinkedSourceOrdinals";
+    const key = this.validateKey(input, operation);
+    const nativeSessionId = nonemptyString(
+      input.nativeSessionId,
+      this.projectId,
+      operation,
+      "native_session_id",
+      true,
+    );
+    return this.read(operation, async (executor) => {
+      const result = await executor.query<LinkedSourceOrdinalRow>({
+        text: `SELECT DISTINCT transcript.source_ordinal
+               FROM lcm.native_transcripts AS transcript
+               INNER JOIN lcm.transcript_messages AS link
+                 ON link.project_id = transcript.project_id
+                AND link.transcript_id = transcript.transcript_id
+               WHERE transcript.project_id = $1
+                 AND transcript.machine_id = $2
+                 AND transcript.client_name = $3
+                 AND transcript.source_locator = $4
+                 AND transcript.native_session_id_sha256 =
+                   public.digest($5, 'sha256')
+                 AND transcript.native_session_id = $5
+               ORDER BY transcript.source_ordinal`,
+        values: [
+          this.projectId,
+          key.machineId,
+          key.clientName,
+          key.sourceLocator,
+          nativeSessionId,
+        ],
+      }, this.context(operation));
+      return result.rows.map((row) => nonnegativeInteger(
+        row.source_ordinal,
+        this.projectId,
+        operation,
+        "source_ordinal",
+      ));
     });
   }
 

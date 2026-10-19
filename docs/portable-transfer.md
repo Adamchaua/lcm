@@ -297,6 +297,15 @@ A run started before the upgrade that adds this check (schema migration 0008)
 carries no per-record content fingerprints and cannot complete. Copy it again
 into a fresh isolated destination.
 
+The portable schema digest also changes in the release that records a
+conversation's parent session (schema migration 0009; see
+[Portable record stream](portable-record-stream.md)). A transfer run, manifest
+or checkpoint produced by an older LCM fails closed with
+`incompatible-schema` under the new binary. Finish or abandon in-flight
+transfers before upgrading, then rerun them with the new binary. Copying again
+after a parent was recorded needs a fresh destination, because that
+conversation's record digest changes while its identity does not.
+
 The recheck belongs to the transition into the completed state. After a run
 has completed, later legitimate edits to the project do not make its completed
 status readback fail, and completing an already completed run again does
