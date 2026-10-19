@@ -28,6 +28,7 @@ const GOLDEN = {
   interrupt: "sha256:8b30c34242015a60fead632bfa0f58a9a9e7561afe958f038d2c3f72eb0a4e62",
   sessionEnd: "sha256:ca7a4d92ea4a593150b9734c2018c5fe9d0e76eb77f6d62cfbebf6c41b0656d9",
   foreign: "sha256:9e559ad47195227680137c179e4b2ea8e191d4bc023e76f73f6e74fdb97b85bb",
+  preTool: "sha256:ab1f47b7396d2f3349aa0006cb6e7aff8bacc25a9fb447a0bb2edd5fbf9a6fe1",
 };
 
 type StateEntry = readonly [snakeEvent: string, group: number, handler: number, hash: string];
@@ -91,6 +92,8 @@ describe("computeCodexHookHash", () => {
     expect(hashOf("UserPromptSubmit")).toBe(GOLDEN.promptCli);
     expect(hashOf("UserPromptSubmit", "mcp")).toBe(GOLDEN.promptMcp);
     expect(hashOf("Stop")).toBe(GOLDEN.stop);
+    const preTool = codexLcmHooks("cli", { preToolRecall: true }).PreToolUse[0];
+    expect(computeCodexHookHash("PreToolUse", preTool, preTool.hooks![0], "linux")).toBe(GOLDEN.preTool);
     expect(hashOf("Interrupt")).toBe(GOLDEN.interrupt);
     expect(hashOf("SessionEnd")).toBe(GOLDEN.sessionEnd);
     expect(computeCodexHookHash(
@@ -264,11 +267,12 @@ describe("inspectCodexReadiness statuses", () => {
       "x = 9223372036854775808\n", "x = 0x8000000000000000\n",
       "x = \"a" + C0(1) + "b\"\n", "x = 'a" + C0(0x7f) + "b'\n", 'x = """a \\q b"""\n', 'x = """a \\uD800 b"""\n',
       "# comment " + C0(1) + "\n", "# comment \r bare\n",
+      "x = 1e309\n", "x = 1_0e309\n", "x = [ -1e999 ]\n",
     ]) {
       const report = inspectCodexReadiness(input({ config: { state: "content", content: invalid + trusted } }));
       expect(new Set(report.rows.map((row) => row.status)), JSON.stringify(invalid)).toEqual(new Set(["state-unknown"]));
     }
-    for (const valid of ["x = 2024-02-29\n", "x = 23:59:60\n", "x = 9223372036854775807\n", "x = { b = 1,\n c = 2, }\n"]) {
+    for (const valid of ["x = 2024-02-29\n", "x = 23:59:60\n", "x = 9223372036854775807\n", "x = { b = 1,\n c = 2, }\n", "x = 1.7976931348623157e308\n", "x = 1e-400\n"]) {
       const report = inspectCodexReadiness(input({ config: { state: "content", content: valid + trusted } }));
       expect(new Set(report.rows.map((row) => row.status)), valid).toEqual(new Set(["ready"]));
     }
@@ -373,6 +377,49 @@ describe("inspectCodexReadiness statuses", () => {
       hooks: hooksWith((hooks) => { hooks.PreToolUse = [{ matcher: "*", hooks: [{ type: "command", command: "lcm post-tool --client codex", timeout: 9 }] }]; }),
     }));
     expect(installed.rows.find((row) => row.event === "PreToolUse")).toMatchObject({ drift: true, status: "untrusted" });
+  });
+});
+
+describe("inspectCodexReadiness opt-in PreToolUse role", () => {
+  const preGroup = codexLcmHooks("cli", { preToolRecall: true }).PreToolUse[0];
+  const preHash = GOLDEN.preTool;
+  const withPre = hooksWith((hooks) => { hooks.PreToolUse = [preGroup]; });
+  const trustedWithPre = { state: "content" as const, content: trustToml([...TRUSTED_ALL, ["pre_tool_use", 0, 0, preHash]]) };
+
+  it("expects the role only while enabled", () => {
+    const disabled = inspectCodexReadiness(input());
+    expect(disabled.rows.some((row) => row.event === "PreToolUse")).toBe(false);
+    expect(formatCodexReadiness(disabled).failures).toBe(0);
+
+    const missing = inspectCodexReadiness(input({ preToolRecall: true }));
+    expect(statuses(missing)["PreToolUse/pre-tool"]).toBe("missing");
+    const text = formatCodexReadiness(missing);
+    expect(text.failures).toBe(1);
+    expect(text.lines.join("\n")).toContain("unavailable LCM capabilities: recall LCM memory before tool use");
+  });
+
+  it("reports an installed role by trust whether or not it is expected", () => {
+    const ready = inspectCodexReadiness(input({ preToolRecall: true, hooks: withPre, config: trustedWithPre }));
+    expect(ready.rows.find((row) => row.event === "PreToolUse")).toMatchObject({ role: "pre-tool", status: "ready", drift: false });
+    expect(formatCodexReadiness(ready).failures).toBe(0);
+
+    const untrusted = inspectCodexReadiness(input({ preToolRecall: true, hooks: withPre }));
+    expect(statuses(untrusted)["PreToolUse/pre-tool"]).toBe("untrusted");
+
+    const stale = hooksWith((hooks) => { hooks.PreToolUse = [{ ...preGroup, matcher: "Bash" }]; });
+    const modified = inspectCodexReadiness(input({ preToolRecall: true, hooks: stale, config: trustedWithPre }));
+    expect(modified.rows.find((row) => row.event === "PreToolUse")).toMatchObject({ status: "modified", drift: true });
+
+    const leftover = inspectCodexReadiness(input({ hooks: withPre, config: trustedWithPre }));
+    expect(leftover.rows.find((row) => row.event === "PreToolUse")).toMatchObject({ status: "ready", drift: false });
+    expect(leftover.rows).toHaveLength(8);
+  });
+
+  it("honors a deliberate disable of the installed role", () => {
+    const toml = trustToml(TRUSTED_ALL)
+      + '[hooks.state."' + HOOKS + ':pre_tool_use:0:0"]\nenabled = false\ntrusted_hash = "' + preHash + '"\n';
+    const report = inspectCodexReadiness(input({ preToolRecall: true, hooks: withPre, config: { state: "content", content: toml } }));
+    expect(statuses(report)["PreToolUse/pre-tool"]).toBe("disabled");
   });
 });
 
@@ -547,6 +594,14 @@ describe("Codex readiness on disk", () => {
     expect(failing.failures).toBe(0);
     expect(failing.lines.join("\n")).toContain("stored connector transport unreadable (could not be read)");
     expect(failing.lines.join("\n")).not.toContain("secret path");
+
+    const wanted = runCodexReadinessCheck({ ...base, readPreToolRecall: () => true });
+    expect(wanted.failures).toBe(1);
+    expect(wanted.lines.join("\n")).toContain("PreToolUse hook (recall LCM memory before tool use): not installed");
+    const unreadable = runCodexReadinessCheck({ ...base, readPreToolRecall: () => { throw new Error("secret path /y"); } });
+    expect(unreadable.failures).toBe(0);
+    expect(unreadable.lines.join("\n")).not.toContain("PreToolUse");
+    expect(runCodexReadinessCheck({ ...base, readPreToolRecall: () => false }).failures).toBe(0);
 
     const stored = runCodexReadinessCheck({ ...base, readStoredTransport: () => "cli" as const });
     expect(stored.failures).toBe(0);

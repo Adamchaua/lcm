@@ -1012,7 +1012,7 @@ function withHookClient(stdinText: string, client: unknown): string {
 
 /** Dispatch a hook; Codex invocations additionally leave a best-effort LCM-local completion record. */
 async function dispatchObservedHook(
-  command: "restore" | "user-prompt" | "post-tool" | "session-snapshot",
+  command: "restore" | "user-prompt" | "post-tool" | "pre-tool" | "session-snapshot",
   input: string,
   client: unknown,
   context?: { transport?: "cli" | "mcp" },
@@ -1261,6 +1261,7 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   // preflight either.
   if (topLevel && (
     action === "post-tool"
+    || action === "pre-tool"
     || action === "restore"
     || action === "session-end"
     || action === "session-snapshot"
@@ -3125,6 +3126,24 @@ export async function runCli(
       exit(r.exitCode);
     });
 
+  // ─── pre-tool (hook) ───────────────────────────────────────────────────────
+  program
+    .command("pre-tool")
+    .description("Dispatch the pre-tool hook (PreToolUse event)")
+    .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
+    .option("-h, --help", "Show help")
+    .action(async (opts) => {
+      if (opts.help) {
+        const { printHelp } = await import("../src/cli-help.js");
+        printHelp("pre-tool"); exit(0);
+      }
+      const input = withHookClient(await readStdin(), opts.client);
+      const r = await dispatchObservedHook("pre-tool", input, opts.client);
+      if (r.stdout) stdout.write(r.stdout);
+      exit(r.exitCode);
+    });
+
   // ─── session-snapshot (hook) ─────────────────────────────────────────────
   program
     .command("session-snapshot")
@@ -3827,7 +3846,7 @@ export async function runCli(
       }
       const { AGENTS } = await import("../src/connectors/registry.js");
       const { listConnectors, listConnectorInventory } = await import("../src/connectors/installer.js");
-      const { readConnectorTransportSnapshot } = await import("../src/config-manager.js");
+      const { readConnectorTransportSnapshot, readPreToolRecallSnapshot } = await import("../src/config-manager.js");
       const { findAgent } = await import("../src/connectors/registry.js");
       const found = agentName ? findAgent(agentName) : undefined;
       const agents = found ? [found] : agentName ? [] : AGENTS;
@@ -3875,6 +3894,7 @@ export async function runCli(
           homeDir: homedir(),
           probeVersion: () => probeCodexCliVersion(connectorCwd),
           readStoredTransport: () => readConnectorTransportSnapshot(defaultConfigPath(), "codex"),
+          readPreToolRecall: () => readPreToolRecallSnapshot(defaultConfigPath()),
         });
         for (const line of readiness.lines) console.log(line);
         failures += readiness.failures;
