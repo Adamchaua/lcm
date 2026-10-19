@@ -59,7 +59,9 @@ closed status in [Observation status](#observation-status) leaves the process.
 ## Observation status
 
 Every telemetry family reports one status from a closed set, together with
-`observedAt` (UTC milliseconds) and the epoch fields that apply to the family.
+`observedAt` (UTC milliseconds). Apart from the cataloged
+`statements_stats_reset`, epoch values are internal comparison data and never
+leave the process (see [Epochs, resets, and rates](#epochs-resets-and-rates)).
 
 | Status | Meaning |
 |---|---|
@@ -129,6 +131,14 @@ their pull requests, and #640 certifies overhead.
 
 Cumulative counters are only comparable inside one epoch.
 
+Epoch values decide comparability and the family status. The
+`pg_stat_statements_info.stats_reset` timestamp is the one exception to the
+internal-only rule: it is exported as the cataloged family-level
+`statements_stats_reset`. Every other epoch value is internal
+comparison-context data and is never emitted: `pg_postmaster_start_time()`
+and the per-entry `stats_since` and `minmax_stats_since` values have no
+catalog entry and do not count toward the cardinality bound.
+
 - The statement epoch is the tuple of `pg_postmaster_start_time()`, the
   `pg_stat_statements_info.stats_reset` timestamp, and the entry's
   `stats_since`. It governs calls, rows, totals, block and WAL counters, mean,
@@ -194,9 +204,10 @@ unchanged. Otherwise no operation-wide rate is computable; LCM never compares
 only the surviving contributors. A min/max-only change invalidates the extrema
 comparison and nothing else.
 
-The first observation has no prior context. It reports cumulative values and
-epoch metadata, has status `observed` if it is otherwise complete, and has no
-computable rate. It makes no reset, decrease, or membership-change claim. The
+The first observation has no prior context. It reports cumulative values,
+retains its internal epoch data in the comparison context, has
+status `observed` if it is otherwise complete, and has no computable rate.
+It makes no reset, decrease, or membership-change claim. The
 missing baseline is a per-field reason, never a false reset.
 
 ## Query fingerprints
