@@ -1087,7 +1087,7 @@ function openValidatedSourceFile(
   }
   const fd = openSync(
     sourcePath,
-    constants.O_RDONLY | constants.O_NOFOLLOW,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
   );
   try {
     const descriptorStat = fstatSync(fd, { bigint: true });

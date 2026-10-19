@@ -624,6 +624,8 @@ publication admission. The retry checks publication state and the original
 project identity again; a blocked publication or changed identity fails closed.
 
 An initially missing or rejected transcript path retains the empty-input behavior.
+Transcript paths must be regular files; FIFOs and other special files are
+rejected without waiting for a writer.
 A source that disappears after path validation, or fails snapshot validation,
 fails closed. Validation now precedes parsed-message persistence for native paths,
 so an invalid source cannot first commit its parsed projection. Existing explicit
