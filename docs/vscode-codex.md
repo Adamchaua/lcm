@@ -316,11 +316,15 @@ forked conversation does not receive the same block twice. `startup` and
 Existing installs keep the old `startup|resume|clear` matcher until you re-run
 `lcm connectors install codex`. If the LCM restore hook has its own
 `SessionStart` group in `hooks.json`, install updates the matcher in place.
-If that group also holds other hooks, install stops without writing either file
+If that group also holds other hooks and its matcher is not already
+`startup|resume|clear|compact|fork`, install stops without writing either file
 and reports that the group matcher must change. Move the LCM handler into its
-own `SessionStart` group in `hooks.json` and re-run install, or run
-`lcm connectors remove codex` and then `lcm connectors install codex`. Either
-way, open Codex `/hooks` afterwards; Codex asks you to trust the hook again.
+own `SessionStart` group at the end of that event in `hooks.json` and re-run
+install, or run `lcm connectors remove codex` and then `lcm connectors install
+codex`. Either manual change can move other hooks between the positions Codex
+uses for their enabled flag and trust record. Open Codex `/hooks` afterwards
+and review every hook that moved, restoring the enabled settings you intend;
+Codex asks you to trust the hook again.
 
 Known limits:
 
