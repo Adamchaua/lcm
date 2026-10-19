@@ -208,6 +208,21 @@ the fail-closed admission behavior.
 
 Completion is best-effort when the daemon is unavailable, busy, or refuses
 publication admission. Ordinary completion failures still allow session exit.
+When a Claude session ends without the daemon acknowledging completion, the
+hook writes one fixed line to stderr:
+
+```text
+lcm: session completion was not acknowledged (<reason>)
+```
+
+`<reason>` is `timeout` when the one-second wait expired, `status-<code>` when
+the daemon answered with an HTTP error status (for example `status-503`), and
+`unavailable` for every other failure, including transport errors and
+publication-lock contention before the request. The line never includes error
+messages, response bodies, paths, or tokens. It does not change the exit code
+(`0`) or stdout. After a `timeout` the daemon may still have recorded the
+session, so persistence is uncertain. Codex Stop events and acknowledged
+completions write no such line.
 
 Concurrent operations in the same daemon queue their publication and storage
 admission, including early project identity checks. This prevents ordinary
