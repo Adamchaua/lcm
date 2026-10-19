@@ -3301,10 +3301,20 @@ describe("PostgreSQL harness container engine selection", () => {
       .toEqual({ cli: "/usr/bin/podman", flavour: "podman" });
     expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "/opt/tools/docker" }))
       .toEqual({ cli: "/opt/tools/docker", flavour: "docker" });
-    for (const rejected of ["", "  ", "podman ", "bogus", "nerdctl", "./podman", "bin/podman", "/usr/bin/nerdctl", "/usr/bin/podman\0x"]) {
+    for (const rejected of [
+      "", "  ", "podman ", "bogus", "nerdctl", "./podman", "bin/podman", "/usr/bin/nerdctl", "/usr/bin/podman\0x",
+      "podman.exe", "/usr/bin/nerdctl.exe", "/usr/bin/.exe", "/usr/bin/podman.exe.bak", "/usr/bin/Podman",
+    ]) {
       expect(() => resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: rejected }), JSON.stringify(rejected))
         .toThrow("LCM_TEST_CONTAINER_CLI must be");
     }
+  });
+
+  it("ignores a Windows .exe suffix on an absolute container CLI path", () => {
+    expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "/x/Podman.EXE" }))
+      .toEqual({ cli: "/x/Podman.EXE", flavour: "podman" });
+    expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "/x/docker.exe" }))
+      .toEqual({ cli: "/x/docker.exe", flavour: "docker" });
   });
 
   it("restricts Podman to local runs without a template archive", () => {

@@ -69,14 +69,17 @@ const CONTAINER_FLAVOURS = Object.freeze(["docker", "podman"]);
 /**
  * Select the container engine CLI once per harness run. Unset selects Docker;
  * otherwise only "docker", "podman" or an absolute path to one of them is valid.
+ * A Windows ".exe" suffix on the path's basename is ignored, case-insensitively.
  */
 export function resolveContainerEngine(environment = process.env) {
   const configured = environment[CONTAINER_CLI_VARIABLE];
   if (configured === undefined) return { cli: "docker", flavour: "docker" };
   if (typeof configured === "string" && !configured.includes("\0")) {
     if (CONTAINER_FLAVOURS.includes(configured)) return { cli: configured, flavour: configured };
-    if (isAbsolute(configured) && CONTAINER_FLAVOURS.includes(basename(configured))) {
-      return { cli: configured, flavour: basename(configured) };
+    if (isAbsolute(configured)) {
+      const executable = basename(configured);
+      const flavour = /\.exe$/iu.test(executable) ? executable.slice(0, -4).toLowerCase() : executable;
+      if (CONTAINER_FLAVOURS.includes(flavour)) return { cli: configured, flavour };
     }
   }
   throw new Error(
