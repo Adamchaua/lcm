@@ -704,6 +704,27 @@ describe("handlePostToolUse", () => {
     expect(await runNativePersistenceCase(payload)).toEqual([]);
   });
 
+  it("persists a bounded decision for a native Codex request_user_input call without raw response fields", async () => {
+    const rows = await runNativePersistenceCase({
+      tool_name: "request_user_input",
+      tool_input: {
+        questions: [{ id: "scope", header: "Scope", question: "Which scope?", options: [{ label: "Narrow", description: "RAW_OPTION_DESCRIPTION" }] }],
+        RAW_INPUT_FIELD: "RAW_INPUT_SECRET",
+      },
+      tool_response: '{"answers":{"scope":{"answers":["Narrow","user_note: keep it small"]},"other":{"answers":["RAW_UNKNOWN_ANSWER"]}}}',
+    });
+    expect(rows).toEqual([
+      expect.objectContaining({
+        session_id: "native-codex-session",
+        type: "decision",
+        category: "decision",
+        data: "Q: Which scope?\nA: Narrow; keep it small",
+        source_hook: "PostToolUse",
+      }),
+    ]);
+    expect(JSON.stringify(rows)).not.toContain("RAW_");
+  });
+
   it("does not persist raw native output, response, or secret sentinels", async () => {
     const rows = await runNativePersistenceCase({
       tool_name: "functions.exec_command",

@@ -333,7 +333,7 @@ configuration option is required for native command capture, and the 2,000-
 character adapter bound is fixed rather than configurable.
 
 Codex sends native tool names `functions.exec` and `functions.exec_command`.
-For those names, lcm accepts only the bounded semantic command (`command`, or
+For those shell names, lcm accepts only the bounded semantic command (`command`, or
 `cmd` when `command` is absent) and a direct status projection. `tool_output` is
 checked before `tool_response`; status fields are considered in this order:
 `isError`, `is_error`, `exit_code`, and `exitCode`. Boolean values are used
@@ -347,6 +347,12 @@ file-like fields. The existing event truncation and scrubbing pipeline still
 runs on derived event data. Commands whose trimmed text begins with `lcm
 store` are suppressed to prevent LCM's own writes from feeding back into
 passive learning.
+
+The native `apply_patch`, `spawn_agent` (reported as
+`collaborationspawn_agent` by Codex multi-agent v2), `request_user_input`, and
+`update_plan` tools are not adapted to Bash: their payloads reach the extractor
+unchanged and produce bounded file, dispatch, decision, and plan events. See
+[Codex native activity](passive-learning.md#codex-native-activity).
 
 `lcm connectors doctor codex` performs two checks for the targeted Codex
 connector. It first verifies the exact structural hook contract above. Only

@@ -357,3 +357,66 @@ describe("normalizePostToolInput", () => {
     expect(codexPostToolFunctionalCoverage()).toBe(true);
   });
 });
+
+describe("native Codex activity through normalization", () => {
+  const sentinel = "native-activity-raw-secret";
+
+  it.each([
+    {
+      name: "apply_patch",
+      input: {
+        tool_name: "apply_patch",
+        tool_input: { command: "*** Begin Patch\n*** Add File: src/new.ts\n+" + sentinel + "\n*** End Patch" },
+        tool_response: "Success. Updated the following files:\nA src/new.ts",
+      },
+      expected: { type: "file_write", category: "file", data: "src/new.ts (source)", priority: 3 },
+    },
+    {
+      name: "collaborationspawn_agent",
+      input: {
+        tool_name: "collaborationspawn_agent",
+        tool_input: { message: sentinel },
+        tool_response: '{"task_name":"/root/worker"}',
+      },
+      expected: { type: "subagent_dispatch", category: "subagent", data: "/root/worker", priority: 3 },
+    },
+    {
+      name: "request_user_input",
+      input: {
+        tool_name: "request_user_input",
+        tool_input: { questions: [{ id: "scope", header: "Scope", question: "Which scope?", options: [] }] },
+        tool_response: '{"answers":{"scope":{"answers":["Narrow"]}}}',
+      },
+      expected: { type: "decision", category: "decision", data: "Q: Which scope?\nA: Narrow", priority: 1 },
+    },
+    {
+      name: "update_plan",
+      input: {
+        tool_name: "update_plan",
+        tool_input: { explanation: "Reordered", plan: [{ step: "Do it", status: "pending" }] },
+        tool_response: "Plan updated",
+      },
+      expected: { type: "plan_update", category: "proposal", data: "Plan: Reordered\nSteps: Do it", priority: 3 },
+    },
+  ])("passes native $name through unchanged and extracts its event", ({ input, expected }) => {
+    const normalized = normalize({ client: "codex", ...input });
+
+    expect(normalized).toEqual(input);
+    expect(extractPostToolEvents(normalized)).toEqual([expected]);
+    expect(JSON.stringify(extractPostToolEvents(normalized))).not.toContain(sentinel);
+  });
+
+  it("keeps a legacy isError projection so a failed native call yields the generic error", () => {
+    const normalized = normalize({
+      client: "codex",
+      tool_name: "update_plan",
+      tool_input: { explanation: "Reordered", plan: [] },
+      tool_output: { isError: true, stdout: sentinel },
+    });
+
+    expect(normalized.tool_output).toEqual({ isError: true });
+    expect(extractPostToolEvents(normalized)).toEqual([
+      { type: "error_tool", category: "error", data: "update_plan error", priority: 1 },
+    ]);
+  });
+});
