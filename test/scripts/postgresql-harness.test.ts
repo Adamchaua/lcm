@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, win32 } from "node:path";
 import { Writable } from "node:stream";
@@ -58,6 +58,7 @@ import {
   runSanitizedProcess,
   sanitizeHarnessText,
   signalCleanupFailed,
+  stageHarnessScripts,
   validateRunNames,
   writeHarnessDiagnostic,
 } from "../../scripts/postgresql-harness.mjs";
@@ -2930,9 +2931,31 @@ describe("PostgreSQL harness utilities", () => {
     expect(mounts).toEqual([
       "${names.volume}:/var/lib/postgresql",
       "${directory}:/run/lcm-harness:ro,z",
-      "${cachedRunInitScript}:/run/lcm-cached-init.sh:ro,z",
-      "${initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro,z",
+      "${stagedScripts.cachedRunInitScript}:/run/lcm-cached-init.sh:ro,z",
+      "${stagedScripts.initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro,z",
     ]);
+    expect(source).toContain("const stagedScripts = stageHarnessScripts(directory);");
+  });
+
+  it("stages byte-identical, readable init scripts in the run directory", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-staged-scripts-"));
+    try {
+      const staged = stageHarnessScripts(directory);
+      expect(staged).toEqual({
+        initScript: join(directory, "init.sh"),
+        cachedRunInitScript: join(directory, "cached-run-init.sh"),
+      });
+      for (const [copy, original] of [
+        [staged.initScript, "init.sh"],
+        [staged.cachedRunInitScript, "cached-run-init.sh"],
+      ]) {
+        const source = new URL(`../postgresql/${original}`, import.meta.url);
+        expect(readFileSync(copy)).toEqual(readFileSync(source));
+        expect(statSync(copy).mode & 0o777).toBe(0o644);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("cleans every owned resource and the secret directory in order", async () => {
