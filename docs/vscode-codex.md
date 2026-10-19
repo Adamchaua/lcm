@@ -129,7 +129,7 @@ The hook connector installs these Codex events:
 |---|---|---|
 | `SessionStart` (`startup\|resume\|clear\|compact\|fork`) | `lcm restore --client codex` | Restores project context when Codex starts, resumes, clears, compacts, or forks a session |
 | `UserPromptSubmit` | `lcm user-prompt --client codex` | Searches memory and injects prompt-time hints |
-| `PostToolUse` | `lcm post-tool --client codex` | Captures bounded semantic signals from Codex shell (`Bash`) and MCP tool results |
+| `PostToolUse` | `lcm post-tool --client codex` | Captures bounded semantic signals from Codex shell (`Bash`) and MCP tool results, plus native file, decision, plan, and delegation tools |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingests transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingests transcript deltas and triggers compaction once the configured token threshold is reached |
 
@@ -284,8 +284,11 @@ command, so those cannot be observed. See
 for the full matrix. Raw stdout/stderr, raw responses, MCP arguments and
 content, and file-like fields are not persisted or interpreted as file events.
 A trimmed command beginning with `lcm store` is suppressed to avoid a feedback
-loop from LCM's own storage calls. There is no new configuration option for
-these fixed capture rules.
+loop from LCM's own storage calls. The native `apply_patch`, `spawn_agent`,
+`request_user_input`, and `update_plan` tools are captured separately as
+bounded file, dispatch, decision, and plan events; see
+[Codex native activity](passive-learning.md#codex-native-activity). There is no
+new configuration option for these fixed capture rules.
 
 Because this hook runs after every tool call, its CLI entrypoint does not run
 legacy-root bootstrap migration before reading and dispatching the payload.

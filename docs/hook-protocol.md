@@ -413,7 +413,7 @@ not):
 | Shell command finished by a later `write_stdin` poll | one `Bash` payload with the original command and call id | attributed to the original command, recorded once |
 | MCP call succeeded | `CallToolResult` with `content` | `mcp_call` |
 | MCP `isError: true`, handler error, aborted or interrupted call | none | nothing; not observable through PostToolUse |
-| `apply_patch` intercepted from a shell command | none | nothing; tracked in #1559 |
+| `apply_patch` intercepted from a shell command | none | nothing; native `apply_patch` calls are captured separately (see below) |
 
 Shell completions arrive without a status, so a nonzero exit is recorded the
 same way as a success. For MCP failures, handler errors and interrupted tools
@@ -428,6 +428,12 @@ file-like fields. The existing event truncation and scrubbing pipeline still
 runs on derived event data. Commands whose trimmed text begins with `lcm
 store` are suppressed to prevent LCM's own writes from feeding back into
 passive learning.
+
+The native `apply_patch`, `spawn_agent` (reported as
+`collaborationspawn_agent` by Codex multi-agent v2), `request_user_input`, and
+`update_plan` tools are not adapted to Bash: their payloads reach the extractor
+unchanged and produce bounded file, dispatch, decision, and plan events. See
+[Codex native activity](passive-learning.md#codex-native-activity).
 
 `lcm connectors doctor codex` reports the readiness of every LCM Codex hook from the
 base user `hooks.json` and `config.toml` (enabled, trusted, modified, missing, and so
