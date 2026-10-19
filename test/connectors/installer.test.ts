@@ -8,6 +8,7 @@ import { LCM_MANAGED_SKILL_MARKER, LCM_MARKERS } from '../../src/connectors/cons
 import { AGENTS } from '../../src/connectors/registry.js';
 import { canonicalHookCommand, hasManagedClaudeSettings, mergeClaudeSettings } from '../../src/installer/settings.js';
 import { renderGuidance } from '../../src/connectors/template-service.js';
+import * as configManager from '../../src/config-manager.js';
 import { readConnectorTransport, setConnectorTransport } from '../../src/config-manager.js';
 
 let tmpDir: string;
@@ -2401,5 +2402,133 @@ describe('error handling', () => {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;
     }
+  });
+});
+
+describe('installConnector — opt-in Codex PreToolUse hook', () => {
+  let originalHome: string | undefined;
+
+  const writeDaemonConfig = (path: string, hooks: unknown): void => {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(path, JSON.stringify({ hooks }), { mode: 0o600 });
+  };
+  const defaultConfig = (): string => join(tmpDir, '.lcm', 'config.json');
+  const hooksFile = (): string => join(tmpDir, '.codex', 'hooks.json');
+  const preToolGroups = (): unknown[] | undefined => (
+    JSON.parse(readFileSync(hooksFile(), 'utf8')) as { hooks: Record<string, unknown[]> }
+  ).hooks.PreToolUse;
+  const installBundle = (options: Record<string, unknown> = {}) => installConnector('codex', 'cli', tmpDir, {
+    persistTransport: false,
+    codexMcpRunner: { get: () => [] },
+    ...options,
+  });
+
+  beforeEach(() => {
+    originalHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  });
+
+  it('registers no PreToolUse hook until the setting is true', () => {
+    expect(installBundle().success).toBe(true);
+    expect(preToolGroups()).toBeUndefined();
+
+    writeDaemonConfig(defaultConfig(), { preToolRecall: false });
+    expect(installBundle().success).toBe(true);
+    expect(preToolGroups()).toBeUndefined();
+  });
+
+  it('adds, keeps and removes the hook across reinstalls as the setting toggles', () => {
+    writeDaemonConfig(defaultConfig(), { preToolRecall: true });
+    expect(installBundle().success).toBe(true);
+    expect(preToolGroups()).toEqual([expect.objectContaining({
+      matcher: '^(Bash|apply_patch|mcp__.*)$',
+      hooks: [expect.objectContaining({ command: 'lcm pre-tool --client codex', timeout: 5 })],
+    })]);
+
+    expect(installBundle().success).toBe(true);
+    expect(preToolGroups()).toHaveLength(1);
+
+    writeDaemonConfig(defaultConfig(), { preToolRecall: false });
+    expect(installBundle().success).toBe(true);
+    expect(preToolGroups()).toBeUndefined();
+  });
+
+  it('reads the setting from the supplied config path', () => {
+    writeDaemonConfig(defaultConfig(), { preToolRecall: false });
+    const alternate = join(tmpDir, 'alternate', 'config.json');
+    writeDaemonConfig(alternate, { preToolRecall: true });
+
+    expect(installBundle({ configPath: alternate }).success).toBe(true);
+    expect(preToolGroups()).toHaveLength(1);
+  });
+
+  it.each([
+    ['the single hook surface', () => installConnector('codex', 'hook', tmpDir)],
+    ['the legacy default bundle', () => installConnector('codex', undefined, tmpDir)],
+  ])('threads the setting through %s', (_label, install) => {
+    expect(install().success).toBe(true);
+    expect(preToolGroups()).toBeUndefined();
+
+    writeDaemonConfig(defaultConfig(), { preToolRecall: true });
+    expect(install().success).toBe(true);
+    expect(preToolGroups()).toHaveLength(1);
+  });
+
+  it.each([
+    ['the transport bundle', () => installBundle()],
+    ['the single hook surface', () => installConnector('codex', 'hook', tmpDir)],
+    ['the legacy default bundle', () => installConnector('codex', undefined, tmpDir)],
+  ])('fails %s before writing any Codex file when the setting cannot be read', (_label, install) => {
+    const hooksBefore = JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo mine' }] }] } });
+    const featuresBefore = '[features]\nhooks = false\n';
+    mkdirSync(join(tmpDir, '.codex'), { recursive: true });
+    writeFileSync(hooksFile(), hooksBefore);
+    writeFileSync(join(tmpDir, '.codex', 'config.toml'), featuresBefore);
+    vi.spyOn(configManager, 'readPreToolRecallSnapshot').mockImplementation(() => {
+      throw new Error('daemon config is unreadable');
+    });
+
+    expect(() => install()).toThrow('daemon config is unreadable');
+    expect(readFileSync(hooksFile(), 'utf8')).toBe(hooksBefore);
+    expect(readFileSync(join(tmpDir, '.codex', 'config.toml'), 'utf8')).toBe(featuresBefore);
+    expect(existsSync(join(tmpDir, '.codex', 'AGENTS.md'))).toBe(false);
+    expect(existsSync(join(tmpDir, '.codex', 'skills', 'lcm-memory', 'SKILL.md'))).toBe(false);
+  });
+
+  it('refuses a disable that would move a later user PreToolUse group and leaves both Codex files untouched', () => {
+    writeDaemonConfig(defaultConfig(), { preToolRecall: true });
+    expect(installBundle().success).toBe(true);
+    const hooks = JSON.parse(readFileSync(hooksFile(), 'utf8')) as { hooks: Record<string, unknown[]> };
+    hooks.hooks.PreToolUse.push({ hooks: [{ type: 'command', command: 'echo after' }] });
+    const edited = JSON.stringify(hooks, null, 2) + '\n';
+    writeFileSync(hooksFile(), edited);
+    const tomlBefore = readFileSync(join(tmpDir, '.codex', 'config.toml'), 'utf8');
+
+    writeDaemonConfig(defaultConfig(), { preToolRecall: false });
+    expect(() => installBundle()).toThrow('LCM cannot update PreToolUse (a later hook would change position)');
+    expect(readFileSync(hooksFile(), 'utf8')).toBe(edited);
+    expect(readFileSync(join(tmpDir, '.codex', 'config.toml'), 'utf8')).toBe(tomlBefore);
+
+    writeDaemonConfig(defaultConfig(), { preToolRecall: true });
+    expect(installBundle().success).toBe(true);
+    expect(preToolGroups()).toHaveLength(2);
+  });
+
+  it('does not read daemon config for installs that write no Codex hook file', () => {
+    const read = vi.spyOn(configManager, 'readPreToolRecallSnapshot').mockImplementation(() => {
+      throw new Error('daemon config must not be read');
+    });
+
+    expect(installConnector('codex', 'skill', tmpDir).success).toBe(true);
+    expect(installConnector('codex', 'rules', tmpDir).success).toBe(true);
+    expect(installConnector('claude-code', 'skill', tmpDir).success).toBe(true);
+    expect(installConnector('claude-code', 'cli', tmpDir, { persistTransport: false }).success).toBe(true);
+    expect(read).not.toHaveBeenCalled();
   });
 });
