@@ -141,6 +141,30 @@ export function codexLcmHooks(
         ],
       },
     ],
+    SubagentStart: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: lcmCommand("restore"),
+            timeout: 30,
+            statusMessage: "Loading LCM memory for subagent",
+          },
+        ],
+      },
+    ],
+    SubagentStop: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: lcmCommand("session-snapshot"),
+            timeout: 30,
+            statusMessage: "Saving LCM subagent memory",
+          },
+        ],
+      },
+    ],
     // Codex clamps Interrupt and SessionEnd command hooks to 1..3 seconds and
     // kills the process group at the cap, so 3 is the most these can use.
     Interrupt: [

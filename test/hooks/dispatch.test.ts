@@ -285,6 +285,16 @@ describe("dispatchHook", () => {
     expect(ensureBootstrapped).not.toHaveBeenCalled();
   });
 
+  it("verifies the endpoint for a Codex child snapshot that lacks the tree session_id", async () => {
+    vi.mocked(ensureCoreEndpoint).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: true, port: 4242 });
+    vi.mocked(handleSessionSnapshot).mockClear();
+    const stdin = JSON.stringify({ client: "codex", agent_id: "child-thread" });
+    await dispatchHook("session-snapshot", stdin);
+    expect(ensureCoreEndpoint).toHaveBeenCalledOnce();
+    expect(handleSessionSnapshot).toHaveBeenCalledWith(stdin, { verifiedPort: 4242 });
+  });
+
   it("binds snapshot dispatch to the verified port when configuration changes afterward", async () => {
     vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: true, port: 3737 });
     vi.mocked(loadHookConfig).mockClear();
@@ -554,6 +564,26 @@ describe("LCM_ENABLED=false", () => {
     ).resolves.toEqual({ exitCode: 0, stdout: "" });
 
     expect(handleUserPromptSubmit).not.toHaveBeenCalled();
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it("makes Codex subagent restore and snapshot hooks no-ops", async () => {
+    vi.clearAllMocks();
+    vi.stubEnv("LCM_ENABLED", "false");
+    const subagent = JSON.stringify({
+      session_id: "tree-root",
+      agent_id: "child-thread",
+      agent_transcript_path: "/rollouts/child.jsonl",
+      client: "codex",
+    });
+
+    await expect(dispatchHook("restore", subagent)).resolves.toEqual({ exitCode: 0, stdout: "" });
+    await expect(dispatchHook("session-snapshot", subagent)).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handleSessionStart).not.toHaveBeenCalled();
     expect(handleSessionSnapshot).not.toHaveBeenCalled();
     expect(ensureBootstrapped).not.toHaveBeenCalled();
     expect(ensureCoreEndpoint).not.toHaveBeenCalled();

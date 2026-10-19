@@ -867,4 +867,33 @@ describe("handlePostToolUse", () => {
       session_id: "s1", tool_name: "AskUserQuestion", tool_input: {}, tool_output: { isError: true }, daemon_port: 0,
     }))).toEqual({ exitCode: 0, stdout: "" });
   });
+
+  describe("Codex subagent scope", () => {
+    const decision = {
+      tool_name: "AskUserQuestion",
+      tool_input: { question: "Use SQLite?" },
+      tool_response: "yes",
+    };
+
+    it("stores a child's events under agent_id rather than the tree session_id", async () => {
+      const rows = await runNativePersistenceCase({ ...decision, agent_id: "child-thread", agent_type: "worker" });
+      expect(rows).toEqual([expect.objectContaining({ session_id: "child-thread", source_hook: "PostToolUse" })]);
+    });
+
+    it("attributes a child by agent_id when the tree session_id is missing or malformed", async () => {
+      expect(await runNativePersistenceCase({ ...decision, session_id: undefined, agent_id: "child-thread" }))
+        .toEqual([expect.objectContaining({ session_id: "child-thread" })]);
+      expect(await runNativePersistenceCase({ ...decision, session_id: 12, agent_id: "child-thread" }))
+        .toEqual([expect.objectContaining({ session_id: "child-thread" })]);
+    });
+
+    it("keeps session_id for malformed agent_id and for non-Codex clients", async () => {
+      expect(await runNativePersistenceCase({ ...decision, agent_id: "" }))
+        .toEqual([expect.objectContaining({ session_id: "native-codex-session" })]);
+      expect(await runNativePersistenceCase({ ...decision, agent_id: 9 }))
+        .toEqual([expect.objectContaining({ session_id: "native-codex-session" })]);
+      expect(await runNativePersistenceCase({ ...decision, agent_id: "child-thread", client: "claude" }))
+        .toEqual([expect.objectContaining({ session_id: "native-codex-session" })]);
+    });
+  });
 });

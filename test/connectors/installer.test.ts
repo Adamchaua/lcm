@@ -1062,6 +1062,8 @@ describe('installConnector — Codex native hooks', () => {
       statusMessage: 'Saving LCM memory before compaction',
     });
     expect(hooks.hooks.Stop[0].hooks[0].command).toBe('lcm session-snapshot --client codex');
+    expect(hooks.hooks.SubagentStart[0].hooks[0].command).toBe('lcm restore --client codex');
+    expect(hooks.hooks.SubagentStop[0].hooks[0].command).toBe('lcm session-snapshot --client codex');
     // Codex clamps terminal hooks to three seconds and ignores matchers.
     expect(hooks.hooks.Interrupt).toEqual([{
       hooks: [{

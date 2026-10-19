@@ -71,6 +71,11 @@ export interface ConversationRepository {
   getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null>;
   getOrCreateConversation(sessionId: string, title?: string): Promise<ConversationRecord>;
   markConversationBootstrapped(conversationId: ConversationId): Promise<void>;
+  /**
+   * Record the immediate parent session once; an existing value is kept and
+   * never cleared. Does not change updated_at.
+   */
+  setParentSessionIdIfNull(conversationId: ConversationId, parentSessionId: string): Promise<void>;
   listConversations(): Promise<ConversationRecord[]>;
   /**
    * Create one explicit sequence value for replay/import.
@@ -228,6 +233,19 @@ export interface NativeTranscriptMessageSnapshotRepository {
   getNativeTranscriptMessageSnapshot(
     nativeSessionId: string,
   ): Promise<readonly NativeTranscriptSessionMessageRecord[]>;
+}
+
+/**
+ * Narrow read-only provenance seam, available inside a project transaction.
+ *
+ * It reports which committed native records of one source are linked to a
+ * stored message, so an ingest decision can honor links that already exist.
+ */
+export interface NativeTranscriptProvenanceRepository {
+  /** Ascending source ordinals of the session's linked native records in one source. */
+  listLinkedSourceOrdinals(
+    input: NativeTranscriptCheckpointKey & { readonly nativeSessionId: string },
+  ): Promise<readonly number[]>;
 }
 
 /**
@@ -458,6 +476,8 @@ export type TransactionRepositories = ProjectRepositories & Readonly<{
    * backends that run concurrent root transactions on separate connections.
    */
   promotedDecisionSerializer?: PromotedDecisionSerializer;
+  /** Transaction-scoped native link provenance; absent on backends without native storage. */
+  nativeProvenance?: NativeTranscriptProvenanceRepository;
 }>;
 
 export interface ProjectStorage extends ProjectRepositories {

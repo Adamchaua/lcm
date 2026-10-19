@@ -6,6 +6,7 @@ import {
   rethrowBackendPublicationJournalError,
 } from "./publication-fence.js";
 import type { ConnectorTransport } from "../connectors/types.js";
+import { resolveHookSessionScope } from "./subagent-scope.js";
 import type { TerminalHookContext } from "./terminal-snapshot.js";
 
 export const HOOK_COMMANDS = ["compact", "post-tool", "pre-tool", "restore", "session-end", "session-snapshot", "user-prompt"] as const;
@@ -72,7 +73,10 @@ export async function dispatchHook(
   if (command !== "compact" && command !== "user-prompt") {
     // Lazy bootstrap: create config + start daemon on first hook fire per session
     try {
-      const { session_id } = JSON.parse(stdinText || "{}");
+      // A Codex child bootstraps under its tree session_id; one that lacks it
+      // is still verified under its agent_id, like any other snapshot.
+      const scope = resolveHookSessionScope(JSON.parse(stdinText || "{}"));
+      const session_id = scope.treeSessionId ?? scope.sessionId;
       if (session_id) {
         const { ensureBootstrapped, ensureCoreEndpoint } = await import("../bootstrap.js");
         // Session snapshots contain transcript paths and payload data, so they
