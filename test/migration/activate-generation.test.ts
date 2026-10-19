@@ -24,6 +24,7 @@ import {
   type PostgreSqlBackendPublicationMutationInput,
 } from "../../src/storage/postgresql/publication-guard.js";
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage/postgresql/publication-remote-guard.js";
+import { PostgreSqlRuntimeReadinessError, type PostgreSqlRuntimeReadiness } from "../../src/storage/postgresql/runtime-readiness.js";
 import { PORTABLE_RECORD_DOMAIN_ORDER, type PortableDomain } from "../../src/storage/portable-record.js";
 import {
   MigrationActivationError,
@@ -114,6 +115,10 @@ const HASH_B = "b".repeat(64);
 const HASH_C = "c".repeat(64);
 const SETTINGS: PostgreSqlConnectionSettings = {
   url: "postgresql://unused", caFile: "/dev/null", poolMax: 1, connectionTimeoutMs: 1000, idleTimeoutMs: 1000, statementTimeoutMs: 1000,
+};
+/** What the (fake) transfer verifier admits; the activation role holds the transfer profile (plan-v7.2 B1). */
+const READINESS: PostgreSqlRuntimeReadiness = {
+  currentMigrationIds: [], expectedOwner: "lcm_migrator", runtimeRole: "lcm", managedObjectCount: 0, definitionObjectCount: 0, privilegeManifestVersion: 1,
 };
 
 const roots: string[] = [];
@@ -407,8 +412,8 @@ async function fixture(options: { held?: boolean; rosterMachine?: string; extraP
     destinationCensus: domainCensus("census"),
     createOrdinaryRuntime: ordinary,
     createTransferRuntime: transfer,
-    verifyTransferSchema: async () => undefined,
-    checkTargetHealth: async () => health.shift() ?? ({ status: "healthy", readiness: { currentMigrationIds: [], expectedOwner: "lcm_migrator", runtimeRole: "lcm", managedObjectCount: 0, definitionObjectCount: 0, privilegeManifestVersion: 1 } }),
+    verifyTransferSchema: async () => READINESS,
+    checkTargetHealth: async () => health.shift() ?? ({ status: "healthy", readiness: READINESS }),
     captureDestinationIdentity: async () => ({ version: 1, ...identity }),
     readDestinationCensus: async () => ({ census: deps.destinationCensus }),
     evidence,
@@ -575,6 +580,24 @@ describe("runMigrationActivation: refusals (no effect begun)", () => {
     f.deps.destinationCensus = domainCensus("drifted");
     const outcome = await f.run();
     expect(outcome).toMatchObject({ status: "refused", step: "S8", reason: "census-drift" });
+  });
+
+  it("S6 admits the activation role through the transfer verifier (plan-v7.2 B2): a transfer-profile refusal is target-unhealthy before any effect", async () => {
+    const f = await fixture();
+    const executors: unknown[] = [];
+    const outcome = await f.run({
+      checkTargetHealth: checkMigrationTargetHealth,
+      verifyTransferSchema: async (executor) => { executors.push(executor); throw new PostgreSqlRuntimeReadinessError("acl-shape", "inspectSchemaAcl"); },
+    });
+    expect(outcome).toMatchObject({ status: "refused", step: "S6", reason: "target-unhealthy", effectBegun: false });
+    if (outcome.status !== "refused") return;
+    expect(outcome.detail).toContain("schema-mismatch");
+    expect(outcome.detail).toContain("acl-shape");
+    // Exactly one admission ran, on the ordinary runtime (the one with the lease guard), not on a transfer runtime.
+    expect(executors).toHaveLength(1);
+    expect((executors[0] as MigrationActivationOrdinaryRuntime).backendPublicationGuard).toBeTypeOf("function");
+    expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+    expect(readActivationGenerationLink({ homeDir: f.homeDir, generationId: GENERATION }).state).toBe("authoritatively-absent");
   });
 });
 
@@ -992,13 +1015,37 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
 
   it("post-publication-unhealthy at S15 keeps the new selection, returns the restart verdict and applied yes on re-entry", async () => {
     const f = await fixture();
-    f.deps.health.push({ status: "healthy", readiness: { currentMigrationIds: [], expectedOwner: "lcm_migrator", runtimeRole: "lcm", managedObjectCount: 0, definitionObjectCount: 0, privilegeManifestVersion: 1 } });
+    f.deps.health.push({ status: "healthy", readiness: READINESS });
     f.deps.health.push({ status: "unhealthy", reason: "schema-mismatch", detail: "fake", sqlState: null });
     const outcome = await f.run();
     expect(outcome).toMatchObject({ status: "post-publication-unhealthy", health: { status: "unhealthy" }, restart: { status: "satisfied" }, identity: { publicationId: f.publicationId } });
     expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("completed");
     expect(f.manifestStore.read(GENERATION).phase).toBe("activating");
     // The next call rolls forward through S15/S16 (I2: no automatic reversal).
+    expectActivated(f, await f.run(), "publication-journal");
+  });
+
+  it("S15 admits through the transfer verifier too (plan-v7.2 B2): a transfer-profile refusal after publication is post-publication-unhealthy", async () => {
+    const f = await fixture();
+    let admissions = 0;
+    const outcome = await f.run({
+      checkTargetHealth: checkMigrationTargetHealth,
+      // Admission 1 is S6, admission 2 is S7's own transfer schema check, admission 3 is S15.
+      verifyTransferSchema: async () => {
+        admissions += 1;
+        if (admissions === 3) throw new PostgreSqlRuntimeReadinessError("effective-privilege", "inspectEffectivePrivileges");
+        return READINESS;
+      },
+    });
+    expect(admissions).toBe(3);
+    expect(outcome).toMatchObject({
+      status: "post-publication-unhealthy",
+      health: { status: "unhealthy", reason: "schema-mismatch", detail: expect.stringContaining("effective-privilege") },
+      restart: { status: "satisfied" },
+      identity: { publicationId: f.publicationId },
+    });
+    expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("completed");
+    expect(f.manifestStore.read(GENERATION).phase).toBe("activating");
     expectActivated(f, await f.run(), "publication-journal");
   });
 
@@ -1204,6 +1251,8 @@ describe("runMigrationActivation: input validation, production defaults and the 
     await transfer.close();
     const failing = { query: async () => { throw new RangeError("no database"); } } as unknown as MigrationActivationTransferRuntime;
     await expect(deps.verifyTransferSchema(failing, { expectedOwner: "lcm_migrator" })).rejects.toBeInstanceOf(Error);
+    // S6/S15 reach checkMigrationTargetHealth itself (whose own default stays the runtime verifier; see target-health.test.ts).
+    expect(deps.checkTargetHealth).toBe(checkMigrationTargetHealth);
     const session = { query: async () => { throw new RangeError("no database"); }, close: async () => undefined } as never;
     await expect(deps.readDestinationCensus(session, { settings, expectedOwner: "lcm_migrator", expectedIdentity: f.input.expectedIdentity, scratchParent: f.homeDir })).rejects.toBeInstanceOf(Error);
     const coordinator = deps.createCoordinator({ homeDir: f.homeDir, guard: f.guard, machineId: MACHINE });

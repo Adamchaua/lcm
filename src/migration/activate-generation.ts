@@ -31,7 +31,7 @@ import {
 } from "../storage/postgresql/publication-guard.js";
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../storage/postgresql/publication-remote-guard.js";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
-import { verifyPostgreSqlTransferSchema } from "../storage/postgresql/runtime-readiness.js";
+import { verifyPostgreSqlTransferSchema, type PostgreSqlRuntimeReadiness } from "../storage/postgresql/runtime-readiness.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
 import { canonicalSha256 } from "../storage/portable-record.js";
 import {
@@ -185,9 +185,12 @@ import {
  *   link is written only after the artifact at S11.
  * - S5 report freshness: activationEligible, id/sha match the manifest
  *   ref, live destination identity, pre-publication projectMapWitness.
- * - S6 G7 health on the ordinary runtime. S7 census on a NEW transfer
- *   snapshot after the transfer schema check (amendment 4). S8: every class
- *   ran, mismatch totals zero, recomputed census equals the report's.
+ * - S6 G7 health on the ordinary runtime, admitted through the transfer
+ *   verifier (plan-v7.2 B2: activation runs under the transfer role alone,
+ *   so both settings carry that role; see MigrationActivationInput). S7
+ *   census on a NEW transfer snapshot after the transfer schema check
+ *   (amendment 4). S8: every class ran, mismatch totals zero, recomputed
+ *   census equals the report's.
  * - S9/S10 prepare-activation (inputSha256 = sha(epochId)) and
  *   publish-activation begin. S11 artifact -> link -> epoch -> attempt ->
  *   witness -> witness binding (mandatory order, plan-v6 section 7).
@@ -336,9 +339,19 @@ export const MIGRATION_ACTIVATION_LEASE_TTL_MS = 15 * 60 * 1000;
 export type MigrationActivationInput = Readonly<{
   homeDir: string;
   generationId: string;
-  /** Transfer-role settings (A5 copy-binding read and the S7 census); #627 supplies them. */
+  /** Transfer-role settings (A5 copy-binding read and the S7 census); #627
+   * supplies them. Activation runs entirely under the transfer role
+   * (plan-v7.2 B1): ordinarySettings MUST carry these same transfer-role
+   * settings, and #627 passes the same object twice. */
   transferSettings: PostgreSqlConnectionSettings;
-  /** Ordinary-role settings (S2 lease guard, S6/S15 health); #627 supplies them (R4). */
+  /** Settings for the S2 lease guard and the S6/S15 health probes; #627
+   * supplies them (R4). These are the SAME transfer-role settings as
+   * transferSettings (plan-v7.2 B1), not the daemon's runtime role: S6 and
+   * S15 admit this role through the transfer verifier, so a caller that
+   * passes runtime-only settings fails closed at S6 (target-unhealthy,
+   * schema-mismatch) before any effect. Applying the runtime grants and
+   * revoking the transfer grants is the operator's step after activation
+   * (docs/migration-cutover.md); #1607 is the later readiness improvement. */
   ordinarySettings: PostgreSqlConnectionSettings;
   /** The destination project identity #627 resolved for verify: id, canonical,
    * remoteProjectId (PostgreSQL UUIDv7) and localProjectId (project hash).
@@ -426,10 +439,12 @@ export interface MigrationActivationDependencies {
   readonly readVerificationReport: (generationId: string, reportSha256: string) => MigrationVerificationReport;
   readonly createOrdinaryRuntime: (settings: PostgreSqlConnectionSettings) => MigrationActivationOrdinaryRuntime;
   readonly createTransferRuntime: (settings: PostgreSqlConnectionSettings) => MigrationActivationTransferRuntime;
+  /** The transfer-profile admission (verifyPostgreSqlTransferSchema): S7's
+   * schema check, and the verifier S6/S15 hand to checkTargetHealth (B2). */
   readonly verifyTransferSchema: (
     executor: PostgreSqlQueryExecutor,
     options: { readonly expectedOwner: string; readonly signal?: AbortSignal },
-  ) => Promise<unknown>;
+  ) => Promise<PostgreSqlRuntimeReadiness>;
   readonly checkTargetHealth: typeof checkMigrationTargetHealth;
   readonly readCopyBinding: typeof readMigrationCopyBindingSha256;
   readonly captureDestinationIdentity: (
@@ -1021,8 +1036,15 @@ function projectMapWitness(ctx: Context, mode: "pre-publication" | "post-publica
   }
 }
 
+/** S6/S15 (plan-v7.2 B2): the health probe is the factory's, but the schema
+ * admission is the transfer verifier, because the activation role holds the
+ * transfer profile. checkMigrationTargetHealth's own default (the runtime
+ * verifier) is untouched for its other callers. */
 function observeHealth(ctx: Context): Promise<MigrationTargetHealthResult> {
-  return ctx.deps.checkTargetHealth({ runtime: ctx.ordinary!, expectedOwner: ctx.input.expectedOwner, signal: ctx.input.signal });
+  return ctx.deps.checkTargetHealth(
+    { runtime: ctx.ordinary!, expectedOwner: ctx.input.expectedOwner, signal: ctx.input.signal },
+    { verifyRuntimeSchema: ctx.deps.verifyTransferSchema },
+  );
 }
 
 /** S6: refuse unless healthy. S15 observes without refusing (see finishAfterSelection). */
