@@ -536,13 +536,17 @@ describe("installRollbackGeneration", () => {
 
     it.each([
       ["missing", (path: string) => { chmodSync(path, 0o600); fsModule.unlinkSync(path); }, "is missing"],
+      // The original is renamed aside rather than unlinked, so its inode stays allocated and the replacement
+      // cannot reuse it (a filesystem that recycles a freed inode number would otherwise pass the identity check
+      // and refuse on the bytes instead; the same-inode case is the "rewritten in place" test below).
       ["replaced by another database", (path: string) => {
-        chmodSync(path, 0o600); fsModule.unlinkSync(path);
+        chmodSync(path, 0o600); fsModule.renameSync(path, path + ".original");
         verifiedGenerationDatabase(join(path, ".."), "replacement-after-crash"); fsModule.renameSync(join(path, "..", "db.sqlite"), path); chmodSync(path, 0o600);
       }, "no longer a plain single-link read-only file"],
       ["replaced by another read-only database", (path: string) => {
-        chmodSync(path, 0o600); fsModule.unlinkSync(path);
+        chmodSync(path, 0o600); fsModule.renameSync(path, path + ".original");
         verifiedGenerationDatabase(join(path, ".."), "replacement-after-crash"); fsModule.renameSync(join(path, "..", "db.sqlite"), path); chmodSync(path, 0o400);
+        expect(statSync(path, { bigint: true }).ino).not.toBe(statSync(path + ".original", { bigint: true }).ino);
       }, "not the file its move-aside record completed"],
       ["the same bytes in a different file", (path: string) => {
         fsModule.copyFileSync(path, path + ".copy"); chmodSync(path, 0o600); fsModule.unlinkSync(path); fsModule.renameSync(path + ".copy", path); chmodSync(path, 0o400);
