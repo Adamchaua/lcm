@@ -272,7 +272,9 @@ source bytes and refuses unsupported content before copying it. After an
 offline in-place repair, rerun reconciliation to continue from its durable
 fence and marker state.
 
-No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
+No data is sent to any Long Context Manager (LCM) server. There is no telemetry;
+PostgreSQL operational observations stay local and on demand and are never
+uploaded.
 An explicitly configured PostgreSQL backend is a user-operated remote-primary
 store; daemon project writes and reads use it only after the publication and
 identity gates described below. Hook capture remains local and the data sent to
@@ -737,7 +739,7 @@ The `Security` section of the doctor output shows:
   There are no configuration options for this defense-in-depth behavior.
 - Hook project paths retain leading and trailing whitespace. Directories whose names differ only by that whitespace remain separate LCM projects.
 - Hook errors are attached to a project sidecar only when the reported working directory is an existing directory. Invalid paths are recorded in the bounded fallback log without creating project metadata.
-- Stats, status, pool diagnostics, and doctor use an allowlisted backend snapshot. They omit recalled-text previews (`topRecalled`), memory and transcript payloads, raw errors, SQL values, URLs, role names, CA paths, and arbitrary local paths. Verbose diagnostics retain the same boundary. Only observed numeric aggregates, safe identifiers, classified states, and fixed guidance are exposed. SQLite content is not modified; necessary WAL/SHM read coordination may occur. See [observational diagnostics](cli.md#observational-diagnostics).
+- Stats, status, pool diagnostics, and doctor use an allowlisted backend snapshot. They omit recalled-text previews (`topRecalled`), memory and transcript payloads, raw errors, SQL values, URLs, role names, CA paths, and arbitrary local paths. Verbose diagnostics retain the same boundary. Only observed numeric aggregates, safe identifiers, classified states, and fixed guidance are exposed. SQLite content is not modified; necessary WAL/SHM read coordination may occur. See [observational diagnostics](cli.md#observational-diagnostics). PostgreSQL telemetry follows the [telemetry and redaction contract](../src/storage/postgresql/reference/postgresql-telemetry.md).
 - Sidecar scans return a single aggregate truncation record when their time or database limit is reached, so diagnostic responses remain bounded even if the events directory contains many files.
 - A rooted path following a nested public URL inside a bracketed `file://` query wrapper is redacted in more shapes. This now includes URLs carrying brackets, such as an IPv6 authority or a bracketed path segment, and a Windows drive root such as `C:\` as the value that arms the handoff. Repeated separators inside one wrapper each redact their successor rather than only the first. Values that are not path roots, such as a bare relative value, still do not arm it.
 - Comma and semicolon are not sibling handoff separators in that wrapper, so a single-leading-backslash Windows value after them stays visible. POSIX paths and Windows drive roots after a comma or semicolon still become `<path>`.

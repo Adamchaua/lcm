@@ -564,7 +564,11 @@ The migrator is intentionally not a superuser.
 The following extensions are not prerequisites:
 
 - Deferred to an owning post-parity issue: `vector`, `vectorscale`, `anon`,
-  `pg_cron`, `pg_partman`, `pg_stat_monitor`, and `pgaudit`.
+  `pg_cron`, and `pg_partman`.
+- Not part of required P4 delivery: `pg_stat_monitor` and `pgaudit`. They
+  remain future opt-in research only after a measured need, under the
+  [deeper audit policy](postgresql-telemetry.md#deeper-audit-policy) of the
+  telemetry contract.
 - Rejected absent a measured use case: `hstore`, `lo`, `ltree`, and TimescaleDB.
 
 Adding one requires an explicit migration and operational review; availability
