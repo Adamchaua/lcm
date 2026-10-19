@@ -475,10 +475,16 @@ async function docker(args) {
   return runProcess("docker", args, { env: containerEngineEnvironment(process.env) });
 }
 
-// GitHub Actions keeps its runner-provided Docker engine. Every other run drives
-// the Docker CLI against the invoking user's rootless Podman API socket.
+// GitHub Actions keeps its runner-provided Docker engine. Other runs default to
+// the invoking user's rootless Podman API socket; LCM_TEST_CONTAINER_ENGINE=docker
+// keeps whatever engine the Docker CLI resolves.
 export function containerEngineEnvironment(environment, inspect = statSync) {
   if (environment.GITHUB_ACTIONS === "true") return environment;
+  const engine = environment.LCM_TEST_CONTAINER_ENGINE;
+  if (engine === "docker") return environment;
+  if (engine !== undefined && engine !== "podman") {
+    throw new Error("LCM_TEST_CONTAINER_ENGINE must be podman or docker");
+  }
   const runtimeDirectory = environment.XDG_RUNTIME_DIR;
   if (!runtimeDirectory || !isAbsolute(runtimeDirectory)) {
     throw new Error("local container harnesses require rootless Podman; XDG_RUNTIME_DIR must be an absolute path");

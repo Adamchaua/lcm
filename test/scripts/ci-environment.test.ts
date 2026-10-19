@@ -498,10 +498,24 @@ describe("container engine selection", () => {
     expect(containerEngineEnvironment(environment, socketStat(false))).toBe(environment);
   });
 
+  it("keeps the resolved Docker engine when Docker is explicitly selected", () => {
+    const environment = { LCM_TEST_CONTAINER_ENGINE: "docker", DOCKER_HOST: "unix:///var/run/docker.sock" };
+    expect(containerEngineEnvironment(environment, socketStat(false))).toBe(environment);
+  });
+
+  it("rejects an unknown engine selection", () => {
+    expect(() => containerEngineEnvironment({ LCM_TEST_CONTAINER_ENGINE: "nerdctl" }, socketStat(true)))
+      .toThrow("LCM_TEST_CONTAINER_ENGINE must be podman or docker");
+  });
+
   it("points local runs at the user's rootless Podman socket", () => {
     const inspected: string[] = [];
     const environment = containerEngineEnvironment(
-      { XDG_RUNTIME_DIR: "/run/user/1000", DOCKER_HOST: "unix:///var/run/docker.sock", KEEP: "1" },
+      {
+        XDG_RUNTIME_DIR: "/run/user/1000",
+        DOCKER_HOST: "unix:///var/run/docker.sock",
+        LCM_TEST_CONTAINER_ENGINE: "podman",
+      },
       (path: string) => {
         inspected.push(path);
         return { isSocket: () => true };
@@ -511,7 +525,7 @@ describe("container engine selection", () => {
     expect(environment).toEqual({
       XDG_RUNTIME_DIR: "/run/user/1000",
       DOCKER_HOST: "unix:///run/user/1000/podman/podman.sock",
-      KEEP: "1",
+      LCM_TEST_CONTAINER_ENGINE: "podman",
     });
   });
 
