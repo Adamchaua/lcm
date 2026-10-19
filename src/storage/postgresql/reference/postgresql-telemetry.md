@@ -428,7 +428,8 @@ even when no other value is usable.
 |---|---|---|---|
 | Pool | counters verified, relationship valid | `observed` | `degraded` at a daemon-origin ratio of 1 or more with waiting above 0, or with the failure latch; otherwise `healthy` |
 | Pool | maximum is 0 or idle exceeds total | `partial` | `degraded` only by the failure latch; otherwise `unavailable` |
-| Pool | counters unverified | `unavailable` | `unavailable` |
+| Pool | a counter is negative or not an exact safe integer | `partial` | `unavailable` |
+| Pool | counters missing or unverified | `unavailable` | `unavailable` |
 | Migration | full ledger within the cap | `observed` | `healthy` for `current`; otherwise `degraded` |
 | Migration | cap reached | `partial` | `degraded` (`ahead`, `drift`, or `checksum-mismatch`) |
 | Migration | malformed ledger or probe failure | `unavailable` or the failure status | `unavailable` |

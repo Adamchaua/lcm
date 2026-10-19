@@ -191,9 +191,21 @@ export function poolAction(health: TelemetryHealth, facts: PoolFacts | undefined
     : evidence?.saturated === true ? RUNTIME_HEALTH_ACTIONS.poolSaturated : RUNTIME_HEALTH_ACTIONS.unavailable;
   return selectAction(health, action);
 }
-export function poolTelemetry(pool: unknown, observedAt: number): PoolTelemetry {
+/** A counter that is a number but not an exact non-negative safe integer is out of range, not unverified. */
+function poolCounterOutOfRange(raw: unknown): boolean {
+  return isRecord(raw) && ["configuredMax", "total", "idle", "waiting"].some(key => {
+    const value = ownValue(raw, key);
+    return typeof value === "number" && safeCount(value) === undefined;
+  });
+}
+/** raw is the unsanitized counter record, used only to tell an out-of-range counter from an unverified pool. */
+export function poolTelemetry(pool: unknown, observedAt: number, raw?: unknown): PoolTelemetry {
   const facts = poolFacts(pool);
-  if (facts === undefined) return failureFamily("pool", "unavailable", observedAt);
+  if (facts === undefined) {
+    if (!poolCounterOutOfRange(raw)) return failureFamily("pool", "unavailable", observedAt);
+    const omitted: TelemetryOmission[] = [{ field: "saturationRatio", reason: "out-of-range" }];
+    return { status: deriveStatus(omitted, 1), observedAt, health: "unavailable", omitted, remediation: RUNTIME_HEALTH_ACTIONS.unavailable };
+  }
   const ratio = poolSaturationRatio(facts);
   const omitted: TelemetryOmission[] = ratio === undefined ? [{ field: "saturationRatio", reason: "invalid-input" }] : [];
   const evidence = poolEvidence(facts);

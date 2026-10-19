@@ -518,6 +518,30 @@ describe('runtime health telemetry on a healthy PostgreSQL probe', () => {
   });
 });
 
+describe('negative pool counters are out of range in telemetry only', () => {
+  const outOfRange={status:'partial',health:'unavailable',omitted:[{field:'saturationRatio',reason:'out-of-range'}]};
+  it('keeps the pool unverified and omits the daemon ratio as out-of-range', async () => {
+    const {dependencies}=fixture();
+    const factory={backend:'postgresql',getDiagnosticPool:()=>({configuredMax:8,total:2,idle:-1,waiting:0,failed:false})} as never;
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:factory});
+    expect(result.pool).toMatchObject({origin:'daemon',status:'unverified'});
+    expect(result.telemetry.pool).toMatchObject(outOfRange);
+  });
+  it('omits the diagnostic-probe ratio as out-of-range', async () => {
+    const {dependencies,runtime}=fixture(); runtime.poolDiagnostics=()=>({configuredMax:-4,total:0,idle:0,waiting:0,failed:false});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.pool).toMatchObject({origin:'diagnostic-probe',status:'unverified'});
+    expect(result.telemetry.pool).toMatchObject(outOfRange);
+  });
+  it('keeps the out-of-range reason in the timeout snapshot', async () => {
+    const {dependencies,runtime}=fixture(); runtime.health=()=>new Promise(()=>{});
+    const factory={backend:'postgresql',getDiagnosticPool:()=>({configuredMax:8,total:-2,idle:0,waiting:0,failed:false})} as never;
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:factory,_deadlineMs:10});
+    expect(result.classification).toBe('timeout');
+    expect(result.telemetry.pool).toMatchObject(outOfRange);
+  });
+});
+
 describe('runtime health telemetry never overrides the existing classification', () => {
   it('folds a degraded family into a healthy classification only', async () => {
     const {dependencies}=fixture();

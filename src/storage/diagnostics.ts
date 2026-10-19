@@ -221,11 +221,13 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
   let poolObservation: BackendDiagnosticPool | undefined;
   // Capture time of the pool counters, reused by the timeout DTO.
   let poolObservedAt = Date.now();
+  // Unsanitized counters, kept only so telemetry can tell an out-of-range value from an unverified pool.
+  let poolRaw: ReturnType<BackendDiagnosticRuntime["poolDiagnostics"]> | undefined;
   if (backend === "postgresql" && options.storageFactory !== undefined) {
     const factory = options.storageFactory as StorageBackendFactory & {
       getDiagnosticPool?: () => ReturnType<BackendDiagnosticRuntime["poolDiagnostics"]> | undefined;
     };
-    try { poolObservation = safePool(factory.getDiagnosticPool?.(), "daemon"); }
+    try { poolRaw = factory.getDiagnosticPool?.(); poolObservation = safePool(poolRaw, "daemon"); }
     catch { poolObservation = { origin: "daemon", status: "unverified" }; }
   } else if (backend === "sqlite") {
     const origin = options.storageFactory === undefined ? "local" : "daemon";
@@ -244,7 +246,7 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
       } catch (error) { return scoped(backendDiagnosticFailure(error, backend)); }
       snapshot.publication = "ready";
       snapshot.pool = poolObservation;
-      if (backend === "postgresql") snapshot.telemetry.pool = poolTelemetry(poolObservation, poolObservedAt);
+      if (backend === "postgresql") snapshot.telemetry.pool = poolTelemetry(poolObservation, poolObservedAt, poolRaw);
     }
     return snapshot;
   };
@@ -288,9 +290,10 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
         snapshot.tls = health.tls === true ? "ready" : "unavailable";
         snapshot.extensions = health.extensions === undefined ? "unverified" : areRequiredPostgreSqlExtensionsReady(health.extensions) ? "ready" : "unavailable";
         snapshot.search = health.searchConfiguration === undefined ? "unverified" : health.searchConfiguration.ready ? "ready" : "unavailable";
-        snapshot.pool = poolObservation ?? safePool(runtime.poolDiagnostics(), "diagnostic-probe");
+        if (poolObservation === undefined) poolRaw = runtime.poolDiagnostics();
+        snapshot.pool = poolObservation ?? safePool(poolRaw, "diagnostic-probe");
         if (poolObservation === undefined) poolObservedAt = Date.now();
-        snapshot.telemetry.pool = poolTelemetry(snapshot.pool, poolObservedAt);
+        snapshot.telemetry.pool = poolTelemetry(snapshot.pool, poolObservedAt, poolRaw);
         finished.add("pool");
         if (health.status !== "healthy" && health.status !== "degraded") throw health.error;
         if (!probeBudget()) snapshot.telemetry.migration = failedFamilies("timeout").migration;
