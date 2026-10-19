@@ -1001,7 +1001,9 @@ from an earlier pass:
   and is activation-eligible;
 - a maintenance journal is held for this generation, every writer on the
   roster is quiescent, and the fenced lease for the project is free or
-  already this generation's;
+  already this generation's. The window must have been entered from SQLite:
+  a window a rollback entered from PostgreSQL is not an activation window and
+  is refused as `maintenance-not-held`;
 - the stored data on this machine belongs to exactly one project, the one
   being migrated. Activation of a machine with data for several projects
   refuses with `uncovered-projects`; multi-project cutover is out of scope;
