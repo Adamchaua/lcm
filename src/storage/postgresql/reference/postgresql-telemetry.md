@@ -485,7 +485,10 @@ a zero timeout count nor evidence of timeout-free operation.
   connection, and the pool maximum is unchanged. Neither read passes project
   options, which would enter the runtime's writer admission transaction.
 
-The two #638 runtime-health reads use the existing #619 diagnostic runtime:
+Scoped exception for the #638 runtime-health families. The Privilege boundaries
+rule that every statement has a `statement_timeout` within the remaining
+snapshot deadline does not apply to the two #638 runtime-health reads, which
+use the existing #619 diagnostic runtime:
 `statement_timeout` remains capped at runtime creation, while the shared signal
 enforces the snapshot deadline. Before either read, a remaining-time guard may
 skip it with `timeout`. The guard is a launch policy, not a reservation for PID
@@ -546,8 +549,7 @@ reaching a limit yields status `partial`.
   cancellable through the caller's signal and has a `statement_timeout`
   within the remaining shared snapshot deadline. The combined work stays
   within that deadline and the declared row, mapping-probe, and
-  comparison-entry limits. The two #638 runtime-health reads follow the scoped
-  exception in [Clocks, statements, and rows](#clocks-statements-and-rows).
+  comparison-entry limits.
 - A #639 runbook that needs another role, such as a provider administrator,
   documents that requirement and sanitizes its output to role-class and
   database aliases.

@@ -157,10 +157,16 @@ describe("PostgreSQL runtime health telemetry", () => {
       }, context)).rows;
 
       const signal = new AbortController().signal;
-      const timings: Record<string, number> = {};
+      const iterations = 5;
+      const samples: Record<string, number[]> = {};
+      // Repeats the work to report spread; the result of the last run is returned.
       const timed = async <T,>(name: string, work: () => Promise<T>): Promise<T> => {
-        const started = performance.now();
-        try { return await work(); } finally { timings[name] = Math.round((performance.now() - started) * 10) / 10; }
+        let result: T | undefined;
+        for (let run = 0; run < iterations; run += 1) {
+          const started = performance.now();
+          try { result = await work(); } finally { (samples[name] ??= []).push(performance.now() - started); }
+        }
+        return result as T;
       };
       const ledger = await timed("migrationProbeMs", () => readPostgreSqlMigrationLedger(database.runtime, signal));
       expect(migrationTelemetry(ledger, 1)).toMatchObject({ status: "observed", health: "healthy", historyStatus: "current", appliedCount: ledger.expected.length });
@@ -250,7 +256,12 @@ describe("PostgreSQL runtime health telemetry", () => {
       expect(failure.telemetry.queue).toMatchObject({ status: "permission-denied", health: "unavailable" });
       await migrator.query({ text: "GRANT SELECT ON lcm.projects TO lcm_test_runtime" }, context);
 
-      console.info("PostgreSQL runtime health timings", JSON.stringify(timings));
+      const rounded = (value: number): number => Math.round(value * 10) / 10;
+      const summary = Object.fromEntries(Object.entries(samples).map(([name, values]) => {
+        const sorted = [...values].sort((left, right) => left - right);
+        return [name, { min: rounded(sorted[0]!), median: rounded(sorted[Math.floor(sorted.length / 2)]!), max: rounded(sorted[sorted.length - 1]!) }];
+      }));
+      console.info("LCM_638_RUNTIME_HEALTH_TIMINGS_MS", JSON.stringify({ iterations, ...summary }));
     });
   });
 });

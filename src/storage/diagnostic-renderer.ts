@@ -130,4 +130,3 @@ export function renderBackendDiagnostics(snapshot: BackendDiagnosticSnapshot): s
     `Action: ${ACTIONS[classification]}`,
   ].join("\n");
 }
-
