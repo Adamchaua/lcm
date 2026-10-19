@@ -2919,6 +2919,22 @@ describe("PostgreSQL harness utilities", () => {
     expect(rules).toContain("test/postgresql/cached-run-init.sh text eol=lf");
   });
 
+  // runHarness has no injectable Docker seam, so inspect the database container's declared mounts.
+  it("relabels the database container's host bind mounts for SELinux", () => {
+    const source = readFileSync(new URL("../../scripts/postgresql-harness.mjs", import.meta.url), "utf8");
+    const start = source.indexOf("const containerArgs = [");
+    const end = source.indexOf("await setupDocker(containerArgs);");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const mounts = [...source.slice(start, end).matchAll(/"--volume", `([^`]+)`/gu)].map((match) => match[1]);
+    expect(mounts).toEqual([
+      "${names.volume}:/var/lib/postgresql",
+      "${directory}:/run/lcm-harness:ro,z",
+      "${cachedRunInitScript}:/run/lcm-cached-init.sh:ro,z",
+      "${initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro,z",
+    ]);
+  });
+
   it("cleans every owned resource and the secret directory in order", async () => {
     const names = createRunNames("a".repeat(32));
     const events: string[] = [];

@@ -1791,12 +1791,13 @@ export async function runHarness(options = {}) {
       ...publish,
       "--env", `LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`,
       "--volume", `${names.volume}:/var/lib/postgresql`,
-      "--volume", `${directory}:/run/lcm-harness:ro`,
-      "--volume", `${cachedRunInitScript}:/run/lcm-cached-init.sh:ro`,
+      // ",z" relabels for SELinux (rootless Podman); a no-op where SELinux is off.
+      "--volume", `${directory}:/run/lcm-harness:ro,z`,
+      "--volume", `${cachedRunInitScript}:/run/lcm-cached-init.sh:ro,z`,
     ];
     if (!usingCachedTemplate) {
       containerArgs.push(
-        "--volume", `${initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro`,
+        "--volume", `${initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro,z`,
         "--env", "POSTGRES_USER=lcm_harness_admin",
         "--env", `POSTGRES_DB=${names.controlDatabase}`,
         "--env", "POSTGRES_PASSWORD_FILE=/run/lcm-private/admin-password",
