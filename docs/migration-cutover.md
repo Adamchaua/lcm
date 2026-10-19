@@ -1114,8 +1114,11 @@ was running before activation keeps its old backend until it restarts, so the
 outcome carries a restart verdict: satisfied when no daemon is running or the
 live daemon already reports the new backend, unsatisfied when a live daemon
 still reports the old one, and unresolvable when the pid file is malformed,
-unreadable, or a daemon answers on the port without a pid file. Restart the
-daemon before relying on the new backend.
+unreadable, a daemon answers on the port without a pid file, or the check
+could not observe the daemon at all (for example, the stored config naming
+the daemon port cannot be read). The port comes from the stored config
+alone; the activation never needs the daemon's PostgreSQL secrets. Restart
+the daemon before relying on the new backend.
 
 ### Preview
 
