@@ -20,7 +20,7 @@ offsets retain their stated offset.
 
 Two hooks capture events during your session:
 
-- **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output. For Codex, shell commands (reported as `Bash`; the legacy `functions.exec` and `functions.exec_command` names are accepted as aliases) and MCP calls are adapted into the existing event semantics.
+- **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output. For Codex, shell commands (reported as `Bash`; the legacy `functions.exec` and `functions.exec_command` names are accepted as aliases) and MCP calls are adapted into the existing event semantics. The native `apply_patch`, `spawn_agent`, `request_user_input`, and `update_plan` tools produce the file, subagent, decision, and plan events described under [Codex native activity](#codex-native-activity).
 - **UserPromptSubmit** — fires on each user prompt. Detects decisions ("always use X"), role statements ("I'm a data scientist"), and intent patterns.
 
 Events are written to a **sidecar SQLite database**
@@ -51,7 +51,8 @@ new global sequences during their transactional schema upgrade.
 The Codex connector recognizes PostToolUse payloads marked with
 `client: "codex"` whose `tool_name` is `Bash` (the name current Codex uses for
 shell commands), the legacy aliases `functions.exec` and
-`functions.exec_command`, or an `mcp__<server>__<tool>` MCP tool. For shell
+`functions.exec_command`, or an `mcp__<server>__<tool>` MCP tool; other native tools are covered
+under [Codex native activity](#codex-native-activity). For shell
 commands the adapter accepts the string `tool_input.command` first, or the
 string `tool_input.cmd` when `command` is not a string. Other command-like,
 path-like, and file-like fields are ignored; a blank `command` does not fall
@@ -85,7 +86,7 @@ extractor:
   nothing for them. See
   [Codex native PostToolUse capture](hook-protocol.md#codex-native-posttooluse-capture)
   for the full matrix, including poll attribution and the
-  intercepted `apply_patch` gap (#1559).
+  intercepted `apply_patch` gap.
 - The raw Codex response, stdout, stderr, and unknown output fields are never
   copied into the normalized event. Shell text is not parsed into file events.
 - A command whose trimmed text begins with `lcm store` is suppressed so LCM's
@@ -96,20 +97,57 @@ itself is not stored as a transcript.
 
 | Category | Examples | Priority |
 |----------|----------|----------|
-| Decisions | User answers to AskUserQuestion, "always use TypeScript" | 1 (immediate) |
+| Decisions | User answers to AskUserQuestion or Codex `request_user_input`, "always use TypeScript" | 1 (immediate) |
 | Plan approvals | EnterPlanMode / ExitPlanMode events | 1 (immediate) |
 | Errors | Bash commands that fail (isError: true) | 1 (immediate) |
 | Git operations | Commits, merges, branch switches | 2 (batch) |
 | Environment | `npm install`, `pip install`, `brew install` | 2 (batch) |
 | File access | Read/Edit/Write/Glob/Grep with file paths | 3 (pattern-only) |
+| File changes | Files added, deleted, edited, or moved by Codex `apply_patch` (paths only) | 3 (pattern-only) |
+| Delegation | Subagent dispatches (Claude `Agent`, Codex `spawn_agent`) as a short label | 3 (pattern-only) |
+| Plan proposals | Codex `update_plan` revisions that include an explanation | 3 (pattern-only) |
 | MCP tools | Which MCP tools are used (tool name only) | 3 (pattern-only) |
 | Skills | Which skills are invoked | 3 (pattern-only) |
 
+#### Codex native activity
+
+Codex runs PostToolUse only after a tool call succeeds, so each of these tools
+is captured when it completes. A payload that flags the call with `isError`
+records only the generic tool error instead. No configuration is needed.
+
+- **`apply_patch`** records each file the patch adds, deletes, or updates, with
+  a type label (source, test, config, docs). An update that moves a file
+  records one event naming both paths. At most 20 file observations are
+  recorded per patch, and a path is skipped when either end is sensitive. Patch
+  contents and the tool response are never stored. Patches that Codex
+  intercepts from a shell command are not `apply_patch` calls and are not
+  captured.
+- **`spawn_agent`** records a short dispatch label: the task name, then the
+  nickname, then the agent type, or the generic label `agent`. The generic
+  label does not identify a distinct child. Codex multi-agent v2 reports the
+  tool as `collaborationspawn_agent`, which is captured the same way; custom
+  collaboration namespaces are not. The brief, items, model, and agent ID are
+  never stored.
+- **`request_user_input`** records each answered question as a decision, using
+  the question text and the chosen options or notes, for at most the first three
+  questions. Unanswered and secret questions are skipped, and so is
+  `request_user_input_async`, which only reports that the question was sent.
+- **`update_plan`** records a plan proposal only when the call includes an
+  explanation: the explanation and up to 10 step names, without statuses. Calls
+  without an explanation are progress updates and are not captured. Proposals
+  are promoted only when they match an existing memory; they never create a
+  preference or decision on their own.
+
+Routine coordination tools such as `send_message`, `wait_agent`,
+`list_agents`, and `close_agent` are not captured.
+
 ### What Is NOT Captured
 
-- Raw tool payload contents such as file contents, command stdout/stderr, and
-  unknown Codex response fields (only bounded semantic metadata and brief user
-  answers are stored)
+- Raw tool payload contents such as file contents, patch bodies, command
+  stdout/stderr, subagent briefs, and unknown Codex response fields (only
+  bounded semantic metadata and brief user answers are stored)
+- Unanswered or secret Codex questions, plan step statuses, and routine
+  subagent coordination calls
 - Sensitive file paths (`.env`, `.ssh/`, `credentials`, `.npmrc`)
 - LCM's own `lcm_store` calls (prevents feedback loops)
 
