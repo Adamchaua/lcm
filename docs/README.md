@@ -79,6 +79,7 @@ with the [storage-backend configuration guide](configuration.md#storage-backend)
 - [Lexical search](../src/storage/postgresql/reference/postgresql-search.md)
 - [Cross-machine coordination](../src/storage/postgresql/reference/postgresql-coordination.md)
 - [Summaries, context, and large files](../src/storage/postgresql/reference/postgresql-summary-context.md)
+- [Telemetry and redaction contract](../src/storage/postgresql/reference/postgresql-telemetry.md)
 
 Each PostgreSQL guide links to the reviewed runtime grant scripts required by
 the repository it describes.
