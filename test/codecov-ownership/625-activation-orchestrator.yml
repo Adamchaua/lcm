@@ -40,3 +40,4 @@ pins:
   - ["src/migration/activation-artifact-store.ts", "unit-migration-cutover"]
   - ["src/migration/activation-report.ts", "unit-migration-cutover"]
   - ["src/migration/index.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-publication.ts", "unit-migration-cutover"]
