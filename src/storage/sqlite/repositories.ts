@@ -148,6 +148,7 @@ export function createSqliteRepositories(
       getConversationBySessionId: (sessionId) => invoke("conversations", "getConversationBySessionId", () => conversations.getConversationBySessionId(sessionId)),
       getOrCreateConversation: (sessionId, title) => invoke("conversations", "getOrCreateConversation", () => conversations.getOrCreateConversation(sessionId, title)),
       markConversationBootstrapped: (id) => invoke("conversations", "markConversationBootstrapped", () => conversations.markConversationBootstrapped(id)),
+      setParentSessionIdIfNull: (id, parentSessionId) => invoke("conversations", "setParentSessionIdIfNull", () => conversations.setParentSessionIdIfNull(id, parentSessionId)),
       listConversations: () => invoke("conversations", "listConversations", () => conversations.listConversations()),
       createMessage: (input) => invoke("conversations", "createMessage", () => conversations.createMessage(input)),
       createMessagesBulk: (inputs) => inputs.length === 0

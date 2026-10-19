@@ -133,6 +133,8 @@ The hook connector installs these Codex events:
 | `PreToolUse` | `lcm pre-tool --client codex` | Optional, off by default (`hooks.preToolRecall`). Adds advisory memory hints before a shell command, `apply_patch` edit, or MCP tool call; see [Opt-in PreToolUse memory hints](configuration.md#opt-in-pretooluse-memory-hints-codex) |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingests transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingests transcript deltas and triggers compaction once the configured token threshold is reached |
+| `SubagentStart` | `lcm restore --client codex` | Loads project memory into a Codex subagent when it starts |
+| `SubagentStop` | `lcm session-snapshot --client codex` | Ingests the subagent rollout under the subagent's own session when it finishes |
 | `Interrupt` | `lcm session-snapshot --client codex --terminal` | Saves the transcript when you interrupt a running turn |
 | `SessionEnd` | `lcm session-snapshot --client codex --terminal` | Saves the transcript when Codex shuts a session down gracefully |
 
@@ -230,7 +232,8 @@ What each case does today:
 | Codex exits gracefully while idle | `SessionEnd` |
 | Codex shuts down gracefully with a turn running | `Interrupt` for that turn, then `SessionEnd` |
 | Codex crashes or is killed | Not saved until a later snapshot of that session |
-| Subagent sessions, and sessions that Codex replaces or ends on a budget limit | Not covered: Codex does not run these hooks for them |
+| A subagent finishes | `SubagentStop` (see [Codex subagent lifecycle](hook-protocol.md#codex-subagent-lifecycle)); `Interrupt` and `SessionEnd` do not run for subagents |
+| Sessions that Codex replaces or ends on a budget limit | Not covered: Codex does not run these hooks for them |
 
 Codex gives these two hooks at most three seconds, counting its login shell, and
 kills the process group at the limit. The command therefore never starts, repairs
@@ -458,6 +461,7 @@ lcm import --provider all
    commands; default/fresh Codex CLI installation remains hook+skill+minimal
    rules and does not inspect MCP.
 4. Codex `Stop` hooks are turn-scoped, not final-session hooks. LCM therefore uses rolling snapshots and thresholded compaction instead of marking Codex sessions complete on each `Stop`; the `PreCompact` snapshot hook fills the pre-compaction gap.
+   Subagents spawned by Codex are recorded as their own sessions through `SubagentStart` and `SubagentStop`; see [Codex subagent lifecycle](hook-protocol.md#codex-subagent-lifecycle).
 5. Claude Code and Codex use native integrations, but their setup commands remain different.
 
 ## Improvement candidates

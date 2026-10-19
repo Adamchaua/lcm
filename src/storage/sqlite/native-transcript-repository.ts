@@ -12,6 +12,7 @@ import {
   type NativeTranscriptCheckpointKey,
   type NativeTranscriptCheckpointRecord,
   type NativeTranscriptMessageSnapshotRepository,
+  type NativeTranscriptProvenanceRepository,
   type NativeTranscriptRecord,
   type NativeTranscriptRepository,
   type NativeTranscriptSessionMessageRecord,
@@ -169,7 +170,7 @@ const transcriptColumns = `transcript.*, (
 const keyWhere = "project_id = ? AND machine_id = ? AND client_name = ? AND source_locator = ?";
 
 /** Active runtime ingest; the invoker owns root/scoped transaction lifetime. */
-export class SqliteNativeTranscriptRepository implements NativeTranscriptRepository, NativeTranscriptMessageSnapshotRepository {
+export class SqliteNativeTranscriptRepository implements NativeTranscriptRepository, NativeTranscriptMessageSnapshotRepository, NativeTranscriptProvenanceRepository {
   constructor(private readonly db: DatabaseSync, private readonly projectId: string, private readonly invoke: RepositoryInvoker) {}
 
   private async execute<T>(operation: string, callback: () => T, atomic = false): Promise<T> {
@@ -302,6 +303,13 @@ export class SqliteNativeTranscriptRepository implements NativeTranscriptReposit
     return this.execute("listByMessage", () => {
       const value = object(input);
       return this.db.prepare(`SELECT ${transcriptColumns} FROM runtime_native_transcripts AS transcript JOIN runtime_native_transcript_messages AS link ON link.project_id = transcript.project_id AND link.transcript_id = transcript.transcript_id WHERE transcript.project_id = ? AND link.conversation_id = ? AND link.message_id = ? ORDER BY link.source_ordinal, transcript.transcript_id`).all(this.projectId, integer(value.conversationId), integer(value.messageId)).map(row => this.readTranscript(row));
+    });
+  }
+
+  listLinkedSourceOrdinals(input: NativeTranscriptCheckpointKey & { readonly nativeSessionId: string }): Promise<readonly number[]> {
+    return this.execute("listLinkedSourceOrdinals", () => {
+      const value = object(input);
+      return this.db.prepare("SELECT DISTINCT transcript.source_ordinal FROM runtime_native_transcripts AS transcript JOIN runtime_native_transcript_messages AS link ON link.project_id = transcript.project_id AND link.transcript_id = transcript.transcript_id WHERE transcript.project_id = ? AND transcript.machine_id = ? AND transcript.client_name = ? AND transcript.source_locator = ? AND transcript.native_session_id = ? ORDER BY transcript.source_ordinal").all(...this.keyValues(checkpointKey(value)), text(value.nativeSessionId)).map(row => integer(row.source_ordinal));
     });
   }
 

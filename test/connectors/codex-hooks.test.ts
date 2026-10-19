@@ -126,6 +126,43 @@ describe("Codex hook configuration boundaries", () => {
     expect(result.hooks.PostToolUse[0].hooks[0].command).toBe("lcm post-tool --client codex");
   });
 
+  it("registers SubagentStart and SubagentStop idempotently without disturbing foreign hooks", () => {
+    writeFileSync(hooksPath, JSON.stringify({
+      hooks: {
+        SubagentStart: [{ hooks: [{ type: "command", command: "echo foreign-start" }] }],
+        SubagentStop: [{ hooks: [{ type: "command", command: "echo foreign-stop" }] }],
+      },
+    }));
+    installCodexHooks(hooksPath, configPath);
+    installCodexHooks(hooksPath, configPath);
+    const result = JSON.parse(readFileSync(hooksPath, "utf-8"));
+    expect(result.hooks.SubagentStart).toEqual([
+      { hooks: [{ type: "command", command: "echo foreign-start" }] },
+      { hooks: [{
+        type: "command",
+        command: "lcm restore --client codex",
+        timeout: 30,
+        statusMessage: "Loading LCM memory for subagent",
+      }] },
+    ]);
+    expect(result.hooks.SubagentStop).toEqual([
+      { hooks: [{ type: "command", command: "echo foreign-stop" }] },
+      { hooks: [{
+        type: "command",
+        command: "lcm session-snapshot --client codex",
+        timeout: 30,
+        statusMessage: "Saving LCM subagent memory",
+      }] },
+    ]);
+
+    removeCodexHooks(hooksPath);
+    const stripped = JSON.parse(readFileSync(hooksPath, "utf-8"));
+    expect(stripped.hooks).toEqual({
+      SubagentStart: [{ hooks: [{ type: "command", command: "echo foreign-start" }] }],
+      SubagentStop: [{ hooks: [{ type: "command", command: "echo foreign-stop" }] }],
+    });
+  });
+
   it("registers no PreToolUse hook by default and never through the legacy installer", () => {
     expect(codexLcmHooks("cli")).not.toHaveProperty("PreToolUse");
     expect(codexLcmHooks("cli", { preToolRecall: false })).not.toHaveProperty("PreToolUse");
@@ -146,7 +183,8 @@ describe("Codex hook configuration boundaries", () => {
     }]);
     const merged = JSON.parse(mergeCodexHooksContent("", "cli", { preToolRecall: true }));
     expect(Object.keys(merged.hooks).sort()).toEqual([
-      "Interrupt", "PostToolUse", "PreCompact", "PreToolUse", "SessionEnd", "SessionStart", "Stop", "UserPromptSubmit",
+      "Interrupt", "PostToolUse", "PreCompact", "PreToolUse", "SessionEnd", "SessionStart", "Stop", "SubagentStart", "SubagentStop",
+      "UserPromptSubmit",
     ]);
   });
 
