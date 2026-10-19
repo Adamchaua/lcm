@@ -41,6 +41,8 @@ import {
   projectPaths,
 } from "../src/daemon/project.js";
 import { recoverMachineIdentity } from "../src/machine-identity.js";
+import { createAbortError } from "../src/daemon/cancellation.js";
+import { TransportedUnboundProjectError } from "../src/storage/identity-context.js";
 import {
   RETIRED_PROJECT_IDENTITY_DIAGNOSTIC,
   serializeWorktreeReconciliationFence,
@@ -49,6 +51,7 @@ import { NinjaRenderer } from "../src/cli/pipeline-runner.js";
 import { makeProgressState } from "../src/cli/progress-state.js";
 
 const FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS = 15_000;
+const FAILURE_POISON = "sk-test-SECRET leaked from /home/poison/secret.txt";
 const BATCH_COMPACT_TEST_MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const mutableFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
 
@@ -2602,6 +2605,92 @@ describe("batch compaction discovery", () => {
         message: "compaction request failed",
       }),
     ]);
+  });
+
+  it.each<[string, () => unknown, string, boolean]>([
+    ["HTTP 500", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 500 }), "daemon compaction failed (HTTP 500); run lcm doctor", false],
+    ["HTTP 599", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 599 }), "daemon compaction failed (HTTP 599); run lcm doctor", false],
+    ["HTTP 503", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 503 }), "daemon unavailable (HTTP 503); run lcm doctor", false],
+    ["HTTP 401", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 401 }), "daemon auth rejected (HTTP 401); run lcm doctor", false],
+    ["HTTP 403", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 403 }), "daemon auth rejected (HTTP 403); run lcm doctor", false],
+    ["HTTP 400", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 400 }), "daemon rejected compact request (HTTP 400)", false],
+    ["HTTP 404", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 404 }), "daemon rejected compact request (HTTP 404)", false],
+    ["status 399", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 399 }), "compaction request failed", false],
+    ["status 600", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 600 }), "compaction request failed", false],
+    ["status 500.5", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 500.5 }), "compaction request failed", false],
+    ["string status", () => Object.assign(new Error(FAILURE_POISON), { statusCode: "500" }), "compaction request failed", false],
+    ["status NaN", () => Object.assign(new Error(FAILURE_POISON), { statusCode: Number.NaN }), "compaction request failed", false],
+    ["EPIPE", () => Object.assign(new Error(FAILURE_POISON), { code: "EPIPE" }), "daemon connection lost; outcome unknown; rerun after lcm doctor", true],
+    ["ETIMEDOUT", () => Object.assign(new Error(FAILURE_POISON), { code: "ETIMEDOUT" }), "daemon connection lost; outcome unknown; rerun after lcm doctor", true],
+    ["request timeout", () => new Error("Daemon request timed out"), "daemon connection lost; outcome unknown; rerun after lcm doctor", true],
+    ["intentional abort", () => createAbortError(new Error(FAILURE_POISON)), "compaction request cancelled", false],
+    ["unbound project", () => Object.assign(new TransportedUnboundProjectError(FAILURE_POISON), { statusCode: 409 }), "no PostgreSQL binding; run lcm project create or lcm project link <id>", false],
+    ["SyntaxError", () => new SyntaxError(FAILURE_POISON), "malformed compact response", false],
+    ["plain Error", () => new Error(FAILURE_POISON), "compaction request failed", false],
+    ["non-Error", () => FAILURE_POISON, "unknown error", false],
+  ])("reports a fixed actionable message for %s without leaking the raw error", async (_name, makeError, expected, transport) => {
+    expect(expected.length).toBeLessThanOrEqual(72);
+    const cwd = makeDir("compact-failure-classification");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    vi.spyOn(DaemonClient.prototype, "post").mockRejectedValue(makeError());
+    const stdout = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const onTransportFailure = vi.fn();
+    const progress: Array<Partial<ProgressState>> = [];
+    const events: CompactProgressEvent[] = [];
+    const state = makeProgressState({ phases: [{ name: "Compact", status: "active" }], total: 1 });
+    const output: string[] = [];
+    const renderer = new NinjaRenderer({
+      state,
+      renderOpts: { isTTY: false, width: 80, color: false, verbose: true },
+      output: {
+        columns: 80,
+        write: (chunk: string | Uint8Array) => {
+          output.push(String(chunk));
+          return true;
+        },
+      },
+      handleSignals: false,
+    });
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onTransportFailure,
+      onProgress: patch => {
+        progress.push(patch);
+        Object.assign(state, patch);
+      },
+      onEvent: event => {
+        events.push(event);
+        renderer.handleEvent(event);
+      },
+    });
+    renderer.printSummary();
+
+    expect(result.failures).toBe(1);
+    expect(progress.find(patch => patch.errors)?.errors).toEqual([
+      expect.objectContaining({ sessionId: "session-1", message: expected }),
+    ]);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "session-terminal",
+      outcome: "failed",
+      message: expected,
+    }));
+    // Lifecycle line (width 96) and summary list (width 72 at 80 columns)
+    // both show the full message, including its recovery command.
+    const rendered = output.join("");
+    expect(rendered.split(`: ${expected}\n`)).toHaveLength(3);
+    const everything = JSON.stringify([stdout.mock.calls, stderr.mock.calls, progress, events, rendered]);
+    expect(everything).not.toContain("sk-test-SECRET");
+    expect(everything).not.toContain("/home/poison");
+    expect(onTransportFailure).toHaveBeenCalledTimes(transport ? 1 : 0);
   });
 
   it("reports daemon no-ops as unchanged and excludes them from promotion projects", async () => {

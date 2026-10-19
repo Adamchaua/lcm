@@ -18,7 +18,12 @@ import { projectPathsForIdentity } from "./daemon/project.js";
 import { CliProjectStorageMissingError, listCliProjects, withCliProjectStorage } from "./cli-storage.js";
 import { NATIVE_SOURCE_LOCATOR_BATCH_SIZE, type ProjectRepositories } from "./storage/contracts.js";
 import { createSqliteRepositories, createSqliteRepositoryStores } from "./storage/sqlite/repositories.js";
-import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "./storage/identity-context.js";
+import {
+  StorageIdentityConfigurationError,
+  TransportedUnboundProjectError,
+  UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+} from "./storage/identity-context.js";
+import { isAbortError } from "./daemon/cancellation.js";
 import {
   RetiredProjectIdentityError,
   assertProjectStorageIdentityActive,
@@ -524,6 +529,31 @@ export async function findUncompacted(minTokens: number, readOnly = false, cwdFi
   return (await discoverUncompacted(minTokens, readOnly, cwdFilter, replay)).conversations;
 }
 
+/**
+ * Derive a per-session failure message from structured error fields only.
+ * The message never contains error.message, a response body or a provider
+ * payload; every string is a constant plus at most a validated HTTP status.
+ */
+function classifySessionFailure(error: unknown): string {
+  if (!(error instanceof Error)) return "unknown error";
+  if (isAbortError(error)) return "compaction request cancelled";
+  if (error instanceof TransportedUnboundProjectError) {
+    return "no PostgreSQL binding; run lcm project create or lcm project link <id>";
+  }
+  if (isDaemonTransportFailure(error)) {
+    return "daemon connection lost; outcome unknown; rerun after lcm doctor";
+  }
+  const statusCode = (error as { statusCode?: unknown }).statusCode;
+  if (typeof statusCode === "number" && Number.isSafeInteger(statusCode) && statusCode >= 400 && statusCode <= 599) {
+    if (statusCode === 401 || statusCode === 403) return `daemon auth rejected (HTTP ${statusCode}); run lcm doctor`;
+    if (statusCode === 503) return "daemon unavailable (HTTP 503); run lcm doctor";
+    if (statusCode < 500) return `daemon rejected compact request (HTTP ${statusCode})`;
+    return `daemon compaction failed (HTTP ${statusCode}); run lcm doctor`;
+  }
+  if (error instanceof SyntaxError) return "malformed compact response";
+  return "compaction request failed";
+}
+
 /** Compact all uncompacted conversations above threshold via the daemon. */
 export async function batchCompact(opts: {
   minTokens: number;
@@ -712,7 +742,7 @@ export async function batchCompact(opts: {
       const activePatch = progressActivePatch();
 
       if ("error" in result) {
-        const errMsg = result.error instanceof Error ? "compaction request failed" : "unknown error";
+        const errMsg = classifySessionFailure(result.error);
         if (isDaemonTransportFailure(result.error)) opts.onTransportFailure?.(result.error);
         progressErrors.push({
           project: conv.cwd,
