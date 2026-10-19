@@ -57,6 +57,29 @@ describe("parseCodexHooksJson", () => {
     const parsed = parseCodexHooksJson('{"a":' + "[".repeat(depth) + "]".repeat(depth) + ',"a":1}')!;
     expect(parsed.duplicates).toEqual([{ path: [], name: "a" }]);
   });
+
+  it("records only the first repeated member below the typed object depth", () => {
+    const deepPath = ["deep", "b", "c", "d", "e", "f"];
+    const parsed = parseCodexHooksJson(
+      '{"s":1,"s":2,"deep":{"b":{"c":{"d":{"e":{"f":{"k":1,"k":2,"k":3,"j":1,"j":2}}}}}},"s":3,'
+        + '"hooks":{"Stop":[{"hooks":[{"t":1,"t":2,"t":3}]}]}}',
+    )!;
+    expect(parsed.duplicates).toEqual([
+      { path: [], name: "s" },
+      { path: deepPath, name: "k" },
+      { path: [], name: "s" },
+      { path: ["hooks", "Stop", 0, "hooks", 0], name: "t" },
+      { path: ["hooks", "Stop", 0, "hooks", 0], name: "t" },
+    ]);
+  });
+
+  it("tracks non-integer numbers only down to the handler field depth", () => {
+    const parsed = parseCodexHooksJson('{"hooks":{"Stop":[{"hooks":[{"timeout":1.5,"input":{"x":2.5,"y":[3.5]}}]}]}}')!;
+    const base = ["hooks", "Stop", 0, "hooks", 0];
+    expect(parsed.nonIntegerNumberAt([...base, "timeout"])).toBe(true);
+    expect(parsed.nonIntegerNumberAt([...base, "input", "x"])).toBe(false);
+    expect(parsed.nonIntegerNumberAt([...base, "input", "y", 0])).toBe(false);
+  });
 });
 
 describe("hooks.json install refusal", () => {

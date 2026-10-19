@@ -168,14 +168,25 @@ export type CodexHooksJsonPath = ReadonlyArray<string | number>;
 export interface CodexHooksJson {
   /** What JSON.parse returns; a repeated member keeps its last value. */
   readonly value: unknown;
-  /** One entry per repeated member name, compared after unescaping, with the path of the object that repeats it. */
+  /**
+   * One entry per repeated member name, compared after unescaping, with the path of the object that
+   * repeats it. Objects deeper than every typed object (more than TYPED_OBJECT_PATH_DEPTH segments)
+   * contribute only their first repeat in the document, so the list stays small on adversarial input.
+   */
   readonly duplicates: ReadonlyArray<{ readonly path: CodexHooksJsonPath; readonly name: string }>;
-  /** True when the number written at path is not an unsigned integer token (a sign, fraction or exponent). */
+  /**
+   * True when the number written at path is not an unsigned integer token (a sign, fraction or exponent).
+   * Only paths up to TRACKED_PATH_DEPTH segments (the handler count fields) are tracked; deeper ones are false.
+   */
   readonly nonIntegerNumberAt: (path: CodexHooksJsonPath) => boolean;
 }
 
 const UNSIGNED_INTEGER_TOKEN = /^(?:0|[1-9][0-9]*)$/;
 const NUMBER_TOKEN_CHAR = /[0-9eE+\-.]/;
+/** hooks / event / group / hooks / handler / field: the deepest number the connector reads. */
+const TRACKED_PATH_DEPTH = 6;
+/** root, hooks, group and handler objects: the deepest object path the connector checks. */
+const TYPED_OBJECT_PATH_DEPTH = 5;
 
 /**
  * Read hooks.json text with JSON.parse for syntax and values, then walk the same text
@@ -193,6 +204,7 @@ export function parseCodexHooksJson(content: string): CodexHooksJson | undefined
   const segment = (frame: Frame): string | number => (frame.object ? frame.key : frame.index);
   const stack: Frame[] = [];
   const duplicates: Array<{ path: CodexHooksJsonPath; name: string }> = [];
+  let deepDuplicateSeen = false;
   const nonInteger = new Set<string>();
   let at = 0;
   while (at < content.length) {
@@ -213,7 +225,10 @@ export function parseCodexHooksJson(content: string): CodexHooksJson | undefined
       while (content[end] !== '"') end += content[end] === "\\" ? 2 : 1;
       if (top?.object && top.expectKey) {
         const name = JSON.parse(content.slice(at, end + 1)) as string;
-        if (top.names.has(name)) duplicates.push({ path: stack.slice(0, -1).map(segment), name });
+        if (top.names.has(name) && (stack.length - 1 <= TYPED_OBJECT_PATH_DEPTH || !deepDuplicateSeen)) {
+          if (stack.length - 1 > TYPED_OBJECT_PATH_DEPTH) deepDuplicateSeen = true;
+          duplicates.push({ path: stack.slice(0, -1).map(segment), name });
+        }
         top.names.add(name);
         top.key = name;
         top.expectKey = false;
@@ -222,13 +237,19 @@ export function parseCodexHooksJson(content: string): CodexHooksJson | undefined
     } else if (char === "-" || (char >= "0" && char <= "9")) {
       let end = at + 1;
       while (end < content.length && NUMBER_TOKEN_CHAR.test(content[end])) end += 1;
-      if (!UNSIGNED_INTEGER_TOKEN.test(content.slice(at, end))) nonInteger.add(JSON.stringify(stack.map(segment)));
+      if (stack.length <= TRACKED_PATH_DEPTH && !UNSIGNED_INTEGER_TOKEN.test(content.slice(at, end))) {
+        nonInteger.add(JSON.stringify(stack.map(segment)));
+      }
       at = end;
     } else {
       at += 1;
     }
   }
-  return { value, duplicates, nonIntegerNumberAt: (path) => nonInteger.has(JSON.stringify(path)) };
+  return {
+    value,
+    duplicates,
+    nonIntegerNumberAt: (path) => path.length <= TRACKED_PATH_DEPTH && nonInteger.has(JSON.stringify(path)),
+  };
 }
 
 function normalizeHooksConfig(value: unknown): CodexHooksConfig {
