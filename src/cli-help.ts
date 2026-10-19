@@ -474,6 +474,15 @@ const HELP: Record<string, CommandHelp> = {
     notes: "Invoked automatically by Claude Code and Codex PostToolUse hooks. Not intended for direct use.",
   },
 
+  "pre-tool": {
+    summary: "Dispatch the opt-in pre-tool hook — surfaces memory hints before a tool call.",
+    usage: "lcm pre-tool",
+    examples: [
+      ["lcm pre-tool", "Surface memory hints for a pending tool call (called by the Codex PreToolUse hook)"],
+    ],
+    notes: "Invoked automatically by the Codex PreToolUse hook, which is installed only when hooks.preToolRecall is true. Not intended for direct use.",
+  },
+
   "session-snapshot": {
     summary: "Dispatch the rolling session snapshot hook.",
     usage: "lcm session-snapshot",
@@ -556,6 +565,7 @@ const GROUPS = [
       { name: "session-snapshot", summary: "Stop hook — ingest rolling transcript snapshots" },
       { name: "user-prompt", summary: "UserPromptSubmit hook — record user prompt context" },
       { name: "post-tool", summary: "PostToolUse hook — record tool invocation events" },
+      { name: "pre-tool", summary: "PreToolUse hook — opt-in memory hints before a tool call" },
     ],
   },
 ];

@@ -23,7 +23,6 @@ import {
   fstatSync,
   lstatSync,
   openSync,
-  readFileSync,
   readSync,
   readdirSync,
   realpathSync,
@@ -31,7 +30,7 @@ import {
 } from "node:fs";
 import { join, basename, sep } from "node:path";
 import { homedir } from "node:os";
-import { estimateTokens } from "./transcript.js";
+import { estimateTokens, readTranscriptFileText } from "./transcript.js";
 import type { ParsedMessage } from "./transcript.js";
 
 // ---------------------------------------------------------------------------
@@ -98,12 +97,8 @@ function extractCodexText(content: string | CodexContentBlock[] | undefined): st
  * Returns an empty array on any read or parse error.
  */
 export function parseCodexTranscript(transcriptPath: string): ParsedMessage[] {
-  let raw: string;
-  try {
-    raw = readFileSync(transcriptPath, "utf-8");
-  } catch {
-    return [];
-  }
+  const raw = readTranscriptFileText(transcriptPath);
+  if (raw === undefined) return [];
 
   return parseCodexTranscriptText(raw);
 }
@@ -168,7 +163,7 @@ export function extractCodexSessionMeta(transcriptPath: string): CodexSessionMet
   let fd: number | undefined;
   let raw: string;
   try {
-    fd = openSync(transcriptPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = openSync(transcriptPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const leaf = fstatSync(fd);
     if (!leaf.isFile()) return undefined;
     const size = Math.min(leaf.size, MAX_CODEX_SESSION_META_PREFIX_BYTES);

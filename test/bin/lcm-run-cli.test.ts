@@ -56,6 +56,7 @@ const state = vi.hoisted(() => ({
   installed: [] as Array<{ agentId: string; type: string; path: string }>,
   codexMcpInspection: { state: "absent" as "installed" | "absent" | "unknown" } as { state: "installed" | "absent" | "unknown"; reason?: "collision" | "unavailable" },
   storedCodexTransport: undefined as "cli" | "mcp" | undefined,
+  storedPreToolRecall: false,
   installResult: { path: "/connector", requiresRestart: false } as Record<string, unknown>,
   removeResult: true,
   batchResult: { compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: ["/project"] },
@@ -273,7 +274,7 @@ vi.mock("../../src/cli-help.js", () => ({
   hasCommandHelp: vi.fn((command: string) => new Set([
     "install", "uninstall", "daemon", "config", "status", "doctor", "machine", "project",
     "postgres", "search", "grep", "describe", "expand", "store", "compact", "restore",
-    "session-end", "user-prompt", "post-tool", "session-snapshot", "mcp", "events", "diagnose",
+    "session-end", "user-prompt", "post-tool", "pre-tool", "session-snapshot", "mcp", "events", "diagnose",
     "connectors", "sensitive", "import", "promote", "export", "import-knowledge",
   ]).has(command)),
   printHelp: state.printHelp,
@@ -357,6 +358,7 @@ vi.mock("../../src/config-manager.js", () => ({
   setConfigValue: state.configSetValue,
   readConnectorTransport: vi.fn(() => state.storedCodexTransport),
   readConnectorTransportSnapshot: vi.fn(() => state.storedCodexTransport),
+  readPreToolRecallSnapshot: vi.fn(() => state.storedPreToolRecall),
 }));
 vi.mock("../../installer/install.js", () => ({
   install: state.install,
@@ -504,6 +506,7 @@ beforeEach(() => {
   state.installed = [];
   state.codexMcpInspection = { state: "absent" };
   state.storedCodexTransport = undefined;
+  state.storedPreToolRecall = false;
   state.installResult = { path: "/connector", requiresRestart: false };
   state.removeResult = true;
   state.runCodexReadinessCheck.mockClear();
@@ -1412,7 +1415,7 @@ describe("runCli registration and help dispatch", () => {
     [["config", "set", "daemon.port", "4242", "-h"], "config"],
     [["config"], "config"],
     [["compact", "--help"], "compact"], [["restore", "--help"], "restore"], [["session-end", "--help"], "session-end"],
-    [["user-prompt", "--help"], "user-prompt"], [["post-tool", "--help"], "post-tool"], [["session-snapshot", "--help"], "session-snapshot"],
+    [["user-prompt", "--help"], "user-prompt"], [["post-tool", "--help"], "post-tool"], [["pre-tool", "--help"], "pre-tool"], [["session-snapshot", "--help"], "session-snapshot"],
     [["mcp", "--help"], "mcp"], [["install", "--help"], "install"], [["uninstall", "--help"], "uninstall"], [["status", "--help"], "status"],
     [["stats", "--help"], "stats"], [["doctor", "--help"], "doctor"], [["events", "--help"], "events"], [["events", "promote", "--help"], "events"],
     [["diagnose", "--help"], "diagnose"], [["connectors", "--help"], "connectors"], [["sensitive", "--help"], "sensitive"], [["import", "--help"], "import"],
@@ -2406,7 +2409,7 @@ describe("runCli orchestration actions", () => {
   });
 
   it.each([
-    ["restore"], ["session-end", "--client", "codex"], ["user-prompt"], ["post-tool"],
+    ["restore"], ["session-end", "--client", "codex"], ["user-prompt"], ["post-tool"], ["pre-tool", "--client", "codex"],
     ["session-snapshot"], ["compact", "--hook", "--client", "claude"],
   ])("dispatches hook action %#", async (...args) => {
     expect((await invoke(args))?.message).toBe("exit:0");
@@ -2724,6 +2727,7 @@ describe("runCli failure and alternate presentation branches", () => {
 
   it.each([
     [["post-tool", "--client", "codex"], "post-tool"],
+    [["pre-tool", "--client", "codex"], "pre-tool"],
     [["restore", "--client", "codex"], "restore"],
     [["session-end", "--client", "codex"], "session-end"],
     [["session-snapshot", "--client", "codex"], "session-snapshot"],
@@ -2778,6 +2782,24 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(migrate).not.toHaveBeenCalled();
   });
 
+  it("lets a pre-tool journal error reach the CLI error handler without root migration", async () => {
+    fakeStdin.isTTY = false;
+    fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
+      if (event === "data") queueMicrotask(() => callback(Buffer.from("{}")));
+      if (event === "end") queueMicrotask(() => callback());
+      return fakeStdin;
+    });
+    const journal = new BackendPublicationJournalError("unresolved-publication", "publication is unresolved");
+    state.dispatchHook.mockRejectedValueOnce(journal);
+    const migrate = vi.fn();
+
+    await expect(runCli(["node", "lcm", "pre-tool", "--client", "codex"], {
+      migrate,
+      sleep: async (_delayMs: number) => undefined,
+    })).rejects.toBe(journal);
+    expect(migrate).not.toHaveBeenCalled();
+  });
+
   it("prints Codex readiness, then the fixture-only self-test, for an explicit codex doctor", async () => {
     state.installed = [{ agentId: "codex", type: "hook", path: "/partial/hooks.json" }];
     state.codexPostToolFunctionalCoverage.mockReturnValue(true);
@@ -2789,7 +2811,10 @@ describe("runCli failure and alternate presentation branches", () => {
       homeDir: string;
       probeVersion: () => unknown;
       readStoredTransport: () => unknown;
+      readPreToolRecall: () => unknown;
     };
+    state.storedPreToolRecall = true;
+    expect(options.readPreToolRecall()).toBe(true);
     expect(options.homeDir).toBe(homedir());
     expect(options.probeVersion()).toEqual({ state: "found", raw: "codex-cli 0.163.0" });
     expect(options.readStoredTransport()).toBe("mcp");
@@ -2798,6 +2823,26 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(output).toContain("✓ Codex: native exec normalization self-test passed (fixtures only; not proof of runtime execution)");
     expect(output).not.toContain("native exec capture functional");
     expect(state.dispatchHook).not.toHaveBeenCalled();
+  });
+
+  it("records a Codex observation for pre-tool through the observed dispatcher, and none for other clients", async () => {
+    const stdin = JSON.stringify({ session_id: "s", tool_name: "Bash" });
+    fakeStdin.isTTY = false;
+    fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
+      if (event === "data") queueMicrotask(() => callback(Buffer.from(stdin)));
+      if (event === "end") queueMicrotask(() => callback());
+      return fakeStdin;
+    });
+    state.dispatchHook.mockResolvedValueOnce({ stdout: "", exitCode: 0 });
+    expect((await invoke(["pre-tool", "--client", "codex"]))?.message).toBe("exit:0");
+    expect(state.runObservedCodexHook).toHaveBeenCalledWith(
+      expect.objectContaining({ client: "codex", command: "pre-tool" }),
+      expect.any(Function),
+    );
+    state.runObservedCodexHook.mockClear();
+    state.dispatchHook.mockResolvedValueOnce({ stdout: "", exitCode: 0 });
+    expect((await invoke(["pre-tool", "--client", "claude"]))?.message).toBe("exit:0");
+    expect(state.runObservedCodexHook).not.toHaveBeenCalled();
   });
 
   it("does not run the Codex readiness check for a bare connectors doctor", async () => {
@@ -3939,7 +3984,7 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(await invoke(["compact", "--no-promote"])).toBeUndefined();
     state.importProgressLast = false;
     expect(await invoke(["import"])).toBeUndefined();
-    for (const command of ["session-end", "user-prompt", "post-tool", "session-snapshot", "compact"] as const) {
+    for (const command of ["session-end", "user-prompt", "post-tool", "pre-tool", "session-snapshot", "compact"] as const) {
       state.dispatchHook.mockResolvedValueOnce({ stdout: "", exitCode: 0 });
       const args = command === "compact" ? [command, "--hook"] : [command];
       expect((await invoke(args))?.message).toBe("exit:0");

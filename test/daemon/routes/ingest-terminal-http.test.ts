@@ -51,7 +51,7 @@ type Fixture = {
   post: (body: unknown, token?: string | null) => Promise<Response>;
   messageCount: () => number;
   holdPublication: () => Promise<{ release: () => void; done: Promise<void> }>;
-  gates: { open?: Gate; projectClose?: Gate; openEntered: Gate };
+  gates: { open?: Gate; projectClose?: Gate; openEntered: Gate; openIgnoresSignal?: boolean };
   idle: ReturnType<typeof vi.fn>;
 };
 
@@ -106,7 +106,8 @@ async function withTerminalDaemon(
           events.push("open:start");
           gates.openEntered.open();
           if (gates.open) await gates.open.promise;
-          const project = await open(...openArgs);
+          // openIgnoresSignal models an open that resolves despite cancellation.
+          const project = await open(...(gates.openIgnoresSignal ? openArgs.slice(0, 2) as typeof openArgs : openArgs));
           events.push("open:end");
           const close = project.close.bind(project);
           vi.spyOn(project, "close").mockImplementation(async (...closeArgs) => {
@@ -301,6 +302,28 @@ describe("POST /ingest/terminal", () => {
       expect(fixture.events).not.toContain("factory.close");
 
       fixture.gates.projectClose.open();
+      await bounded(stopping);
+      expect(fixture.events).toEqual([
+        "open:start", "open:end", "project.close:start", "project.close:end", "factory.close",
+      ]);
+    });
+  });
+
+  it("waits for a cancelled ingest's pending project open before the shared factory closes", async () => {
+    await withTerminalDaemon({}, async (fixture) => {
+      fixture.gates.open = gate();
+      fixture.gates.openIgnoresSignal = true;
+      expect((await fixture.post(body(fixture))).status).toBe(202);
+      await bounded(fixture.gates.openEntered.promise);
+
+      let stopped = false;
+      const stopping = fixture.daemon.stop().then(() => { stopped = true; });
+      // Let every already-resolved continuation of stop() run to a standstill.
+      for (let turn = 0; turn < 20; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+      expect(fixture.events).toEqual(["open:start"]);
+      expect(stopped).toBe(false);
+
+      fixture.gates.open.open();
       await bounded(stopping);
       expect(fixture.events).toEqual([
         "open:start", "open:end", "project.close:start", "project.close:end", "factory.close",

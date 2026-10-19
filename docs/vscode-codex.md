@@ -130,6 +130,7 @@ The hook connector installs these Codex events:
 | `SessionStart` (`startup\|resume\|clear\|compact\|fork`) | `lcm restore --client codex` | Restores project context when Codex starts, resumes, clears, compacts, or forks a session |
 | `UserPromptSubmit` | `lcm user-prompt --client codex` | Searches memory and injects prompt-time hints |
 | `PostToolUse` | `lcm post-tool --client codex` | Captures bounded semantic signals from Codex shell (`Bash`) and MCP tool results, plus native file, decision, plan, and delegation tools |
+| `PreToolUse` | `lcm pre-tool --client codex` | Optional, off by default (`hooks.preToolRecall`). Adds advisory memory hints before a shell command, `apply_patch` edit, or MCP tool call; see [Opt-in PreToolUse memory hints](configuration.md#opt-in-pretooluse-memory-hints-codex) |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingests transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingests transcript deltas and triggers compaction once the configured token threshold is reached |
 | `Interrupt` | `lcm session-snapshot --client codex --terminal` | Saves the transcript when you interrupt a running turn |
@@ -314,7 +315,17 @@ forked conversation does not receive the same block twice. `startup` and
 `clear` always print.
 
 Existing installs keep the old `startup|resume|clear` matcher until you re-run
-`lcm connectors install codex`. Codex may ask you to re-trust the changed hook.
+`lcm connectors install codex`. If the LCM restore hook has its own
+`SessionStart` group in `hooks.json`, install updates the matcher in place.
+If that group also holds other hooks and its matcher is not already
+`startup|resume|clear|compact|fork`, install stops without writing either file
+and reports that the group matcher must change. Move the LCM handler into its
+own `SessionStart` group at the end of that event in `hooks.json` and re-run
+install, or run `lcm connectors remove codex` and then `lcm connectors install
+codex`. Either manual change can move other hooks between the positions Codex
+uses for their enabled flag and trust record. Open Codex `/hooks` afterwards
+and review every hook that moved, restoring the enabled settings you intend;
+Codex asks you to trust the hook again.
 
 Known limits:
 
@@ -392,7 +403,7 @@ LCM installation and session startup establish or migrate the private root;
 PostToolUse remains an observer and cannot contend on that startup boundary.
 
 The other installed hook entrypoints (restore, session-end, session-snapshot,
-user-prompt, and `compact --hook`) also skip that migration. See
+user-prompt, pre-tool, and `compact --hook`) also skip that migration. See
 [Hook entrypoints and legacy-root migration](hook-protocol.md#hook-entrypoints-and-legacy-root-migration)
 for which invocations still migrate and how publication-lock contention is
 handled.

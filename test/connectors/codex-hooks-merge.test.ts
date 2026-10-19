@@ -155,6 +155,57 @@ describe("in-place Codex hook merge", () => {
   });
 });
 
+describe("opt-in PreToolUse hook in the in-place merge", () => {
+  const enabled = { preToolRecall: true };
+  const mergeWith = (hooks: unknown, options: { preToolRecall?: boolean } = enabled) =>
+    JSON.parse(mergeCodexHooksContent(JSON.stringify({ hooks }), "cli", options)).hooks as Record<string, any[]>;
+  const preTool = () => codexLcmHooks("cli", enabled).PreToolUse[0];
+
+  it("identifies the pre-tool role", () => {
+    expect(codexLcmHookRole("lcm pre-tool --client codex")).toBe("pre-tool");
+  });
+
+  it("appends the group after a user's own PreToolUse group without moving it, idempotently", () => {
+    const userGroup = { matcher: "Bash", hooks: [foreign("guard")] };
+    const first = mergeWith({ PreToolUse: [userGroup] });
+    expect(first.PreToolUse).toEqual([userGroup, preTool()]);
+    const again = mergeCodexHooksContent(JSON.stringify({ hooks: first }), "cli", enabled);
+    expect(JSON.parse(again).hooks.PreToolUse).toEqual([userGroup, preTool()]);
+    expect(mergeCodexHooksContent(again, "cli", enabled)).toBe(again);
+  });
+
+  it("keeps an installed group at its slot and replaces its definition in place", () => {
+    const hooks = mergeWith({
+      PreToolUse: [
+        { hooks: [foreign("first")] },
+        { matcher: "old", hooks: [lcm("lcm pre-tool --client codex", { timeout: 99 })] },
+        { hooks: [foreign("last")] },
+      ],
+    });
+    expect(hooks.PreToolUse.map((group) => group.hooks[0].command)).toEqual(["echo first", "lcm pre-tool --client codex", "echo last"]);
+    expect(hooks.PreToolUse[1]).toEqual(preTool());
+  });
+
+  it("removes the group on disable when it is the last one and refuses when a later group would move", () => {
+    const withLcm = mergeWith({ PreToolUse: [{ hooks: [foreign("mine")] }] });
+    expect(mergeWith(withLcm, {}).PreToolUse).toEqual([{ hooks: [foreign("mine")] }]);
+    expect(mergeWith(withLcm, { preToolRecall: false }).PreToolUse).toEqual([{ hooks: [foreign("mine")] }]);
+    expect("PreToolUse" in mergeWith(mergeWith({}), {})).toBe(false);
+
+    const later = JSON.stringify({ hooks: { PreToolUse: [preTool(), { hooks: [foreign("after")] }] } });
+    expect(() => mergeCodexHooksContent(later, "cli")).toThrow("LCM cannot update PreToolUse (a later hook would change position)");
+    expect(planCodexHooksInstall(later, "").refusal).toContain("a later hook would change position");
+    expect(JSON.parse(mergeCodexHooksContent(later, "cli", enabled)).hooks.PreToolUse).toHaveLength(2);
+  });
+
+  it("threads the option through the install plan and never through the legacy helper", () => {
+    expect(JSON.parse(planCodexHooksInstall("", "", "cli").hooksContent).hooks).not.toHaveProperty("PreToolUse");
+    expect(JSON.parse(planCodexHooksInstall("", "", "cli", enabled).hooksContent).hooks.PreToolUse).toEqual([preTool()]);
+    const custom = { Stop: codexLcmHooks().Stop };
+    expect(JSON.parse(planCodexHooksInstall("", "", "cli", { preToolRecall: true, expected: custom }).hooksContent).hooks).toEqual(custom);
+  });
+});
+
 describe("Codex hooks install planning", () => {
   it("adds the trust step and writes config only when the feature is absent", () => {
     const fresh = planCodexHooksInstall("", "");
@@ -179,6 +230,14 @@ describe("Codex hooks install planning", () => {
     const unsafe = planCodexHooksInstall("", "features.other = 1\n");
     expect(unsafe.configContent).toBeUndefined();
     expect(unsafe.notices[0]).toContain("Could not safely add the Codex hooks feature");
+  });
+
+  it("plans no config write for a config.toml with an overflowing float", () => {
+    for (const config of ["x = 1e309\n", "x = 1_0e309\n", "x = [ -1e999 ]\n"]) {
+      const plan = planCodexHooksInstall("", config);
+      expect(plan.configContent, config).toBeUndefined();
+      expect(plan.notices[0], config).toContain("Could not interpret the Codex hooks feature");
+    }
   });
 
   it("returns the refusal without any planned content", () => {

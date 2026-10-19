@@ -135,6 +135,26 @@ function scheduleBackgroundRequest(schedule: () => void): void {
   }
 }
 
+function classifyCompletionFailure(signal: AbortSignal | undefined, error: unknown): string {
+  if (signal?.aborted === true) return "timeout";
+  const statusCode = typeof error === "object" && error !== null
+    ? (error as { statusCode?: unknown }).statusCode
+    : undefined;
+  return typeof statusCode === "number" && Number.isInteger(statusCode)
+    && statusCode >= 100 && statusCode <= 599
+    ? "status-" + statusCode
+    : "unavailable";
+}
+
+// Fixed text only: never include the error message, response body or paths.
+function reportUnacknowledgedCompletion(reason: string): void {
+  try {
+    process.stderr.write("lcm: session completion was not acknowledged (" + reason + ")\n");
+  } catch {
+    // The diagnostic is best-effort and must not change the hook outcome.
+  }
+}
+
 export async function handleSessionEnd(
   stdin: string,
   client: DaemonClient,
@@ -239,18 +259,22 @@ export async function handleSessionEnd(
   scheduleBackgroundRequest(() => firePromoteRequest(daemonPort, { cwd: input.cwd }));
   scheduleBackgroundRequest(() => firePromoteEventsRequest(daemonPort, { cwd: input.cwd }));
   if (clientName === "claude") {
+    // Created only after the fence check so the one-second budget covers the request alone.
+    let completionSignal: AbortSignal | undefined;
     try {
       // The CLI explicitly exits after dispatch. Wait for the completion
       // response, with an absolute bound, without retaining publication locks.
       assertHookPublicationFence();
+      completionSignal = AbortSignal.timeout(1000);
       await client.post("/session-complete", {
         session_id: input.session_id,
         cwd: input.cwd,
         message_count: ingestResult.ingested ?? 0,
-      }, { signal: AbortSignal.timeout(1000) });
+      }, { signal: completionSignal });
     } catch (error) {
       if (isBackendPublicationJournalError(error)) throw error;
       // Completion remains best-effort on contention or transport failure.
+      reportUnacknowledgedCompletion(classifyCompletionFailure(completionSignal, error));
     }
   }
   return { exitCode: 0, stdout: "" };

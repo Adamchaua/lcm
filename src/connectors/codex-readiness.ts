@@ -127,6 +127,8 @@ export interface CodexReadinessInput {
   readonly storedTransport: CodexTransportLookup;
   readonly now: number;
   readonly platform?: NodeJS.Platform;
+  /** The opt-in PreToolUse role is expected only while hooks.preToolRecall is enabled. */
+  readonly preToolRecall?: boolean;
   /** Test seam: replaces the default required LCM definitions. */
   readonly expected?: Record<string, CodexHookGroup[]>;
 }
@@ -308,7 +310,7 @@ export function inspectCodexReadiness(input: CodexReadinessInput): CodexReadines
     }
     transport = installedUserPromptTransport(installed ?? []);
   }
-  const expected = input.expected ?? codexLcmHooks(transport ?? "cli");
+  const expected = input.expected ?? codexLcmHooks(transport ?? "cli", { preToolRecall: input.preToolRecall });
   const expectedRoles = new Map<string, string | undefined>();
   for (const [event, groups] of Object.entries(expected)) {
     for (const group of groups) {
@@ -463,6 +465,8 @@ export interface CodexReadinessCheckOptions {
   readonly homeDir: string;
   readonly probeVersion: () => CodexVersionProbe;
   readonly readStoredTransport: () => ConnectorTransport | undefined;
+  /** Whether hooks.preToolRecall is enabled; an unreadable setting counts as disabled. */
+  readonly readPreToolRecall?: () => boolean;
   readonly now?: () => number;
   readonly readReceipts?: () => readonly CodexHookReceipt[];
 }
@@ -478,6 +482,12 @@ export function runCodexReadinessCheck(options: CodexReadinessCheckOptions): { l
   } catch {
     storedTransport = { state: "error", reason: "could not be read" };
   }
+  let preToolRecall = false;
+  try {
+    preToolRecall = options.readPreToolRecall?.() === true;
+  } catch {
+    preToolRecall = false;
+  }
   let receipts: readonly CodexHookReceipt[];
   try {
     receipts = (options.readReceipts ?? readCodexHookReceipts)();
@@ -491,6 +501,7 @@ export function runCodexReadinessCheck(options: CodexReadinessCheckOptions): { l
     receipts,
     version: options.probeVersion(),
     storedTransport,
+    preToolRecall,
     now: (options.now ?? Date.now)(),
   }));
 }
