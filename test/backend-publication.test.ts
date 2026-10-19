@@ -5583,7 +5583,7 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
     const { home, fake } = await preparedFixture();
     const active = coordinator(home, fake.driver);
     const resumed = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.resume(token));
-    expect(resumed.phase).not.toBe("preparing");
+    expect(resumed.phase).toBe("completed");
   });
 
   it("resume: still acquires the lock when no token is supplied", async () => {
@@ -5611,7 +5611,7 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
     const { home, fake } = await preparedFixture();
     const active = coordinator(home, fake.driver);
     const recovered = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.recoverPending({}, token));
-    expect(recovered).not.toBeNull();
+    expect(recovered?.phase).toBe("completed");
   });
 
   it("recoverPending: still acquires the lock when no token is supplied", async () => {
@@ -5654,7 +5654,7 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
       async (token) => active.resume(token),
       { allowUnresolved: true },
     );
-    expect(resumed.phase).not.toBe("preparing");
+    expect(resumed.phase).toBe("completed");
   });
 
   it("enterMaintenance: accepts a retained barrier token", async () => {

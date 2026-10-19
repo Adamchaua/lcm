@@ -1562,6 +1562,24 @@ function createDockerRunnerEnvironment(environment, censusCost = false) {
   };
 }
 
+/** Build the one owned CI runner; the runner-provided init reaps CLI orphans. */
+export function createCiRunnerContainerArgs(context, envFile) {
+  return [
+    "create", "--name", context.names.runner,
+    ...dockerLabelArgs(ownershipLabels(context.runId, "runner", context.owner)),
+    "--init",
+    "--network", context.names.network,
+    "--env-file", envFile,
+    "--volume", `${repositoryRoot}:/workspace:ro`,
+    "--volume", `${context.directory}:${context.directory}:ro`,
+    "--workdir", "/workspace",
+    NODE_IMAGE,
+    "node", "/workspace/node_modules/vitest/vitest.mjs", "run",
+    "--configLoader", "runner",
+    "--config", "/workspace/vitest.postgresql.config.ts",
+  ];
+}
+
 export async function runTests(context, ci, setupDocker = docker, testProcess = runProcess) {
   const env = { ...process.env, ...context.environment };
   delete env.LCM_TEST_POSTGRES_FORK_PROBE;
@@ -1645,19 +1663,7 @@ export async function runTests(context, ci, setupDocker = docker, testProcess = 
   const envFile = join(context.directory, "runner.env");
   writeFileSync(envFile, Object.entries(createDockerRunnerEnvironment(context.environment, censusCost))
     .map(([key, value]) => `${key}=${value}`).join("\n") + "\n", { mode: 0o600 });
-  await setupDocker([
-    "create", "--name", context.names.runner,
-    ...dockerLabelArgs(ownershipLabels(context.runId, "runner", context.owner)),
-    "--network", context.names.network,
-    "--env-file", envFile,
-    "--volume", `${repositoryRoot}:/workspace:ro`,
-    "--volume", `${context.directory}:${context.directory}:ro`,
-    "--workdir", "/workspace",
-    NODE_IMAGE,
-    "node", "/workspace/node_modules/vitest/vitest.mjs", "run",
-    "--configLoader", "runner",
-    "--config", "/workspace/vitest.postgresql.config.ts",
-  ]);
+  await setupDocker(createCiRunnerContainerArgs(context, envFile));
   await runSanitizedProcess("docker", ["start", "--attach", context.names.runner], {
     processRunner: (_command, args, processOptions) => setupDocker(args, processOptions),
     secrets,

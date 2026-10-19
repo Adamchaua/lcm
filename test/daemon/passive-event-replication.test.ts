@@ -214,6 +214,126 @@ function worker(
   );
 }
 
+type FakeInboxStatus = "pending" | "claimed" | "retry" | "applied" | "quarantined";
+
+interface FakeInboxRow {
+  readonly machineId: string;
+  readonly machineSequence: bigint;
+  readonly eventVersion: number;
+  status: FakeInboxStatus;
+}
+
+/**
+ * An in-memory inbox honouring the claim predecessor guard: a row is claimable
+ * only while pending and only when every earlier row of its machine is applied
+ * or quarantined, and one fetch yields at most one row per machine, the
+ * earliest. completeApplied runs the effect and terminalizes the row, so a
+ * successor becomes claimable only once the predecessor has been applied.
+ */
+function statefulInbox(
+  rows: readonly FakeInboxRow[],
+  options: { readonly failApply?: (row: FakeInboxRow) => boolean } = {},
+) {
+  const sorted = [...rows].sort((left, right) =>
+    left.machineId === right.machineId
+      ? Number(left.machineSequence - right.machineSequence)
+      : left.machineId.localeCompare(right.machineId));
+  const find = (c: PostgreSqlPassiveEventClaim): FakeInboxRow =>
+    sorted.find(row =>
+      row.machineId === c.machineId && row.machineSequence === c.machineSequence)!;
+  const record = (row: FakeInboxRow) => remoteRecord({
+    machineId: row.machineId,
+    machineSequence: row.machineSequence,
+    eventId: `event-${row.machineId}-${row.machineSequence.toString()}`,
+    status: row.status,
+    claimedBy: row.status === "claimed" ? "worker:7" : null,
+  });
+  const log = {
+    limits: [] as number[],
+    claimed: [] as string[],
+    applied: [] as string[],
+    retried: [] as string[],
+  };
+  const key = (row: FakeInboxRow): string =>
+    `${row.machineId}:${row.machineSequence.toString()}`;
+  const claimEvents = vi.fn(async ({ limit }: { limit: number }) => {
+    log.limits.push(limit);
+    const out: PostgreSqlPassiveEventClaim[] = [];
+    const seen = new Set<string>();
+    for (const row of sorted) {
+      if (seen.has(row.machineId)) continue;
+      if (row.status === "applied" || row.status === "quarantined") continue;
+      seen.add(row.machineId);
+      if (row.status !== "pending" || out.length >= limit) continue;
+      row.status = "claimed";
+      log.claimed.push(key(row));
+      out.push(claim({
+        machineId: row.machineId,
+        machineSequence: row.machineSequence,
+        eventVersion: row.eventVersion,
+        eventId: `event-${row.machineId}-${row.machineSequence.toString()}`,
+        inboxId: row.machineSequence,
+      }));
+    }
+    return out;
+  });
+  const completeApplied = vi.fn(async (
+    input: { claim: PostgreSqlPassiveEventClaim },
+    effect: (executor: PostgreSqlQueryExecutor, c: PostgreSqlPassiveEventClaim) => Promise<void>,
+  ) => {
+    const row = find(input.claim);
+    if (options.failApply?.(row)) throw new Error("effect rejected");
+    await effect({} as PostgreSqlQueryExecutor, input.claim);
+    row.status = "applied";
+    log.applied.push(key(row));
+    return { event: record(row), result: undefined };
+  });
+  const quarantine = vi.fn(async (input: { claim: PostgreSqlPassiveEventClaim }) => {
+    const row = find(input.claim);
+    row.status = "quarantined";
+    return record(row);
+  });
+  const scheduleRetry = vi.fn(async (input: { claim: PostgreSqlPassiveEventClaim }) => {
+    const row = find(input.claim);
+    row.status = "retry";
+    log.retried.push(key(row));
+    return record(row);
+  });
+  const readEvent = vi.fn(async (input: { machineId: string; eventId: string }) => {
+    const row = sorted.find(candidate =>
+      candidate.machineId === input.machineId
+      && `event-${candidate.machineId}-${candidate.machineSequence.toString()}` === input.eventId);
+    return row === undefined ? null : record(row);
+  });
+  return { rows: sorted, log, claimEvents, completeApplied, quarantine, scheduleRetry, readEvent };
+}
+
+function inboxRows(machineId: string, count: number, from = 1): FakeInboxRow[] {
+  return Array.from({ length: count }, (_, index) => ({
+    machineId,
+    machineSequence: BigInt(from + index),
+    eventVersion: 1,
+    status: "pending" as const,
+  }));
+}
+
+function inboxRemote(
+  inbox: ReturnType<typeof statefulInbox>,
+  overrides: Record<string, unknown> = {},
+) {
+  return remoteRepository({
+    claimEvents: inbox.claimEvents,
+    completeApplied: inbox.completeApplied,
+    quarantine: inbox.quarantine,
+    scheduleRetry: inbox.scheduleRetry,
+    readEvent: inbox.readEvent,
+    ...overrides,
+  });
+}
+
+const MACHINE_A = "0195d250-0000-7000-8000-00000000000a";
+const MACHINE_B = "0195d250-0000-7000-8000-00000000000b";
+
 describe("PassiveEventReplicationWorker", () => {
   it("runs the upload, fenced apply, acknowledgement, and exact prune handoff", async () => {
     const pending = localRow({ delivery_state: "claimed", delivery_owner: "worker:local" });
@@ -239,7 +359,7 @@ describe("PassiveEventReplicationWorker", () => {
     const claimed = claim();
     const remote = remoteRepository({
       insertEvents: vi.fn().mockResolvedValue([pendingRemote]),
-      claimEvents: vi.fn().mockResolvedValue([claimed]),
+      claimEvents: vi.fn().mockResolvedValueOnce([claimed]).mockResolvedValue([]),
       completeApplied: vi.fn().mockResolvedValue({
         event: appliedRemote,
         result: undefined,
@@ -283,7 +403,9 @@ describe("PassiveEventReplicationWorker", () => {
         },
       },
     ], undefined);
-    expect(remote.renewDrainLease).toHaveBeenCalledTimes(2);
+    // Pre-claim, apply-time, and the renewal before the second (empty) fetch.
+    expect(remote.renewDrainLease).toHaveBeenCalledTimes(3);
+    expect(remote.claimEvents).toHaveBeenCalledTimes(2);
     expect(remote.completeApplied).toHaveBeenCalledWith({
       claim: claimed,
       processId: "worker",
@@ -594,7 +716,7 @@ describe("PassiveEventReplicationWorker", () => {
     const future = claim({ eventVersion: 2 });
     const local = localRepository();
     const remote = remoteRepository({
-      claimEvents: vi.fn().mockResolvedValue([future]),
+      claimEvents: vi.fn().mockResolvedValueOnce([future]).mockResolvedValue([]),
       quarantine: vi.fn().mockResolvedValue(remoteRecord({
         eventVersion: 2,
         status: "quarantined",
@@ -621,7 +743,7 @@ describe("PassiveEventReplicationWorker", () => {
     const future = claim({ eventVersion: 2 });
     const local = localRepository();
     const remote = remoteRepository({
-      claimEvents: vi.fn().mockResolvedValue([future]),
+      claimEvents: vi.fn().mockResolvedValueOnce([future]).mockResolvedValue([]),
       quarantine: vi.fn().mockRejectedValue(new Error("commit response lost")),
       readEvent: vi.fn().mockResolvedValue(remoteRecord({
         eventVersion: 2,
@@ -672,7 +794,7 @@ describe("PassiveEventReplicationWorker", () => {
     const local = localRepository();
     const claimed = claim();
     const remote = remoteRepository({
-      claimEvents: vi.fn().mockResolvedValue([claimed]),
+      claimEvents: vi.fn().mockResolvedValueOnce([claimed]).mockResolvedValue([]),
       completeApplied: vi.fn().mockRejectedValue(new Error("commit response lost")),
       readEvent: vi.fn().mockResolvedValue(remoteRecord({
         status: "applied",
@@ -744,7 +866,7 @@ describe("PassiveEventReplicationWorker", () => {
     const local = localRepository();
     const claimed = claim({ attemptCount: 2 });
     const remote = remoteRepository({
-      claimEvents: vi.fn().mockResolvedValue([claimed]),
+      claimEvents: vi.fn().mockResolvedValueOnce([claimed]).mockResolvedValue([]),
       completeApplied: vi.fn().mockRejectedValue(
         new Error("password=hunter2 at /Users/alice/private.txt"),
       ),
@@ -769,7 +891,7 @@ describe("PassiveEventReplicationWorker", () => {
   it("uses a bounded generic diagnostic for a non-Error poison failure", async () => {
     const claimed = claim({ attemptCount: 2 });
     const remote = remoteRepository({
-      claimEvents: vi.fn().mockResolvedValue([claimed]),
+      claimEvents: vi.fn().mockResolvedValueOnce([claimed]).mockResolvedValue([]),
       completeApplied: vi.fn().mockRejectedValue("effect failed"),
       readEvent: vi.fn().mockResolvedValue(remoteRecord({
         status: "claimed",
@@ -1116,6 +1238,420 @@ describe("PassiveEventReplicationWorker", () => {
     });
   });
 
+  describe("a pending row whose earlier upload landed in another project (#1511)", () => {
+    const ID = (n: number) => `aaaaaaaa-0000-4000-8000-${String(n).padStart(12, "0")}`;
+    const THRESHOLD = PASSIVE_EVENT_REPLICATION_DEFAULTS.quarantineAfterAttempts;
+
+    function pendingRow(n: number, overrides: Partial<LocalHookEventRow> = {}): LocalHookEventRow {
+      return localRow({
+        event_id: n,
+        event_uuid: ID(n),
+        machine_sequence: String(n).padStart(19, "0"),
+        delivery_state: "claimed",
+        delivery_owner: "worker:local",
+        ...overrides,
+      });
+    }
+
+    function copy(n: number, overrides: Partial<PostgreSqlPassiveEventRecord> = {}) {
+      return remoteRecord({
+        inboxId: BigInt(100 + n),
+        eventId: ID(n),
+        machineSequence: BigInt(n),
+        ...overrides,
+      });
+    }
+
+    /** The first insert rolls back; the second one succeeds for whatever it is given. */
+    function insertThenSucceed(firstMissing: number) {
+      return vi.fn()
+        .mockRejectedValueOnce(
+          new PostgreSqlPassiveEventDataError(PROJECT_ID, "idempotency_readback", ID(firstMissing)),
+        )
+        .mockImplementation(async (inputs: ReadonlyArray<{ machineSequence: bigint }>) =>
+          inputs.map(input => copy(Number(input.machineSequence))));
+    }
+
+    const idsOf = (calls: ReadonlyArray<ReadonlyArray<unknown>>): string[] =>
+      calls.map(call => call[0] as string);
+
+    const insertedIds = (remote: { insertEvents: ReturnType<typeof vi.fn> }, call: number): string[] =>
+      remote.insertEvents.mock.calls[call][0].map((input: { eventId: string }) => input.eventId);
+
+    it("settles every outcome of one batch and uploads the rest in the same pass", async () => {
+      const rows = [
+        pendingRow(1),
+        pendingRow(2),
+        pendingRow(3),
+        pendingRow(4),
+        pendingRow(5),
+        pendingRow(6, { delivery_attempts: THRESHOLD }),
+        pendingRow(7),
+        pendingRow(8, { delivery_attempts: 1 }),
+        pendingRow(9, { delivery_attempts: THRESHOLD }),
+        pendingRow(10),
+      ];
+      const local = localRepository({ claimDeliveries: vi.fn().mockResolvedValue(rows) });
+      const onError = vi.fn();
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(2),
+        // Only row 1 is visible in the bound project.
+        readEvents: vi.fn().mockResolvedValue([copy(1)]),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(2), outcome: "absent" },
+          { eventId: ID(3), outcome: "released" },
+          { eventId: ID(4), outcome: "applied", inboxId: 104n },
+          { eventId: ID(5), outcome: "quarantined", inboxId: 105n, quarantineReason: "poison" },
+          { eventId: ID(6), outcome: "busy" },
+          { eventId: ID(7), outcome: "bound" },
+          { eventId: ID(8), outcome: "mismatch" },
+          { eventId: ID(9), outcome: "mismatch" },
+        ]),
+      });
+      const signal = new AbortController().signal;
+
+      await expect(worker(local, remote, { onError }).runOnce(signal)).resolves.toMatchObject({
+        uploaded: 3,
+        acknowledged: 1,
+        quarantined: 2,
+        retried: 4,
+      });
+
+      // Release is asked about exactly the rows the bound project lacks, with
+      // no recorded inbox id, and every remote call carries the pass signal.
+      expect(remote.releaseFromOtherProjects).toHaveBeenCalledTimes(1);
+      const [keys, options] = remote.releaseFromOtherProjects.mock.calls[0];
+      expect(keys.map((key: { eventId: string }) => key.eventId))
+        .toEqual([2, 3, 4, 5, 6, 7, 8, 9, 10].map(ID));
+      expect(keys.every((key: object) => !("inboxId" in key))).toBe(true);
+      expect(keys[0]).toEqual({
+        machineId: MACHINE_ID,
+        eventId: ID(2),
+        eventVersion: 1,
+        machineSequence: 2n,
+        eventType: "choice",
+        payload: {
+          sessionId: "session",
+          sessionSequence: 1,
+          category: "decision",
+          data: "SQLite",
+          priority: 1,
+          sourceHook: "PostToolUse",
+          previousEventId: null,
+          createdAt: "2026-07-29 12:00:00",
+        },
+      });
+      expect(options).toEqual({ staleClaimMs: 60_000, signal });
+      // The one extra insert holds the visible, withdrawn, and absent rows in
+      // their original order and nothing else.
+      expect(remote.insertEvents).toHaveBeenCalledTimes(2);
+      expect(insertedIds(remote, 1)).toEqual([1, 2, 3].map(ID));
+      expect(remote.insertEvents.mock.calls[0][1]).toBe(signal);
+      expect(remote.insertEvents.mock.calls[1][1]).toBe(signal);
+      expect(remote.readEvents).toHaveBeenCalledTimes(1);
+      expect(local.markReplicated.mock.calls).toEqual([
+        [ID(1), "worker:local", 101n],
+        [ID(2), "worker:local", 102n],
+        [ID(3), "worker:local", 103n],
+      ]);
+      expect(local.markAcknowledged.mock.calls).toEqual([[ID(4), 104n]]);
+      expect(local.markQuarantined.mock.calls).toEqual([[ID(5), 105n, "poison"]]);
+      // A live claim, a bound copy, a young mismatch, and a row nobody
+      // answered for stay queued; a mismatch at the boundary is quarantined.
+      expect(idsOf(local.markDeliveryRetry.mock.calls)).toEqual([6, 7, 8, 10].map(ID));
+      expect(local.markDeliveryQuarantined.mock.calls).toEqual([
+        [ID(9), "worker:local", "remote copy in another project differs from the local row"],
+      ]);
+      expect(onError).toHaveBeenCalledTimes(1);
+      const reported = onError.mock.calls[0][0] as Error;
+      expect(reported.message).toContain(ID(8));
+      expect(reported.message).toContain(ID(9));
+    });
+
+    it("inserts only the rows that remain visible when the others are settled", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(2),
+        readEvents: vi.fn().mockResolvedValue([copy(1)]),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(2), outcome: "busy" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 1,
+        retried: 1,
+      });
+      expect(insertedIds(remote, 1)).toEqual([ID(1)]);
+    });
+
+    it("does not insert again when no row remains to upload", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(1),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(1), outcome: "busy" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 1,
+      });
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+    });
+
+    it("inserts the whole batch again when the remote proves every row absent", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(1),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(1), outcome: "absent" },
+          { eventId: ID(2), outcome: "absent" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 2,
+        retried: 0,
+      });
+      expect(remote.insertEvents).toHaveBeenCalledTimes(2);
+      expect(insertedIds(remote, 1)).toEqual([ID(1), ID(2)]);
+    });
+
+    it.each([
+      ["a differing row in the bound project", [copy(1, { eventType: "different" })]],
+      ["a readback outage", new Error("readback unavailable")],
+    ])("asks nothing of other projects after %s", async (_label, readback) => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: vi.fn().mockRejectedValue(new Error("insert failed")),
+        readEvents: readback instanceof Error
+          ? vi.fn().mockRejectedValue(readback)
+          : vi.fn().mockResolvedValue(readback),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 2,
+      });
+      expect(remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+    });
+
+    it("asks nothing of other projects when the readback holds every row", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: vi.fn().mockRejectedValue(new Error("connection lost")),
+        readEvents: vi.fn().mockResolvedValue([copy(1), copy(2)]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({ uploaded: 2 });
+      expect(remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back to retrying the whole batch when the recovery query fails", async () => {
+      const failure = new Error("release unavailable");
+      const onError = vi.fn();
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(2),
+        readEvents: vi.fn().mockResolvedValue([copy(1)]),
+        releaseFromOtherProjects: vi.fn().mockRejectedValue(failure),
+      });
+      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 2,
+      });
+      expect(onError).toHaveBeenCalledWith(failure);
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries rather than quarantines a row at the limit when the recovery query fails", async () => {
+      const failure = new Error("release unavailable");
+      const onError = vi.fn();
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([
+          pendingRow(1, { delivery_attempts: THRESHOLD }),
+        ]),
+      });
+      const remote = remoteRepository({
+        // The failed insert names this very row, as a quarantine-worthy error would.
+        insertEvents: insertThenSucceed(1),
+        readEvents: vi.fn().mockResolvedValue([]),
+        releaseFromOtherProjects: vi.fn().mockRejectedValue(failure),
+      });
+      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 1,
+        quarantined: 0,
+      });
+      expect(local.markDeliveryRetry).toHaveBeenCalledTimes(1);
+      expect(local.markDeliveryRetry).toHaveBeenCalledWith(
+        ID(1),
+        expect.any(String),
+        "release unavailable",
+        expect.any(String),
+      );
+      expect(local.markDeliveryQuarantined).not.toHaveBeenCalled();
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+      expect(onError.mock.calls.filter(([error]) => error === failure)).toHaveLength(1);
+    });
+
+    it("acts on the first answer per row and reports a repeated one once", async () => {
+      const onError = vi.fn();
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(1),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(1), outcome: "released" },
+          { eventId: ID(1), outcome: "busy" },
+          { eventId: ID(1), outcome: "busy" },
+          { eventId: ID(99), outcome: "released" },
+          { eventId: ID(2), outcome: "busy" },
+        ]),
+      });
+      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({
+        uploaded: 1,
+        retried: 1,
+      });
+      expect(insertedIds(remote, 1)).toEqual([ID(1)]);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect((onError.mock.calls[0][0] as Error).message).toContain(ID(1));
+    });
+
+    it("recovers only the rows of the extra insert when it fails too", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2), pendingRow(3)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: vi.fn().mockRejectedValue(new Error("insert failed")),
+        readEvents: vi.fn()
+          .mockResolvedValueOnce([copy(1)])
+          .mockResolvedValueOnce([copy(1)]),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(2), outcome: "released" },
+          { eventId: ID(3), outcome: "busy" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 3,
+      });
+      expect(idsOf(local.markDeliveryRetry.mock.calls)).toEqual([3, 1, 2].map(ID));
+      // No second recovery and no third insert.
+      expect(remote.releaseFromOtherProjects).toHaveBeenCalledTimes(1);
+      expect(remote.insertEvents).toHaveBeenCalledTimes(2);
+      expect(remote.readEvents.mock.calls[1][0]).toEqual([
+        { machineId: MACHINE_ID, eventId: ID(1) },
+        { machineId: MACHINE_ID, eventId: ID(2) },
+      ]);
+    });
+
+    it("adopts the readback when the extra insert committed uncertainly", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: vi.fn().mockRejectedValue(new Error("insert failed")),
+        readEvents: vi.fn()
+          .mockResolvedValueOnce([copy(1)])
+          .mockResolvedValueOnce([copy(1), copy(2)]),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(2), outcome: "released" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 2,
+        retried: 0,
+      });
+      expect(local.markReplicated.mock.calls.map(call => call[0])).toEqual([ID(1), ID(2)]);
+    });
+
+    it("retries the rows of the extra insert when their readback fails", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+      });
+      const remote = remoteRepository({
+        insertEvents: vi.fn().mockRejectedValue(new Error("insert failed")),
+        readEvents: vi.fn()
+          .mockResolvedValueOnce([copy(1)])
+          .mockRejectedValueOnce(new Error("readback unavailable")),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(2), outcome: "released" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 0,
+        retried: 2,
+      });
+    });
+
+    it("does not count marks that raced and does not retry their rows", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([
+          pendingRow(1),
+          pendingRow(2),
+          pendingRow(3),
+          pendingRow(4, { delivery_attempts: THRESHOLD }),
+          pendingRow(5),
+          pendingRow(6, { delivery_attempts: 1 }),
+        ]),
+        markAcknowledged: vi.fn().mockResolvedValue(false),
+        markQuarantined: vi.fn().mockResolvedValue(false),
+        markDeliveryQuarantined: vi.fn().mockResolvedValue(false),
+        markDeliveryRetry: vi.fn().mockResolvedValue(false),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(1),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(1), outcome: "absent" },
+          { eventId: ID(2), outcome: "applied", inboxId: 102n },
+          { eventId: ID(3), outcome: "quarantined", inboxId: 103n, quarantineReason: "poison" },
+          { eventId: ID(4), outcome: "mismatch" },
+          { eventId: ID(5), outcome: "busy" },
+          { eventId: ID(6), outcome: "mismatch" },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({
+        uploaded: 1,
+        acknowledged: 0,
+        quarantined: 0,
+        retried: 0,
+      });
+      expect(insertedIds(remote, 1)).toEqual([ID(1)]);
+      expect(idsOf(local.markDeliveryRetry.mock.calls)).toEqual([5, 6].map(ID));
+    });
+
+    it("does not insert again after a local mark throws", async () => {
+      const failure = new Error("local store unavailable");
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([pendingRow(1), pendingRow(2)]),
+        markAcknowledged: vi.fn().mockRejectedValue(failure),
+      });
+      const remote = remoteRepository({
+        insertEvents: insertThenSucceed(1),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([
+          { eventId: ID(1), outcome: "absent" },
+          { eventId: ID(2), outcome: "applied", inboxId: 102n },
+        ]),
+      });
+      await expect(worker(local, remote).runOnce()).rejects.toBe(failure);
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+    });
+  });
+
+
 
   it.each([
     ["missing", null],
@@ -1287,6 +1823,9 @@ describe("PassiveEventReplicationWorker", () => {
     await expect(worker(local, remote, { onError }).runOnce())
       .resolves.toMatchObject({ leaseAcquired: true, applied: 0 });
     expect(remote.claimEvents).not.toHaveBeenCalled();
+    // Losing the lease before any claim skips reconcile and prune.
+    expect(local.listAwaitingRemote).not.toHaveBeenCalled();
+    expect(local.listAcknowledgedForRemotePrune).not.toHaveBeenCalled();
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({
       message: "passive-event drain lease expired",
     }));
@@ -1597,9 +2136,13 @@ describe("PassiveEventReplicationWorker", () => {
         events.push("insertEvents");
         return [remoteRecord()];
       }),
+      renewDrainLease: vi.fn().mockImplementation(async () => {
+        events.push("renewDrainLease");
+        return lease();
+      }),
       claimEvents: vi.fn().mockImplementation(async () => {
         events.push("claimEvents");
-        return [claimed];
+        return events.includes("completeApplied") ? [] : [claimed];
       }),
       completeApplied: vi.fn().mockImplementation(async () => {
         events.push("completeApplied");
@@ -1617,9 +2160,9 @@ describe("PassiveEventReplicationWorker", () => {
       applied: 1,
     });
 
-    // Lease acquisition, upload, renew, claim fetch, one apply, reconcile,
-    // prune: seven admissions.
-    expect(events.filter(event => event === "enter")).toHaveLength(7);
+    // Lease acquisition, upload, renew, claim fetch, one apply, renew before
+    // the next fetch, the empty fetch, reconcile, prune: nine admissions.
+    expect(events.filter(event => event === "enter")).toHaveLength(9);
     // Every replication operation ran inside exactly one admission, and only
     // the cleanup lease release ran outside all of them.
     let depth = 0;
@@ -1636,6 +2179,13 @@ describe("PassiveEventReplicationWorker", () => {
     expect(events.indexOf("claimDeliveries")).toBeLessThan(events.indexOf("insertEvents"));
     expect(events.indexOf("insertEvents")).toBeLessThan(events.indexOf("claimEvents"));
     expect(events.indexOf("claimEvents")).toBeLessThan(events.indexOf("completeApplied"));
+    // The renewal and the empty fetch that follow the apply are their own
+    // admitted phases, in that order.
+    expect(events.lastIndexOf("renewDrainLease"))
+      .toBeGreaterThan(events.indexOf("completeApplied"));
+    expect(events.lastIndexOf("claimEvents"))
+      .toBeGreaterThan(events.lastIndexOf("renewDrainLease"));
+    expect(events.filter(event => event === "claimEvents")).toHaveLength(2);
     expect(events[0]).toBe("enter");
     expect(events.indexOf("enter")).toBeLessThan(events.indexOf("acquireDrainLease"));
     expect(events.lastIndexOf("exit")).toBeLessThan(events.indexOf("releaseDrainLease"));
@@ -1695,5 +2245,169 @@ describe("PassiveEventReplicationWorker", () => {
       { applyEvent },
     ).applyEvent(executor, claim());
     expect(applyEvent).toHaveBeenCalledOnce();
+  });
+
+  describe("draining a machine's backlog in one pass (#1530)", () => {
+    it("applies every ready event of one machine in sequence order in one run", async () => {
+      const inbox = statefulInbox(inboxRows(MACHINE_ID, 3));
+      const order: string[] = [];
+      const applyEvent = vi.fn(async (_executor: PostgreSqlQueryExecutor, event: PostgreSqlPassiveEventClaim) => {
+        order.push(event.machineSequence.toString());
+      });
+      const remote = inboxRemote(inbox);
+
+      await expect(worker(localRepository(), remote, { applyEvent }).runOnce())
+        .resolves.toMatchObject({ applied: 3, retried: 0, quarantined: 0 });
+      expect(order).toEqual(["1", "2", "3"]);
+      expect(inbox.log.applied).toEqual([1, 2, 3].map(n => `${MACHINE_ID}:${String(n)}`));
+      // Each non-final fetch returns one row, and the empty terminator ends it.
+      expect(inbox.log.limits).toEqual([100, 99, 98, 97]);
+      expect(remote.releaseDrainLease).toHaveBeenCalledOnce();
+    });
+
+    it("stops claiming when the shared claimed-row budget is spent", async () => {
+      const inbox = statefulInbox(inboxRows(MACHINE_ID, 3));
+      const remote = inboxRemote(inbox);
+
+      await expect(worker(localRepository(), remote, {}, { batchSize: 2 }).runOnce())
+        .resolves.toMatchObject({ applied: 2 });
+      expect(inbox.log.limits).toEqual([2, 1]);
+      expect(inbox.log.claimed).toHaveLength(2);
+      expect(inbox.rows.map(row => row.status)).toEqual(["applied", "applied", "pending"]);
+    });
+
+    it("shares one budget across machines and blocks only a stuck head's successor", async () => {
+      const inbox = statefulInbox(
+        [...inboxRows(MACHINE_A, 2), ...inboxRows(MACHINE_B, 2)],
+        { failApply: row => row.machineId === MACHINE_A && row.machineSequence === 1n },
+      );
+      const remote = inboxRemote(inbox);
+
+      await expect(worker(localRepository(), remote, {}, { batchSize: 4 }).runOnce())
+        .resolves.toMatchObject({ applied: 2, retried: 1 });
+      // Fetch 1 claims both heads (budget 4 -> 2); A1 retries, B1 applies,
+      // so B2 is claimed by fetch 2 (budget 2 -> 1); A2 stays blocked behind
+      // the retrying A1, and the third fetch ends the pass.
+      expect(inbox.log.limits).toEqual([4, 2, 1]);
+      expect(inbox.log.applied).toEqual([`${MACHINE_B}:1`, `${MACHINE_B}:2`]);
+      expect(inbox.rows.map(row => row.status)).toEqual(["retry", "pending", "applied", "applied"]);
+    });
+
+    it("divides the budget between machines in fetch order", async () => {
+      const inbox = statefulInbox([...inboxRows(MACHINE_A, 2), ...inboxRows(MACHINE_B, 2)]);
+
+      await expect(worker(localRepository(), inboxRemote(inbox), {}, { batchSize: 3 }).runOnce())
+        .resolves.toMatchObject({ applied: 3 });
+      expect(inbox.log.limits).toEqual([3, 1]);
+      expect(inbox.log.applied).toEqual([
+        `${MACHINE_A}:1`,
+        `${MACHINE_B}:1`,
+        `${MACHINE_A}:2`,
+      ]);
+      expect(inbox.rows.at(-1)?.status).toBe("pending");
+    });
+
+    it("does not fetch again after a claim that is scheduled for retry", async () => {
+      const inbox = statefulInbox(inboxRows(MACHINE_ID, 2), { failApply: () => true });
+      const remote = inboxRemote(inbox);
+
+      await expect(worker(localRepository(), remote).runOnce())
+        .resolves.toMatchObject({ applied: 0, retried: 1 });
+      expect(inbox.claimEvents).toHaveBeenCalledOnce();
+      expect(remote.renewDrainLease).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not count an upload-phase quarantine as claim progress", async () => {
+      const inbox = statefulInbox(inboxRows(MACHINE_ID, 2), { failApply: () => true });
+      const future = localRow({
+        event_version: 2,
+        delivery_state: "claimed",
+        delivery_owner: "worker:local",
+      });
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([future]),
+      });
+
+      await expect(worker(local, inboxRemote(inbox)).runOnce())
+        .resolves.toMatchObject({ applied: 0, retried: 1, quarantined: 1 });
+      expect(inbox.claimEvents).toHaveBeenCalledOnce();
+    });
+
+    it("does not fetch again after a failure that settles nothing", async () => {
+      const onError = vi.fn();
+      const inbox = statefulInbox(inboxRows(MACHINE_ID, 2), { failApply: () => true });
+      const remote = inboxRemote(inbox, { readEvent: vi.fn().mockResolvedValue(null) });
+
+      await expect(worker(localRepository(), remote, { onError }).runOnce())
+        .resolves.toMatchObject({ applied: 0, retried: 0 });
+      expect(inbox.claimEvents).toHaveBeenCalledOnce();
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "effect rejected" }));
+    });
+
+    it("counts the quarantine of an unsupported head as progress for its successor", async () => {
+      const rows = inboxRows(MACHINE_ID, 2);
+      const inbox = statefulInbox([{ ...rows[0]!, eventVersion: 2 }, rows[1]!]);
+
+      await expect(worker(localRepository(), inboxRemote(inbox)).runOnce())
+        .resolves.toMatchObject({ applied: 1, quarantined: 1 });
+      expect(inbox.rows.map(row => row.status)).toEqual(["quarantined", "applied"]);
+      expect(inbox.completeApplied).toHaveBeenCalledOnce();
+    });
+
+    it("renews the lease before every further fetch and skips the fetch when it is lost", async () => {
+      const inbox = statefulInbox(inboxRows(MACHINE_ID, 2));
+      const local = localRepository();
+      const remote = inboxRemote(inbox, {
+        renewDrainLease: vi.fn()
+          .mockResolvedValueOnce(lease())
+          .mockResolvedValueOnce(lease())
+          .mockResolvedValueOnce(null),
+      });
+
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({ applied: 1 });
+      expect(inbox.claimEvents).toHaveBeenCalledOnce();
+      expect(inbox.rows.map(row => row.status)).toEqual(["applied", "pending"]);
+      expect(local.listAwaitingRemote).toHaveBeenCalledOnce();
+      expect(local.listAcknowledgedForRemotePrune).toHaveBeenCalledOnce();
+      expect(remote.releaseDrainLease).toHaveBeenCalledOnce();
+    });
+
+    it("stops fetching when the lease is lost while applying a later batch", async () => {
+      const inbox = statefulInbox(inboxRows(MACHINE_ID, 3));
+      const local = localRepository();
+      const remote = inboxRemote(inbox, {
+        renewDrainLease: vi.fn()
+          .mockResolvedValueOnce(lease())
+          .mockResolvedValueOnce(lease())
+          .mockResolvedValueOnce(lease())
+          .mockResolvedValueOnce(null),
+      });
+
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({ applied: 1 });
+      expect(inbox.claimEvents).toHaveBeenCalledTimes(2);
+      expect(inbox.completeApplied).toHaveBeenCalledOnce();
+      expect(local.listAwaitingRemote).toHaveBeenCalledOnce();
+      expect(local.listAcknowledgedForRemotePrune).toHaveBeenCalledOnce();
+    });
+
+    it("propagates a refused admission on a later fetch without reconciling", async () => {
+      const refusal = new BackendPublicationJournalError("backend-mismatch", "publication moved on");
+      const inbox = statefulInbox(inboxRows(MACHINE_ID, 2));
+      let admissions = 0;
+      const admitPhase = async <T>(operation: () => Promise<T>): Promise<T> => {
+        admissions += 1;
+        // lease, upload, renew, fetch, apply, renew, then the second fetch.
+        if (admissions === 7) throw refusal;
+        return operation();
+      };
+      const local = localRepository();
+      const remote = inboxRemote(inbox);
+
+      await expect(worker(local, remote, { admitPhase }).runOnce()).rejects.toBe(refusal);
+      expect(inbox.claimEvents).toHaveBeenCalledOnce();
+      expect(local.listAwaitingRemote).not.toHaveBeenCalled();
+      expect(local.listAcknowledgedForRemotePrune).not.toHaveBeenCalled();
+      expect(remote.releaseDrainLease).toHaveBeenCalledOnce();
+    });
   });
 });

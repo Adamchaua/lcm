@@ -1,0 +1,7 @@
+references: ["#1514", "#1515"]
+rationale: >-
+  #1514 and #1515 make sanitizeError redact a root after a fragment marker and
+  after a URL scheme inside a redacted path on the first pass; safe-error.ts
+  keeps its established owner.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]

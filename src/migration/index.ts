@@ -36,6 +36,35 @@ export type { AuthenticatedSqliteMigrationSnapshot, MigrationReceiptReference } 
 export { runSqliteMigrationCopy, inspectSqliteMigrationCopy, MigrationCopyError } from './batch-copy.js';
 export type { SqliteMigrationCopyInput, MigrationCopyBoundary, MigrationCopyTestingDependencies } from './batch-copy.js';
 
+export {
+  readBackendPublicationOperabilityFact,
+  deriveRollbackPublicationId,
+  deriveRollbackPrepareInputSha256,
+  deriveRollbackReportId,
+  deriveRollbackAuthorityArtifactId,
+  writeRollbackReport,
+  readRollbackReport,
+  writeRollbackAuthorityArtifact,
+  readRollbackAuthorityArtifact,
+  runMigrationRollback,
+  RollbackOrchestrationError,
+} from "./rollback.js";
+export type {
+  MigrationSelectionBindingRecorder,
+  MigrationWitnessBindingRecorder,
+  RollbackAuthoritativeContextResolver,
+  RollbackFencedSession,
+  OpenRollbackFencedSession,
+  RollbackReportBody,
+  RollbackAuthorityArtifactBody,
+  ComputeRollbackTerminalEvidenceInput,
+  RollbackTerminalEvidenceComputer,
+  RunMigrationRollbackDependencies,
+  RunMigrationRollbackInput,
+  RunMigrationRollbackOutcome,
+  RollbackOrchestrationErrorReason,
+} from "./rollback.js";
+
 // --- #624: activation witness schema (frozen, pure, no I/O) ----------------
 
 export {

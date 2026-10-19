@@ -631,6 +631,57 @@ describe("PostgreSQL 18 passive-event repository", () => {
       });
     });
 
+    it("releases a copy by event id alone so the rolled-back batch can be inserted (#1511)", async () => {
+      await withPostgreSqlTestDatabase("passive-release-without-inbox-id", async (database) => {
+        await grantPassiveEventRuntimePrivileges(database);
+        const oldId = await createProject(database, "old");
+        const boundId = await createProject(database, "bound");
+        const machineId = await createMachine(database, "Passive release without inbox id machine");
+        const old = new PostgreSqlPassiveEventRepository(database.runtime, oldId, machineId);
+        const bound = new PostgreSqlPassiveEventRepository(database.runtime, boundId, machineId);
+        const [unrelated, pending, applied, envelope] = eventIds;
+        const inserted = await old.insertEvents([
+          input(machineId, pending, 2n, pending),
+          input(machineId, applied, 3n, applied),
+          input(machineId, envelope, 4n, envelope),
+        ]);
+        const appliedInboxId = inserted.find((event) => event.eventId === applied)!.inboxId;
+        await seed(database, applied, "status = 'applied', applied_at = pg_catalog.statement_timestamp()");
+
+        // The copy in the old project fails the whole bound batch, so the
+        // unrelated row ahead of it is not inserted either.
+        const batch = [input(machineId, unrelated, 1n, unrelated), input(machineId, pending, 2n, pending)];
+        await expect(bound.insertEvents(batch)).rejects.toMatchObject({
+          name: "PostgreSqlPassiveEventDataError",
+          field: "idempotency_readback",
+          eventId: pending,
+        });
+        expect(await bound.readEvents(batch.map(({ machineId: machine, eventId }) =>
+          ({ machineId: machine, eventId })))).toEqual([]);
+
+        // The upload that went to the old project was never recorded locally,
+        // so the keys carry no inbox id.
+        await expect(bound.releaseFromOtherProjects([
+          input(machineId, unrelated, 1n, unrelated),
+          input(machineId, pending, 2n, pending),
+          input(machineId, applied, 3n, applied),
+          // The envelope differs from the stored copy.
+          input(machineId, envelope, 4n, "forged"),
+        ], { staleClaimMs: 60_000 })).resolves.toEqual([
+          { eventId: unrelated, outcome: "absent" },
+          { eventId: pending, outcome: "released" },
+          { eventId: applied, outcome: "applied", inboxId: appliedInboxId },
+          { eventId: envelope, outcome: "mismatch" },
+        ]);
+        expect(await remaining(database)).toEqual([`old:${envelope}:pending`]);
+
+        await expect(bound.insertEvents(batch)).resolves.toMatchObject([
+          { eventId: unrelated, projectId: boundId, status: "pending" },
+          { eventId: pending, projectId: boundId, status: "pending" },
+        ]);
+      });
+    });
+
     it("rejects keys of another machine and duplicate keys without touching any row", async () => {
       await withPostgreSqlTestDatabase("passive-release-input", async (database) => {
         await grantPassiveEventRuntimePrivileges(database);

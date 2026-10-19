@@ -1,0 +1,9 @@
+references: ["#1530"]
+rationale: >-
+  #1530 makes the replication worker keep claiming after its own applies make
+  a machine's next events claimable, because a claim fetch yields at most one
+  event per machine. The pass shares one claimed-event budget across fetches
+  and renews the drain lease before each. Every changed file keeps its current
+  owner.
+pins:
+  - ["src/daemon/passive-event-replication.ts", "integration-postgresql-passive-events"]

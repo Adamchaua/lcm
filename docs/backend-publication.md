@@ -181,8 +181,10 @@ compare-and-swap; completion is reserved for a caller that has authoritative
 terminal readback. A source-preserving abort verifies the original selection
 evidence and never invokes the version-2 target config/map restoration path.
 
-After `maintenance-aborted`, normal configuration loading resumes for SQLite,
-including installations whose configuration file is absent. After
+After `maintenance-aborted`, normal configuration loading resumes for the
+source backend the journal recorded when the window was entered: SQLite for an
+activation's window, including installations whose configuration file is
+absent, and PostgreSQL for a rollback's. After
 `selection-completed`, it resumes for the target backend recorded in the
 journal. Entering, held, and prepared maintenance continue to block normal
 configuration reads. A terminal journal for a different backend is also refused.
@@ -275,8 +277,10 @@ pre-journal directory state, does not block durable local enqueue. Existing
 journals must still have an authenticated supported shape; malformed or unknown
 versions and unsafe paths refuse. Consumer operations remain fenced until their
 own authoritative terminal readback.
-After an authenticated abort, SQLite consumer admission resumes. After selected-
-generation completion, only the recorded target backend is admitted.
+After an authenticated abort, consumer admission resumes for the journal's
+recorded source backend (SQLite for an activation's window, PostgreSQL for a
+rollback's). After selected-generation completion, only the recorded target
+backend is admitted.
 
 A daemon that is already running authenticates its startup backend once and
 keeps it for its whole lifetime. Changing the configured backend underneath it
@@ -551,7 +555,12 @@ guard by hand. Four exports in `src/storage` cover that.
   to 24 hours), and it validates all three when it is created.
 - `composeBackendPublicationMaterial` (`backend-publication-material.ts`)
   reads the live `config.json` and `map.json` and returns
-  `{ sourceBackend, targetBackend, material, projects }`.
+  `{ sourceBackend, targetBackend, material, projects }`. It runs the
+  stored-config validator on the composed target config and refuses with
+  `backend publication target config is invalid for <target>` before
+  anything is prepared, so a source config that the target backend would
+  reject (for example a null `storage.postgresql.migrationRole` composed for
+  PostgreSQL) never reaches the project map.
 - `readRetainedBackendPublicationMaterial` returns the retained recovery
   material of the last completed publication.
 
@@ -662,10 +671,16 @@ archives it, and the reader never looks in `history/`, so after a new
 `readRetainedBackendPublicationMaterial` answers `present` (with the journal
 and the authenticated material), `authoritatively-absent` (the publication
 directory is confirmed absent, or the journal is not at `completed`), or
-`unresolvable` with a reason. A publication directory that exists without a
-readable journal, and a completed journal whose material file is missing or
-fails authentication, are `unresolvable`; neither is treated as "nothing to
-reverse".
+`unresolvable` with a reason. `present` requires a completed journal that
+passes the same terminal-evidence checks as consumer access (a recovery
+reference, no active remote fence, published hashes equal to the intended
+hashes), material that authenticates, and the same journal checksum when the
+journal is re-read after the material read. The reader takes no lock, so
+`present` does not promise that the journal is still the live one when the
+call returns. A publication directory that exists without a readable
+journal, a completed journal that fails those checks or whose material file
+is missing or fails authentication, and a journal that changes while it is
+read are `unresolvable`; none of them is treated as "nothing to reverse".
 
 ### What the driver leaves to the coordinator
 
