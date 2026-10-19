@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { semanticDigest } from "./assertions.mjs";
-import { partitionFencedLeases } from "./passive-leases.mjs";
+import { partitionFencedLeases, settleHeldLeases } from "./passive-leases.mjs";
 
 const machineId = "01a15240-ea21-720e-a5bf-51124fafef10";
 const primary = "01a15240-ea23-7d5a-b9e7-40fe885d305b";
@@ -39,7 +39,6 @@ describe("surface parity passive replication lease exemption", () => {
     ["foreign machine", { resource_key: foreignMachine, owner_machine_id: foreignMachine }],
     ["foreign owner machine only", { owner_machine_id: foreignMachine }],
     ["foreign resource key only", { resource_key: foreignMachine }],
-    ["unreleased lease", { released_at: null }],
     ["wrong operation", { operation: "drain" }],
     ["non-daemon owner", { owner_process_id: "worker:1" }],
     ["zero token", { fencing_token: 0 }],
@@ -51,6 +50,62 @@ describe("surface parity passive replication lease exemption", () => {
   it("rejects the triage probe that main left digest-neutral", () => {
     const probe = passive({ project_id: foreignProject, resource_key: foreignMachine, owner_machine_id: foreignMachine, released_at: null });
     expect(() => partitionFencedLeases([other(), probe], authority)).toThrow("surface-parity-parent:passive-replication-lease-shape");
+  });
+
+  it("reports a held but otherwise valid fixture lease as held", () => {
+    expect(() => partitionFencedLeases([passive({ released_at: null })], authority)).toThrow("surface-parity-parent:passive-replication-lease-held");
+    // Another violation in the same row set wins over a held lease.
+    expect(() => partitionFencedLeases([passive({ released_at: null }), passive({ project_id: prepared, operation: "drain" })], authority))
+      .toThrow("surface-parity-parent:passive-replication-lease-shape");
+  });
+
+  it.each([
+    ["unbound project", { project_id: foreignProject }],
+    ["foreign machine", { resource_key: foreignMachine, owner_machine_id: foreignMachine }],
+    ["non-daemon owner", { owner_process_id: "worker:1" }],
+  ])("keeps a held lease with %s a shape violation", (_name, overrides) => {
+    expect(() => partitionFencedLeases([passive({ ...overrides, released_at: null })], authority)).toThrow("surface-parity-parent:passive-replication-lease-shape");
+  });
+
+  describe("settleHeldLeases", () => {
+    const held = () => new Error("surface-parity-parent:passive-replication-lease-held");
+    /** A fake clock that only advances when the retry loop sleeps. */
+    const clock = () => {
+      let time = 0;
+      const sleeps: number[] = [];
+      return { sleeps, now: () => time, sleep: async (ms: number) => { sleeps.push(ms); time += ms; } };
+    };
+
+    it("returns the first successful read after transient held failures", async () => {
+      const { sleeps, now, sleep } = clock();
+      let reads = 0;
+      const result = await settleHeldLeases(async () => { if (++reads < 3) throw held(); return "ok"; }, { timeoutMs: 1000, intervalMs: 250, now, sleep });
+      expect(result).toBe("ok");
+      expect(reads).toBe(3);
+      expect(sleeps).toEqual([250, 250]);
+    });
+
+    it("rethrows the held error after a finite number of reads when the lease stays held", async () => {
+      const { now, sleep } = clock();
+      let reads = 0;
+      await expect(settleHeldLeases(async () => { reads++; throw held(); }, { timeoutMs: 1000, intervalMs: 250, now, sleep }))
+        .rejects.toThrow("surface-parity-parent:passive-replication-lease-held");
+      expect(reads).toBe(5);
+    });
+
+    it("propagates any other error on the first read without retry", async () => {
+      const { sleeps, now, sleep } = clock();
+      let reads = 0;
+      await expect(settleHeldLeases(async () => { reads++; throw new Error("surface-parity-parent:passive-replication-lease-shape"); }, { now, sleep }))
+        .rejects.toThrow("surface-parity-parent:passive-replication-lease-shape");
+      expect(reads).toBe(1);
+      expect(sleeps).toEqual([]);
+    });
+
+    it("waits on real timers with the default bounds when nothing is injected", async () => {
+      let reads = 0;
+      expect(await settleHeldLeases(async () => { if (++reads < 2) throw held(); return reads; }, { intervalMs: 1 })).toBe(2);
+    });
   });
 
   it("rejects duplicate leases for one project", () => {

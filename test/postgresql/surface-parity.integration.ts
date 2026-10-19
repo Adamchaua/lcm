@@ -13,7 +13,7 @@ import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import { createCertificate, encodeBookkeeping, loadMatrix, sourceDigest } from "../../scripts/surface-parity-artifact.mjs";
 import { assertCompleteReport, assertSemanticEqual, compareBackendReports, semanticDigest } from "../surface-parity/assertions.mjs";
 import { createAdmissionLedger, preparedCase, validatePreparedCatalog } from "../surface-parity/prepared-projects.mjs";
-import { partitionFencedLeases } from "../surface-parity/passive-leases.mjs";
+import { partitionFencedLeases, settleHeldLeases } from "../surface-parity/passive-leases.mjs";
 import { createGitFixture } from "../surface-parity/git-fixture.mjs";
 import { FAULT_ASSERTION_OWNERS, type SurfaceRow } from "../surface-parity/inventory.js";
 import { expectedSurfaceObservations } from "./fixtures/surface-parity-workflows.mjs";
@@ -254,10 +254,13 @@ class OwnedAdministrator {
    * start or pass acquire and release one fenced lease row per remote-bound
    * project: resource_type passive-events, operation replicate, keyed by the
    * machine id. Only released leases of the fixture machine's bound projects
-   * are exempt from the exact table digest (see passive-leases.mjs); any other
-   * passive-events row fails the snapshot, and every other lease row stays
-   * pinned. The aliases are read after the leases, so a project bound in
-   * between can only widen the bound set.
+   * are exempt from the exact table digest (see passive-leases.mjs). A
+   * well-formed fixture lease that is still held belongs to an in-flight
+   * sweep (the startup sweep is not synchronised with daemon readiness), so
+   * snapshot() re-reads it up to the settle bound; any other passive-events
+   * row fails the snapshot at once, and every other lease row stays pinned.
+   * The aliases are read after the leases, so a project bound in between can
+   * only widen the bound set.
    */
   private async pinnedLeaseRows(leases: Json[]): Promise<Json[]> {
     requireThat(this.fixtureMachineId, "fixture-machine-unset");
@@ -283,7 +286,12 @@ class OwnedAdministrator {
     requireThat(this.passiveLeaseObserved, "passive-replication-lease-observed");
   }
 
-  private async snapshot(): Promise<Json> {
+  /** Re-reads the whole snapshot while a fixture lease is still held, up to the bound in settleHeldLeases (matches the worker's 30 s startup pass). */
+  private snapshot(): Promise<Json> {
+    return settleHeldLeases(() => this.readSnapshot());
+  }
+
+  private async readSnapshot(): Promise<Json> {
     const catalog = await this.runtime.query<{ table_name: string; column_name: string; data_type: string; is_nullable: string; column_default: string | null }>({
       text: `SELECT table_name,column_name,data_type,is_nullable,column_default
         FROM information_schema.columns WHERE table_schema='lcm'
@@ -310,8 +318,9 @@ class OwnedAdministrator {
       // fenced lease per bound project and pass, so its bookkeeping rows can
       // appear or advance across a restart or an idle interval without any
       // user-visible change. Only released fixture-machine leases of bound
-      // projects are validated and excluded from the exact digest; every other
-      // lease row stays exactly pinned.
+      // projects are validated and excluded from the exact digest; a still-held
+      // fixture lease throws and is waited out by snapshot(); every other lease
+      // row stays exactly pinned.
       const rows = await this.runtime.query<{ row: Json }>({
         text: `SELECT to_jsonb(record) AS row FROM lcm."${name}" AS record
           ORDER BY to_jsonb(record)::text COLLATE "C"`,
