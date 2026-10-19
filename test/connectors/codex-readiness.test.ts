@@ -309,8 +309,12 @@ describe("inspectCodexReadiness statuses", () => {
     rejected(command('"additionalContextLimit":2500.0'));
     rejected('{"type":"mcp_tool","server":"s","tool":"t","timeout":30.0}');
     rejected('{"type":"mcp_tool","server":"s","tool":"t","timeout":3e1}');
-    rejected('{"type":"prompt","timeout":3e1}');
-    rejected('{"type":"agent","timeout":-0}');
+    // Codex ignores the timeout of prompt and agent handlers, so only the base safe-integer check applies.
+    rejected('{"type":"prompt","timeout":-1}');
+    rejected('{"type":"agent","timeout":1.5}');
+    accepted('{"type":"prompt","timeout":3e1}');
+    accepted('{"type":"agent","timeout":-0}');
+    accepted('{"type":"agent","timeout":30.0}');
     for (const spelling of ["30", "0", "2500", "9007199254740991"]) {
       accepted(command('"timeout":' + spelling + ',"additionalContextLimit":' + spelling));
     }
