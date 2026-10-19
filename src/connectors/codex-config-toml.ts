@@ -79,7 +79,8 @@ function validScalar(token: string): boolean {
     const value = BigInt(token.replaceAll("_", ""));
     return value >= I64_MIN && value <= I64_MAX;
   }
-  if (FLOAT.test(token) || SPECIAL_FLOAT.test(token)) return true;
+  if (FLOAT.test(token)) return Number.isFinite(Number(token.replaceAll("_", "")));
+  if (SPECIAL_FLOAT.test(token)) return true;
   const time = LOCAL_TIME.exec(token);
   if (time !== null) return Number(time[1]) <= 23 && Number(time[2]) <= 59 && Number(time[3]) <= 60;
   const date = DATE_TIME.exec(token);

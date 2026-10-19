@@ -264,11 +264,12 @@ describe("inspectCodexReadiness statuses", () => {
       "x = 9223372036854775808\n", "x = 0x8000000000000000\n",
       "x = \"a" + C0(1) + "b\"\n", "x = 'a" + C0(0x7f) + "b'\n", 'x = """a \\q b"""\n', 'x = """a \\uD800 b"""\n',
       "# comment " + C0(1) + "\n", "# comment \r bare\n",
+      "x = 1e309\n", "x = 1_0e309\n", "x = [ -1e999 ]\n",
     ]) {
       const report = inspectCodexReadiness(input({ config: { state: "content", content: invalid + trusted } }));
       expect(new Set(report.rows.map((row) => row.status)), JSON.stringify(invalid)).toEqual(new Set(["state-unknown"]));
     }
-    for (const valid of ["x = 2024-02-29\n", "x = 23:59:60\n", "x = 9223372036854775807\n", "x = { b = 1,\n c = 2, }\n"]) {
+    for (const valid of ["x = 2024-02-29\n", "x = 23:59:60\n", "x = 9223372036854775807\n", "x = { b = 1,\n c = 2, }\n", "x = 1.7976931348623157e308\n", "x = 1e-400\n"]) {
       const report = inspectCodexReadiness(input({ config: { state: "content", content: valid + trusted } }));
       expect(new Set(report.rows.map((row) => row.status)), valid).toEqual(new Set(["ready"]));
     }

@@ -181,6 +181,14 @@ describe("Codex hooks install planning", () => {
     expect(unsafe.notices[0]).toContain("Could not safely add the Codex hooks feature");
   });
 
+  it("plans no config write for a config.toml with an overflowing float", () => {
+    for (const config of ["x = 1e309\n", "x = 1_0e309\n", "x = [ -1e999 ]\n"]) {
+      const plan = planCodexHooksInstall("", config);
+      expect(plan.configContent, config).toBeUndefined();
+      expect(plan.notices[0], config).toContain("Could not interpret the Codex hooks feature");
+    }
+  });
+
   it("returns the refusal without any planned content", () => {
     const duplicate = JSON.stringify({ hooks: { Stop: [{ hooks: [lcm("lcm session-snapshot --client codex"), lcm("lcm session-snapshot --client codex")] }] } });
     expect(planCodexHooksInstall(duplicate, "")).toEqual({ hooksContent: duplicate, notices: [], refusal: expect.stringContaining("multiple LCM handlers") });
