@@ -130,6 +130,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * first non-blank record is consulted; a later session_meta is ignored.
  */
 export function readCodexInheritedBoundary(raw: string): CodexInheritedBoundary | undefined {
+  const payload = firstSessionMetaPayload(raw);
+  if (payload === undefined) return undefined;
+  const start = payload.subagent_history_start_ordinal;
+  if (!isCodexOrdinal(start)) return undefined;
+  return { start, paginated: payload.history_mode === "paginated" };
+}
+
+/** A Codex rollout's first session_meta identifies the rollout and its immediate parent. */
+export interface CodexSessionParent {
+  readonly id: string;
+  readonly parentThreadId: string;
+}
+
+/**
+ * Read the rollout's own id and immediate parent thread from already-bound
+ * bytes. Independent of the inherited-history boundary: only the first
+ * non-blank record is consulted, and both fields must be strings.
+ */
+export function readCodexSessionParent(raw: string): CodexSessionParent | undefined {
+  const payload = firstSessionMetaPayload(raw);
+  if (payload === undefined) return undefined;
+  const { id, parent_thread_id: parentThreadId } = payload;
+  return typeof id === "string" && typeof parentThreadId === "string"
+    ? { id, parentThreadId }
+    : undefined;
+}
+
+function firstSessionMetaPayload(raw: string): Record<string, unknown> | undefined {
   let offset = 0;
   while (offset <= raw.length) {
     const newline = raw.indexOf("\n", offset);
@@ -144,9 +172,7 @@ export function readCodexInheritedBoundary(raw: string): CodexInheritedBoundary 
       return undefined;
     }
     if (!isRecord(first) || first.type !== "session_meta" || !isRecord(first.payload)) return undefined;
-    const start = first.payload.subagent_history_start_ordinal;
-    if (!isCodexOrdinal(start)) return undefined;
-    return { start, paginated: first.payload.history_mode === "paginated" };
+    return first.payload;
   }
   return undefined;
 }

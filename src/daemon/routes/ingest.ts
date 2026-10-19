@@ -30,7 +30,7 @@ import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { ParsedMessage } from "../../transcript.js";
 import { normalizeTranscriptClient, parseTranscriptTextForClient, type TranscriptClient } from "../../transcript-provider.js";
-import { readCodexInheritedBoundary, type CodexInheritedBoundary } from "../../codex-transcript.js";
+import { readCodexInheritedBoundary, readCodexSessionParent, type CodexInheritedBoundary } from "../../codex-transcript.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
@@ -172,17 +172,33 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         scrubber: ScrubEngine | undefined,
         filteredMessages: ParsedMessage[] | undefined,
         hasLinkedInheritedRecord: (provenance: NativeTranscriptProvenanceRepository) => Promise<boolean>,
+        parentSessionId: string | undefined,
       ) {
         const resolvedMessages = messages;
         return await project.transaction(async (repositories) => {
+          // Keep-first parent linkage runs on every attempt, before any early
+          // return, and never creates a conversation of its own.
+          const linkParent = async (conversation: { conversationId: number; parentSessionId: string | null } | null) => {
+            if (parentSessionId === undefined || conversation === null || conversation.parentSessionId !== null) return;
+            await repositories.conversations.setParentSessionIdIfNull(conversation.conversationId, parentSessionId);
+          };
+          const linkExistingParent = async () => {
+            if (parentSessionId !== undefined) {
+              await linkParent(await repositories.conversations.getConversationBySessionId(session_id));
+            }
+          };
           if (resolvedMessages.length === 0 && filteredMessages === undefined) {
+            await linkExistingParent();
             return { persisted: null, history: undefined };
           }
           // A forked subagent's history mode needs the stored rows, so it never
           // takes the session-count shortcut below, even when nothing is new.
           if (filteredMessages === undefined) {
             const row = await repositories.coordination.getSessionIngest(session_id);
-            if (row && resolvedMessages.length <= row.messageCount) return { persisted: null, history: undefined };
+            if (row && resolvedMessages.length <= row.messageCount) {
+              await linkExistingParent();
+              return { persisted: null, history: undefined };
+            }
           }
 
           // Nothing can be appended without messages, so no conversation is
@@ -190,6 +206,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
           const conversation = resolvedMessages.length === 0
             ? await repositories.conversations.getConversationBySessionId(session_id)
             : await repositories.conversations.getOrCreateConversation(session_id);
+          await linkParent(conversation);
           let history: SubagentHistory | undefined;
           let chosen = resolvedMessages;
           let storedCount: number;
@@ -245,6 +262,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       let retryFailure: NativeTranscriptSourceChangedError | undefined;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         throwIfAborted(signal);
+        let parentSessionId: string | undefined;
         let snapshot: NativeTranscriptSourceSnapshot | undefined;
         let closeSnapshot: (() => Promise<void>) | undefined;
         let sourceClosed = false;
@@ -296,6 +314,13 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
               if (inheritedBoundary !== undefined) {
                 filteredMessages = parseTranscriptTextForClient(raw, "codex", { excludeInheritedSubagentHistory: true });
               }
+              // The immediate parent comes from the same bound bytes; only the
+              // rollout whose own id is the child key may name one.
+              const meta = readCodexSessionParent(raw);
+              if (
+                meta !== undefined && meta.id === session_id && meta.parentThreadId !== ""
+                && meta.parentThreadId !== session_id && !meta.parentThreadId.includes("\0")
+              ) parentSessionId = meta.parentThreadId;
             }
           }
           throwIfAborted(signal);
@@ -335,6 +360,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                     const inherited = await inheritedNativeSourceOrdinals(rolloutBytes!, inheritedBoundary!);
                     return linked.some((ordinal) => inherited.has(ordinal));
                   },
+                  parentSessionId,
                 );
                 if (persisted) {
                   accumulated = accumulated === null ? persisted : {

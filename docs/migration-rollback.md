@@ -239,6 +239,14 @@ is the abort evidence itself admitted, on PostgreSQL. Neither path ever answers
 SQLite. Only an aborted activation window selects SQLite, because that is the
 backend it was entered from.
 
+## Upgrading LCM during a rollback
+
+The portable schema digest changes in the release that adds
+`conversations.parent_session_id`. Census evidence and cutover proof
+manifests produced by an older LCM fail closed with `incompatible-schema`
+under the new binary. Finish or abandon an in-flight rollback before
+upgrading, then rerun it with the new binary.
+
 ## The maintenance window scales with data size
 
 Rollback holds the same PostgreSQL fence used by the forward migration for

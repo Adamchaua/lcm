@@ -6,6 +6,7 @@ import {
   parseCodexTranscript,
   parseCodexTranscriptText,
   readCodexInheritedBoundary,
+  readCodexSessionParent,
   isInheritedSubagentRecord,
   extractCodexSessionCwd,
   extractCodexSessionMeta,
@@ -543,6 +544,26 @@ describe("inherited subagent history", () => {
     ["a null start", { subagent_history_start_ordinal: null }],
   ])("ignores %s", (_name, payload) => {
     expect(readCodexInheritedBoundary(meta(payload))).toBeUndefined();
+  });
+
+  it("reads a session's own id and immediate parent independent of any history boundary", () => {
+    const payload = { id: "child", parent_thread_id: "parent" };
+    expect(readCodexSessionParent(join_("", "  ", meta(payload)))).toEqual({ id: "child", parentThreadId: "parent" });
+    expect(readCodexSessionParent(meta({ ...payload, subagent_history_start_ordinal: 3 })))
+      .toEqual({ id: "child", parentThreadId: "parent" });
+  });
+
+  it("returns no parent unless the first record is a session_meta with string id and parent", () => {
+    const good = meta({ id: "child", parent_thread_id: "parent" });
+    expect(readCodexSessionParent("")).toBeUndefined();
+    expect(readCodexSessionParent(join_("{broken", good))).toBeUndefined();
+    expect(readCodexSessionParent(join_(record(0, "user", "x"), good))).toBeUndefined();
+    expect(readCodexSessionParent(JSON.stringify({ type: "session_meta", payload: "x" }))).toBeUndefined();
+    expect(readCodexSessionParent(meta({ parent_thread_id: "parent" }))).toBeUndefined();
+    expect(readCodexSessionParent(meta({ id: 1, parent_thread_id: "parent" }))).toBeUndefined();
+    expect(readCodexSessionParent(meta({ id: "child" }))).toBeUndefined();
+    expect(readCodexSessionParent(meta({ id: "child", parent_thread_id: null }))).toBeUndefined();
+    expect(readCodexSessionParent(join_(meta({ id: "child" }), good))).toBeUndefined();
   });
 
   it("reads only the first non-blank record", () => {

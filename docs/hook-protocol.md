@@ -422,10 +422,18 @@ A `SubagentStop` payload without a valid `agent_id` or without
 
 **Limits:**
 
-- The immediate parent of a subagent is not stored by LCM. It can be recovered
-  from the subagent's rollout: its `session_meta` record has `id` (the
-  subagent's session key in LCM) and `parent_thread_id`. Deleting the rollout
-  removes that link, and LCM offers no query for it yet.
+- LCM stores the immediate parent of a subagent in the conversation's
+  `parent_session_id` column (SQLite and PostgreSQL), taken from
+  `parent_thread_id` in the first `session_meta` record of the subagent's
+  own rollout. A grandchild records its direct parent, never the root of the
+  agent tree. The first recorded parent is kept and never overwritten or
+  cleared. A root conversation, a conversation from another client, and a
+  rollout without `parent_thread_id` leave the column empty. The value is
+  filled when a rollout is ingested (a `SubagentStop` or `PreCompact`
+  snapshot, or `lcm import --codex`), including for a conversation stored
+  earlier; ingesting only a message list never fills it. LCM offers no command
+  that queries it yet. Portable transfer between SQLite and PostgreSQL carries
+  it.
 - A subagent that is interrupted or fails may never emit `SubagentStop`. Its
   tool observations are already stored, and its rollout can still be imported
   with `lcm import --codex`.

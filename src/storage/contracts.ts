@@ -71,6 +71,11 @@ export interface ConversationRepository {
   getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null>;
   getOrCreateConversation(sessionId: string, title?: string): Promise<ConversationRecord>;
   markConversationBootstrapped(conversationId: ConversationId): Promise<void>;
+  /**
+   * Record the immediate parent session once; an existing value is kept and
+   * never cleared. Does not change updated_at.
+   */
+  setParentSessionIdIfNull(conversationId: ConversationId, parentSessionId: string): Promise<void>;
   listConversations(): Promise<ConversationRecord[]>;
   /**
    * Create one explicit sequence value for replay/import.
