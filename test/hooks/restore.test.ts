@@ -1,6 +1,6 @@
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { dirname, join } from "node:path";
-import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import {
   handleSessionStart,
@@ -372,10 +372,12 @@ describe("handleSessionStart", () => {
     expect(result.stdout).not.toContain("<learned-insights");
   });
 
-  it("returns empty output without contacting daemon on duplicate session_id", async () => {
+  it("returns empty output without contacting daemon while another live process holds the session lock", async () => {
     const sessionId = "dedup-guard-test-abc123";
     const lockPath = sessionLockPathForTesting(sessionId);
     rmSync(lockPath, { force: true });
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, String(process.ppid));
 
     mockEnsureDaemon.mockClear();
     mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
@@ -385,16 +387,66 @@ describe("handleSessionStart", () => {
     };
     const stdin = JSON.stringify({ session_id: sessionId, cwd: "/proj" });
 
-    // First call proceeds normally
-    await handleSessionStart(stdin, client);
-    expect(mockEnsureDaemon).toHaveBeenCalledTimes(1);
-
-    // Second call with same session_id returns empty, daemon not called again
-    const second = await handleSessionStart(stdin, client);
-    expect(second).toEqual({ exitCode: 0, stdout: "" });
-    expect(mockEnsureDaemon).toHaveBeenCalledTimes(1); // still 1, not 2
+    const blocked = await handleSessionStart(stdin, client);
+    expect(blocked).toEqual({ exitCode: 0, stdout: "" });
+    expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    expect(readFileSync(lockPath, "utf-8")).toBe(String(process.ppid));
 
     rmSync(lockPath, { force: true });
+  });
+
+  it("releases the session lock so the next start for the same session proceeds", async () => {
+    const sessionId = "dedup-guard-test-abc123";
+    const lockPath = sessionLockPathForTesting(sessionId);
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const client = { post: vi.fn().mockResolvedValue({ context: "ctx" }) };
+    const stdin = JSON.stringify({ session_id: sessionId, cwd: "/proj" });
+
+    await expect(handleSessionStart(stdin, client)).resolves.toEqual({ exitCode: 0, stdout: "ctx" });
+    expect(existsSync(lockPath)).toBe(false);
+    await expect(handleSessionStart(stdin, client)).resolves.toEqual({ exitCode: 0, stdout: "ctx" });
+    expect(mockEnsureDaemon).toHaveBeenCalledTimes(2);
+  });
+
+  it("releases the session lock on every return path", async () => {
+    const sessionId = "s1";
+    const lockPath = sessionLockPathForTesting(sessionId);
+    const stdin = JSON.stringify({ session_id: sessionId });
+
+    mockEnsureDaemon.mockRejectedValueOnce(new Error("spawn failed"));
+    await handleSessionStart(stdin, { post: vi.fn() });
+    expect(existsSync(lockPath)).toBe(false);
+
+    mockEnsureDaemon.mockResolvedValueOnce({ connected: false, port: 3737, spawned: false });
+    await handleSessionStart(stdin, { post: vi.fn() });
+    expect(existsSync(lockPath)).toBe(false);
+
+    mockEnsureDaemon.mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
+    await handleSessionStart(stdin, { post: vi.fn().mockRejectedValue(new Error("down")) });
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("keeps a lock that no longer names this process and tolerates a vanished lock", async () => {
+    const sessionId = "s2";
+    const lockPath = sessionLockPathForTesting(sessionId);
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+    const stdin = JSON.stringify({ session_id: sessionId });
+
+    await handleSessionStart(stdin, {
+      post: vi.fn().mockImplementation(async () => {
+        writeFileSync(lockPath, String(process.ppid));
+        return { context: "ctx" };
+      }),
+    });
+    expect(readFileSync(lockPath, "utf-8")).toBe(String(process.ppid));
+    rmSync(lockPath, { force: true });
+
+    await expect(handleSessionStart(stdin, {
+      post: vi.fn().mockImplementation(async () => {
+        rmSync(lockPath, { force: true });
+        return { context: "ctx" };
+      }),
+    })).resolves.toEqual({ exitCode: 0, stdout: "ctx" });
   });
 
   it("proceeds normally when lock file exists but owner process is dead", async () => {
@@ -827,7 +879,10 @@ describe("handleSessionStart", () => {
     await handleSessionStart(JSON.stringify({ session_id: sessionId }), { post: vi.fn() });
 
     expect(statSync(dirname(lockPath)).mode & 0o777).toBe(0o700);
+    expect(existsSync(lockPath)).toBe(false);
+    expect(tryAcquireSessionLockForTesting(sessionId)).toBe(true);
     expect(statSync(lockPath).mode & 0o777).toBe(0o600);
+    rmSync(lockPath, { force: true });
   });
 
   it("does not follow a symlink planted at a stale lock path", async () => {
@@ -997,11 +1052,13 @@ describe("handleSessionStart", () => {
         handleSessionStart(codexChild("child-a"), { post }),
         handleSessionStart(codexChild("child-b"), { post }),
       ]);
-      expect(a).toEqual({ exitCode: 0, stdout: "child ctx" });
-      expect(b).toEqual({ exitCode: 0, stdout: "child ctx" });
+      expect(a).toEqual({ exitCode: 0, stdout: "<!-- lcm-restoration -->\nchild ctx" });
+      expect(b).toEqual({ exitCode: 0, stdout: "<!-- lcm-restoration -->\nchild ctx" });
       expect(post).toHaveBeenCalledWith("/restore", expect.objectContaining({ session_id: "child-a", agent_id: "child-a" }));
       expect(post).toHaveBeenCalledWith("/restore", expect.objectContaining({ session_id: "child-b" }));
-      // A repeat child start is deduplicated by its own lock, not the parent's.
+      // A child start is deduplicated by that child's own live lock, not the parent's.
+      const childLock = sessionLockPathForTesting("child-a");
+      writeFileSync(childLock, String(process.ppid));
       expect(await handleSessionStart(codexChild("child-a"), { post })).toEqual({ exitCode: 0, stdout: "" });
       expect(post).toHaveBeenCalledTimes(2);
       // The parent's lock is untouched and the parent itself stays suppressed.
@@ -1026,7 +1083,7 @@ describe("handleSessionStart", () => {
     it("restores a child whose payload lacks a usable tree session_id", async () => {
       const post = vi.fn().mockResolvedValue({ context: "ctx" });
       const result = await handleSessionStart(codexChild("child-a", { session_id: 42 }), { post });
-      expect(result.stdout).toBe("ctx");
+      expect(result.stdout).toBe("<!-- lcm-restoration -->\nctx");
       expect(post).toHaveBeenCalledWith("/restore", expect.objectContaining({ session_id: "child-a" }));
     });
 

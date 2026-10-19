@@ -5,6 +5,7 @@ import {
   chmodSync,
   closeSync,
   constants,
+  copyFileSync,
   fstatSync,
   mkdtempSync,
   openSync,
@@ -1671,6 +1672,20 @@ export async function runTests(context, ci, setupDocker = docker, testProcess = 
   });
 }
 
+// Copies the database container's init scripts into the harness-owned run
+// directory so SELinux relabeling applies to the copies, not the checkout.
+export function stageHarnessScripts(directory) {
+  const staged = {
+    initScript: join(directory, "init.sh"),
+    cachedRunInitScript: join(directory, "cached-run-init.sh"),
+  };
+  copyFileSync(initScript, staged.initScript);
+  copyFileSync(cachedRunInitScript, staged.cachedRunInitScript);
+  chmodSync(staged.initScript, 0o644);
+  chmodSync(staged.cachedRunInitScript, 0o644);
+  return staged;
+}
+
 export async function runHarness(options = {}) {
   resolveSignalProbeReadinessTimeout(process.env);
   const ci = options.ci ?? process.env.GITHUB_ACTIONS === "true";
@@ -1746,6 +1761,7 @@ export async function runHarness(options = {}) {
     writeFileSync(join(directory, "admin-password"), `${passwords.admin}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "migrator-password"), `${passwords.migrator}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "runtime-password"), `${passwords.runtime}\n`, { mode: 0o600 });
+    const stagedScripts = stageHarnessScripts(directory);
     await writeTlsFixtures(directory, names.alias, setupProcess);
     await setupDocker([
       "network", "create",
@@ -1791,12 +1807,14 @@ export async function runHarness(options = {}) {
       ...publish,
       "--env", `LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`,
       "--volume", `${names.volume}:/var/lib/postgresql`,
-      "--volume", `${directory}:/run/lcm-harness:ro`,
-      "--volume", `${cachedRunInitScript}:/run/lcm-cached-init.sh:ro`,
+      // ",z" relabels for SELinux (rootless Podman); a no-op where SELinux is off.
+      // It applies only to harness-owned paths, never to repository checkout files.
+      "--volume", `${directory}:/run/lcm-harness:ro,z`,
+      "--volume", `${stagedScripts.cachedRunInitScript}:/run/lcm-cached-init.sh:ro,z`,
     ];
     if (!usingCachedTemplate) {
       containerArgs.push(
-        "--volume", `${initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro`,
+        "--volume", `${stagedScripts.initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro,z`,
         "--env", "POSTGRES_USER=lcm_harness_admin",
         "--env", `POSTGRES_DB=${names.controlDatabase}`,
         "--env", "POSTGRES_PASSWORD_FILE=/run/lcm-private/admin-password",

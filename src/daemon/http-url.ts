@@ -319,6 +319,10 @@ export async function daemonJsonResponse<T>(
         path: routePath,
         method: options.method,
         headers,
+        // A pooled socket the daemon already closed at its keep-alive timeout
+        // would receive the request and fail with EPIPE/ECONNRESET. A fresh
+        // loopback connection per request (Connection: close) cannot be stale.
+        agent: false,
       }, (incomingResponse: IncomingMessage) => {
         response = incomingResponse;
         incomingResponse.on("data", onResponseData);

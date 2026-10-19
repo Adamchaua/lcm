@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseCodexTranscriptText } from "../../src/codex-transcript.js";
+import { sanitizeHookErrorDiagnostic } from "../../src/hooks/hook-error-diagnostic.js";
 import { parseTranscriptText } from "../../src/transcript.js";
 import { ScrubEngine } from "../../src/scrub.js";
 import type {
@@ -126,6 +127,21 @@ async function collect(
 
 function digest(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function linkError(
+  condition: string,
+  sourceOrdinal: number,
+  sessionSequence?: number,
+): Record<string, unknown> {
+  return {
+    name: "NativeTranscriptLinkError",
+    condition,
+    sourceOrdinal,
+    sessionSequence,
+    message: `native transcript message linkage failed: ${condition} at source ordinal ${sourceOrdinal}`
+      + (sessionSequence === undefined ? "" : ` (session sequence ${sessionSequence})`),
+  };
 }
 
 function mutateAfterCtimeTick(
@@ -2564,6 +2580,133 @@ describe("exact native transcript message resolver", () => {
     }
     expect(getNativeTranscriptMessageSnapshot).not.toHaveBeenCalled();
   });
+
+  it("explains every miss condition over the shared snapshot", async () => {
+    const row = (
+      messageSequence: number,
+      role: "user" | "assistant" = "user",
+      content = "question",
+    ): NativeTranscriptSessionMessageRecord => ({
+      conversationId: 7,
+      messageId: 9,
+      messageSequence,
+      role,
+      content,
+    });
+    const sessions: Record<string, readonly NativeTranscriptSessionMessageRecord[]> = {
+      ok: [row(0)],
+      empty: [],
+      malformed: [row(1)],
+    };
+    const getNativeTranscriptMessageSnapshot = vi.fn(
+      async (nativeSessionId: string) => sessions[nativeSessionId] ?? [],
+    );
+    const resolver = createExactNativeTranscriptMessageResolver({
+      getNativeTranscriptMessageSnapshot,
+    });
+    const base = {
+      nativeSessionId: "ok",
+      sessionSequence: 0,
+      role: "user" as const,
+      content: "question",
+    };
+    const cases = [
+      ["invalid-input", { ...base, sessionSequence: -1 }],
+      ["invalid-input", { ...base, nativeSessionId: "" }],
+      ["session-not-found", { ...base, nativeSessionId: "empty" }],
+      ["invalid-session-snapshot", { ...base, nativeSessionId: "malformed" }],
+      ["sequence-out-of-range", { ...base, sessionSequence: 1 }],
+      ["role-mismatch", { ...base, role: "assistant" as const }],
+      ["content-mismatch", { ...base, content: "other" }],
+    ] as const;
+    for (const [condition, input] of cases) {
+      await expect(resolver.resolveExact(input)).resolves.toBeNull();
+      await expect(resolver.explainMiss!(input)).resolves.toBe(condition);
+    }
+    await expect(resolver.explainMiss!(base)).resolves.toBe("unresolved");
+    await expect(resolver.resolveExact(base)).resolves.toEqual({
+      conversationId: 7,
+      messageId: 9,
+    });
+    expect(getNativeTranscriptMessageSnapshot.mock.calls).toEqual([
+      ["empty"],
+      ["malformed"],
+      ["ok"],
+    ]);
+  });
+
+  it("keeps a rejected snapshot load a rejection for explanations", async () => {
+    const failure = new Error("snapshot failed");
+    const getNativeTranscriptMessageSnapshot = vi.fn()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue([{
+        conversationId: 7,
+        messageId: 9,
+        messageSequence: 0,
+        role: "user",
+        content: "question",
+      }]);
+    const resolver = createExactNativeTranscriptMessageResolver({
+      getNativeTranscriptMessageSnapshot,
+    });
+    const input = {
+      nativeSessionId: "session-1",
+      sessionSequence: 0,
+      role: "user" as const,
+      content: "other",
+    };
+    await expect(resolver.explainMiss!(input)).rejects.toBe(failure);
+    await expect(resolver.explainMiss!(input)).resolves.toBe("content-mismatch");
+    expect(getNativeTranscriptMessageSnapshot).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("native transcript link error", () => {
+  it("keeps the one-argument form and prefix", () => {
+    const error = new NativeTranscriptLinkError(3);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.name).toBe("NativeTranscriptLinkError");
+    expect(error.sourceOrdinal).toBe(3);
+    expect(error.condition).toBe("unresolved");
+    expect(error.sessionSequence).toBeUndefined();
+    expect(error.message).toBe(
+      "native transcript message linkage failed: unresolved at source ordinal 3",
+    );
+  });
+
+  it("interpolates only validated codes and integers", () => {
+    expect(new NativeTranscriptLinkError(0, {
+      condition: "content-mismatch",
+      sessionSequence: 0,
+    }).message).toBe(
+      "native transcript message linkage failed: content-mismatch at source ordinal 0 (session sequence 0)",
+    );
+    const hostile = "secret/path user@example.com";
+    for (const condition of [hostile, 42, undefined, "ambiguous"]) {
+      const error = new NativeTranscriptLinkError(1, {
+        condition: condition as never,
+      });
+      expect(error.condition).toBe("unresolved");
+      expect(error.message).not.toContain(hostile);
+    }
+    for (const sessionSequence of [-1, 1.5, Number.NaN, 2 ** 53, "7", null]) {
+      const error = new NativeTranscriptLinkError(1, {
+        condition: "role-mismatch",
+        sessionSequence: sessionSequence as never,
+      });
+      expect(error.sessionSequence).toBeUndefined();
+      expect(error.message).toBe(
+        "native transcript message linkage failed: role-mismatch at source ordinal 1",
+      );
+    }
+    for (const sourceOrdinal of [-1, 0.5, Number.NaN, "3"]) {
+      expect(new NativeTranscriptLinkError(sourceOrdinal as never, {
+        condition: "ambiguous-pending-match",
+      }).message).toBe(
+        "native transcript message linkage failed: ambiguous-pending-match",
+      );
+    }
+  });
 });
 
 describe("native transcript backfill coordinator", () => {
@@ -2844,7 +2987,7 @@ describe("native transcript backfill coordinator", () => {
       sourceLocator: "sessions/session.jsonl",
       globalPatterns: patterns,
       messageResolver,
-    })).rejects.toBeInstanceOf(NativeTranscriptLinkError);
+    })).rejects.toMatchObject(linkError("content-mismatch", 0, 0));
     expect(repo.ingestBatch).not.toHaveBeenCalled();
   });
 
@@ -2902,7 +3045,7 @@ describe("native transcript backfill coordinator", () => {
           content: parserContent,
         }]),
       }),
-    })).rejects.toBeInstanceOf(NativeTranscriptLinkError);
+    })).rejects.toMatchObject(linkError("content-mismatch", 0, 0));
     expect(repo.ingestBatch).not.toHaveBeenCalled();
   });
 
@@ -3498,7 +3641,10 @@ describe("native transcript backfill coordinator", () => {
             : [],
       },
       messageResolver: { resolveExact },
-    })).rejects.toBeInstanceOf(NativeTranscriptLinkError);
+    })).rejects.toMatchObject(linkError(
+      "unsupported-pending-after-quarantine",
+      1,
+    ));
     expect(resolveExact).not.toHaveBeenCalled();
     expect(repo.batches).toHaveLength(1);
   });
@@ -3559,26 +3705,28 @@ describe("native transcript backfill coordinator", () => {
     }]);
 
     const absent = await run([]);
-    await expect(absent.result).rejects.toBeInstanceOf(
-      NativeTranscriptLinkError,
-    );
+    await expect(absent.result).rejects.toMatchObject(linkError(
+      "unmatched-pending-window",
+      1,
+    ));
     expect(absent.resolveExact).toHaveBeenCalledTimes(2);
     expect(absent.repo.batches).toHaveLength(1);
 
     const duplicate = await run([0, 1]);
-    await expect(duplicate.result).rejects.toBeInstanceOf(
-      NativeTranscriptLinkError,
-    );
+    await expect(duplicate.result).rejects.toMatchObject(linkError(
+      "ambiguous-pending-match",
+      1,
+    ));
     expect(duplicate.resolveExact).toHaveBeenCalledTimes(2);
     expect(duplicate.repo.batches).toHaveLength(1);
   });
 
   it.each([
-    ["missing", []],
-    ["ambiguous", [0, 1]],
+    ["missing", [], "unmatched-pending-window"],
+    ["ambiguous", [0, 1], "ambiguous-pending-match"],
   ] as const)(
     "persists private quarantine metadata before a %s destination-link abort",
-    async (_failure, matchingSequences) => {
+    async (_failure, matchingSequences, expectedCondition) => {
       const unsafePayload = "unsafe-payload-must-not-persist";
       const quarantinedLine = JSON.stringify({
         message: {
@@ -3650,9 +3798,9 @@ describe("native transcript backfill coordinator", () => {
       };
 
       await expect(runNativeTranscriptBackfillCore(options)).rejects
-        .toBeInstanceOf(NativeTranscriptLinkError);
+        .toMatchObject(linkError(expectedCondition, 1));
       await expect(runNativeTranscriptBackfillCore(options)).rejects
-        .toBeInstanceOf(NativeTranscriptLinkError);
+        .toMatchObject(linkError(expectedCondition, 1));
 
       expect(events).toEqual([
         "quarantine",
@@ -4293,7 +4441,7 @@ describe("native transcript backfill coordinator", () => {
         }],
       },
       messageResolver: resolver(),
-    })).rejects.toBeInstanceOf(NativeTranscriptLinkError);
+    })).rejects.toMatchObject(linkError("content-mismatch", 1, 1));
     expect(stored.size).toBe(1);
     expect(batches).toHaveLength(1);
     expect(current?.checkpoint.scrubberVersion).toMatch(
@@ -4730,8 +4878,140 @@ describe("native transcript backfill coordinator", () => {
         }],
       },
       messageResolver: { resolveExact: vi.fn(async () => null) },
-    })).rejects.toBeInstanceOf(NativeTranscriptLinkError);
+    })).rejects.toMatchObject(linkError("unresolved", 0, 0));
     expect(repo.ingestBatch).not.toHaveBeenCalled();
+  });
+
+  describe("linkage diagnostics", () => {
+    const linkQuarantine = {
+      clientName: "claude-code" as const,
+      quarantine: vi.fn(),
+      get: vi.fn(),
+      list: vi.fn(),
+      close: vi.fn(),
+    };
+    const linkOptions = (
+      messageResolver: NativeTranscriptBackfillOptions["messageResolver"],
+      repo: ReturnType<typeof repository>,
+    ): NativeTranscriptBackfillOptions => ({
+      repository: repo,
+      quarantine: linkQuarantine,
+      source: source(
+        '{"message":{"role":"user","content":"hello"}}\n'
+        + '{"message":{"role":"user","content":"world"}}\n',
+      ),
+      machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "session-1",
+      sourceLocator: "sessions/session.jsonl",
+      globalPatterns: [],
+      projectPatterns: [],
+      messageResolver,
+    });
+    const storedRow = (
+      overrides: Partial<NativeTranscriptSessionMessageRecord> = {},
+    ): NativeTranscriptSessionMessageRecord => ({
+      conversationId: 7,
+      messageId: 9,
+      messageSequence: 0,
+      role: "user",
+      content: "hello",
+      ...overrides,
+    });
+
+    it.each([
+      ["session-not-found", [], 0, 0],
+      ["invalid-session-snapshot", [storedRow({ messageSequence: 1 })], 0, 0],
+      ["role-mismatch", [storedRow({ role: "assistant" })], 0, 0],
+      ["content-mismatch", [storedRow({ content: "other" })], 0, 0],
+      ["sequence-out-of-range", [storedRow()], 1, 1],
+    ] as const)(
+      "names the real resolver condition %s in the thrown message",
+      async (condition, rows, sourceOrdinal, sessionSequence) => {
+        const repo = repository();
+        const error = await runNativeTranscriptBackfillCore(linkOptions(
+          createExactNativeTranscriptMessageResolver({
+            getNativeTranscriptMessageSnapshot: vi.fn(async () => rows),
+          }),
+          repo,
+        )).then(() => undefined, (caught: unknown) => caught);
+        expect(error).toBeInstanceOf(NativeTranscriptLinkError);
+        expect(error).toMatchObject(
+          linkError(condition, sourceOrdinal, sessionSequence),
+        );
+        expect(sanitizeHookErrorDiagnostic(error)).toBe(
+          (error as Error).message,
+        );
+        expect(repo.ingestBatch).not.toHaveBeenCalled();
+      },
+    );
+
+    it("uses a valid condition from a custom resolver explanation", async () => {
+      await expect(runNativeTranscriptBackfillCore(linkOptions({
+        resolveExact: vi.fn(async () => null),
+        explainMiss: vi.fn(async () => "role-mismatch" as const),
+      }, repository()))).rejects.toMatchObject(
+        linkError("role-mismatch", 0, 0),
+      );
+    });
+
+    it.each([
+      ["hostile text", async () => "SECRET-FIXTURE user@example.com /etc/passwd"],
+      ["a pending-window code", async () => "ambiguous-pending-match"],
+      ["a non-string value", async () => 42],
+      ["a throw", async () => {
+        throw new Error("SECRET-FIXTURE user@example.com /etc/passwd");
+      }],
+      ["a rejection", () =>
+        Promise.reject(new Error("SECRET-FIXTURE user@example.com"))],
+    ])("reports unresolved when explainMiss returns %s", async (_name, explainMiss) => {
+      const error = await runNativeTranscriptBackfillCore(linkOptions({
+        resolveExact: vi.fn(async () => null),
+        explainMiss: explainMiss as never,
+      }, repository())).then(() => undefined, (caught: unknown) => caught);
+      expect(error).toBeInstanceOf(NativeTranscriptLinkError);
+      expect(error).toMatchObject(linkError("unresolved", 0, 0));
+      expect((error as Error).message).not.toContain("SECRET-FIXTURE");
+      expect(sanitizeHookErrorDiagnostic(error)).not.toContain("SECRET-FIXTURE");
+      expect(sanitizeHookErrorDiagnostic(error)).not.toContain("example.com");
+    });
+
+    it("rejects a non-function explainMiss before source access", async () => {
+      const options = linkOptions({
+        resolveExact: vi.fn(async () => null),
+        explainMiss: "not-a-function" as never,
+      }, repository());
+      await expect(runNativeTranscriptBackfillCore(options)).rejects.toBeInstanceOf(
+        NativeTranscriptConfigurationError,
+      );
+      expect(options.source.openSnapshot).not.toHaveBeenCalled();
+    });
+
+    it("freezes explainMiss when the backfill starts", async () => {
+      let releaseResolver!: () => void;
+      const resolverGate = new Promise<void>((resolve) => {
+        releaseResolver = resolve;
+      });
+      const initialExplain = vi.fn(async () => "content-mismatch" as const);
+      const resolverDependency = {
+        resolveExact: vi.fn(async () => {
+          await resolverGate;
+          return null;
+        }),
+        explainMiss: initialExplain,
+      };
+      const pending = runNativeTranscriptBackfillCore(
+        linkOptions(resolverDependency, repository()),
+      );
+      Object.assign(resolverDependency, {
+        explainMiss: vi.fn(async () => "role-mismatch"),
+      });
+      releaseResolver();
+      await expect(pending).rejects.toMatchObject(
+        linkError("content-mismatch", 0, 0),
+      );
+      expect(initialExplain).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("rejects unsafe mapped message metadata before resolution", async () => {

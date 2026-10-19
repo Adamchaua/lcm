@@ -591,6 +591,29 @@ compact.” A failed scan does not mark any session as processed. Back up the
 reported project database, resolve its storage or schema error, and rerun the
 command; the still-eligible sessions will be discovered again.
 
+When the daemon fails a single session's compaction request, `lcm compact`
+lists that session under "Failed" with a fixed message that names the cause
+and the next step. Per-session, progress, event, and summary output never
+interpolate the daemon's raw error text, provider responses, or file paths; they
+use a fixed message plus at most the numeric HTTP status. The CLI's separate
+daemon transport and heartbeat log lines are outside this redaction scope and
+still print Node's socket-layer text (for example `write EPIPE`). A failed
+session is not marked processed, so rerunning `lcm compact` after fixing the
+cause retries it; discovery re-checks eligibility.
+
+| Message | Meaning and next step |
+| --- | --- |
+| `daemon connection lost; outcome unknown; rerun after lcm doctor` | The connection dropped or timed out before a result arrived, so the compaction may or may not have been applied. Run `lcm doctor`, then rerun. |
+| `daemon auth rejected (HTTP 401 or 403); run lcm doctor` | The daemon refused the CLI's credentials. Run `lcm doctor`. |
+| `daemon unavailable (HTTP 503); run lcm doctor` | The daemon could not admit the request, for example because storage or invocation control is unavailable. Run `lcm doctor`, then rerun. |
+| `daemon rejected compact request (HTTP 4xx)` | The daemon rejected the request itself; rerunning unchanged is unlikely to help. |
+| `daemon compaction failed (HTTP 5xx); run lcm doctor` | The daemon failed while compacting. Run `lcm doctor` and rerun. |
+| `no PostgreSQL binding; run lcm project create or lcm project link <id>` | Run `lcm project create` or `lcm project link <project-id>` in the affected project directory. |
+| `compaction request cancelled` | The run was interrupted before this session finished. |
+| `malformed compact response` | The daemon replied with a body the CLI could not read. |
+| `compaction request failed` | Any other failure; run `lcm doctor`. |
+| `unknown error` | The request was rejected with a value that is not an error object; run `lcm doctor`. |
+
 `lcm compact --all` discovers projects from authenticated project bindings.
 It does not read `meta.json` to select projects or trust unbound metadata
 directories. Missing or unsafe discovery metadata therefore does not override
@@ -781,6 +804,22 @@ signals keep waiting and print a diagnostic instead of interrupting settlement.
 Provider work already accepted by a remote service may continue remotely; the
 local guarantee covers LCM-owned queued/active requests, SDK retries, provider
 processes/groups, locks, and invocation-scoped promotion only.
+
+Discovery of eligible sessions also honors cancellation. It hands control back
+to the event loop at project, conversation, message-page, source-locator batch,
+and per-session locator-fallback boundaries, and again after each project scan
+finishes, so the lease heartbeat keeps running during a long scan and Ctrl+C or
+`SIGTERM` stops discovery at the next boundary rather than after the whole
+scan. Listing the project inventory before the first project starts, opening
+one project's storage, and reading one conversation's final page together with
+its summaries and context items are not interruptible and finish first. An
+interrupted scan closes the project storage it opened, reports no failure for
+the interrupted project, prints neither the "Found N uncompacted conversations"
+summary nor "Nothing to compact", and sends no `/compact` request. Failures
+recorded for earlier projects before the interruption are still reported. Every
+request to the local daemon uses a fresh loopback connection, so a connection
+the daemon already closed at its keep-alive timeout cannot cause a spurious
+"write EPIPE" transport failure.
 
 If cancellation cannot prove that the managed daemon and its owned provider
 work disappeared, LCM does not signal an unknown process or claim success. It
