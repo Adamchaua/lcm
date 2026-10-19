@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
-import { lstatSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, win32 } from "node:path";
+import { isAbsolute, join, relative, win32 } from "node:path";
 import { Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -3351,6 +3351,58 @@ describe("PostgreSQL harness container engine selection", () => {
       write.mockRestore();
     }
   });
+
+  it.each(["docker", "podman"])(
+    "binds the real run directory into the %s database container",
+    async (flavour) => {
+      const scratch = mkdtempSync(join(tmpdir(), "lcm-postgresql-fake-cli-"));
+      const log = join(scratch, "calls.log");
+      const cli = join(scratch, flavour);
+      // A fake engine CLI: records every call, fails the database create, and reports
+      // every inspected object as missing so teardown completes without a real engine.
+      writeFileSync(cli, [
+        "#!/bin/bash",
+        "IFS=$'\\x1f'; echo \"$*\" >> '" + log + "'",
+        'case "$1:$2" in',
+        '  create:*) echo "stop at database create" >&2; exit 1;;',
+        '  container:inspect) echo "No such container: $3" >&2; exit 1;;',
+        '  network:inspect) echo "network $3 not found" >&2; exit 1;;',
+        '  volume:inspect) echo "get $3: no such volume" >&2; exit 1;;',
+        "esac",
+        "exit 0",
+        "",
+      ].join("\n"));
+      chmodSync(cli, 0o755);
+      const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      vi.stubEnv("GITHUB_ACTIONS", "");
+      vi.stubEnv("LCM_POSTGRES_TEMPLATE_ARCHIVE", "");
+      vi.stubEnv("LCM_TEST_CONTAINER_CLI", cli);
+      try {
+        await expect(runHarness({ ci: false })).rejects.toThrow();
+        const created = readFileSync(log, "utf8").split("\n").filter(Boolean)
+          .map((line) => line.split("\x1f")).filter((args) => args[0] === "create");
+        expect(created).toHaveLength(1);
+        const args = created[0];
+        const volumes = args.flatMap((value, index) => value === "--volume" ? [args[index + 1]] : []);
+        const label = flavour === "podman" ? "ro,Z" : "ro,z";
+        const runMount = volumes.find((volume) => volume.includes(":/run/lcm-harness:")) ?? "";
+        const directory = runMount.slice(0, runMount.indexOf(":/run/lcm-harness:"));
+        expect(directory).toMatch(/lcm-postgresql-harness-[A-Za-z0-9_-]+$/u);
+        expect(isAbsolute(directory)).toBe(true);
+        expect(volumes).toEqual([
+          expect.stringMatching(/^lcm-pg-data-[0-9a-f]+:\/var\/lib\/postgresql$/u),
+          `${directory}:/run/lcm-harness:${label}`,
+          `${directory}/cached-run-init.sh:/run/lcm-cached-init.sh:${label}`,
+          `${directory}/init.sh:/docker-entrypoint-initdb.d/10-lcm-harness.sh:${label}`,
+        ]);
+        expect(volumes.some((volume) => volume.startsWith("undefined"))).toBe(false);
+      } finally {
+        vi.unstubAllEnvs();
+        write.mockRestore();
+        rmSync(scratch, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("keeps the Docker database container arguments unchanged", () => {
     const runId = "c".repeat(32);

@@ -1918,6 +1918,7 @@ export async function runHarness(options = {}) {
       names,
       runId,
       owner,
+      directory,
       stagedScripts,
       publish: ci ? [] : ["--publish", "127.0.0.1::5432"],
       usingCachedTemplate,
