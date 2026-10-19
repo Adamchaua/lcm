@@ -751,6 +751,18 @@ describe("PostgreSQL 18 native transcript repository", () => {
       })).resolves.toHaveLength(2);
       await expect(repository.getById(unlinkedTranscriptId)).resolves
         .toMatchObject({ messageLinks: [] });
+      await expect(repository.listLinkedSourceOrdinals({
+        machineId: scope.machineId,
+        clientName: "codex",
+        sourceLocator: "aggregate/session.jsonl",
+        nativeSessionId: "aggregate-session",
+      })).resolves.toEqual([1]);
+      await expect(repository.listLinkedSourceOrdinals({
+        machineId: scope.machineId,
+        clientName: "codex",
+        sourceLocator: "aggregate/session.jsonl",
+        nativeSessionId: "other-session",
+      })).resolves.toEqual([]);
       await expect(repository.listByMessage({
         conversationId: scope.conversationId,
         messageId: scope.messageId,

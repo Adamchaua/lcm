@@ -479,6 +479,15 @@ recovery. Until those features land, normal installations continue using their
 existing storage selection and should not manually create or mutate this
 journal.
 
+### Upgrading LCM during a migration
+
+The portable schema digest changes in the release that adds
+`conversations.parent_session_id`. Copy manifests, verification reports and
+cutover proof manifests that were produced by an older LCM bind the old
+digest and fail closed with `incompatible-schema` under the new binary.
+Finish or abandon an in-flight migration before upgrading, then rerun it with
+the new binary.
+
 ## Bounded migration copy and resume
 
 The internal migration API copies one authenticated SQLite generation into an

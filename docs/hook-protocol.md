@@ -511,7 +511,7 @@ minimum score by 0.5 for results that match every query term. Surfacing is logge
 
 **Command:** `lcm session-snapshot`
 
-An optional periodic hook that incrementally ingests the live session transcript between `SessionEnd` events. This is used for long-running sessions where you want memory to be updated without waiting for the session to end. Codex uses this command on `Stop` for rolling snapshots and on `PreCompact` to force-ingest deltas immediately before manual or automatic compaction.
+An optional periodic hook that incrementally ingests the live session transcript between `SessionEnd` events. This is used for long-running sessions where you want memory to be updated without waiting for the session to end. Codex uses this command on `Stop` for rolling snapshots, on `PreCompact` to force-ingest deltas immediately before manual or automatic compaction, and on `SubagentStop` to ingest a finished subagent (see [Codex subagent lifecycle](#codex-subagent-lifecycle)).
 
 Snapshot ingestion is skipped when daemon bootstrap cannot verify the configured daemon PID, installed version, and exact loopback listener. This prevents transcript paths, request bodies, and bearer credentials from being sent to an occupied but unverified port.
 
@@ -522,9 +522,86 @@ Snapshot ingestion is skipped when daemon bootstrap cannot verify the configured
 | `session_id` | string | Session identifier |
 | `cwd` | string | Working directory |
 | `transcript_path` | string | Path to the live JSONL session transcript |
-| `hook_event_name` | string | `"SessionSnapshot"` or `"PreCompact"` (if provided) |
+| `agent_id` | string | Codex subagent thread id; keys the subagent's memory instead of `session_id` |
+| `agent_transcript_path` | string | Codex `SubagentStop` only: path to the subagent's own rollout, used instead of `transcript_path` |
+| `hook_event_name` | string | `"SessionSnapshot"`, `"PreCompact"` or `"SubagentStop"` (if provided) |
 
 **Response:** Exit code `0`.
+
+## Codex subagent lifecycle
+
+Codex runs a separate thread for every subagent it spawns. Those threads fire
+`SubagentStart` and `SubagentStop` instead of `SessionStart` and `Stop`, and
+the `lcm connectors install codex` hook set registers both. Internal Codex
+subagents run no hooks, so LCM sees nothing from them.
+
+Every hook payload from a subagent carries `session_id`, which is the root
+thread of the whole agent tree, and `agent_id`, which is the subagent's own
+thread. LCM treats a Codex payload with a non-empty string `agent_id` as a
+subagent and keys its memory by `agent_id`, so a subagent's messages, tool
+events and restore state never mix into its parent's conversation. Root Codex
+sessions and other clients are unchanged, even if their payload happens to
+carry `agent_id`. A malformed `agent_id` (empty or not a string) is handled
+as a root payload.
+
+| Event | Command | Behavior for a subagent |
+|-------|---------|-------------------------|
+| `SubagentStart` | `lcm restore --client codex` | Prints project memory (orientation, promoted knowledge, learned insights and project instructions) on stdout, which Codex gives the subagent as context. The restore lock is per subagent, so the parent and sibling subagents never suppress it. The best-effort outbox maintenance that a root start performs is skipped. |
+| `UserPromptSubmit` | `lcm user-prompt --client codex` | Searches memory under the subagent's key. The prompt itself is not recorded as a user decision, because the parent wrote it. |
+| `PostToolUse` | `lcm post-tool --client codex` | Records tool events under the subagent's key. |
+| `PreCompact` | `lcm session-snapshot --client codex` | Ingests the subagent's own rollout under its key. |
+| `SubagentStop` | `lcm session-snapshot --client codex` | Ingests the subagent's rollout (`agent_transcript_path`) under its key, bypassing the snapshot throttle. The parent's rollout (`transcript_path`, which may be `null`) is never read for a subagent. |
+
+`SubagentStop` handling never blocks or continues the subagent: it writes
+nothing to stdout, returns no decision, and never exits with code `2`. Ordinary
+failures exit `0`. An unresolved backend publication keeps its fail-closed
+exit `1` with a diagnostic on stderr, which Codex reports as a failed hook.
+A `SubagentStop` payload without a valid `agent_id` or without
+`agent_transcript_path` is ignored.
+
+**Limits:**
+
+- LCM stores the immediate parent of a subagent in the conversation's
+  `parent_session_id` column (SQLite and PostgreSQL), taken from
+  `parent_thread_id` in the first `session_meta` record of the subagent's
+  own rollout. A grandchild records its direct parent, never the root of the
+  agent tree. The first recorded parent is kept and never overwritten or
+  cleared. A root conversation, a conversation from another client, and a
+  rollout without `parent_thread_id` leave the column empty. The value is
+  filled when a rollout is ingested (a `SubagentStop` or `PreCompact`
+  snapshot, or `lcm import --codex`), including for a conversation stored
+  earlier; ingesting only a message list never fills it. LCM offers no command
+  that queries it yet. Portable transfer between SQLite and PostgreSQL carries
+  it.
+- A subagent that is interrupted or fails may never emit `SubagentStop`. Its
+  tool observations are already stored, and its rollout can still be imported
+  with `lcm import --codex`.
+- Codex delivers a parent-to-child prompt through `UserPromptSubmit` only for
+  some delivery paths, so prompt-time recall inside a subagent is not
+  guaranteed. `SubagentStart` is the dependable point where it receives
+  memory.
+- A subagent forked from its parent starts with the parent's history in its
+  rollout. When the rollout's first record is a `session_meta` with a numeric
+  `subagent_history_start_ordinal`, LCM skips the records that precede it, so
+  the parent's messages are not stored again under the subagent. Only rollouts
+  that Codex stamps with per-record ordinals (`history_mode: "paginated"`) are
+  filtered completely; in other rollouts only records that carry an explicit
+  ordinal below the boundary are skipped, and a forked subagent without them
+  keeps the inherited history. `lcm import --codex` applies the same rule.
+- A subagent conversation stored before this change keeps its inherited
+  history: each ingest follows whichever reading (with or without the inherited
+  prefix) extends what is already stored. If the stored messages match neither
+  reading, for example after the rollout was rewritten, LCM appends nothing for
+  that subagent, writes a diagnostic to the hook error log, and leaves the rest
+  of the conversation untouched. Adding, removing or changing a sensitive
+  pattern (or a built-in scrubber change) after a subagent was stored changes
+  how its text is redacted, so it has the same effect for that subagent.
+- When one session id has several stored conversations, ingest continues to
+  append to the most recent one, as it does for every other client.
+- Sibling subagents count as distinct sessions for passive pattern
+  reinforcement, so a pattern that several siblings repeat gains confidence
+  faster than the same pattern repeated within one session. Promotion rules are
+  unchanged.
 
 ## Codex Interrupt and SessionEnd snapshots
 

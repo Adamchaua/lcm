@@ -169,4 +169,61 @@ describe("handleSessionSnapshot default integrations", () => {
     await handleSessionSnapshot(JSON.stringify(payload));
     expect(mocks.fireCompactRequest).toHaveBeenCalledWith(3737, expect.any(Object));
   });
+
+  describe("Codex SubagentStop", () => {
+    const stop = {
+      client: "codex",
+      hook_event_name: "SubagentStop",
+      session_id: "tree-root",
+      agent_id: "child-thread",
+      cwd: "/project",
+      transcript_path: null,
+      agent_transcript_path: "/rollouts/child.jsonl",
+    };
+
+    it("ingests the child rollout under the child key and compacts under it", async () => {
+      mocks.statSync.mockReturnValue({ mtimeMs: Date.now() });
+      const result = await handleSessionSnapshot(JSON.stringify(stop));
+      expect(result).toEqual({ exitCode: 0, stdout: "" });
+      expect(mocks.daemonJsonRequest).toHaveBeenCalledWith(4545, "/ingest", expect.objectContaining({
+        body: {
+          session_id: "child-thread",
+          cwd: "/project",
+          transcript_path: "/rollouts/child.jsonl",
+          client: "codex",
+        },
+      }));
+      expect(mocks.fireCompactRequest).toHaveBeenCalledWith(4545, {
+        session_id: "child-thread",
+        cwd: "/project",
+        skip_ingest: true,
+        client: "codex",
+      });
+      expect(mocks.writeFileSync).not.toHaveBeenCalled();
+      expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(4545, { cwd: "/project" });
+    });
+
+    it("never reads the parent rollout and ignores a child event without a valid scope", async () => {
+      await handleSessionSnapshot(JSON.stringify({ ...stop, agent_transcript_path: undefined, transcript_path: "/rollouts/parent.jsonl" }));
+      await handleSessionSnapshot(JSON.stringify({ ...stop, agent_id: undefined, transcript_path: "/rollouts/parent.jsonl" }));
+      await handleSessionSnapshot(JSON.stringify({ ...stop, agent_id: 5 }));
+      await handleSessionSnapshot(JSON.stringify({ ...stop, client: "claude" }));
+      expect(mocks.daemonJsonRequest).not.toHaveBeenCalled();
+    });
+
+    it("rejects a publication journal error without stdout so Codex sees a failed hook", async () => {
+      const publicationError = new BackendPublicationJournalError(
+        "malformed-journal",
+        "publication journal is malformed",
+      );
+      mocks.isBackendPublicationJournalError.mockReturnValue(true);
+      mocks.daemonJsonRequest.mockRejectedValueOnce(publicationError);
+      await expect(handleSessionSnapshot(JSON.stringify(stop))).rejects.toBe(publicationError);
+    });
+
+    it("answers ordinary failures with exit 0 and no output", async () => {
+      mocks.daemonJsonRequest.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+      await expect(handleSessionSnapshot(JSON.stringify(stop))).resolves.toEqual({ exitCode: 0, stdout: "" });
+    });
+  });
 });
