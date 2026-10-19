@@ -400,6 +400,15 @@ it("activates a real verified SQLite copy through the production dependencies: r
     const home = mkdtempSync(join(tmpdir(), "migration-activation-e2e-"));
     vi.stubEnv("HOME", home);
     vi.stubEnv("USERPROFILE", home);
+    // The daemon's environment, exactly as daemon-runtime.integration.ts sets
+    // it: config.json never stores the PostgreSQL secrets, so once the
+    // publication has switched storage.backend to postgresql, reading the
+    // daemon config (which the S15/S16 restart verdict does for the daemon
+    // port) requires LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE. These are the
+    // daemon's runtime-role settings, not the activation role's.
+    const daemon = settings(db.runtimeUrl);
+    vi.stubEnv("LCM_POSTGRES_URL", daemon.url);
+    vi.stubEnv("LCM_POSTGRES_CA_FILE", daemon.caFile);
     try {
       const installation = await prepareVerifiedInstallation(db, home, transfer);
       const publicationId = deriveActivationPublicationId(GENERATION_ID);
