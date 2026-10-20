@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { performance } from "node:perf_hooks";
 import { Client } from "pg";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { parseDaemonConfig } from "../../src/daemon/config.js";
@@ -9,6 +9,7 @@ import { runDoctor } from "../../src/doctor/doctor.js";
 import { renderBackendDiagnostics } from "../../src/storage/diagnostic-renderer.js";
 import { collectBackendDiagnostics } from "../../src/storage/diagnostics.js";
 import { buildPostgreSqlClientConfig } from "../../src/storage/postgresql/client-config.js";
+import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import {
   assertHarnessReady,
   settings,
@@ -58,13 +59,18 @@ function readRunbookSql(id: "session-context" | "recovery-state"): string {
 }
 
 async function applyRuntimeGrants(database: PostgreSqlTestDatabase): Promise<void> {
-  for (const part of ["readiness", "identity", "conversation", "summary-context", "memory", "search", "coordination", "transcript"]) {
-    const template = readFileSync(join(
-      process.cwd(), `src/storage/postgresql/reference/postgresql-runtime-${part}-grants.sql`,
-    ), "utf8");
-    const sql = template.split("\n").filter((line) => !line.startsWith("\\"))
-      .join("\n").replaceAll(':"lcm_runtime_role"', '"lcm_test_runtime"');
-    await database.migrator.query({ text: sql }, context);
+  const administrator = new PostgreSqlRuntime(settings(database.adminUrl));
+  try {
+    for (const part of ["readiness", "identity", "conversation", "summary-context", "memory", "search", "coordination", "transcript"]) {
+      const template = readFileSync(join(
+        process.cwd(), `src/storage/postgresql/reference/postgresql-runtime-${part}-grants.sql`,
+      ), "utf8");
+      const sql = template.split("\n").filter((line) => !line.startsWith("\\"))
+        .join("\n").replaceAll(':"lcm_runtime_role"', '"lcm_test_runtime"');
+      await administrator.query({ text: sql }, context);
+    }
+  } finally {
+    await administrator.close();
   }
 }
 
@@ -171,21 +177,23 @@ async function seedCanaries(database: PostgreSqlTestDatabase): Promise<{
       [contractCanaries.message, ...regressionSeeds].join("\n")],
   }, context);
   await database.runtime.query({ text: "SELECT $1::pg_catalog.text", values: [contractCanaries.sqlParameter] }, context);
-  await database.runtime.query({ text: `SELECT '${contractCanaries.utilityLiteral}'::pg_catalog.text` }, context);
+  await database.runtime.query({ text: "SET application_name = 'incident-utility-literal-canary'" }, context);
   return { projectId, machineId };
 }
 
 describe("incident runbook PostgreSQL evidence", () => {
   it("executes the approved SQL with runtime grants and rejects seeded leaks", async () => {
     await withPostgreSqlTestDatabase("incident-runbook", async (database) => {
-      const started = performance.now();
       await applyRuntimeGrants(database);
       const { projectId, machineId } = await seedCanaries(database);
+      const home = mkdtempSync(join(tmpdir(), "lcm-incident-runbook-"));
+      mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+      writeFileSync(join(home, ".lcm", "config.json"), "{}", { mode: 0o600 });
       const held = new Client(buildPostgreSqlClientConfig(
         settings(database.runtimeUrl), { applicationName: contractCanaries.applicationName },
       ));
-      await held.connect();
       try {
+        await held.connect();
         await held.query("SELECT 1");
         const session = await database.runtime.query({ text: readRunbookSql("session-context") }, context);
         const recovery = await database.runtime.query({ text: readRunbookSql("recovery-state") }, context);
@@ -226,6 +234,7 @@ describe("incident runbook PostgreSQL evidence", () => {
         const captured = await captureProcessStreams(async () => {
           const snapshot = await collectBackendDiagnostics({
             cwd: "/incident-fixture",
+            homeDir: home,
             _dependencies: { observePublication: () => ({
               config,
               witness: "incident-witness",
@@ -235,18 +244,25 @@ describe("incident runbook PostgreSQL evidence", () => {
               } }),
             }) },
           });
+          expect(snapshot.schema).toBe("ready");
+          expect(snapshot.project).toMatchObject({ scope: "selected", status: "ready", projectId });
+          expect(snapshot.identity).toMatchObject({ status: "ready", machineId });
           const rendered = renderBackendDiagnostics(snapshot);
           const doctor = await runDoctor({
-            homedir: process.env.HOME,
-            cwd: "/incident-fixture",
+            homedir: home,
+            cwd: home,
             fetch: vi.fn(),
             spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }),
             collectBackendSnapshot: vi.fn().mockResolvedValue(snapshot),
           });
-          return { rendered, doctor };
+          const backendHealth = doctor.find((result) => result.name === "backend-health");
+          expect(backendHealth).toMatchObject({ message: rendered, backendDiagnostics: snapshot });
+          return { rendered, backendHealth, doctor };
         });
-        const { rendered, doctor } = captured.value;
-        const privateSurfaces = [rendered, JSON.stringify(doctor), captured.stdout, captured.stderr].join("\n");
+        const { rendered, backendHealth, doctor } = captured.value;
+        const privateSurfaces = [
+          rendered, JSON.stringify(backendHealth), JSON.stringify(doctor), captured.stdout, captured.stderr,
+        ].join("\n");
         assertNoCanary(privateSurfaces, [...Object.values(contractCanaries), ...regressionSeeds]);
         expect(rendered).toContain(projectId);
         expect(rendered).toContain(machineId);
@@ -262,9 +278,12 @@ describe("incident runbook PostgreSQL evidence", () => {
         }, context);
         expect(leaking.rows).toHaveLength(1);
         expect(() => assertNoCanary(JSON.stringify(leaking.rows), canaries)).toThrow(/leaked canary/u);
-        expect(performance.now() - started).toBeLessThan(30_000);
       } finally {
-        await held.end();
+        try {
+          await held.end();
+        } finally {
+          rmSync(home, { recursive: true, force: true });
+        }
       }
     });
   }, 30_000);

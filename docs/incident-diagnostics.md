@@ -65,9 +65,9 @@ recovery sessions, and all credential sessions stay private.
 The jq program is a positive projection of a current, already-sanitized LCM
 snapshot. It is not a general JSON sanitizer. Future fields remain excluded
 until reviewed. Missing numeric fields remain absent rather than becoming zero.
-An unavailable snapshot returns a fixed error; its stderr stays private. `jq`
-is an operator prerequisite. The pipe uses `pipefail`, and only exit-zero
-stdout is evidence.
+A missing `backendDiagnostics` object returns a fixed error; its stderr stays
+private. `jq` is an operator prerequisite. The pipe uses `pipefail`, and only
+exit-zero stdout is evidence.
 
 <!-- incident: id=status-bundle phase=observe share=approved kind=shell role=runtime -->
 ```sh
@@ -375,6 +375,7 @@ mkdir -m 0700 -- "<private-dir>"
 ```
 
 Preview at most 20 provider-returned backup rows. This does not claim ordering.
+Run the preview in Bash.
 The checked pipeline distinguishes a provider failure from expected `head`
 termination. If the required time is absent or ambiguous, stop and inspect the
 control panel privately. Never infer that there are no backups from empty
