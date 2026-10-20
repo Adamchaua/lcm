@@ -68,8 +68,13 @@ function defaultReadPidFile(homeDir: string): MigrationDaemonPidFileRead {
     if (code === "ENOENT") return { status: "absent" };
     return { status: "unresolvable", evidence: `pidfile-${String(code)}` };
   }
-  const pid = Number.parseInt(content.trim(), 10);
-  if (!Number.isInteger(pid) || pid <= 0) {
+  // The whole trimmed content must be one canonical positive integer:
+  // Number.parseInt would accept a numeric prefix ("123junk"), and then
+  // probe a pid the file never named. A dead stranger would read as
+  // absence and a live one as the wrong liveness evidence.
+  const trimmed = content.trim();
+  const pid = /^[1-9][0-9]*$/u.test(trimmed) ? Number(trimmed) : Number.NaN;
+  if (!Number.isSafeInteger(pid)) {
     return { status: "unresolvable", evidence: "pidfile-malformed" };
   }
   return { status: "present", pid };

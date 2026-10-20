@@ -99,6 +99,31 @@ describe("classifyMigrationDaemonPresence: the unresolvable outcome, never misre
     expect(result).toEqual({ status: "unresolvable", evidence: "pidfile-malformed" });
   });
 
+  it.each([
+    ["trailing junk after a dead pid", (deadPid: number) => `${deadPid}junk\n`],
+    ["trailing junk after a live pid", () => `${process.pid} extra\n`],
+    ["a leading zero", (deadPid: number) => `0${deadPid}\n`],
+    ["a signed value", (deadPid: number) => `+${deadPid}\n`],
+    ["a hexadecimal prefix", () => "0x10\n"],
+    ["a decimal fraction", (deadPid: number) => `${deadPid}.5\n`],
+    ["zero", () => "0\n"],
+    ["an unsafe integer", () => "9007199254740993\n"],
+    ["an empty file", () => ""],
+  ])("classifies unresolvable, never probing a pid, for a pid file carrying %s (Codex PR #1653 P2: parseInt accepted a numeric prefix)", async (_name, content) => {
+    const homeDir = home();
+    writeFileSync(join(homeDir, ".lcm", "daemon.pid"), content(realDeadPid()), { mode: 0o600 });
+    const kill = vi.spyOn(process, "kill");
+    const result = await classifyMigrationDaemonPresence({ homeDir });
+    expect(result).toEqual({ status: "unresolvable", evidence: "pidfile-malformed" });
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("still accepts a whole-content pid with surrounding whitespace (the format the daemon writes)", async () => {
+    const homeDir = home();
+    writeFileSync(join(homeDir, ".lcm", "daemon.pid"), `  ${realDeadPid()}\n\n`, { mode: 0o600 });
+    expect(await classifyMigrationDaemonPresence({ homeDir })).toEqual({ status: "authoritatively-absent" });
+  });
+
   it("classifies unresolvable for a pid file that cannot be read for a non-ENOENT reason (real EACCES via chmod 0o000, not injected)", async () => {
     const homeDir = home();
     const pidPath = join(homeDir, ".lcm", "daemon.pid");
