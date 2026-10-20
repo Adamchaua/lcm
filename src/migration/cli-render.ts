@@ -189,13 +189,17 @@ export function renderMigrationApplyEnvelope(outcome: MigrationApplyOutcome): Mi
  * still print exactly one document under `--json`. Only the error's name
  * reaches the evidence.
  */
+const READ_ONLY_MIGRATION_COMMANDS: ReadonlySet<MigrationCommandName> = new Set<MigrationCommandName>(["plan", "dry-run", "report"]);
+
 export function renderMigrationUnexpectedFailureEnvelope(command: MigrationCommandName, error: unknown): MigrationEnvelope {
   return refusalEnvelope({
     command,
     reason: MIGRATION_UNEXPECTED_FAILURE_REASON,
     evidenceDetail: unexpectedFailureEvidence(error),
-    // Only plan and dry-run are known never to have written anything.
-    applied: command !== "plan" && command !== "dry-run",
+    // The read-only commands cannot have written anything: plan, dry-run
+    // and report. Every other command may have, and the failure cannot
+    // rule it out.
+    applied: !READ_ONLY_MIGRATION_COMMANDS.has(command),
   });
 }
 

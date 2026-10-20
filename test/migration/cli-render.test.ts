@@ -186,7 +186,7 @@ describe("renderMigrationApplyEnvelope, applied and presence evidence (round-1 A
 });
 
 describe("renderMigrationUnexpectedFailureEnvelope (round-1 B-4)", () => {
-  it.each([["plan", false], ["dry-run", false], ["apply", true], ["abort", true]] as const)(
+  it.each([["plan", false], ["dry-run", false], ["report", false], ["apply", true], ["abort", true], ["activate", true], ["rollback", true], ["resume", true], ["verify", true]] as const)(
     "builds the closed exit-5 envelope for %s, with applied:%s and only the error name as evidence",
     (command, applied) => {
       const envelope = renderMigrationUnexpectedFailureEnvelope(command, new RangeError("a message with /a/path"));
