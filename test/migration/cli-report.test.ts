@@ -3,7 +3,6 @@ import { writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import {
-  NOT_AVAILABLE_IN_THIS_BUILD,
   performMigrationReportCommand,
   type MigrationReportCommandOperations,
 } from "../../src/migration/cli-report.js";
@@ -59,8 +58,8 @@ describe("report: a read-only account of one generation", () => {
         journalKind: "hold", journalPhase: "maintenance-held", journalGeneration: journal.generationId,
         snapshot: "complete", manifestPresent: true, manifestRevision: 0, recovery: "ready", pendingEffect: null, activationEligible: false,
         verificationReport: "absent", cell: 19, primary: "resume", allowed: "abort", selectedBackend: null,
-        activationLink: NOT_AVAILABLE_IN_THIS_BUILD, activationReport: NOT_AVAILABLE_IN_THIS_BUILD,
-        generationBinding: NOT_AVAILABLE_IN_THIS_BUILD, rollbackEvidence: NOT_AVAILABLE_IN_THIS_BUILD,
+        activationLink: "absent", activationReport: "none", generationBinding: "absent", rollbackEvidence: "absent",
+        rollbackReport: "none", rollbackAuthority: "absent",
       },
     });
     expect(checkRestart).not.toHaveBeenCalled();
@@ -180,7 +179,7 @@ describe("report: rows with no owner and no way forward exit non-zero but still 
     });
     expect(result.reason).toBe(reason);
     expect(result.generationId).toBe(FIXTURE_GENERATION);
-    expect(result.evidence).toMatchObject({ activationLink: NOT_AVAILABLE_IN_THIS_BUILD });
+    expect(result.evidence).toMatchObject({ activationLink: "absent", generationBinding: "absent" });
   });
 
   it("row 9 (an aborted journal beside a manifest no abort settles) exits as a contradiction", async () => {
@@ -329,6 +328,140 @@ describe("report: the boundary", () => {
       homeDir: "/tmp/none", _operationsForTesting: { resolve: async () => { throw new TypeError("boom /a/path"); } },
     });
     expect(result).toEqual({ reason: "unexpected-failure", generationId: null, manifestPhase: null, next: null, restart: null, evidence: { detail: "TypeError" } });
+  });
+});
+
+
+describe("report: the activation and rollback readers (#625 and #626), all lock-free and three-valued", () => {
+  const link = (publicationId = "pub-1") => ({
+    state: "resolved" as const, path: "/ignored",
+    link: { version: 1, generationId: FIXTURE_GENERATION, publicationId, identityDigest: "d".repeat(64), epochManifestRevision: 4, epochManifestChecksumSha256: "e".repeat(64) },
+  }) as never;
+
+  function activeFixture() {
+    const home = makeFixtureHome(roots);
+    createFixtureManifest(new MigrationManifestStore({ homeDir: home }), "active");
+    const observation = { kind: "publication" as const, publicationId: "pub-1", phase: "completed" as const };
+    const resolutionOwn = { _operationsForTesting: { observeJournal: () => observation, classifySnapshot: complete, readLink: () => link() } };
+    return { home, resolutionOwn };
+  }
+  const present = {
+    readActivationReport: () => ({ state: "resolved", report: {}, path: "/p" }) as never,
+    resolveBindings: () => ({ state: "resolved", witnesses: [{}, {}], selections: [{ kind: "activation" }, { kind: "rollback" }] }) as never,
+    readActivationEvidence: () => ({ state: "resolved", epochs: [{}], attempts: [{}, {}], witnesses: [{}, {}, {}] }) as never,
+    readRollbackReport: () => ({ kind: "rollback", mode: "pre-write", eligibility: "pre-write" }) as never,
+    readRollbackAuthority: () => ({}) as never,
+    ...restartOps(verdict("satisfied"), ABSENT),
+  };
+
+  it("shows every reader that answered: the link, the report, the bindings, the epoch store, the rollback report and the authority artifact", async () => {
+    const { home, resolutionOwn } = activeFixture();
+    const before = snapshotHome(home);
+    const result = await performMigrationReportCommand({ homeDir: home, generation: FIXTURE_GENERATION, _resolution: resolutionOwn, _operationsForTesting: present });
+    expect(result.reason).toBeUndefined();
+    expect(result.evidence).toMatchObject({
+      activationLink: "present", activationPublicationId: "pub-1", activationEpochManifestRevision: 4,
+      activationReport: "present", activationReportSha256: "b".repeat(64),
+      generationBinding: "present", witnessBindings: 2, selectionBindings: "activation,rollback",
+      rollbackEvidence: "present", activationEpochs: 1, activationAttempts: 2, activationWitnesses: 3,
+      rollbackReport: "none", rollbackAuthority: "present", cell: 10, selectedBackend: "postgresql",
+    });
+    expect(snapshotHome(home)).toEqual(before);
+  });
+
+  it("an absent store is absent, not a problem: the exit stays 0", async () => {
+    const { home, resolutionOwn } = activeFixture();
+    const result = await performMigrationReportCommand({
+      homeDir: home, generation: FIXTURE_GENERATION, _resolution: { _operationsForTesting: { ...resolutionOwn._operationsForTesting, readLink: () => ({ state: "authoritatively-absent", detail: "x" }) as never, observeJournal: () => ({ kind: "absent" }) } },
+      _operationsForTesting: {
+        ...present,
+        resolveBindings: () => ({ state: "authoritatively-absent" }) as never,
+        readActivationEvidence: () => ({ state: "authoritatively-absent" }) as never,
+        readRollbackAuthority: () => null,
+      },
+    });
+    expect(result.evidence).toMatchObject({ activationLink: "absent", generationBinding: "absent", rollbackEvidence: "absent", rollbackAuthority: "absent" });
+  });
+
+  it("the rollback report named by the manifest is read by its id, and its kind, mode and eligibility are shown", async () => {
+    const home = makeFixtureHome(roots);
+    createFixtureManifest(new MigrationManifestStore({ homeDir: home }), "rolled-back");
+    const readRollback = vi.fn(present.readRollbackReport);
+    const result = await performMigrationReportCommand({
+      homeDir: home, generation: FIXTURE_GENERATION, _resolution: resolution,
+      _operationsForTesting: { ...present, readRollbackReport: readRollback, ...restartOps(verdict("satisfied"), ABSENT) },
+    });
+    expect(readRollback).toHaveBeenCalledWith(home, FIXTURE_GENERATION, "rollback-report");
+    expect(result.evidence).toMatchObject({ rollbackReport: "present", rollbackReportKind: "rollback", rollbackMode: "pre-write", rollbackEligibility: "pre-write" });
+  });
+
+  it.each([
+    ["the link", { activationLink: { state: "unresolvable", reason: "multi-link", detail: "x" } }, "activationLink", "unresolvable", "route-unresolvable"],
+  ])("%s that cannot be resolved is the router's row 1", async (_name, _unused, key, value, reason) => {
+    const { home, resolutionOwn } = activeFixture();
+    const result = await performMigrationReportCommand({
+      homeDir: home, generation: FIXTURE_GENERATION,
+      _resolution: { _operationsForTesting: { ...resolutionOwn._operationsForTesting, readLink: () => ({ state: "unresolvable", reason: "multi-link", detail: "x" }) as never } },
+      _operationsForTesting: present,
+    });
+    expect(result.reason).toBe(reason);
+    expect(result.evidence).toMatchObject({ [key]: value, activationLinkReason: "multi-link" });
+  });
+
+  it.each([
+    ["an activation report that cannot be read", { readActivationReport: () => ({ state: "unresolvable", reason: "malformed-record", detail: "x" }) as never }, { activationReport: "unresolvable", activationReportReason: "malformed-record" }],
+    ["an activation report the manifest names but the store lacks", { readActivationReport: () => ({ state: "authoritatively-absent", detail: "x" }) as never }, { activationReport: "missing" }],
+    ["an activation report reader that throws", { readActivationReport: () => { throw new TypeError("boom"); } }, { activationReport: "unresolvable", activationReportReason: "TypeError" }],
+    ["unresolvable bindings", { resolveBindings: () => ({ state: "unresolvable", reason: "free text /secret" }) as never }, { generationBinding: "unresolvable" }],
+    ["a bindings reader that throws", { resolveBindings: () => { throw new RangeError("boom"); } }, { generationBinding: "unresolvable", generationBindingReason: "RangeError" }],
+    ["an unresolvable epoch store", { readActivationEvidence: () => ({ state: "unresolvable", reason: "free text" }) as never }, { rollbackEvidence: "unresolvable" }],
+    ["an epoch store reader that throws", { readActivationEvidence: () => { throw new RangeError("boom"); } }, { rollbackEvidence: "unresolvable", rollbackEvidenceReason: "RangeError" }],
+    ["a rollback authority artifact that cannot be read", { readRollbackAuthority: () => { throw new SyntaxError("boom"); } }, { rollbackAuthority: "unresolvable", rollbackAuthorityReason: "SyntaxError" }],
+  ])("%s is exit 5 (report-evidence-unresolvable) and still prints every section", async (_name, override, expected) => {
+    const { home, resolutionOwn } = activeFixture();
+    const result = await performMigrationReportCommand({
+      homeDir: home, generation: FIXTURE_GENERATION, _resolution: resolutionOwn, _operationsForTesting: { ...present, ...override },
+    });
+    expect(result.reason).toBe("report-evidence-unresolvable");
+    expect(result.evidence).toMatchObject({ ...expected, cell: 10 });
+    expect(JSON.stringify(result)).not.toContain("secret");
+  });
+
+  it("a rollback report the manifest names but the store lacks, or cannot read, is exit 5", async () => {
+    const home = makeFixtureHome(roots);
+    createFixtureManifest(new MigrationManifestStore({ homeDir: home }), "rolled-back");
+    const missing = await performMigrationReportCommand({
+      homeDir: home, generation: FIXTURE_GENERATION, _resolution: resolution, _operationsForTesting: { ...present, readRollbackReport: () => null },
+    });
+    expect(missing).toMatchObject({ reason: "report-evidence-unresolvable", evidence: { rollbackReport: "missing" } });
+    const throwing = await performMigrationReportCommand({
+      homeDir: home, generation: FIXTURE_GENERATION, _resolution: resolution, _operationsForTesting: { ...present, readRollbackReport: () => { throw new SyntaxError("boom"); } },
+    });
+    expect(throwing).toMatchObject({ reason: "report-evidence-unresolvable", evidence: { rollbackReport: "unresolvable", rollbackReportReason: "SyntaxError" } });
+  });
+
+  it("an unresolvable reader outranks a restart refusal, and a router refusal outranks both", async () => {
+    const { home, resolutionOwn } = activeFixture();
+    const restartRequired = restartOps(verdict("unsatisfied"), { status: "present", storageBackend: "sqlite", pid: 7, daemonInstanceId: "d" });
+    const evidenceFirst = await performMigrationReportCommand({
+      homeDir: home, generation: FIXTURE_GENERATION, _resolution: resolutionOwn,
+      _operationsForTesting: { ...present, ...restartRequired, resolveBindings: () => ({ state: "unresolvable", reason: "x" }) as never },
+    });
+    expect(evidenceFirst.reason).toBe("report-evidence-unresolvable");
+    const restartOnly = await performMigrationReportCommand({
+      homeDir: home, generation: FIXTURE_GENERATION, _resolution: resolutionOwn, _operationsForTesting: { ...present, ...restartRequired },
+    });
+    expect(restartOnly.reason).toBe("report-restart-required");
+  });
+
+  it("uses the real readers when none are injected: an empty home has no activation or rollback evidence", async () => {
+    const home = makeFixtureHome(roots);
+    await heldFixtureJournal(home);
+    createFixtureManifest(new MigrationManifestStore({ homeDir: home }), "planned");
+    const result = await performMigrationReportCommand({ homeDir: home, _resolution: resolution });
+    expect(result.evidence).toMatchObject({
+      activationLink: "absent", activationReport: "none", generationBinding: "absent", rollbackEvidence: "absent", rollbackReport: "none", rollbackAuthority: "absent",
+    });
   });
 });
 

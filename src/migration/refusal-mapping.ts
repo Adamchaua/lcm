@@ -441,6 +441,10 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     remedy: "The journal records a completed selection without naming its backend. Nothing was changed; run `lcm doctor` and inspect the evidence.",
   }),
   Object.freeze({
+    reason: "report-evidence-unresolvable", exitClass: "refused-evidence",
+    remedy: "A reader of the activation or rollback evidence could not give an answer, or a report the manifest references is missing. The report still prints every section it read; run `lcm doctor` and inspect the evidence named as unresolvable or missing.",
+  }),
+  Object.freeze({
     reason: "abort-carried-effect-mismatch", exitClass: "refused-evidence",
     remedy: "The pending abort effect on the manifest is not the one an abort of this generation begins. Nothing was changed; run `lcm doctor` and inspect the evidence.",
   }),

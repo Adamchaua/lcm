@@ -11,6 +11,10 @@ import type { MigrationEnvelopeRestart, MigrationEvidence } from "./envelope.js"
 import { resolveExistingMigrationGeneration, type ExistingGenerationContext, type ExistingGenerationInput } from "./existing-generation.js";
 import { observeMigrationMaintenanceJournal } from "./journal-observation.js";
 import { MigrationManifestStore } from "./manifest-store.js";
+import { readMigrationActivationReport } from "./activation-report.js";
+import { resolveMigrationWitnessBindings } from "./generation-binding-store.js";
+import { readMigrationActivationEvidence } from "./activation-evidence-store.js";
+import { readRollbackAuthorityArtifact, readRollbackReport } from "./rollback.js";
 
 /**
  * The `report` command's CLI orchestration (plan-v4 section 7 as amended by
@@ -23,8 +27,12 @@ import { MigrationManifestStore } from "./manifest-store.js";
  * is named, so a report after an abort needs no flag), shows what each
  * reader saw as ids, digests, phases and booleans, and names `nextAction`
  * from the same router `resume` and the mutating commands use, so the three
- * cannot disagree. Readers that belong to #625 and #626 print
- * `not-available-in-this-build` until those merge.
+ * cannot disagree. #625's and #626's readers are all lock-free and
+ * three-valued, and each is shown as present, absent or unresolvable: the
+ * activation link and report, the generation bindings, the activation epoch,
+ * attempt and witness store, the rollback report and the rollback authority
+ * artifact. An unresolvable one, or a report the manifest references that is
+ * missing, is exit 5; it never reads as absence.
  *
  * **Exit codes.** 0 when the generation was read and no contradiction was
  * found; 2 when the generation cannot be resolved; 4 for a foreign
@@ -39,8 +47,6 @@ import { MigrationManifestStore } from "./manifest-store.js";
  * own `targetBackend`). Its verdict and the daemon presence are two
  * observations and neither decides alone (plan-v4 section 7's matrix).
  */
-
-export const NOT_AVAILABLE_IN_THIS_BUILD = "not-available-in-this-build";
 
 export type MigrationReportOutcome = Readonly<{
   /** Absent for a report that was read; a closed reason when the exit is non-zero. */
@@ -57,6 +63,11 @@ export type MigrationReportCommandOperations = Readonly<{
   checkRestart: typeof checkActivationRestartAdmission;
   classifyPresence: typeof classifyMigrationDaemonPresence;
   readDaemonPort: (homeDir: string) => number;
+  readActivationReport: typeof readMigrationActivationReport;
+  resolveBindings: typeof resolveMigrationWitnessBindings;
+  readActivationEvidence: typeof readMigrationActivationEvidence;
+  readRollbackReport: typeof readRollbackReport;
+  readRollbackAuthority: typeof readRollbackAuthorityArtifact;
 }>;
 
 export type MigrationReportCommandInput = Readonly<{
@@ -194,6 +205,114 @@ async function restartEvidence(
   return combineRestart(verdict, presence, selected);
 }
 
+/** Evidence values that mean a reader could not give an answer; any of them makes the report exit 5. */
+const UNRESOLVED_READER_STATES: ReadonlySet<string> = new Set(["unresolvable", "missing"]);
+
+type ReaderSections = Readonly<{ evidence: MigrationEvidence; unresolved: boolean }>;
+
+function lastReference(context: ExistingGenerationContext, kinds: readonly string[]) {
+  return [...(context.manifest?.reports ?? [])].reverse().find((report) => kinds.includes(report.kind));
+}
+
+/**
+ * Everything #625 and #626 persist about a generation, read with their
+ * lock-free readers. A reader that throws is unresolvable, with the error's
+ * name only; none of them is allowed to turn an unreadable entry into absence.
+ */
+function activationAndRollbackSections(
+  context: ExistingGenerationContext,
+  homeDir: string,
+  ops: Partial<MigrationReportCommandOperations> | undefined,
+): ReaderSections {
+  const generationId = context.generationId;
+  const readActivationReport = ops?.readActivationReport ?? readMigrationActivationReport;
+  const resolveBindings = ops?.resolveBindings ?? resolveMigrationWitnessBindings;
+  const readActivationEvidence = ops?.readActivationEvidence ?? readMigrationActivationEvidence;
+  const readRollback = ops?.readRollbackReport ?? readRollbackReport;
+  const readAuthority = ops?.readRollbackAuthority ?? readRollbackAuthorityArtifact;
+  const sections: Record<string, string | number | boolean | null> = {};
+
+  const link = context.activationLink;
+  sections.activationLink = link.state === "resolved" ? "present" : link.state === "authoritatively-absent" ? "absent" : "unresolvable";
+  if (link.state === "resolved") {
+    sections.activationPublicationId = link.link.publicationId;
+    sections.activationEpochManifestRevision = link.link.epochManifestRevision;
+  }
+  if (link.state === "unresolvable") sections.activationLinkReason = link.reason;
+
+  const activationReference = lastReference(context, ["activation"]);
+  if (activationReference === undefined) {
+    sections.activationReport = "none";
+  } else {
+    try {
+      const read = readActivationReport({ homeDir, generationId, reportSha256: activationReference.reportSha256 });
+      // The manifest references this report, so its absence is a contradiction, not an empty store.
+      sections.activationReport = read.state === "resolved" ? "present" : read.state === "authoritatively-absent" ? "missing" : "unresolvable";
+      if (read.state === "resolved") sections.activationReportSha256 = activationReference.reportSha256;
+      if (read.state === "unresolvable") sections.activationReportReason = read.reason;
+    } catch (error) {
+      sections.activationReport = "unresolvable";
+      sections.activationReportReason = unexpectedFailureEvidence(error);
+    }
+  }
+
+  try {
+    const bindings = resolveBindings({ homeDir, generationId });
+    if (bindings.state === "resolved") {
+      sections.generationBinding = "present";
+      sections.witnessBindings = bindings.witnesses.length;
+      sections.selectionBindings = bindings.selections.map((selection) => selection.kind).join(",");
+    } else {
+      sections.generationBinding = bindings.state === "authoritatively-absent" ? "absent" : "unresolvable";
+    }
+  } catch (error) {
+    sections.generationBinding = "unresolvable";
+    sections.generationBindingReason = unexpectedFailureEvidence(error);
+  }
+
+  try {
+    const evidence = readActivationEvidence({ homeDir, generationId });
+    if (evidence.state === "resolved") {
+      sections.rollbackEvidence = "present";
+      sections.activationEpochs = evidence.epochs.length;
+      sections.activationAttempts = evidence.attempts.length;
+      sections.activationWitnesses = evidence.witnesses.length;
+    } else {
+      sections.rollbackEvidence = evidence.state === "authoritatively-absent" ? "absent" : "unresolvable";
+    }
+  } catch (error) {
+    sections.rollbackEvidence = "unresolvable";
+    sections.rollbackEvidenceReason = unexpectedFailureEvidence(error);
+  }
+
+  const rollbackReference = lastReference(context, ["rollback", "abandonment"]);
+  if (rollbackReference === undefined) {
+    sections.rollbackReport = "none";
+  } else {
+    try {
+      const read = readRollback(homeDir, generationId, rollbackReference.reportId);
+      sections.rollbackReport = read === null ? "missing" : "present";
+      if (read !== null) {
+        sections.rollbackReportKind = read.kind;
+        sections.rollbackMode = read.mode;
+        sections.rollbackEligibility = read.eligibility;
+      }
+    } catch (error) {
+      sections.rollbackReport = "unresolvable";
+      sections.rollbackReportReason = unexpectedFailureEvidence(error);
+    }
+  }
+
+  try {
+    sections.rollbackAuthority = readAuthority(homeDir, generationId) === null ? "absent" : "present";
+  } catch (error) {
+    sections.rollbackAuthority = "unresolvable";
+    sections.rollbackAuthorityReason = unexpectedFailureEvidence(error);
+  }
+
+  return { evidence: sections, unresolved: Object.values(sections).some((value) => typeof value === "string" && UNRESOLVED_READER_STATES.has(value)) };
+}
+
 async function runMigrationReportCommand(input: MigrationReportCommandInput): Promise<MigrationReportOutcome> {
   const ops = input._operationsForTesting;
   const resolve = ops?.resolve ?? resolveExistingMigrationGeneration;
@@ -222,6 +341,7 @@ async function runMigrationReportCommand(input: MigrationReportCommandInput): Pr
   const { route } = context;
 
   const restart = await restartEvidence(context, input.homeDir, ops);
+  const readers = activationAndRollbackSections(context, input.homeDir, ops);
   const evidence: MigrationEvidence = {
     ...journalEvidence(context),
     snapshot: context.snapshot,
@@ -231,12 +351,9 @@ async function runMigrationReportCommand(input: MigrationReportCommandInput): Pr
     primary: route.primary,
     allowed: route.allowed.join(","),
     ...restart.evidence,
-    activationLink: NOT_AVAILABLE_IN_THIS_BUILD,
-    activationReport: NOT_AVAILABLE_IN_THIS_BUILD,
-    generationBinding: NOT_AVAILABLE_IN_THIS_BUILD,
-    rollbackEvidence: NOT_AVAILABLE_IN_THIS_BUILD,
+    ...readers.evidence,
   };
-  const reason = REPORT_ROW_REASONS[route.row] ?? restart.reason;
+  const reason = REPORT_ROW_REASONS[route.row] ?? (readers.unresolved ? "report-evidence-unresolvable" : undefined) ?? restart.reason;
   return {
     ...(reason === undefined ? {} : { reason }),
     generationId: context.generationId,
