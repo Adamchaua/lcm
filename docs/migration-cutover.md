@@ -1100,7 +1100,11 @@ Recovery is to run activation again. The run resumes from the durable
 evidence it finds (the manifest, the link and artifact, the stored attempt,
 the journals, the stored report) and rolls forward; it never re-derives an
 attempt that a selection already carries, and it reuses an artifact or a
-report byte-identically when the bytes still authenticate. Nothing is
+report byte-identically when the bytes still authenticate. A resumed run
+re-checks the same preconditions a fresh run does; one that fails on a
+resumed run is reported as an interruption of the step that was in flight
+(`S9`, `S10` or `S11`), with the failed check named in the detail, because
+an effect has already begun. Nothing is
 reversed automatically. If the published target turns out unhealthy after
 publication, the outcome is `post-publication-unhealthy` with the restart
 verdict; the selection stands, and the next run completes once the target is

@@ -1912,3 +1912,53 @@ describe("runMigrationActivation: the S2 lease is released on every pre-effect e
     expect(row(f).releasedAt).toBeNull();
   });
 });
+
+describe("runMigrationActivation: an S0-S8 re-check that fails on an effect-begun re-entry is an interruption (PR #1628 review, Codex P1)", () => {
+  const row = (f: Fixture) => f.guard.rows.get(REMOTE)!;
+
+  it("prepare-activation pending (S9 in flight): S4 uncovered-projects is interrupted S9 state-unresolvable, keeps the lease, and the next call converges", async () => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-begin");
+    const outcome = await f.run({ enumerateStoredData: () => ({ status: "enumerated", projectHashes: [f.localProjectId, HASH_B] }) });
+    expect(outcome).toMatchObject({
+      status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, applied: "no", reportStored: "no",
+      identity: { generationId: GENERATION, publicationId: f.publicationId },
+    });
+    expect((outcome as { detail: string }).detail).toMatch(/^S4 uncovered-projects on roll-forward: /u);
+    expect(row(f).releasedAt).toBeNull();
+    expectActivated(f, await f.run(), "prepare-activation-pending");
+  });
+
+  it("activating with no pending effect (between S9 and S10): S6 unhealthy is interrupted S10", async () => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-complete");
+    f.deps.health.push({ status: "unhealthy", reason: "schema-mismatch", detail: "fake", sqlState: null } as MigrationTargetHealthResult);
+    const outcome = await f.run();
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S10", cause: "state-unresolvable", effectBegun: true, applied: "no" });
+    expect((outcome as { detail: string }).detail).toContain("S6 target-unhealthy on roll-forward: schema-mismatch");
+    expect(row(f).releasedAt).toBeNull();
+    expectActivated(f, await f.run(), "activating-no-effect");
+  });
+
+  it("publish-activation pending (S11 in flight): the lease and project-map reasons map to their own causes", async () => {
+    const f = await fixture();
+    await stopAt(f, "after-link");
+    const acquire = f.guard.acquire.bind(f.guard);
+    f.guard.acquire = async (input) => { throw new PostgreSqlBackendPublicationGuardError(input.projectId, "acquire", "publication-conflict"); };
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S11", cause: "lease-lost", effectBegun: true, detail: expect.stringMatching(/^S2 lease-conflict on roll-forward: /u) });
+    f.guard.acquire = async (input) => { throw new PostgreSqlBackendPublicationGuardError(input.projectId, "acquire", "readback-mismatch"); };
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S11", cause: "lease-unresolvable", effectBegun: true });
+    f.guard.acquire = acquire;
+    expect(await f.run({ computeProjectMapWitness: () => "0".repeat(64) })).toMatchObject({ status: "interrupted", step: "S11", cause: "project-map-drift", effectBegun: true, detail: expect.stringMatching(/^S5 project-map-drift on roll-forward: /u) });
+    expect(row(f).releasedAt).toBeNull();
+    expectActivated(f, await f.run(), "publish-pending-after-link");
+  });
+
+  it("a foreign pending prepare-activation effect stays a refusal (this activation began nothing) and releases the row", async () => {
+    const f = await fixture();
+    const verified = f.manifestStore.read(GENERATION);
+    f.manifestStore.update(GENERATION, verified.checksumSha256, (m) => beginMigrationEffect(m, { effectId: "prepare-activation-foreign", kind: "prepare-activation", inputSha256: HASH_A, startedAt: "2026-10-16T13:30:00.000Z" }));
+    expect(await f.run()).toMatchObject({ status: "refused", step: "S0", reason: "pending-effect-foreign", effectBegun: false });
+    expect(row(f).releasedAt).not.toBeNull();
+  });
+});

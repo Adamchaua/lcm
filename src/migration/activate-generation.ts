@@ -602,12 +602,48 @@ function isExit<T>(step: Step<T>): step is Exit {
   return step.exit !== undefined;
 }
 
-function refused(
+function refusal(
   step: MigrationActivationRefusalStep,
   reason: MigrationActivationRefusalReason,
   detail: string,
 ): Exit {
   return { exit: { status: "refused", step, reason, detail, effectBegun: false } };
+}
+
+/** Refusal reasons with a closed interruption cause of their own (A7); the rest are state-unresolvable. */
+const ROLL_FORWARD_CAUSES: Partial<Record<MigrationActivationRefusalReason, MigrationActivationInterruptionCause>> = {
+  "lease-conflict": "lease-lost",
+  "lease-unresolvable": "lease-unresolvable",
+  "project-map-drift": "project-map-drift",
+};
+
+/** The step the earlier run was in when it stopped, from the manifest step C
+ * read: prepare-activation pending (S9), activating with no pending effect
+ * (between S9 and S10) or publish-activation pending (S11). */
+function inFlightStep(ctx: Context): MigrationActivationInterruptionStep {
+  const pending = ctx.manifest.pendingEffect;
+  if (pending === null) return "S10";
+  return pending.kind === "prepare-activation" ? "S9" : "S11";
+}
+
+/**
+ * A refusal names a precondition this activation failed before any effect
+ * of its own, so the refused outcome has effectBegun false by contract
+ * (plan-v7.1 interface). When the same S0-S8 re-check fails on a re-entry
+ * whose effect already began (step C: manifest activating or a pending
+ * activation effect), the run is an interrupted roll-forward instead: the
+ * step in flight when the earlier run stopped, the nearest closed cause,
+ * and the refusal step and reason kept in the detail. The lease is then
+ * kept for the next call (see releaseAbandonedLease).
+ */
+function refused(
+  ctx: Context,
+  step: MigrationActivationRefusalStep,
+  reason: MigrationActivationRefusalReason,
+  detail: string,
+): Exit {
+  if (!ctx.effectBegun) return refusal(step, reason, detail);
+  return interrupted(ctx, inFlightStep(ctx), ROLL_FORWARD_CAUSES[reason] ?? "state-unresolvable", step + " " + reason + " on roll-forward: " + detail);
 }
 
 const PREPARE_EFFECT_PREFIX = "prepare-activation-";
@@ -762,10 +798,10 @@ function readManifest(ctx: Context): Step<MigrationManifest> {
     return ok(ctx.deps.manifestStore.read(ctx.generationId));
   } catch (error) {
     if (isManifestAbsent(error)) {
-      return refused("S0", "manifest-absent", "no migration manifest exists for generation " + ctx.generationId);
+      return refused(ctx, "S0", "manifest-absent", "no migration manifest exists for generation " + ctx.generationId);
     }
     if (error instanceof MigrationProtocolError) {
-      return refused("S0", "manifest-unresolvable", "the migration manifest could not be read: " + error.message);
+      return refused(ctx, "S0", "manifest-unresolvable", "the migration manifest could not be read: " + error.message);
     }
     throw error;
   }
@@ -844,15 +880,15 @@ function readVerification(ctx: Context): Step<{ ref: MigrationReportReference; r
     report = ctx.deps.readVerificationReport(ctx.generationId, ref.reportSha256);
   } catch (error) {
     if (error instanceof MigrationVerificationStoreError) {
-      return refused("S5", "verification-unresolvable", "the verification report could not be read: " + error.message);
+      return refused(ctx, "S5", "verification-unresolvable", "the verification report could not be read: " + error.message);
     }
     throw error;
   }
   if (report.reportId !== ref.reportId || report.reportSha256 !== ref.reportSha256) {
-    return refused("S5", "verification-stale", "the stored verification report does not match the manifest's reference");
+    return refused(ctx, "S5", "verification-stale", "the stored verification report does not match the manifest's reference");
   }
   if (!report.activationEligible) {
-    return refused("S5", "verification-stale", "the verification report is not activation-eligible");
+    return refused(ctx, "S5", "verification-stale", "the verification report is not activation-eligible");
   }
   return ok({ ref, report });
 }
@@ -917,7 +953,7 @@ async function stepCopyBinding(ctx: Context): Promise<Step<string>> {
       executor: transfer, projectId: ctx.remoteProjectId, generationId: ctx.generationId, signal: ctx.input.signal,
     });
     if (read.state === "unresolvable") {
-      return refused("S0", "verification-unresolvable", "the copy binding digest could not be read back (" + read.reason + "): " + read.detail);
+      return refused(ctx, "S0", "verification-unresolvable", "the copy binding digest could not be read back (" + read.reason + "): " + read.detail);
     }
     const identity = await identityCheck(ctx, transfer, "S0");
     if (isExit(identity)) return identity;
@@ -942,12 +978,12 @@ async function identityCheck(ctx: Context, executor: PostgreSqlQueryExecutor, st
     );
   } catch (error) {
     if (error instanceof Error && error.name === "MigrationVerificationDriverError") {
-      return refused(step, "identity-drift", "the live destination identity does not match the sealed manifest: " + error.message);
+      return refused(ctx, step, "identity-drift", "the live destination identity does not match the sealed manifest: " + error.message);
     }
     throw error;
   }
   if (live.sealedWitnessSha256 !== ctx.report.body.destinationIdentity.sealedWitnessSha256) {
-    return refused(step, "identity-drift", "the live destination identity does not match the verification report");
+    return refused(ctx, step, "identity-drift", "the live destination identity does not match the verification report");
   }
   return ok(live);
 }
@@ -965,14 +1001,14 @@ async function stepLeaseAcquire(ctx: Context): Promise<Step<ActivationLeaseFence
   };
   const acquired: ActivationLeaseAcquireResult = await acquireActivationLease(ctx.guard!, base);
   if (acquired.status === "acquired") return ok(acquired.fence);
-  if (acquired.status === "conflict") return refused("S2", "lease-conflict", acquired.detail);
-  if (acquired.status === "unresolvable") return refused("S2", "lease-unresolvable", acquired.detail);
+  if (acquired.status === "conflict") return refused(ctx, "S2", "lease-conflict", acquired.detail);
+  if (acquired.status === "unresolvable") return refused(ctx, "S2", "lease-unresolvable", acquired.detail);
   const current = await ctx.guard!.read({ projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
-  if (current === null) return refused("S2", "lease-unresolvable", "the expired lease row vanished before takeover");
+  if (current === null) return refused(ctx, "S2", "lease-unresolvable", "the expired lease row vanished before takeover");
   const took: ActivationLeaseTakeoverResult = await takeoverActivationLease(ctx.guard!, { ...base, expectedFencingToken: current.fencingToken });
   if (took.status === "took-over") return ok(took.fence);
-  if (took.status === "conflict") return refused("S2", "lease-conflict", took.detail);
-  return refused("S2", "lease-unresolvable", took.detail);
+  if (took.status === "conflict") return refused(ctx, "S2", "lease-conflict", took.detail);
+  return refused(ctx, "S2", "lease-unresolvable", took.detail);
 }
 
 type LeaseContinuation =
@@ -1061,20 +1097,20 @@ async function stepQuiescence(ctx: Context): Promise<Step<ActivationQuiescenceRe
   const result = await ctx.deps.checkQuiescence({ homeDir: ctx.homeDir, lockToken: ctx.token }, { now: ctx.now });
   if (result.status === "satisfied") return ok(result);
   if (result.reason === "maintenance-journal-absent" || result.reason === "maintenance-not-held") {
-    return refused("S3", "maintenance-not-held", result.detail);
+    return refused(ctx, "S3", "maintenance-not-held", result.detail);
   }
-  if (result.reason === "maintenance-journal-unresolvable") return refused("S3", "maintenance-unresolvable", result.detail);
-  return refused("S3", result.status === "unsatisfied" ? "quiescence-unsatisfied" : "quiescence-unresolvable", result.detail);
+  if (result.reason === "maintenance-journal-unresolvable") return refused(ctx, "S3", "maintenance-unresolvable", result.detail);
+  return refused(ctx, "S3", result.status === "unsatisfied" ? "quiescence-unsatisfied" : "quiescence-unresolvable", result.detail);
 }
 
 function stepCoverage(ctx: Context): Step<ActivationCoverageResult> {
   const coverage = ctx.deps.checkCoverage({ homeDir: ctx.homeDir, publicationLockToken: ctx.token });
-  if (coverage.status === "unsatisfied") return refused("S4", "coverage-unsatisfied", coverage.detail);
-  if (coverage.status === "unresolvable") return refused("S4", "coverage-unresolvable", coverage.detail);
+  if (coverage.status === "unsatisfied") return refused(ctx, "S4", "coverage-unsatisfied", coverage.detail);
+  if (coverage.status === "unresolvable") return refused(ctx, "S4", "coverage-unresolvable", coverage.detail);
   const inventory: StoredDataProjectEnumeration = ctx.deps.enumerateStoredData({ homeDir: ctx.homeDir, publicationLockToken: ctx.token });
-  if (inventory.status === "unresolvable") return refused("S4", "coverage-unresolvable", inventory.detail);
+  if (inventory.status === "unresolvable") return refused(ctx, "S4", "coverage-unresolvable", inventory.detail);
   const verdict = evaluateActivationSingleProjectCoverage({ storedDataProjectHashes: inventory.projectHashes, localProjectId: ctx.localProjectId });
-  if (verdict.status === "unsatisfied") return refused("S4", "uncovered-projects", verdict.detail);
+  if (verdict.status === "unsatisfied") return refused(ctx, "S4", "uncovered-projects", verdict.detail);
   return ok(coverage);
 }
 
@@ -1101,7 +1137,7 @@ function projectMapWitness(ctx: Context, mode: "pre-publication" | "post-publica
   } catch (error) {
     if (error instanceof MigrationProjectMapWitnessError) {
       if (mode === "pre-publication") {
-        return refused("S5", error.reason === "project-map-drift" ? "project-map-drift" : "state-unresolvable", error.message);
+        return refused(ctx, "S5", error.reason === "project-map-drift" ? "project-map-drift" : "state-unresolvable", error.message);
       }
       return interrupted(ctx, "S16", error.reason === "project-map-drift" ? "project-map-drift" : "state-unresolvable", error.message);
     }
@@ -1124,7 +1160,7 @@ function observeHealth(ctx: Context): Promise<MigrationTargetHealthResult> {
 async function stepHealth(ctx: Context): Promise<Step<MigrationTargetHealthResult>> {
   const health = await observeHealth(ctx);
   if (health.status === "healthy") return ok(health);
-  return refused("S6", health.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", health.reason + ": " + health.detail);
+  return refused(ctx, "S6", health.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", health.reason + ": " + health.detail);
 }
 
 /** S7: a NEW transfer snapshot, after the transfer schema check (amendment 4). */
@@ -1159,13 +1195,13 @@ async function stepCensus(ctx: Context, scratchParent: string): Promise<Step<{ c
 function stepEligibility(ctx: Context, recomputed: MigrationCensusVector): Step<true> {
   const body = ctx.report.body;
   if (!body.classCoverage.every((entry) => entry.ran)) {
-    return refused("S8", "class-coverage-incomplete", "a reconciliation class did not run in the verification report");
+    return refused(ctx, "S8", "class-coverage-incomplete", "a reconciliation class did not run in the verification report");
   }
   if (ctx.report.mismatchTotals.length !== 0) {
-    return refused("S8", "verification-mismatch", "the verification report records mismatches");
+    return refused(ctx, "S8", "verification-mismatch", "the verification report records mismatches");
   }
   if (!migrationCensusVectorsEqual(recomputed, body.censusVector)) {
-    return refused("S8", "census-drift", "the recomputed destination census differs from the verification report's census");
+    return refused(ctx, "S8", "census-drift", "the recomputed destination census differs from the verification report's census");
   }
   return ok(true);
 }
@@ -1186,7 +1222,7 @@ function stepPrepareActivation(ctx: Context): Step<MigrationManifest> {
       crash(ctx, "after-prepare-begin");
     }
     if (manifest.pendingEffect?.kind !== "prepare-activation" || manifest.pendingEffect.effectId !== ids.prepare) {
-      return refused("S0", "pending-effect-foreign", "the pending effect is not this activation's prepare-activation");
+      return refusal("S0", "pending-effect-foreign", "the pending effect is not this activation's prepare-activation");
     }
     manifest = ctx.deps.manifestStore.update(ctx.generationId, manifest.checksumSha256, (current) =>
       completeMigrationEffect(current, { effectId: ids.prepare, completedAt: ctx.now().toISOString() }));
@@ -1600,15 +1636,15 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
   ctx.manifest = manifest.value;
   const recovery = classifyMigrationRecovery(ctx.manifest);
   if (recovery.action === "settled") {
-    if (recovery.phase !== "active") return refused("S0", "manifest-not-eligible", "the generation is settled at phase " + recovery.phase).exit;
+    if (recovery.phase !== "active") return refused(ctx, "S0", "manifest-not-eligible", "the generation is settled at phase " + recovery.phase).exit;
     return settledActive(ctx);
   }
   if ((recovery.action === "resume" || recovery.action === "readback")
     && recovery.effect.kind !== "prepare-activation" && recovery.effect.kind !== "publish-activation") {
-    return refused("S0", "pending-effect-foreign", "the pending effect " + recovery.effect.kind + " is not an activation effect").exit;
+    return refused(ctx, "S0", "pending-effect-foreign", "the pending effect " + recovery.effect.kind + " is not an activation effect").exit;
   }
   if (recovery.action === "ready" && (ctx.manifest.phase !== "verified" && ctx.manifest.phase !== "activating")) {
-    return refused("S0", "manifest-not-eligible", "the manifest is at phase " + ctx.manifest.phase + ", not verified").exit;
+    return refused(ctx, "S0", "manifest-not-eligible", "the manifest is at phase " + ctx.manifest.phase + ", not verified").exit;
   }
   // A verified or activating manifest is activation-eligible by protocol.ts's
   // own invariant (verify-generation completes only with activationEligible
@@ -1624,7 +1660,7 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
   if (link.state === "unresolvable") {
     return ctx.effectBegun
       ? interrupted(ctx, "S11", "state-unresolvable", "the generation link is unresolvable: " + link.detail).exit
-      : refused("S0", "state-unresolvable", "the generation link is unresolvable: " + link.detail).exit;
+      : refused(ctx, "S0", "state-unresolvable", "the generation link is unresolvable: " + link.detail).exit;
   }
   if (link.state === "resolved") {
     if (link.link.publicationId !== ctx.publicationId) {
@@ -1646,12 +1682,12 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
   } catch (error) {
     return ctx.effectBegun
       ? interrupted(ctx, "S12", "journal-unexpected", "a backend journal could not be read: " + (error as Error).message).exit
-      : refused("S0", "maintenance-unresolvable", "a backend journal could not be read: " + (error as Error).message).exit;
+      : refused(ctx, "S0", "maintenance-unresolvable", "a backend journal could not be read: " + (error as Error).message).exit;
   }
   const ownV2 = v2 !== null && v2.publicationId === ctx.publicationId ? v2 : null;
   if (v3 !== null && !isActivationMaintenance(v3)) {
     const detail = foreignMaintenanceDetail(v3);
-    return ctx.effectBegun ? interrupted(ctx, "S12", "journal-unexpected", detail).exit : refused("S3", "maintenance-not-held", detail).exit;
+    return ctx.effectBegun ? interrupted(ctx, "S12", "journal-unexpected", detail).exit : refused(ctx, "S3", "maintenance-not-held", detail).exit;
   }
 
   // Link resolved: everything comes from link + artifact; compose is never called (A9).
@@ -1709,7 +1745,7 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
   // --- Pre-selection: fresh or re-entry before S12 --------------------------
   if (v3 === null || v3.generationId !== ctx.generationId || v3.phase !== "maintenance-held") {
     const detail = v3 === null ? "no maintenance journal is held for this generation" : "the maintenance journal is at phase " + v3.phase + " for generation " + v3.generationId;
-    return ctx.effectBegun ? interrupted(ctx, "S12", "journal-unexpected", detail).exit : refused("S3", "maintenance-not-held", detail).exit;
+    return ctx.effectBegun ? interrupted(ctx, "S12", "journal-unexpected", detail).exit : refused(ctx, "S3", "maintenance-not-held", detail).exit;
   }
   if (ctx.manifest.phase === "activating") {
     ctx.resumedFrom = ctx.link !== null ? "publish-pending-after-link"
@@ -1749,7 +1785,7 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
   const pre = projectMapWitness(ctx, "pre-publication");
   if (isExit(pre)) return pre.exit;
   if (pre.value !== ctx.report.body.projectMapWitnessSha256) {
-    return refused("S5", "project-map-drift", "the pre-publication project map witness differs from the verification report's").exit;
+    return refused(ctx, "S5", "project-map-drift", "the pre-publication project map witness differs from the verification report's").exit;
   }
   if (ctx.link === null) {
     // No link means no version-2 journal of ours either (that pair is the
@@ -1767,7 +1803,7 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
       if (isArtifactReadRefusal(error)) {
         return ctx.effectBegun
           ? interrupted(ctx, "S11", "artifact-unresolvable", error.message).exit
-          : refused("S0", "state-unresolvable", error.message).exit;
+          : refused(ctx, "S0", "state-unresolvable", error.message).exit;
       }
       throw error;
     }
@@ -1791,8 +1827,8 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
   if (isExit(eligible)) return eligible.exit;
   // Renew after S7.
   const renewedAfterCensus = await continueLease(ctx);
-  if (renewedAfterCensus.kind === "lost") return refused("S8", "lease-conflict", renewedAfterCensus.detail).exit;
-  if (renewedAfterCensus.kind === "unresolvable") return refused("S8", "lease-unresolvable", renewedAfterCensus.detail).exit;
+  if (renewedAfterCensus.kind === "lost") return refused(ctx, "S8", "lease-conflict", renewedAfterCensus.detail).exit;
+  if (renewedAfterCensus.kind === "unresolvable") return refused(ctx, "S8", "lease-unresolvable", renewedAfterCensus.detail).exit;
   ctx.fence = renewedAfterCensus.fence;
   // Epoch, attempt, witness (attempt and witness are re-derived if the lease is taken over before S12).
   ctx.epoch = epochFor(ctx, ctx.pair);
