@@ -1261,7 +1261,11 @@ function stepPrepareActivation(ctx: Context): Step<MigrationManifest> {
       crash(ctx, "after-prepare-begin");
     }
     if (manifest.pendingEffect?.kind !== "prepare-activation" || manifest.pendingEffect.effectId !== ids.prepare) {
-      return refusal("S0", "pending-effect-foreign", "the pending effect is not this activation's prepare-activation");
+      // A durable prepare-activation effect under another effectId: an
+      // effect exists on this generation's manifest, so this is an
+      // interruption that keeps the lease (as S10 reports its own mismatch),
+      // never a refusal that would release the row under a pending effect.
+      return interrupted(ctx, "S9", "state-unresolvable", "the pending effect is not this activation's prepare-activation");
     }
     manifest = ctx.deps.manifestStore.update(ctx.generationId, manifest.checksumSha256, (current) =>
       completeMigrationEffect(current, { effectId: ids.prepare, completedAt: ctx.now().toISOString() }));

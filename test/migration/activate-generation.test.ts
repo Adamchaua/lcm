@@ -1528,7 +1528,7 @@ describe("runMigrationActivation: refusal rows reached only through injected che
     const f = await fixture();
     const verified = f.manifestStore.read(GENERATION);
     f.manifestStore.update(GENERATION, verified.checksumSha256, (m) => beginMigrationEffect(m, { effectId: "prepare-activation-foreign", kind: "prepare-activation", inputSha256: HASH_A, startedAt: "2026-10-16T13:30:00.000Z" }));
-    expect(await f.run()).toMatchObject({ status: "refused", step: "S0", reason: "pending-effect-foreign" });
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, applied: "no", detail: "the pending effect is not this activation's prepare-activation" });
     const g = await fixture();
     const unbegun = await g.run({ manifestStore: countedStore(g, { updateAt: [1, () => { throw new MigrationProtocolError("unexpected-state", "injected"); }] }) });
     expect(unbegun).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: false, applied: "no" });
@@ -1974,12 +1974,17 @@ describe("runMigrationActivation: an S0-S8 re-check that fails on an effect-begu
     expectActivated(f, await f.run(), "publish-pending-after-link");
   });
 
-  it("a foreign pending prepare-activation effect stays a refusal (this activation began nothing) and releases the row", async () => {
+  it("a durable prepare-activation effect under another effectId is an S9 interruption that keeps the row (an effect exists; PR #1628 review)", async () => {
     const f = await fixture();
     const verified = f.manifestStore.read(GENERATION);
     f.manifestStore.update(GENERATION, verified.checksumSha256, (m) => beginMigrationEffect(m, { effectId: "prepare-activation-foreign", kind: "prepare-activation", inputSha256: HASH_A, startedAt: "2026-10-16T13:30:00.000Z" }));
-    expect(await f.run()).toMatchObject({ status: "refused", step: "S0", reason: "pending-effect-foreign", effectBegun: false });
-    expect(row(f).releasedAt).not.toBeNull();
+    const outcome = await f.run();
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, identity: { generationId: GENERATION, publicationId: f.publicationId } });
+    expect((outcome as { detail: string }).detail).not.toContain("lease");
+    expect(f.guard.calls.filter((c) => c === "release")).toHaveLength(0);
+    expect(row(f)).toMatchObject({ publicationId: f.publicationId, releasedAt: null });
+    // S10's own mismatch row already reports an interruption (see the S9 / S10 row above); the pending abort
+    // effect at step C is still a refusal, taken before any lease exists.
   });
 });
 
