@@ -26,6 +26,9 @@ detail you need.
 
 ### Setup and troubleshooting
 
+- [Incident diagnostics](incident-diagnostics.md) — collect bounded,
+  least-privilege PostgreSQL and provider evidence and follow private recovery
+  procedures without exposing content or credentials.
 - [Managed daemon recovery](daemon-restart-recovery.md) — diagnose and recover
   the user-managed daemon safely.
 - [Managed daemon temporary storage](daemon-temporary-storage.md) — understand

@@ -583,6 +583,30 @@ asynchronous resource cleanup has completed when the snapshot DTO returns.
 
 ## Labels and cardinality
 
+The [incident diagnostics runbook](../../../../docs/incident-diagnostics.md)
+keeps three separate closed lists:
+
+- Snapshot labels remain the unchanged collector labels documented below.
+- Runbook aliases are `runtime`, `migration`, and `administrator` role classes,
+  database alias `lcm-db`, and application alias `lcm`; they are documentation
+  identifiers with fixed cardinality five, never collector labels.
+- Provider credential classes are `provider-read` and `provider-recover`.
+  They describe authority and are not identifiers or telemetry dimensions.
+
+The #639 unit and PostgreSQL harness tests validate the runbook registry,
+positive jq projection, approved SQL rows, and encoded leak canaries. The
+integration seeds the exact #903/#924/#925 regression inputs:
+`file://host.invalid?q=(file://host.invalid/Users/canary/private.db`,
+`file://host.invalid?q=[a=b]file://host.invalid/Users/canary/private.db`,
+`file://host.invalid?next=1file://host.invalid/Users/canary/private.db`,
+`file://outer.invalid?q=prefix-file://host.invalid/Users/canary/private.db`,
+`file://outer.invalid#q=prefix-file://host.invalid/Users/canary/private.db`,
+`file://host"name/Users/canary/private.db`, and
+`file://host'name/Users/canary/private.db`. Their shared local path must not
+appear in approved evidence. Existing sanitizer regression tests remain the
+redaction proof; the incident tests prove that those inputs do not escape
+through the runbook's approved surfaces.
+
 Label keys and values are fixed when the package is built. The family is the
 structural snapshot section identifier, not a dimension on emitted values.
 
@@ -604,10 +628,10 @@ Each family uses only its own label tuple:
 | Queue and replay | scope |
 
 The observation status is one value per family, not a series dimension. The
-`role_class` values (`runtime`, `migration`, `administrator`) and a
-current-database alias exist only in #639 runbooks and are never collector
-dimensions. Project and machine UUIDs remain snapshot metadata and are never
-labels. A query identifier is never a label.
+three runbook role classes, database alias `lcm-db`, and application alias
+`lcm` exist only in #639 documentation and are never collector dimensions.
+Project and machine UUIDs remain snapshot metadata and are never labels. A
+query identifier is never a label.
 
 The query family emits at most 22 metrics for each of 64 operations plus the 3
 family-level values, which is 1411 scalar values per snapshot. #637 and #638

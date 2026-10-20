@@ -51,6 +51,7 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
       "test/package-config.test.ts",
       "test/daemon/remediation-string-regression.test.ts",
       "test/external-admission-workflow.test.ts",
+      "test/incident-runbook.test.ts",
       "test/release-workflows.test.ts",
     ]),
   }),
@@ -85,6 +86,7 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
 // The PostgreSQL conformance harness exercises the packed CLI and daemon in a
 // container, which the module graph of `test/postgresql/**` does not see.
 export const POSTGRESQL_PATH_PATTERNS = Object.freeze([
+  /^docs\/incident-diagnostics\.md$/u,
   /^bin\//u,
   /^installer\//u,
   /^src\/cli\//u,

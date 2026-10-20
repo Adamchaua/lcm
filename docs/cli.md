@@ -455,6 +455,9 @@ project ID was selected; an absent ID is not evidence of a missing project.
 
 ### Runtime health families
 
+Use the [incident diagnostics runbook](incident-diagnostics.md) for bounded,
+least-privilege collection, interpretation, and private recovery procedures.
+
 On a PostgreSQL backend the snapshot also carries four runtime health families
 under `telemetry`: `pool`, `migration`, `extensions`, and `queue`. Each reports a status
 (`observed`, `partial`, `unavailable`, `permission-denied`, or `timeout`), the time it

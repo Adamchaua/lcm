@@ -527,6 +527,10 @@ The `Security` section of the doctor output shows:
 
 ## Safe local diagnostics
 
+For PostgreSQL incidents, use the [least-privilege incident diagnostics
+runbook](incident-diagnostics.md) to create the explicitly allowlisted evidence
+bundle and keep provider, credential, quarantine, and recovery sessions private.
+
 - The `/describe` and `/expand` compatibility handlers sanitize fallback error
   messages before handing them to the daemon response layer, which sanitizes
   top-level error strings again before serialization. They retain their legacy
