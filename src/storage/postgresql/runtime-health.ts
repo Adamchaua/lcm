@@ -73,4 +73,3 @@ export async function readPostgreSqlQueueHealth(
   if (result.rows.length !== 1 || candidates === undefined) return invalidRead("diagnosticQueue");
   return { capReached: candidates > QUEUE_CANDIDATE_LIMIT, claimed: row.claimed, quarantined: row.quarantined, lagSeconds: row.replay_lag_seconds };
 }
-

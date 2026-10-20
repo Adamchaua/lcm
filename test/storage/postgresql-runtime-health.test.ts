@@ -95,4 +95,3 @@ describe("PostgreSQL queue health read", () => {
     await expect(readPostgreSqlQueueHealth({ query: lateQuery } as unknown as PostgreSqlQueryExecutor, late.signal)).rejects.toBeInstanceOf(StorageOperationError);
   });
 });
-

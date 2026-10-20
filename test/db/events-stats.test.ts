@@ -498,4 +498,3 @@ describe("read-only sidecar oldest pending capture time", () => {
     expect((await collectEventStats({ pruneOrphanSidecars: true })).oldestPendingAt).toBeUndefined();
   });
 });
-

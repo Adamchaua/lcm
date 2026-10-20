@@ -328,4 +328,3 @@ describe("queue interpretation", () => {
     expect(queueAction("unavailable", { inboxQuarantined: 9 })).toBe(ACTIONS.unavailable);
   });
 });
-

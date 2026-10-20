@@ -1,4 +1,5 @@
 import type { BackendDiagnosticSnapshot } from "./diagnostics.js";
+import { QUERY_OPERATION_IDS } from "./postgresql/query-operations.js";
 import {
   MIGRATION_HISTORY_STATUSES, TELEMETRY_FIELDS, TELEMETRY_HEALTHS, TELEMETRY_REASONS, TELEMETRY_STATUSES,
   extensionsAction, isRecord, migrationAction, ownValue, pickExtensions, poolAction, poolFacts, queueAction,
@@ -30,6 +31,34 @@ function identifier(value: unknown, kind: "uuid" | "hash" | "either"): string {
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
   const hash = /^[0-9a-f]{64}$/u;
   return ((kind !== "hash" && uuid.test(value)) || (kind !== "uuid" && hash.test(value))) ? value : "unverified";
+}
+const QUERY_STATUSES = [
+  "not-applicable", "disabled", "unavailable", "permission-denied", "timeout",
+  "stale", "reset", "partial", "observed",
+] as const;
+
+export function renderQueryStatistics(value: unknown): string {
+  const family = typeof value === "object" && value !== null
+    ? value as { status?: unknown; scope?: unknown; operations?: unknown }
+    : {};
+  const status = choice(family.status, QUERY_STATUSES, "unavailable");
+  if (!Array.isArray(family.operations)) return `Query statistics: ${status}`;
+  const catalog = new Set(QUERY_OPERATION_IDS);
+  const counted = new Set<string>();
+  const withCalls = family.operations.filter((operation) => {
+    if (typeof operation !== "object" || operation === null) return false;
+    const operationId = (operation as { operation?: unknown }).operation;
+    if (typeof operationId !== "string" || !catalog.has(operationId) || counted.has(operationId)) {
+      return false;
+    }
+    const values = (operation as { values?: unknown }).values;
+    if (typeof values !== "object" || values === null) return false;
+    const calls = (values as { queryCallsTotal?: unknown }).queryCallsTotal;
+    if (typeof calls !== "number" || !Number.isSafeInteger(calls) || calls < 0) return false;
+    counted.add(operationId);
+    return true;
+  }).length;
+  return `Query statistics: ${status}; scope: aggregate; operations with call counters: ${withCalls} of ${QUERY_OPERATION_IDS.length}`;
 }
 interface FamilyView { record: Record<string, unknown>; status: string; health: TelemetryHealth; omitted: string }
 /** A family is only as healthy as its closed status allows; anything unrecognized is unavailable. */
@@ -126,6 +155,7 @@ export function renderBackendDiagnostics(snapshot: BackendDiagnosticSnapshot): s
     `Outbox: ${readiness(outbox.status)}`,
     `Outbox counts: captured: ${count(outbox.captured)}; unprocessed: ${count(outbox.unprocessed)}; errors: ${count(outbox.errors)}`,
     `Outbox delivery: pending: ${count(outbox.deliveryPending)}; claimed: ${count(outbox.deliveryClaimed)}; retry: ${count(outbox.deliveryRetry)}; replicated: ${count(outbox.deliveryReplicated)}; acknowledged: ${count(outbox.deliveryAcknowledged)}; awaiting remote prune: ${count(outbox.deliveryAwaitingRemotePrune)}; quarantined: ${count(outbox.deliveryQuarantined)}`,
+    renderQueryStatistics(snapshot.telemetry?.statements),
     ...telemetryLines(snapshot),
     `Action: ${ACTIONS[classification]}`,
   ].join("\n");
