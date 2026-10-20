@@ -281,8 +281,14 @@ export interface NativeTranscriptSessionMessageRecord {
   readonly messageSequence: number;
   readonly role: MessageRole;
   readonly content: string;
-  /** The message has a compaction part, so it is not a transcript row. */
-  readonly isCompactionEvent: boolean;
+  /**
+   * The message has a compaction part, so it is not a transcript row.
+   *
+   * The built-in SQLite and PostgreSQL repositories always set it. An absent
+   * value means the message is not a compaction event, so a repository
+   * written before this field existed keeps linking as before.
+   */
+  readonly isCompactionEvent?: boolean;
 }
 
 /**

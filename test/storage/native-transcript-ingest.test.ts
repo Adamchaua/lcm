@@ -2614,10 +2614,25 @@ describe("exact native transcript message resolver", () => {
     await expect(resolverFor([]).explainMiss!(lookup(0, "event")))
       .resolves.toBe("session-not-found");
 
-    // The flag is required and validated.
-    await expect(resolverFor([
-      { ...row(1, 10, 0, "t0"), isCompactionEvent: undefined as never },
-    ]).explainMiss!(lookup(0, "t0"))).resolves.toBe("invalid-session-snapshot");
+    // A repository written before the flag existed omits it; the row is a
+    // transcript message and links as before.
+    const withoutFlag = ({ isCompactionEvent: _omitted, ...rest }: NativeTranscriptSessionMessageRecord) => rest;
+    const legacy = resolverFor([
+      withoutFlag(row(1, 10, 0, "t0")),
+      row(1, 11, 1, "event", true),
+      withoutFlag(row(1, 12, 2, "t1")),
+    ]);
+    await expect(legacy.resolveExact(lookup(0, "t0")))
+      .resolves.toEqual({ conversationId: 1, messageId: 10 });
+    await expect(legacy.resolveExact(lookup(1, "t1")))
+      .resolves.toEqual({ conversationId: 1, messageId: 12 });
+
+    // A defined value must still be a boolean.
+    for (const isCompactionEvent of [1, "true", null]) {
+      await expect(resolverFor([
+        { ...row(1, 10, 0, "t0"), isCompactionEvent: isCompactionEvent as never },
+      ]).explainMiss!(lookup(0, "t0"))).resolves.toBe("invalid-session-snapshot");
+    }
   });
 
   it("rejects invalid resolver inputs before snapshot access", async () => {

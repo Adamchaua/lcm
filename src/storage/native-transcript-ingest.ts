@@ -1711,7 +1711,10 @@ export function createExactNativeTranscriptMessageResolver(
         || message.messageSequence < 0
         || !isMessageRole(message.role)
         || message.content.includes("\0")
-        || typeof message.isCompactionEvent !== "boolean"
+        || (
+          message.isCompactionEvent !== undefined
+          && typeof message.isCompactionEvent !== "boolean"
+        )
       ) {
         return { kind: "invalid" };
       }
