@@ -316,7 +316,7 @@ describe("cutover-set member capture", () => {
     expect(captured.cutoverSet!.bindings.every((binding) => binding.roster[0]!.queueCutoff !== null)).toBe(true);
     // Neither the set id nor a member has a manifest or snapshot of its own; the held journal names the set id.
     expect(await performMigrationAbortCommand({ homeDir, confirmGenerationId: "wrong-set", generation: SET_ID }))
-      .toMatchObject({ status: "refuse" });
+      .toEqual({ status: "refuse", reason: "abort-confirmation-moved", generationId: SET_ID });
     expect(readBackendMaintenanceJournal(homeDir)).toEqual(captured);
     expect(await performMigrationAbortCommand({ homeDir, confirmGenerationId: SET_ID }))
       .toEqual({ status: "ok", generationId: SET_ID, journalPhase: "maintenance-aborted", manifestPhase: null, applied: true });
