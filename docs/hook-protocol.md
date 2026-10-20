@@ -609,7 +609,11 @@ A `SubagentStop` payload without a valid `agent_id` or without
   nothing; a session stored earlier keeps its copied history. A fork without
   its own settings event yet stores only native records.
 - When one session id has several stored conversations, ingest continues to
-  append to the most recent one, as it does for every other client.
+  append to the most recent one, as it does for every other client. For a
+  Codex session the reading its first stored message chose is looked up across
+  all of its conversations: a copied fork rollout then stops (stores and links
+  nothing), and a message list or rollout that contradicts that reading stops
+  too.
 - Sibling subagents count as distinct sessions for passive pattern
   reinforcement, so a pattern that several siblings repeat gains confidence
   faster than the same pattern repeated within one session. Promotion rules are

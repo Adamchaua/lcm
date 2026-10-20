@@ -362,7 +362,8 @@ Known limits:
   unchanged. A fork that has not written that event yet archives its native
   records but stores no messages, and starts storing them once the event
   appears. A session that already has transcript messages and no lineage marker
-  keeps the copied parent history it stored and keeps following it. Older
+  keeps the copied parent history it stored and keeps following it, as long as
+  no compaction event has taken a transcript position; after that it stops. Older
   forks whose settings events do not name their thread keep the full parse. A
   message-list ingest and a rollout ingest of the same fork must stay on the
   reading the session's first messages chose, so mixing them stops the fork: LCM

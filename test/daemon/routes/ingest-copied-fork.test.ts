@@ -9,6 +9,7 @@ import {
   createIngestHandler,
   encodeCodexLineageMarker,
   parseCodexLineageMarker,
+  persistCodexLineage,
 } from "../../../src/daemon/routes/ingest.js";
 import { createCompactHandler } from "../../../src/daemon/routes/compact.js";
 import { createSessionCompleteHandler } from "../../../src/daemon/routes/session-complete.js";
@@ -443,13 +444,47 @@ describe("Codex copied fork history on ingest", () => {
     });
   });
 
-  it("inspects a session split across conversations without finding a marker", async () => {
+  it("reads a split session's array marker from its first row", async () => {
     await withWorld(async (world) => {
       await world.seed("codex", ["user", "A"]);
       world.exec(laterConversation);
       world.write(lines(fork({ forked_from_id: undefined }), message("user", "A"), message("assistant", "B")));
       expect((await world.ingest()).body).toMatchObject({ ingested: 1 });
       expect(world.messages()).toEqual(["A", "B"]);
+    });
+  });
+
+  it("stops a message list or plain rollout once a boundary session splits across conversations", async () => {
+    await withWorld(async (world) => {
+      world.write(copied([message("user", "parent")], [message("user", "own 1")]));
+      await world.ingest();
+      world.exec(laterConversation);
+      const links = world.links();
+      const records = world.nativeRecords();
+      // The Codex cumulative list still holds the parent's message and the stored own one.
+      await world.seed("codex", ["user", "parent"], ["user", "own 1"], ["assistant", "own 2"]);
+      expect(world.messages()).toEqual(["own 1"]);
+      expect(logs.error).toHaveBeenCalledTimes(1);
+      world.write(lines(fork({ forked_from_id: undefined }), message("user", "parent"), message("user", "own 1"), message("assistant", "own 2")));
+      expect(await world.ingest()).toEqual(NOTHING);
+      expect(world.messages()).toEqual(["own 1"]);
+      expect(world.links()).toEqual(links);
+      expect(world.nativeRecords()).toBe(records);
+      expect(logs.error).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("skips other sessions and empty conversations when looking for a split session's first row", async () => {
+    await withWorld(async (world) => {
+      world.write(copied([message("user", "parent")], [message("user", "own 1")]));
+      await world.ingest();
+      world.exec("INSERT INTO conversations(session_id, created_at) VALUES('other-thread', '1998-01-01 00:00:00')");
+      world.exec("INSERT INTO conversations(session_id, created_at) VALUES('child-thread', '1999-01-01 00:00:00')");
+      world.exec(laterConversation);
+      world.exec(transcriptRow(1, "assistant", "own 2"));
+      await world.seed("codex", ["user", "parent"], ["user", "own 1"]);
+      expect(world.messages()).toEqual(["own 1", "own 2"]);
+      expect(logs.error).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -657,17 +692,23 @@ describe("Codex copied fork history on compact", () => {
     });
   });
 
-  it("does not freeze a legacy session whose compaction event consumed a slot", async () => {
+  it("stops an unmarked copied-fork session whose compaction event consumed a slot", async () => {
     await withWorld(async (world) => {
       await world.seed("claude", ["user", "P1"]);
       world.exec(eventRow(1, null));
       world.exec(transcriptRow(2, "assistant", "P2"));
       world.write(copied([message("user", "P1"), message("assistant", "P2")], [message("user", "own 1"), message("assistant", "own 2")]));
-      // The event took list index 1 of the full list, so it continues after index 3.
+      // The event took a list position, so a count cannot show the full reading continues the rows.
       expect((await world.compact()).status).toBe(200);
-      expect(world.messages()).toEqual(["P1", "P2", "own 2"]);
+      expect(world.messages()).toEqual(["P1", "P2"]);
       expect(world.markers()).toEqual([]);
-      expect(logs.error).not.toHaveBeenCalled();
+      expect(world.nativeRecords()).toBe(0);
+      expect(logs.error).toHaveBeenCalledTimes(1);
+      expect(String(logs.error.mock.calls[0]![0])).toBe("compact");
+      expect(await world.ingest()).toEqual(NOTHING);
+      expect(world.messages()).toEqual(["P1", "P2"]);
+      expect(world.links()).toEqual([]);
+      expect(logs.error).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -756,5 +797,27 @@ describe("Codex lineage marker", () => {
   ])("reads %s as malformed", (_name, value) => {
     expect(parseCodexLineageMarker(JSON.stringify(value))).toBe("malformed");
   });
-});
 
+  it("stops a message list when no first transcript row can be found for a stored session", async () => {
+    const conversation = { conversationId: 7, sessionId: "s", parentSessionId: null };
+    const conversations = {
+      getOrCreateConversation: async () => conversation,
+      getTranscriptSlotSnapshot: async () => ({ transcriptCount: 2, events: [] }),
+      getMessageCount: async () => 1,
+      getMessageCountBySessionId: async () => 2,
+      listConversations: async () => [],
+      getMessages: vi.fn(),
+      appendMessages: vi.fn(),
+    };
+    const result = await persistCodexLineage(
+      { conversations } as never,
+      "s",
+      { source: "array", full: [{ role: "user", content: "a", tokenCount: 1 }] },
+      undefined,
+      async () => undefined,
+    );
+    expect(result).toEqual({ persisted: null, history: "lineage-mismatch" });
+    expect(conversations.getMessages).not.toHaveBeenCalled();
+    expect(conversations.appendMessages).not.toHaveBeenCalled();
+  });
+});

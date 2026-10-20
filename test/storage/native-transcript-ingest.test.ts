@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  type CodexInheritedBoundaryInput,
   parseCodexCopiedForkMessages,
   parseCodexTranscriptText,
   readCodexInheritedBoundary,
@@ -5814,6 +5815,37 @@ describe("Codex inherited subagent history option", () => {
     expect(repo.batches.flatMap((batch) => batch.records).map((record) => record.messageLinks.length)).toEqual([1, 1]);
   });
 
+  it("still accepts the ordinal boundary callers passed before it had a kind", async () => {
+    const content = codexMessage(0, "user", "inherited")
+      + codexMessage(1, "user", "own 1")
+      + codexMessage(2, "assistant", "own 2");
+    const linkedOrdinals = async (codexInheritedBoundary: CodexInheritedBoundaryInput): Promise<number[]> => {
+      const repo = repository();
+      await runNativeTranscriptBackfill({
+        ...base(content, resolverFor("own 1", "own 2")),
+        repository: repo,
+        codexInheritedBoundary,
+      });
+      return repo.batches.flatMap((batch) => batch.records)
+        .filter((record) => record.messageLinks.length > 0)
+        .map((record) => record.sourceOrdinal);
+    };
+    const legacy = await linkedOrdinals({ start: 1, paginated: true });
+    expect(legacy).toEqual([1, 2]);
+    expect(legacy).toEqual(await linkedOrdinals({ kind: "ordinal", start: 1, paginated: true }));
+
+    const records = await Array.fromAsync(readNativeTranscriptJsonl({
+      bytes: (async function* () { yield Buffer.from(content); })(),
+      format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
+      nativeSessionId: "child",
+      sourceLocator: "sessions/child.jsonl",
+      scrubber: { scrubberVersion: "test/v1", scrubJson: (value) => value },
+      codexInheritedBoundary: { start: 1, paginated: true },
+    }));
+    expect(records.map((record) => record.kind === "record" ? record.inheritedHistory : undefined))
+      .toEqual([true, false, false]);
+  });
+
   it.each([
     ["a non-object boundary", { codexInheritedBoundary: null }],
     ["a fractional start", { codexInheritedBoundary: { kind: "ordinal", start: 1.5, paginated: true } }],
@@ -5942,7 +5974,9 @@ describe("Codex inherited subagent history option", () => {
 
   it.each([
     ["an unknown kind", { kind: "other", start: 1, paginated: true }],
-    ["a missing kind", { start: 1, paginated: true }],
+    ["a missing kind without a start", { paginated: true }],
+    ["a missing kind without a mode", { start: 1 }],
+    ["a missing kind with a negative start", { start: -1, paginated: true }],
     ["a copied fork without a position", { kind: "copied-fork" }],
     ["a fractional start record", { kind: "copied-fork", startRecord: 1.5 }],
     ["a negative start record", { kind: "copied-fork", startRecord: -1 }],

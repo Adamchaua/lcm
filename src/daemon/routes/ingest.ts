@@ -256,6 +256,36 @@ async function readCodexLineageMarker(
   return modes.values().next().value ?? null;
 }
 
+/**
+ * The first transcript row of a session across all its conversations, which is
+ * where its lineage marker lives; undefined when none can be found.
+ */
+async function firstSessionTranscriptRow(
+  conversations: TransactionRepositories["conversations"],
+  sessionId: string,
+  newestConversationId: number,
+  eventMessageIds: ReadonlySet<number>,
+) {
+  // An event row can take at most the first few places of a conversation.
+  const firstOf = async (conversationId: number) => (await conversations.getMessages(
+    conversationId,
+    { limit: eventMessageIds.size + 1 },
+  )).find((message) => !eventMessageIds.has(message.messageId));
+  if (
+    await conversations.getMessageCount(newestConversationId)
+      === await conversations.getMessageCountBySessionId(sessionId)
+  ) {
+    return firstOf(newestConversationId);
+  }
+  // The session is split: listConversations is already in session order.
+  for (const conversation of await conversations.listConversations()) {
+    if (conversation.sessionId !== sessionId) continue;
+    const first = await firstOf(conversation.conversationId);
+    if (first !== undefined) return first;
+  }
+  return undefined;
+}
+
 /** What one Codex ingest or compact presents to the lineage decision. */
 export interface CodexLineageRequest {
   /** A message list from the request body, or a rollout file. */
@@ -298,8 +328,9 @@ export type CodexLineageHistory = "filtered" | "unfiltered" | "lineage-mismatch"
  * marker) or from a message list ("array" marker) stays on that reading. Rows
  * stored without a marker are the legacy full reading and keep following it.
  * The marker is written once, with the session's first transcript rows, never
- * inferred from native links or content. Whatever contradicts the stored
- * reading, or a marker that cannot be read, is a mismatch.
+ * inferred from native links or content, and is read from the session's first
+ * row across all its conversations. Whatever contradicts the stored reading, or
+ * a marker that cannot be read or found, is a mismatch.
  */
 export async function persistCodexLineage(
   repositories: Pick<TransactionRepositories, "conversations" | "redactionAdmin" | "context">,
@@ -346,31 +377,37 @@ export async function persistCodexLineage(
     return { persisted: await append(full, next, source === "array" ? "array" : undefined), history: undefined };
   }
 
-  // A copied fork compares every stored row; any other ingest only needs the
-  // first one, which holds the marker, and an event row can take at most the
-  // first few places.
-  const rows = (await conversations.getMessages(
-    conversationId,
-    child === undefined ? { limit: slot.eventMessageIds.size + 1 } : undefined,
-  )).filter((message) => !slot.eventMessageIds.has(message.messageId));
-  const marker = rows.length === 0 ? null : await readCodexLineageMarker(conversations, rows[0]!.messageId);
-  if (marker === "invalid") return mismatch;
-
   if (child === undefined) {
-    return marker === "boundary"
+    // The marker is on the session's first transcript row, wherever the
+    // session's conversations put it; without that row nothing is appended.
+    const first = await firstSessionTranscriptRow(
+      conversations,
+      sessionId,
+      conversationId,
+      slot.eventMessageIds,
+    );
+    const marker = first === undefined ? "invalid" : await readCodexLineageMarker(conversations, first.messageId);
+    return marker === "invalid" || marker === "boundary"
       ? mismatch
       : { persisted: await append(full, next, undefined), history: undefined };
   }
-  // A consumed slot or a session split across conversations means the newest
-  // conversation's rows are not the session-wide prefix: leave it.
-  if (rows.length !== slot.transcriptCount || marker === "array") return mismatch;
+  // A copied fork compares every stored row. A session split across
+  // conversations means the newest conversation's rows are not the
+  // session-wide prefix: leave it.
+  const rows = (await conversations.getMessages(conversationId))
+    .filter((message) => !slot.eventMessageIds.has(message.messageId));
+  if (rows.length !== slot.transcriptCount) return mismatch;
+  const marker = await readCodexLineageMarker(conversations, rows[0]!.messageId);
+  if (marker === "invalid" || marker === "array") return mismatch;
   if (marker === "boundary") {
     return slot.consumedCount > 0 || !storedIsPrefix(rows, child, scrubber!)
       ? mismatch
       : { persisted: await append(child, slot.transcriptCount, undefined), history: "filtered" };
   }
-  // Rows stored without a marker are the legacy full reading and stay on it.
-  return slot.consumedCount === 0 && !storedIsPrefix(rows, full, scrubber!)
+  // Rows stored without a marker are the legacy full reading and stay on it,
+  // unless an event took a position: then a count cannot show that the full
+  // reading still continues them.
+  return slot.consumedCount > 0 || !storedIsPrefix(rows, full, scrubber!)
     ? mismatch
     : { persisted: await append(full, next, undefined), history: "unfiltered" };
 }

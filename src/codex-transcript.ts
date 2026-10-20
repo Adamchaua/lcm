@@ -124,6 +124,19 @@ export type CodexInheritedBoundary =
   | { readonly kind: "copied-fork"; readonly startRecord: number; readonly pending?: undefined }
   | { readonly kind: "copied-fork"; readonly pending: true; readonly startRecord?: undefined };
 
+/**
+ * The ordinal boundary as callers passed it before boundaries had a kind; it
+ * is still accepted and means the `ordinal` variant.
+ */
+export interface CodexOrdinalBoundaryWithoutKind {
+  readonly kind?: undefined;
+  readonly start: number;
+  readonly paginated: boolean;
+}
+
+/** What the native transcript options accept as an inherited-history boundary. */
+export type CodexInheritedBoundaryInput = CodexInheritedBoundary | CodexOrdinalBoundaryWithoutKind;
+
 function isCodexOrdinal(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
