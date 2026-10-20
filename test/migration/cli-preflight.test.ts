@@ -526,25 +526,53 @@ describe("resolveMigrationExpectedIdentity (the minting step, taken only after a
       createIdentityRuntime: vi.fn(stubIdentityRuntime),
       resolveLocalIdentity: vi.fn(() => ({ id: "b".repeat(64), canonical: "/projects/minted" })),
       readLocalIdentity: vi.fn(() => ({ id: "c".repeat(64), canonical: "/projects/persisted" }) as { id: string; canonical: string } | null),
-      resolveTargetIdentity: vi.fn(async () => ({ status: "resolved" as const, projectId: "minted-project" })),
+      resolveTargetIdentity: vi.fn(async () => ({ status: "resolved" as const, projectId: "minted-project", effect: "created" as const })),
       lookupTargetProject: vi.fn(async () => "existing-project" as string | null),
       ...extra,
     };
   }
 
-  it("fresh: mints the local entry with the home passed through, then the destination project", async () => {
-    const ops = mintOps();
-    const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops });
+  it("fresh: mints the local entry with the home passed through, then the destination project, reporting both write boundaries as they succeed", async () => {
+    const ops = mintOps({ readLocalIdentity: vi.fn(() => null) });
+    const effects: unknown[] = [];
+    const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops, observe: (effect) => effects.push(effect) });
     expect(result).toEqual({
       status: "resolved",
       expectedIdentity: {
         id: "minted-project", remoteProjectId: "minted-project", localProjectId: "b".repeat(64),
         machineId: REGISTERED_MACHINE, canonical: "/projects/minted", selectedPath: "/projects/minted",
       },
+      effects: { localProject: "persisted", destinationProject: "created" },
     });
     expect(ops.resolveLocalIdentity).toHaveBeenCalledWith("/c", { homeDir: "/h" });
-    expect(ops.readLocalIdentity).not.toHaveBeenCalled();
+    // The pre-write read decides the actual effect under the caller's admission.
+    expect(ops.readLocalIdentity).toHaveBeenCalledWith({ homeDir: "/h", cwd: "/c" });
     expect(ops.lookupTargetProject).not.toHaveBeenCalled();
+    expect(effects).toEqual([{ stage: "local", outcome: "persisted" }, { stage: "destination", outcome: "created" }]);
+  });
+
+  it("fresh: an entry and a destination a concurrent actor already wrote are reported reused, never as this step's mint (round-3 synthesis P2)", async () => {
+    const ops = mintOps({ resolveTargetIdentity: vi.fn(async () => ({ status: "resolved" as const, projectId: "winner-project", effect: "reused" as const })) });
+    const effects: unknown[] = [];
+    const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops, observe: (effect) => effects.push(effect) });
+    expect(result).toMatchObject({ status: "resolved", effects: { localProject: "reused", destinationProject: "reused" } });
+    expect(effects).toEqual([{ stage: "local", outcome: "reused" }, { stage: "destination", outcome: "reused" }]);
+  });
+
+  it("fresh: an unreadable map before the write is local-identity-unresolvable, writes nothing and reports no boundary", async () => {
+    const ops = mintOps({ readLocalIdentity: () => { throw new RangeError("boom /a/path"); } });
+    const effects: unknown[] = [];
+    const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops, observe: (effect) => effects.push(effect) });
+    expect(result).toEqual({ status: "refuse", reason: "local-identity-unresolvable", evidence: "RangeError" });
+    expect(ops.resolveLocalIdentity).not.toHaveBeenCalled();
+    expect(effects).toEqual([]);
+  });
+
+  it("fresh: a destination refusal still reported the local boundary that preceded it", async () => {
+    const ops = mintOps({ readLocalIdentity: () => null, resolveTargetIdentity: async () => ({ status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" }) });
+    const effects: unknown[] = [];
+    await resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops, observe: (effect) => effects.push(effect) });
+    expect(effects).toEqual([{ stage: "local", outcome: "persisted" }]);
   });
 
   it("fresh: a caller already inside the append barrier hands its token to the local mint instead of taking the consumer lock", async () => {
@@ -565,14 +593,17 @@ describe("resolveMigrationExpectedIdentity (the minting step, taken only after a
     "%s: mints nothing under a hold: reads the persisted local identity and SELECTs the destination only",
     async (disposition) => {
       const ops = mintOps();
-      const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview(disposition), cwd: "/c", homeDir: "/h", _operationsForTesting: ops });
+      const effects: unknown[] = [];
+      const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview(disposition), cwd: "/c", homeDir: "/h", _operationsForTesting: ops, observe: (effect) => effects.push(effect) });
       expect(result).toMatchObject({
         status: "resolved",
         expectedIdentity: { id: "existing-project", remoteProjectId: "existing-project", localProjectId: "c".repeat(64), canonical: "/projects/persisted" },
+        effects: { localProject: "reused", destinationProject: "reused" },
       });
       expect(ops.resolveLocalIdentity).not.toHaveBeenCalled();
       expect(ops.resolveTargetIdentity).not.toHaveBeenCalled();
       expect(ops.readLocalIdentity).toHaveBeenCalledWith({ homeDir: "/h", cwd: "/c" });
+      expect(effects).toEqual([{ stage: "local", outcome: "reused" }, { stage: "destination", outcome: "reused" }]);
     },
   );
 

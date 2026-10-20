@@ -130,7 +130,12 @@ export async function lookupMigrationTargetProjectId(input: Readonly<{
 }
 
 export type MigrationTargetIdentityResolution =
-  | Readonly<{ status: "resolved"; projectId: string }>
+  | Readonly<{
+    status: "resolved";
+    projectId: string;
+    /** What this call did: `created` the row, or `reused` one that existed (including a concurrent winner's). */
+    effect: "created" | "reused";
+  }>
   | Readonly<{ status: "refuse"; reason: "migration-target-identity-unresolvable"; evidence?: string }>;
 
 export type MigrationTargetIdentityOperations = Readonly<{
@@ -161,7 +166,7 @@ export async function resolveMigrationTargetProjectId(input: Readonly<{
   const normalizedPath = normalizeProjectPath(input.authorityCanonicalPath);
 
   const existing = await resolveProject(input.machineId, normalizedPath);
-  if (existing !== null) return { status: "resolved", projectId: existing.projectId };
+  if (existing !== null) return { status: "resolved", projectId: existing.projectId, effect: "reused" };
 
   try {
     const created = await createProject({
@@ -170,14 +175,14 @@ export async function resolveMigrationTargetProjectId(input: Readonly<{
       path: input.authorityCanonicalPath,
       normalizedPath,
     });
-    return { status: "resolved", projectId: created.projectId };
+    return { status: "resolved", projectId: created.projectId, effect: "created" };
   } catch (error) {
     if (!(error instanceof PostgreSqlIdentityConflictError)) throw error;
     // The losing side of a real concurrent race: createProject's own
     // transaction has already rolled back cleanly. Re-read rather than
     // refuse -- the winner's commit is what "resolved" means here.
     const resolved = await resolveProject(input.machineId, normalizedPath);
-    if (resolved !== null) return { status: "resolved", projectId: resolved.projectId };
+    if (resolved !== null) return { status: "resolved", projectId: resolved.projectId, effect: "reused" };
     // Unreachable in practice: PostgreSqlIdentityConflictError itself
     // proves a row exists at this exact key. An absent re-read here is
     // unresolvable evidence, never a signal to guess or retry blindly.

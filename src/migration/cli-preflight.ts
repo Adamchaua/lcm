@@ -276,8 +276,25 @@ export type MigrationExpectedIdentityOperations = Readonly<{
 }>;
 
 export type MigrationExpectedIdentityResult =
-  | Readonly<{ status: "resolved"; expectedIdentity: StorageIdentityContext }>
+  | Readonly<{ status: "resolved"; expectedIdentity: StorageIdentityContext; effects: MigrationIdentityEffects }>
   | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
+
+/**
+ * What the identity step actually did at each of its two write boundaries,
+ * reported from the step itself rather than inferred from the preview the
+ * preflight took earlier: a concurrent actor may have persisted the entry
+ * or created the destination in between, and the step then reuses it.
+ * `local` is decided by a read under the caller's own token immediately
+ * before the write, so nothing can change the map between the two. A held
+ * step reads only and reports `reused` for both.
+ */
+export type MigrationIdentityEffect =
+  | Readonly<{ stage: "local"; outcome: "persisted" | "reused" }>
+  | Readonly<{ stage: "destination"; outcome: "created" | "reused" }>;
+export type MigrationIdentityEffects = Readonly<{
+  localProject: "persisted" | "reused";
+  destinationProject: "created" | "reused";
+}>;
 
 /**
  * The identity `apply` takes after its fence (plan-v5 Part B (3)), split on
@@ -311,6 +328,11 @@ export async function resolveMigrationExpectedIdentity(input: Readonly<{
    * instead of taking the consumer lock the barrier already holds.
    */
   publicationLockToken?: BackendPublicationLockToken;
+  /**
+   * Called once per write boundary as soon as that boundary has succeeded,
+   * so a caller whose step later throws still knows what was written.
+   */
+  observe?: (effect: MigrationIdentityEffect) => void;
   /** @internal Deterministic failure-injection seam for tests only. */
   _operationsForTesting?: Partial<MigrationExpectedIdentityOperations>;
 }>): Promise<MigrationExpectedIdentityResult> {
@@ -324,11 +346,21 @@ export async function resolveMigrationExpectedIdentity(input: Readonly<{
   const fresh = preflight.candidate.disposition === "fresh";
 
   let local: Readonly<{ id: string; canonical: string }>;
+  let localEffect: MigrationIdentityEffects["localProject"];
   if (fresh) {
+    // Read before the write, under the same admission as the write: the
+    // answer is the actual effect of the mint, never the preflight's preview.
+    let existing: ReturnType<typeof readProjectMapIdentity>;
+    try {
+      existing = readLocalIdentity({ homeDir: input.homeDir, cwd: input.cwd });
+    } catch (error) {
+      return { status: "refuse", reason: "local-identity-unresolvable", evidence: unexpectedFailureEvidence(error) };
+    }
     local = resolveLocalIdentity(input.cwd, {
       homeDir: input.homeDir,
       ...(input.publicationLockToken === undefined ? {} : { _publicationLockToken: input.publicationLockToken }),
     });
+    localEffect = existing === null ? "persisted" : "reused";
   } else {
     let persisted: ReturnType<typeof readProjectMapIdentity>;
     try {
@@ -338,9 +370,12 @@ export async function resolveMigrationExpectedIdentity(input: Readonly<{
     }
     if (persisted === null) return { status: "refuse", reason: "local-identity-not-persisted" };
     local = persisted;
+    localEffect = "reused";
   }
+  input.observe?.({ stage: "local", outcome: localEffect });
 
   let projectId: string;
+  let destinationEffect: MigrationIdentityEffects["destinationProject"];
   const runtime = createIdentityRuntime(preflight.targetConfig.postgresql);
   try {
     const repository = new PostgreSqlIdentityRepository(runtime);
@@ -355,16 +390,19 @@ export async function resolveMigrationExpectedIdentity(input: Readonly<{
         return { status: "refuse", reason: resolution.reason, evidence: resolution.evidence };
       }
       projectId = resolution.projectId;
+      destinationEffect = resolution.effect;
     } else {
       const found = await lookupTargetProject({
         repository, machineId: preflight.machineId, authorityCanonicalPath: local.canonical,
       });
       if (found === null) return { status: "refuse", reason: "destination-project-absent" };
       projectId = found;
+      destinationEffect = "reused";
     }
   } finally {
     await closeQuietly(runtime);
   }
+  input.observe?.({ stage: "destination", outcome: destinationEffect });
 
   return {
     status: "resolved",
@@ -376,5 +414,6 @@ export async function resolveMigrationExpectedIdentity(input: Readonly<{
       canonical: local.canonical,
       selectedPath: local.canonical,
     },
+    effects: { localProject: localEffect, destinationProject: destinationEffect },
   };
 }

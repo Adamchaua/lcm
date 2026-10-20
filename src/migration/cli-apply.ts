@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   resolveMigrationExpectedIdentity,
   resolveMigrationPreflight,
-  type MigrationExpectedIdentityResult,
+  type MigrationIdentityEffect,
   type MigrationIdentityPreview,
   type MigrationPreflightResult,
   migrationIdentityPreview,
@@ -61,9 +61,12 @@ import type { BackendPublicationCoordinator } from "../storage/backend-publicati
  * destination project only after its own re-check of the confirmed
  * candidate, so `confirmation-generation-moved` never leaves identity
  * behind. The refusals that can still follow a mint (a failed hold entry,
- * a capture, genesis or copy failure) carry what was minted: the envelope
- * then reports `applied: true` with `localProject` and `destinationProject`
- * evidence, and the next `apply` reads both as already persisted.
+ * a capture, genesis or copy failure, or an unclassified throw) carry what
+ * the step actually did at each of its write boundaries: the envelope then
+ * reports `applied: true` with `localProject` and `destinationProject`
+ * evidence. A minted local entry is reused by the next `apply`; a
+ * destination is reused only when the evidence says `created` or `exists`,
+ * and is created then when it says `not-created` or `unknown`.
  */
 
 export const DEFAULT_MIGRATION_APPLY_MAX_RECORDS = 500;
@@ -97,26 +100,41 @@ export type MigrationApplyOutcome =
   }>;
 
 /**
- * What a fresh `apply`'s identity step left behind, derived from the
- * preview taken before it ran and its own answer: a local map entry that was
- * `not-persisted` is `minted` once the step ran at all (the local write
- * precedes the destination resolution), and a destination that
- * `will-be-created-at-apply` is `created` only when the step resolved.
+ * What a fresh `apply`'s identity step left behind, from the effects the
+ * step reported at each successful write boundary, never from the
+ * preflight's earlier preview (a concurrent actor may have persisted or
+ * created either in between, and the step then reuses it). A stage whose
+ * boundary was never reached is `not-persisted` / `not-created` after a
+ * classified refusal, which happens before that stage writes, and
+ * `unknown` after a throw, which may have interrupted the write itself.
  */
 export type MigrationApplyIdentityMutation = Readonly<{
-  localProject: "minted" | "persisted";
-  destinationProject: "created" | "exists" | "not-created";
+  localProject: "minted" | "persisted" | "not-persisted" | "unknown";
+  destinationProject: "created" | "exists" | "not-created" | "unknown";
 }>;
 
+/** The boundaries a fresh identity step has reported so far. */
+export type MigrationApplyIdentityProgress = Readonly<{
+  localProject?: "minted" | "persisted";
+  destinationProject?: "created" | "exists";
+}>;
+
+export function recordMigrationIdentityEffect(
+  progress: MigrationApplyIdentityProgress,
+  effect: MigrationIdentityEffect,
+): MigrationApplyIdentityProgress {
+  return effect.stage === "local"
+    ? { ...progress, localProject: effect.outcome === "persisted" ? "minted" : "persisted" }
+    : { ...progress, destinationProject: effect.outcome === "created" ? "created" : "exists" };
+}
+
 export function migrationApplyIdentityMutation(
-  preview: MigrationIdentityPreview,
-  result: MigrationExpectedIdentityResult,
+  progress: MigrationApplyIdentityProgress,
+  ending: "returned" | "thrown",
 ): MigrationApplyIdentityMutation {
   return {
-    localProject: preview.localProject === "persisted" ? "persisted" : "minted",
-    destinationProject: preview.destinationProject === "exists"
-      ? "exists"
-      : result.status === "resolved" ? "created" : "not-created",
+    localProject: progress.localProject ?? (ending === "returned" ? "not-persisted" : "unknown"),
+    destinationProject: progress.destinationProject ?? (ending === "returned" ? "not-created" : "unknown"),
   };
 }
 
@@ -128,6 +146,13 @@ function withIdentityMutation(refusal: ApplyRefusal, mutation: MigrationApplyIde
   const wrote = mutation.localProject === "minted" || mutation.destinationProject === "created";
   return { ...refusal, ...(wrote ? { applied: true } : {}), identity: mutation };
 }
+
+/**
+ * The fresh identity step's bookkeeping, shared between the span callback
+ * and the boundary so a throw anywhere after the step began still reports
+ * what the step had written by then.
+ */
+type IdentityBookkeeping = { started: boolean; progress: MigrationApplyIdentityProgress; mutation?: MigrationApplyIdentityMutation };
 
 export type MigrationApplyOperations = Readonly<{
   performCapture: typeof performMigrationApplyThroughCapture;
@@ -167,13 +192,17 @@ export type MigrationApplyInput = Readonly<{
 }>;
 
 export function performMigrationApply(input: MigrationApplyInput): Promise<MigrationApplyOutcome> {
+  const identity: IdentityBookkeeping = { started: false, progress: {} };
   return withMigrationBoundary(
-    () => runMigrationApply(input),
-    (evidence) => ({ status: "refuse", reason: MIGRATION_UNEXPECTED_FAILURE_REASON, evidence }),
+    () => runMigrationApply(input, identity),
+    (evidence) => withIdentityMutation(
+      { status: "refuse", reason: MIGRATION_UNEXPECTED_FAILURE_REASON, evidence },
+      identity.mutation ?? (identity.started ? migrationApplyIdentityMutation(identity.progress, "thrown") : undefined),
+    ),
   );
 }
 
-async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationApplyOutcome> {
+async function runMigrationApply(input: MigrationApplyInput, identity: IdentityBookkeeping): Promise<MigrationApplyOutcome> {
   const performCapture = input._operationsForTesting?.performCapture ?? performMigrationApplyThroughCapture;
   const performGenesisAndCopy = input._operationsForTesting?.performGenesisAndCopy ?? performMigrationApplyGenesisAndCopy;
   const mintOwnerProcessId = input._operationsForTesting?.mintOwnerProcessId ?? randomUUID;
@@ -207,9 +236,9 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
   // Past the fence, the capture span runs the identity step under its own
   // token, after its re-check of the confirmed candidate (plan-v5 Part B
   // (3)). The span names the path it actually found; a held journal only
-  // reads. The fresh mint is recorded here so every later refusal reports it.
-  const preview = migrationIdentityPreview(preflight);
-  let mutation: MigrationApplyIdentityMutation | undefined;
+  // reads. The fresh step reports each write boundary as it succeeds, so
+  // every later refusal, and the boundary after a throw, reports what the
+  // step actually did.
   const captureResult: MigrationApplyThroughCaptureOutcome = await performCapture({
     cwd: input.cwd,
     homeDir: input.homeDir,
@@ -219,24 +248,31 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
     manifestStore: input.manifestStore,
     now: input.now,
     resolveExpectedIdentity: async (step) => {
+      if (step.path === "held") {
+        return resolveExpectedIdentity({
+          preflight: { ...preflight, candidate: { disposition: "continue-held" } }, cwd: input.cwd, homeDir: input.homeDir,
+        });
+      }
+      identity.started = true;
       const result = await resolveExpectedIdentity({
-        preflight: step.path === "fresh" ? preflight : { ...preflight, candidate: { disposition: "continue-held" } },
+        preflight,
         cwd: input.cwd,
         homeDir: input.homeDir,
-        ...(step.path === "fresh" ? { publicationLockToken: step.token } : {}),
+        publicationLockToken: step.token,
+        observe: (effect) => { identity.progress = recordMigrationIdentityEffect(identity.progress, effect); },
       });
-      if (step.path === "fresh") mutation = migrationApplyIdentityMutation(preview, result);
+      identity.mutation = migrationApplyIdentityMutation(identity.progress, "returned");
       return result;
     },
   });
   if (captureResult.status === "refuse") {
-    return withIdentityMutation(captureResult, mutation);
+    return withIdentityMutation(captureResult, identity.mutation);
   }
   const expectedIdentity = captureResult.expectedIdentity;
   if (expectedIdentity === undefined) {
     // The span never ran the identity step it was given. Unreachable through
     // the real span; refused rather than copying under an unknown identity.
-    return withIdentityMutation({ status: "refuse", reason: MIGRATION_UNEXPECTED_FAILURE_REASON, evidence: "identity-not-resolved" }, mutation);
+    return withIdentityMutation({ status: "refuse", reason: MIGRATION_UNEXPECTED_FAILURE_REASON, evidence: "identity-not-resolved" }, identity.mutation);
   }
 
   const ownerProcessId = mintOwnerProcessId();
@@ -255,7 +291,7 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
     now: input.now,
   });
   if (genesisCopyResult.status === "refuse") {
-    return withIdentityMutation(genesisCopyResult, mutation);
+    return withIdentityMutation(genesisCopyResult, identity.mutation);
   }
 
   // Plan section 5.1 / round-1 A-16: the manifest head is read back, and the
@@ -269,10 +305,10 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
       status: "refuse",
       reason: "manifest-unresolvable",
       evidence: error instanceof MigrationProtocolError ? `manifest-${error.reason}` : "manifest-internal-error",
-    }, mutation);
+    }, identity.mutation);
   }
   if (head.phase !== genesisCopyResult.result.phase) {
-    return withIdentityMutation({ status: "refuse", reason: "copy-failed", evidence: "manifest-readback-mismatch" }, mutation);
+    return withIdentityMutation({ status: "refuse", reason: "copy-failed", evidence: "manifest-readback-mismatch" }, identity.mutation);
   }
 
   return {

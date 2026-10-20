@@ -5,13 +5,16 @@ import { describe, expect, it } from "vitest";
 import {
   performMigrationApply,
   migrationApplyIdentityMutation,
+  recordMigrationIdentityEffect,
   DEFAULT_MIGRATION_APPLY_MAX_RECORDS,
   DEFAULT_MIGRATION_APPLY_MAX_BYTES,
 } from "../../src/migration/cli-apply.js";
 import type { MigrationApplyThroughCaptureOutcome } from "../../src/migration/apply.js";
-import type { MigrationPreflightResult } from "../../src/migration/cli-preflight.js";
+import { resolveMigrationExpectedIdentity, type MigrationIdentityEffects, type MigrationPreflightResult } from "../../src/migration/cli-preflight.js";
 import type { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import { MigrationProtocolError } from "../../src/migration/protocol.js";
+import { withBackendPublicationAppendBarrierAsync } from "../../src/storage/backend-publication.js";
+import { readProjectMapIdentity } from "../../src/project-map.js";
 
 const PRESENT = { status: "present", storageBackend: "sqlite", pid: 1, daemonInstanceId: "gen-1" } as const;
 
@@ -28,7 +31,15 @@ const IDENTITY = {
   machineId: "018f0b5d-1234-4abc-8def-1234567890ab",
   selectedPath: "/tmp/project",
 };
-const resolveIdentity = async () => ({ status: "resolved" as const, expectedIdentity: IDENTITY });
+const MINTED: MigrationIdentityEffects = { localProject: "persisted", destinationProject: "created" };
+/** A resolver double that reports its boundaries the way the real step does, then resolves. */
+const resolveIdentityWith = (effects: MigrationIdentityEffects) =>
+  async (input: { observe?: (effect: { stage: "local"; outcome: "persisted" | "reused" } | { stage: "destination"; outcome: "created" | "reused" }) => void }) => {
+    input.observe?.({ stage: "local", outcome: effects.localProject });
+    input.observe?.({ stage: "destination", outcome: effects.destinationProject });
+    return { status: "resolved" as const, expectedIdentity: IDENTITY, effects };
+  };
+const resolveIdentity = resolveIdentityWith(MINTED);
 const PREVIEW = { destinationProject: "will-be-created-at-apply", localProject: "persisted" } as const;
 
 function readyPreflight(overrides: Partial<Extract<MigrationPreflightResult, { status: "ready" }>> = {}): MigrationPreflightResult {
@@ -524,7 +535,7 @@ describe("performMigrationApply: a refusal after the fresh identity step reports
     expect(minted).toBe(false);
   });
 
-  it("hold-entry-contention after the fresh mint carries applied: true and what was minted", async () => {
+  it("hold-entry-contention after the fresh mint carries applied: true and what the step reported writing", async () => {
     const result = await performMigrationApply({
       cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore(),
       _preflight: async () => readyPreflight({ local: { id: "local-1", canonical: "/tmp/project", persisted: false } }),
@@ -540,7 +551,7 @@ describe("performMigrationApply: a refusal after the fresh identity step reports
     const result = await performMigrationApply({
       cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore(),
       _preflight: async () => readyPreflight({ destinationProjectId: "remote-project-1" }),
-      _operationsForTesting: { resolveExpectedIdentity: resolveIdentity, performCapture: refusingSpan("hold-entry-contention", true, "lock-contention") },
+      _operationsForTesting: { resolveExpectedIdentity: resolveIdentityWith({ localProject: "reused", destinationProject: "reused" }), performCapture: refusingSpan("hold-entry-contention", true, "lock-contention") },
     });
     expect(result).toEqual({
       status: "refuse", reason: "hold-entry-contention", evidence: "lock-contention",
@@ -548,12 +559,28 @@ describe("performMigrationApply: a refusal after the fresh identity step reports
     });
   });
 
+  it("the race the preview cannot see: both absent at preflight, both written concurrently before the step, so the step reuses them and a pre-hold refusal reports reuse, never this invocation's mint (round-3 synthesis P2)", async () => {
+    const result = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore(),
+      _preflight: async () => readyPreflight({ local: { id: "local-1", canonical: "/tmp/project", persisted: false }, destinationProjectId: null }),
+      _operationsForTesting: { resolveExpectedIdentity: resolveIdentityWith({ localProject: "reused", destinationProject: "reused" }), performCapture: refusingSpan("hold-entry-contention", true, "lock-contention") },
+    });
+    expect(result).toEqual({
+      status: "refuse", reason: "hold-entry-contention", evidence: "lock-contention",
+      identity: { localProject: "persisted", destinationProject: "exists" },
+    });
+    expect(result).not.toHaveProperty("applied");
+  });
+
   it("a destination refusal from the fresh step still reports the local entry it minted first", async () => {
     const result = await performMigrationApply({
       cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore(),
       _preflight: async () => readyPreflight({ local: { id: "local-1", canonical: "/tmp/project", persisted: false } }),
       _operationsForTesting: {
-        resolveExpectedIdentity: async () => ({ status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" }),
+        resolveExpectedIdentity: async (input) => {
+          input.observe?.({ stage: "local", outcome: "persisted" });
+          return { status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" };
+        },
         performCapture: refusingSpan("unreachable", true),
       },
     });
@@ -561,6 +588,86 @@ describe("performMigrationApply: a refusal after the fresh identity step reports
       status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent", applied: true,
       identity: { localProject: "minted", destinationProject: "not-created" },
     });
+  });
+
+  it("a classified refusal before the local boundary reports nothing persisted and nothing created, applied left to the reason", async () => {
+    const result = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore(),
+      _preflight: async () => readyPreflight(),
+      _operationsForTesting: {
+        resolveExpectedIdentity: async () => ({ status: "refuse", reason: "local-identity-unresolvable", evidence: "RangeError" }),
+        performCapture: refusingSpan("unreachable", true),
+      },
+    });
+    expect(result).toEqual({
+      status: "refuse", reason: "local-identity-unresolvable", evidence: "RangeError",
+      identity: { localProject: "not-persisted", destinationProject: "not-created" },
+    });
+  });
+
+  it("a throw after a real map write (the destination step fails unclassified) reaches the boundary with the local boundary's evidence and an unknown destination (review 3A P2)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-cli-apply-throw-"));
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const cwd = join(home, "project");
+    mkdirSync(cwd, { mode: 0o700 });
+    try {
+      expect(readProjectMapIdentity({ homeDir: home, cwd })).toBeNull();
+      const result = await performMigrationApply({
+        cwd, homeDir: home, confirmGenerationId: "generation-0", manifestStore: headStore(),
+        _preflight: async () => readyPreflight({ local: { id: "unused", canonical: cwd, persisted: false } }),
+        _operationsForTesting: {
+          // The real step: a real map write under a real barrier token, then a
+          // destination connection that fails with an unclassified error.
+          resolveExpectedIdentity: (input) => resolveMigrationExpectedIdentity({
+            ...input,
+            _operationsForTesting: {
+              createIdentityRuntime: () => ({ close: async () => undefined }) as never,
+              resolveTargetIdentity: async () => { throw new Error("connection reset"); },
+            },
+          }),
+          performCapture: (captureInput) => withBackendPublicationAppendBarrierAsync(home, async (token) => {
+            const identity = await captureInput.resolveExpectedIdentity!({ path: "fresh", token });
+            throw new Error(`unreachable: ${identity.status}`);
+          }),
+        },
+      });
+      expect(result).toEqual({
+        status: "refuse", reason: "unexpected-failure", evidence: "Error", applied: true,
+        identity: { localProject: "minted", destinationProject: "unknown" },
+      });
+      expect(readProjectMapIdentity({ homeDir: home, cwd })).toMatchObject({ canonical: cwd });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("a throw after the step resolved (genesis throws) reaches the boundary with both boundaries' evidence", async () => {
+    const result = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore(),
+      _preflight: async () => readyPreflight({ local: { id: "local-1", canonical: "/tmp/project", persisted: false } }),
+      _operationsForTesting: {
+        resolveExpectedIdentity: resolveIdentity,
+        performCapture: async (captureInput) => {
+          const identity = await captureInput.resolveExpectedIdentity!({ path: "fresh", token: {} });
+          if (identity.status !== "resolved") throw new Error("unreachable");
+          return { ...await captured(), expectedIdentity: identity.expectedIdentity };
+        },
+        performGenesisAndCopy: async () => { throw new TypeError("boom"); },
+      },
+    });
+    expect(result).toEqual({
+      status: "refuse", reason: "unexpected-failure", evidence: "TypeError", applied: true,
+      identity: { localProject: "minted", destinationProject: "created" },
+    });
+  });
+
+  it("a throw before the identity step began carries no identity evidence", async () => {
+    const result = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore(),
+      _preflight: async () => readyPreflight(),
+      _operationsForTesting: { resolveExpectedIdentity: resolveIdentity, performCapture: async () => { throw new TypeError("boom"); } },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "unexpected-failure", evidence: "TypeError" });
   });
 
   it.each([
@@ -599,13 +706,16 @@ describe("performMigrationApply: a refusal after the fresh identity step reports
     expect(genesisCalled).toBe(false);
   });
 
-  it("migrationApplyIdentityMutation derives the mint from the preview and the step's answer", () => {
-    const resolved = { status: "resolved" as const, expectedIdentity: IDENTITY };
-    const refused = { status: "refuse" as const, reason: "destination-project-absent" };
-    expect(migrationApplyIdentityMutation({ localProject: "not-persisted", destinationProject: "will-be-created-at-apply" }, resolved)).toEqual({ localProject: "minted", destinationProject: "created" });
-    expect(migrationApplyIdentityMutation({ localProject: "not-persisted", destinationProject: "will-be-created-at-apply" }, refused)).toEqual({ localProject: "minted", destinationProject: "not-created" });
-    expect(migrationApplyIdentityMutation({ localProject: "persisted", destinationProject: "exists" }, resolved)).toEqual({ localProject: "persisted", destinationProject: "exists" });
-    expect(migrationApplyIdentityMutation({ localProject: "persisted", destinationProject: "exists" }, refused)).toEqual({ localProject: "persisted", destinationProject: "exists" });
+  it("the mutation record follows the reported boundaries; an unreached stage is not-written after a return and unknown after a throw", () => {
+    const local = recordMigrationIdentityEffect({}, { stage: "local", outcome: "persisted" });
+    expect(local).toEqual({ localProject: "minted" });
+    expect(recordMigrationIdentityEffect(local, { stage: "destination", outcome: "reused" })).toEqual({ localProject: "minted", destinationProject: "exists" });
+    expect(recordMigrationIdentityEffect({}, { stage: "local", outcome: "reused" })).toEqual({ localProject: "persisted" });
+    expect(recordMigrationIdentityEffect({}, { stage: "destination", outcome: "created" })).toEqual({ destinationProject: "created" });
+    expect(migrationApplyIdentityMutation({}, "returned")).toEqual({ localProject: "not-persisted", destinationProject: "not-created" });
+    expect(migrationApplyIdentityMutation({}, "thrown")).toEqual({ localProject: "unknown", destinationProject: "unknown" });
+    expect(migrationApplyIdentityMutation(local, "thrown")).toEqual({ localProject: "minted", destinationProject: "unknown" });
+    expect(migrationApplyIdentityMutation({ localProject: "persisted", destinationProject: "exists" }, "returned")).toEqual({ localProject: "persisted", destinationProject: "exists" });
   });
 });
 

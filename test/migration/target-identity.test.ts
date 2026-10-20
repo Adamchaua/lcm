@@ -49,7 +49,7 @@ describe("resolveMigrationTargetProjectId", () => {
       repository: repositoryStub({ resolveProject, createProject }),
       machineId: MACHINE_ID, displayName: "d", authorityCanonicalPath: "/tmp/project",
     });
-    expect(result).toEqual({ status: "resolved", projectId: "project-1" });
+    expect(result).toEqual({ status: "resolved", projectId: "project-1", effect: "reused" });
     expect(createProject).not.toHaveBeenCalled();
   });
 
@@ -60,7 +60,7 @@ describe("resolveMigrationTargetProjectId", () => {
       repository: repositoryStub({ resolveProject, createProject }),
       machineId: MACHINE_ID, displayName: "d", authorityCanonicalPath: "/tmp/project",
     });
-    expect(result).toEqual({ status: "resolved", projectId: "project-2" });
+    expect(result).toEqual({ status: "resolved", projectId: "project-2", effect: "created" });
     expect(createProject).toHaveBeenCalledWith(expect.objectContaining({
       machineId: MACHINE_ID, path: "/tmp/project",
     }));
@@ -77,7 +77,7 @@ describe("resolveMigrationTargetProjectId", () => {
       repository: repositoryStub({ resolveProject, createProject }),
       machineId: MACHINE_ID, displayName: "d", authorityCanonicalPath: "/tmp/project",
     });
-    expect(result).toEqual({ status: "resolved", projectId: "winner-project" });
+    expect(result).toEqual({ status: "resolved", projectId: "winner-project", effect: "reused" });
     expect(resolveProject).toHaveBeenCalledTimes(2);
   });
 
