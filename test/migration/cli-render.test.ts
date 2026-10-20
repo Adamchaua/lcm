@@ -243,7 +243,8 @@ describe("renderMigrationVerifyEnvelope", () => {
   });
 
   it.each([
-    ["requires-625-project-map-witness", 7, undefined],
+    ["verify-contention", 4, undefined],
+    ["verify-not-eligible", 5, undefined],
     ["verify-destination-drift", 5, undefined],
     ["existing-confirmation-moved", 3, undefined],
     ["route-not-owner", 2, "resume"],

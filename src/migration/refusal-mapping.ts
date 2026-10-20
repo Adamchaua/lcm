@@ -396,8 +396,20 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
 
   // --- verify (plan-v4 section 5, plan-v5 Part B (2)). ---
   Object.freeze({
-    reason: "requires-625-project-map-witness", exitClass: "failed-operator-required",
-    remedy: "A fresh verification needs the project-map witness that #625 provides, which this build does not include. Nothing was changed; the generation stays copied.",
+    reason: "verify-contention", exitClass: "refused-contention",
+    remedy: "Another worker holds the verification lease or the source append barrier, or the lease was lost. No effect was begun; run `lcm migration verify` again.",
+  }),
+  Object.freeze({
+    reason: "verify-not-eligible", exitClass: "refused-evidence",
+    remedy: "The verification found mismatches or incomplete coverage. A non-eligible report is kept as evidence, and the generation stays copied. Run `lcm migration report` and inspect it.",
+  }),
+  Object.freeze({
+    reason: "verify-project-map-drift", exitClass: "refused-evidence",
+    remedy: "The project map no longer matches the generation's destination project. Nothing was changed; run `lcm doctor` and inspect the project map.",
+  }),
+  Object.freeze({
+    reason: "verify-project-map-unresolvable", exitClass: "refused-evidence",
+    remedy: "The project map could not be read for the verification witness. Run `lcm doctor` before retrying.",
   }),
   Object.freeze({
     reason: "verify-report-identity-conflict", exitClass: "refused-evidence",

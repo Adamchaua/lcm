@@ -2157,6 +2157,7 @@ export function registerMigrationCommand(program: Command): void {
     dryRun?: boolean;
     maxRecords?: string;
     maxBytes?: string;
+    leaseTtlMs?: string;
   };
 
   const migrationCmd = new Command("migration")
@@ -2250,19 +2251,23 @@ export function registerMigrationCommand(program: Command): void {
 
   migrationCmd
     .command("verify")
-    .description("Verify a copied generation from persisted evidence, or confirm one that is already verified")
+    .description("Verify a copied generation against PostgreSQL, finish a pending verification, or confirm a verified one")
     .option("--generation <id>", "The generation to verify (default: the live maintenance hold)")
     .option("--confirm-generation <id>", "The resolved generation id")
-    .option("--dry-run", "Name what verify would do; take no lease and write nothing")
+    .option("--dry-run", "Compute the verification without recording it (takes and releases the verification lease)")
+    .option("--lease-ttl-ms <n>", "Verification lease time to live in milliseconds (default 300000)")
     .option("--json", "Output structured JSON")
     .helpOption(false).option("-h, --help", "Show help")
     .action(async (opts: MigrationApplyOptions) => {
+      const leaseTtlMs = opts.leaseTtlMs === undefined ? undefined : parsePositiveInteger(opts.leaseTtlMs, "--lease-ttl-ms");
       writeCliError("Verifying the migration generation...\n");
       const outcome = await performMigrationVerifyCommand({
+        cwd: process.cwd(),
         homeDir: homedir(),
         generation: opts.generation,
         confirmGenerationId: opts.confirmGeneration,
         dryRun: opts.dryRun,
+        leaseTtlMs,
       });
       writeCliError("Migration verify finished.\n");
       emitMigrationEnvelope("verify", () => renderMigrationVerifyEnvelope(outcome), opts.json);

@@ -1,10 +1,24 @@
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import { MigrationManifestStore } from "./manifest-store.js";
-import { MigrationProtocolError } from "./protocol.js";
+import { MigrationProtocolError, type MigrationManifest } from "./protocol.js";
 import {
   completePendingMigrationVerification,
+  inspectMigrationVerification,
   MigrationVerificationDriverError,
+  verifyMigrationGeneration,
+  type VerifyMigrationGenerationInput,
 } from "./verify-generation.js";
 import { MigrationVerificationReportStore, MigrationVerificationStoreError } from "./verification-store.js";
+import { parseMigrationQueueClassificationWitness } from "./verification-report.js";
+import { migrationWitnessSha256 } from "./activation-witness.js";
+import { migrationCopyTargetGeneration } from "./copy-source.js";
+import { computeMigrationProjectMapWitnessSha256, MigrationProjectMapWitnessError } from "./project-map-witness.js";
+import { inspectAuthenticatedSqliteMigrationSnapshot } from "./queue-evidence.js";
+import { resolveMigrationDestination } from "./cli-destination.js";
 import { MIGRATION_UNEXPECTED_FAILURE_REASON, withMigrationBoundary } from "./boundary.js";
 import {
   admitExistingMigrationCommand,
@@ -25,13 +39,18 @@ import type { ExistingGenerationInput } from "./existing-generation.js";
  * - **Row 24** (already `verified`, nothing pending; `verify` is allowed there
  *   by owner ruling R9): an idempotent confirmation from persisted evidence.
  *   Nothing is written.
- * - **Row 22** (`copied`, nothing pending): the fresh computation, which needs
- *   #625's `computeMigrationProjectMapWitnessSha256`. That function is not in
- *   this build, and no value is invented in its place, so the command refuses
- *   with the closed reason `requires-625-project-map-witness` (exit 7) and
- *   changes nothing. The lease and the source append barrier belong to that
- *   path; none is taken here, which the envelope's `coordinationEffects`
- *   states.
+ * - **Row 22** (`copied`, nothing pending): the fresh computation
+ *   (plan-v4 section 5). Every input of `VerifyMigrationGenerationInput` is
+ *   read from an existing source and none is invented: the destination
+ *   settings, owner and identity from `resolveMigrationDestination`; the
+ *   sealed destination digests and system identifier from the manifest; the
+ *   queue-classification witness from the authenticated snapshot's receipt
+ *   reference; and #625's `computeMigrationProjectMapWitnessSha256`
+ *   (`pre-publication`) for the project-map witness. Only this path opens
+ *   PostgreSQL. It takes #624's verification lease and the source append
+ *   barrier, which the envelope's `coordinationEffects` states, and
+ *   `--dry-run` runs the same computation through
+ *   `inspectMigrationVerification` and persists nothing.
  *
  * Owner check, then the `--confirm-generation` fence, then the first read of
  * persisted evidence; each reads only, so a refusal leaves durable state
@@ -63,13 +82,21 @@ type VerifyRefusal = Extract<MigrationVerifyCommandOutcome, { status: "refuse" }
 export type MigrationVerifyCommandOperations = Readonly<{
   completePending: typeof completePendingMigrationVerification;
   admit: typeof admitExistingMigrationCommand;
+  resolveDestination: typeof resolveMigrationDestination;
+  inspectSnapshot: typeof inspectAuthenticatedSqliteMigrationSnapshot;
+  computeProjectMapWitness: typeof computeMigrationProjectMapWitnessSha256;
+  verify: typeof verifyMigrationGeneration;
+  inspect: typeof inspectMigrationVerification;
+  mintOwnerProcessId: () => string;
 }>;
 
 export type MigrationVerifyCommandInput = Readonly<{
+  cwd: string;
   homeDir: string;
   generation?: string;
   confirmGenerationId?: string;
   dryRun?: boolean;
+  leaseTtlMs?: number;
   manifestStore?: MigrationManifestStore;
   reportStore?: MigrationVerificationReportStore;
   /** @internal Test-only seam into the generation resolver. */
@@ -175,9 +202,199 @@ export function completePendingVerificationCell(input: Readonly<{
   const confirmed = readVerifiedEvidence(generationId, input.manifestStore, input.reportStore, completed.report.reportSha256);
   if (confirmed.status !== "verified") return { ...confirmed, applied: true };
   return {
-    status: "ok", generationId, manifestPhase: "verified", applied: true, next: "report",
+    status: "ok", generationId, manifestPhase: "verified", applied: true, next: "activate",
     evidence: { ...confirmed.evidence, cell: 23, coordinationEffects: "none" },
   };
+}
+
+/** The verification lease's default time to live (plan-v4 section 5). */
+export const DEFAULT_MIGRATION_VERIFY_LEASE_TTL_MS = 300_000;
+
+const VERIFY_COORDINATION_EFFECTS = "verification-lease,source-append-barrier";
+
+type FreshInputsResult =
+  | Readonly<{ status: "ready"; input: Omit<VerifyMigrationGenerationInput, "scratchParent"> }>
+  | VerifyRefusal;
+
+/**
+ * Builds every input of the fresh computation from existing sources (see the
+ * module comment). A source that cannot be read is a closed refusal; nothing
+ * is written and PostgreSQL is contacted only to SELECT the destination alias.
+ */
+async function buildFreshInputs(args: Readonly<{
+  input: MigrationVerifyCommandInput;
+  generationId: string;
+  manifest: MigrationManifest;
+  ops: Partial<MigrationVerifyCommandOperations> | undefined;
+}>): Promise<FreshInputsResult> {
+  const { input, generationId, manifest, ops } = args;
+  const refuse = (reason: string, evidence?: string): VerifyRefusal =>
+    ({ status: "refuse", reason, generationId, ...(evidence === undefined ? {} : { evidence }) });
+
+  // A manifest written before the copy recorded the cluster identifier cannot
+  // be verified, and no identifier is invented in its place.
+  const expectedSystemIdentifier = manifest.destination.systemIdentifier;
+  if (expectedSystemIdentifier === undefined) return refuse("verify-destination-drift", "system-identifier-absent");
+
+  const destination = await (ops?.resolveDestination ?? resolveMigrationDestination)({ cwd: input.cwd, homeDir: input.homeDir });
+  if (destination.status === "refuse") return refuse(destination.reason, destination.evidence);
+  const { expectedIdentity } = destination;
+  // A resolved identity always names its local project; this guards the type, not a reachable state.
+  if (expectedIdentity.localProjectId === undefined || expectedIdentity.remoteProjectId === undefined) {
+    return refuse("verify-invalid-input", "identity-incomplete");
+  }
+
+  let receipt;
+  try {
+    receipt = (await (ops?.inspectSnapshot ?? inspectAuthenticatedSqliteMigrationSnapshot)(generationId, input.homeDir)).receiptReference;
+  } catch {
+    return refuse("snapshot-unresolvable");
+  }
+  // The five-field projection of the authenticated receipt reference (the thirteen-field form does not parse).
+  const queueClassificationWitness = parseMigrationQueueClassificationWitness({
+    version: 1,
+    queueCutoff: receipt.queueCutoff,
+    queueSetSha256: receipt.queueSetSha256,
+    receiptSetSha256: receipt.receiptSetSha256,
+    epochChecksumSha256: receipt.epochChecksumSha256,
+  });
+
+  let projectMapWitnessSha256: string;
+  try {
+    projectMapWitnessSha256 = (ops?.computeProjectMapWitness ?? computeMigrationProjectMapWitnessSha256)({
+      homeDir: input.homeDir,
+      localProjectId: expectedIdentity.localProjectId,
+      remoteProjectId: expectedIdentity.remoteProjectId,
+      mode: "pre-publication",
+    });
+  } catch (error) {
+    if (error instanceof MigrationProjectMapWitnessError) {
+      return refuse(error.reason === "project-map-drift" ? "verify-project-map-drift"
+        : error.reason === "project-map-unresolvable" ? "verify-project-map-unresolvable" : "verify-invalid-input");
+    }
+    throw error;
+  }
+
+  return {
+    status: "ready",
+    input: {
+      generationId,
+      targetGenerationId: migrationCopyTargetGeneration(generationId),
+      homeDir: input.homeDir,
+      expectedIdentity,
+      destinationSettings: destination.settings,
+      expectedOwner: destination.expectedOwner,
+      ownerProcessId: (ops?.mintOwnerProcessId ?? randomUUID)(),
+      leaseTtlMs: input.leaseTtlMs ?? DEFAULT_MIGRATION_VERIFY_LEASE_TTL_MS,
+      manifestRevision: manifest.revision,
+      manifestChecksumSha256: manifest.checksumSha256,
+      destinationMigrationsSha256: manifest.destination.schemaSha256,
+      expectedDestinationIdentitySha256: manifest.destination.identitySha256,
+      expectedSystemIdentifier,
+      projectMapWitnessSha256,
+      queueClassificationWitness,
+      sampleParameters: {
+        version: 1,
+        strideOrdinal: 1,
+        sampleCount: 0,
+        seedBasisSha256: migrationWitnessSha256(["lcm-migration-verify-seed-v1", generationId, manifest.destination.identitySha256]),
+      },
+    },
+  };
+}
+
+/** Failures that can only precede the first durable write of the fresh computation. */
+const PRE_WRITE_FAILURES: ReadonlySet<string> = new Set(["verify-contention", "verify-invalid-input", "verify-destination-drift"]);
+
+/**
+ * A typed failure of the fresh computation, mapped to the closed table, or
+ * `null` for anything else (which escapes to the boundary: exit 5).
+ * `mayHaveWritten` is false for the dry run, which persists nothing; for a
+ * real run only the pre-write reasons are known to leave the home unchanged.
+ */
+function freshFailure(generationId: string, error: unknown, mayHaveWritten: boolean): VerifyRefusal | null {
+  let reason: string;
+  let evidence: string | undefined;
+  if (error instanceof PrivateMutationLockContentionError) {
+    reason = "verify-contention";
+  } else if (error instanceof MigrationVerificationDriverError) {
+    reason = error.reason === "lease-unavailable" || error.reason === "lease-lost" ? "verify-contention" : `verify-${error.reason}`;
+  } else if (error instanceof MigrationProtocolError) {
+    reason = "manifest-unresolvable";
+    evidence = `manifest-${error.reason}`;
+  } else if (error instanceof MigrationVerificationStoreError) {
+    reason = "verify-report-unresolvable";
+    evidence = `report-${error.reason}`;
+  } else {
+    return null;
+  }
+  return {
+    status: "refuse", reason, generationId,
+    ...(evidence === undefined ? {} : { evidence }),
+    ...(mayHaveWritten && !PRE_WRITE_FAILURES.has(reason) ? { applied: true as const } : {}),
+  };
+}
+
+async function runFreshVerification(args: Readonly<{
+  input: MigrationVerifyCommandInput;
+  generationId: string;
+  manifest: MigrationManifest;
+  manifestStore: MigrationManifestStore;
+  reportStore: MigrationVerificationReportStore;
+  ops: Partial<MigrationVerifyCommandOperations> | undefined;
+}>): Promise<MigrationVerifyCommandOutcome> {
+  const { input, generationId, manifest, manifestStore, reportStore, ops } = args;
+  const dryRun = input.dryRun === true;
+  const inputs = await buildFreshInputs({ input, generationId, manifest, ops });
+  if (inputs.status === "refuse") return inputs;
+
+  const scratchParent = mkdtempSync(join(tmpdir(), "lcm-migration-verify-"));
+  try {
+    if (dryRun) {
+      let report;
+      try {
+        report = await (ops?.inspect ?? inspectMigrationVerification)({ ...inputs.input, scratchParent });
+      } catch (error) {
+        const mapped = freshFailure(generationId, error, false);
+        if (mapped === null) throw error;
+        return mapped;
+      }
+      if (!report.activationEligible) {
+        return { status: "refuse", reason: "verify-not-eligible", generationId, evidence: report.clean ? "coverage-incomplete" : "mismatches" };
+      }
+      return {
+        status: "ok", generationId, manifestPhase: manifest.phase, applied: false, next: "verify (drop --dry-run to record it)",
+        evidence: {
+          reportId: report.reportId, reportSha256: report.reportSha256, activationEligible: true,
+          cell: 22, wouldBe: "clean", coordinationEffects: VERIFY_COORDINATION_EFFECTS,
+        },
+      };
+    }
+
+    let result;
+    try {
+      result = await (ops?.verify ?? verifyMigrationGeneration)({ ...inputs.input, scratchParent });
+    } catch (error) {
+      const mapped = freshFailure(generationId, error, true);
+      if (mapped === null) throw error;
+      return mapped;
+    }
+    if (!result.report.activationEligible) {
+      // The report is persisted as operator evidence; the manifest stays copied.
+      return {
+        status: "refuse", reason: "verify-not-eligible", generationId, applied: true,
+        evidence: result.report.clean ? "coverage-incomplete" : "mismatches",
+      };
+    }
+    const confirmed = readVerifiedEvidence(generationId, manifestStore, reportStore, result.report.reportSha256);
+    if (confirmed.status !== "verified") return { ...confirmed, applied: true };
+    return {
+      status: "ok", generationId, manifestPhase: "verified", applied: true, next: "activate",
+      evidence: { ...confirmed.evidence, cell: 22, coordinationEffects: VERIFY_COORDINATION_EFFECTS },
+    };
+  } finally {
+    rmSync(scratchParent, { recursive: true, force: true });
+  }
 }
 
 async function runMigrationVerifyCommand(input: MigrationVerifyCommandInput): Promise<MigrationVerifyCommandOutcome> {
@@ -201,15 +418,15 @@ async function runMigrationVerifyCommand(input: MigrationVerifyCommandInput): Pr
 
   switch (context.route.row) {
     case 22:
-      // The fresh computation needs #625's project-map witness, which this
-      // build does not have. Nothing was read beyond routing, nothing is written.
-      return { status: "refuse", reason: "requires-625-project-map-witness", generationId };
+      return runFreshVerification({
+        input, generationId, manifest: context.manifest!, manifestStore, reportStore, ops: input._operationsForTesting,
+      });
 
     case 24: {
       const confirmed = readVerifiedEvidence(generationId, manifestStore, reportStore, null);
       if (confirmed.status !== "verified") return confirmed;
       return {
-        status: "ok", generationId, manifestPhase: "verified", applied: false, next: "report",
+        status: "ok", generationId, manifestPhase: "verified", applied: false, next: "activate",
         evidence: { ...confirmed.evidence, cell: 24, coordinationEffects: "none" },
       };
     }

@@ -336,12 +336,12 @@ describe("lcm migration command group", () => {
     expect(JSON.parse(stdoutText(out))).toMatchObject({ command: "verify", applied: true, manifestPhase: "verified", evidence: { cell: 23 } });
   });
 
-  it("verify: the fresh path's closed refusal exits 7", async () => {
-    state.verify.mockResolvedValueOnce({ status: "refuse", reason: "requires-625-project-map-witness", generationId: "gen-1" });
+  it("verify: the fresh path's contention refusal exits 4", async () => {
+    state.verify.mockResolvedValueOnce({ status: "refuse", reason: "verify-contention", generationId: "gen-1" });
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     await invoke("migration", "verify", "--confirm-generation", "gen-1");
-    expect(process.exitCode).toBe(7);
-    expect(stdoutText(out)).toContain("requires-625-project-map-witness");
+    expect(process.exitCode).toBe(4);
+    expect(stdoutText(out)).toContain("verify-contention");
   });
 
   it("resume: passes the generation, token, dry-run and copy bounds through", async () => {
