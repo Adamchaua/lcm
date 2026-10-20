@@ -2149,3 +2149,78 @@ describe("runMigrationActivation: S7 classifies target failures like S6 (PR #162
     expectActivated(f, await f.run(), "prepare-activation-pending");
   });
 });
+
+describe("runMigrationActivation: the release tail and the abort family are driven without an own fence (PR #1628 review)", () => {
+  const row = (f: Fixture) => f.guard.rows.get(REMOTE);
+  const foreignRow = (f: Fixture, overrides: Partial<PostgreSqlBackendPublicationFence> = {}) => {
+    f.guard.rows.delete(REMOTE);
+    f.guard.seed({ projectId: REMOTE, publicationId: "another-publication", ...overrides });
+  };
+
+  it("crash at released with the fence row gone: the retry drives the journal to completed and activates", async () => {
+    const f = await fixture();
+    await crashCoordinatorAt(f, "released");
+    expect(row(f)!.releasedAt).not.toBeNull();
+    f.guard.rows.delete(REMOTE);
+    const mutations = f.guard.calls.filter((c) => c !== "read").length;
+    const outcome = await f.run();
+    expectActivated(f, outcome, "publication-journal");
+    if (outcome.status !== "activated") return;
+    expect(outcome.successorFencingToken).toBeNull();
+    // No lease continuation, acquire or release ran: the coordinator owns the fences in the release tail.
+    expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+    expect(row(f)).toBeUndefined();
+  });
+
+  it("crash at releasing with the fence already released (row kept): the retry completes the release tail and activates", async () => {
+    const f = await fixture();
+    await crashCoordinatorAt(f, "releasing");
+    // The journal entered releasing before the fence was released; release it as the coordinator would have.
+    const held = row(f)!;
+    f.guard.rows.set(REMOTE, { ...held, releasedAt: "2026-10-16T13:00:05.000Z" });
+    const renews = f.guard.calls.filter((c) => c === "renew").length;
+    const outcome = await f.run();
+    expectActivated(f, outcome, "publication-journal");
+    expect(f.guard.calls.filter((c) => c === "renew")).toHaveLength(renews);
+  });
+
+  it("crash at releasing with the fence row gone: the orchestrator no longer stops at S13b; the coordinator, which must release that row, reports it", async () => {
+    const f = await fixture();
+    await crashCoordinatorAt(f, "releasing");
+    f.guard.rows.delete(REMOTE);
+    // Before the fix this was interrupted S13b lease-lost without ever reaching the drive.
+    await expect(f.run()).rejects.toThrow("remote release evidence is missing");
+    expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("releasing");
+  });
+
+  it("a fence of another publication or evidence digest stays lease-lost in the release tail; an unattributable read is lease-unresolvable", async () => {
+    const f = await fixture();
+    await crashCoordinatorAt(f, "released");
+    foreignRow(f);
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", effectBegun: true, detail: "the fenced lease row names another publication" });
+    foreignRow(f, { publicationId: f.publicationId, evidenceSha256: "d".repeat(64) });
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", detail: expect.stringContaining("does not match the expected") });
+    f.guard.read = async (input) => { throw new PostgreSqlStorageOperationError("STORAGE_OPERATION_FAILED", { domain: "factory", operation: "read" }, "08006", true); };
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-unresolvable" });
+  });
+  it("the abort family is handled like the release tail: an absent own fence at abort-releasing reaches the drive without a lease continuation", async () => {
+    const f = await fixture();
+    await crashCoordinatorAt(f, "prepared");
+    f.guard.rows.delete(REMOTE);
+    const read = f.deps.readPublicationJournal;
+    const unwinding = (h: string) => { const j = read(h); return j === null ? null : { ...j, phase: "abort-releasing" as const }; };
+    const renews = f.guard.calls.filter((c) => c === "renew").length;
+    const outcome = await f.run({
+      readPublicationJournal: unwinding,
+      drive: async () => ({ status: "aborted", detail: "unwound by the coordinator", journal: null, fenceChecks: [], dispatch: "abort-completion" }),
+    });
+    expect(outcome).toMatchObject({ status: "publication-failed", publication: { status: "aborted", dispatch: "abort-completion" } });
+    expect(f.guard.calls.filter((c) => c === "renew")).toHaveLength(renews);
+    // A foreign row in the same phase is still a lost lease.
+    foreignRow(f);
+    expect(await f.run({ readPublicationJournal: unwinding })).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost" });
+    // Outside those phases (prepared), an absent row is still a lost lease.
+    f.guard.rows.delete(REMOTE);
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", detail: "no fenced lease row exists for this generation" });
+  });
+});

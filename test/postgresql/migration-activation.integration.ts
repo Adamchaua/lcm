@@ -29,6 +29,10 @@
  * cancelled through its own signal after S2 is proven to do the same (the
  * cleanup runs under its own signal, Bug #1641).
  *
+ * A second case crashes the real coordinator right after it journals
+ * "released", removes the released fence row, and proves the retry drives the
+ * journal to completed: the release tail needs no own fence (plan-v7 A3).
+ *
  * Role topology follows plan-v7.2 B1/B3: activation runs entirely under ONE
  * transfer-profile role, provisioned here under a per-run unique name with
  * the reviewed runtime grant scripts plus the transfer grant script (exactly
@@ -69,7 +73,10 @@ import {
   readBackendPublicationJournal,
   withBackendPublicationAppendBarrierAsync,
   type BackendPublicationDriver,
+  type BackendPublicationObserver,
 } from "../../src/storage/backend-publication.js";
+import { createBackendPublicationCoordinator } from "../../src/storage/backend-publication-driver.js";
+import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage/postgresql/publication-remote-guard.js";
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
 import { closeLcmConnection } from "../../src/db/connection.js";
 import { localProjectIdentity } from "../../src/daemon/project.js";
@@ -78,6 +85,7 @@ import { readMachineIdentity } from "../../src/machine-identity.js";
 import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
 import { configPath, projectsDir } from "../../src/runtime-paths.js";
 import {
+  MIGRATION_ACTIVATION_LEASE_TTL_MS,
   createMigrationActivationDependencies,
   previewMigrationActivation,
   runMigrationActivation,
@@ -591,3 +599,66 @@ it("activates a real verified SQLite copy through the production dependencies: r
   });
 }, 240_000);
 
+/** The production coordinator with an observer that throws right after the
+ * journal is written at the given version-2 phase: a crash in the release
+ * tail, reproduced on the real coordinator and the real guard. */
+function coordinatorCrashingAt(phase: string, home: string): MigrationActivationDependencies["createCoordinator"] {
+  let crashed = false;
+  const observer: BackendPublicationObserver = (event) => {
+    if (crashed || event !== "after-journal-write") return;
+    if (readBackendPublicationJournal(home)?.phase === phase) { crashed = true; throw new Error("injected coordinator crash at " + phase); }
+  };
+  return ({ homeDir, guard, machineId }) => createBackendPublicationCoordinator({
+    homeDir,
+    observer,
+    remoteGuard: { mode: "delegated", provider: createPostgreSqlBackendPublicationRemoteGuard({ guard, machineId, ttlMs: MIGRATION_ACTIVATION_LEASE_TTL_MS }) },
+  });
+}
+
+it("drives a publication that crashed at released, with its fence row gone, to completed on the retry (PR #1628 review: the release tail needs no own fence)", async () => {
+  await withPostgreSqlTestDatabase("migration-activation-release-tail", async (db) => {
+    const home = mkdtempSync(join(tmpdir(), "migration-activation-release-tail-"));
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    try {
+      const transfer = await provisionActivationRole(db);
+      const installation = await prepareVerifiedInstallation(db, home, transfer);
+      const publicationId = deriveActivationPublicationId(GENERATION_ID);
+      const deps = createMigrationActivationDependencies({ homeDir: home });
+
+      // Crash the real coordinator right after it journals "released": the
+      // fences are released, the journal is one transition short of completed.
+      await expect(runMigrationActivation(installation.input, { ...deps, createCoordinator: coordinatorCrashingAt("released", home) }))
+        .rejects.toThrow("injected coordinator crash at released");
+      expect(readBackendPublicationJournal(home)).toMatchObject({ phase: "released", publicationId });
+      expect(readConfigBackend(home)).toBe("postgresql");
+
+      // The released row is still there; remove it so the retry finds no row
+      // of its own (the real guard keeps released rows, so a vanished row is
+      // the only "absent" the orchestrator can meet on PostgreSQL).
+      const removed = await db.migrator.query<{ count: string }>({
+        text: "WITH removed AS (DELETE FROM lcm.fenced_leases WHERE project_id = $1 "
+          + "AND operation LIKE 'backend-publication:postgresql:%' RETURNING 1) SELECT count(*)::text AS count FROM removed",
+        values: [installation.remoteProjectId],
+      }, { domain: "factory", operation: "activationIntegration" });
+      expect(removed.rows).toEqual([{ count: "1" }]);
+
+      // Before the fix this retry stopped at interrupted S13b lease-lost.
+      const outcome = await runMigrationActivation(installation.input, deps);
+      expect(outcome.status, JSON.stringify(outcome, (_key, value) => typeof value === "bigint" ? value.toString() : value)).toBe("activated");
+      expect(outcome).toMatchObject({ status: "activated", resumedFrom: "publication-journal", successorFencingToken: null, identity: { generationId: GENERATION_ID, publicationId } });
+      expect(readBackendPublicationJournal(home)).toMatchObject({ phase: "completed", publicationId });
+      expect(new MigrationManifestStore({ homeDir: home }).read(GENERATION_ID)).toMatchObject({ phase: "active", pendingEffect: null });
+      const leases = await db.migrator.query<{ count: string }>({
+        text: "SELECT count(*)::text AS count FROM lcm.fenced_leases WHERE project_id = $1 AND operation LIKE 'backend-publication:postgresql:%'",
+        values: [installation.remoteProjectId],
+      }, { domain: "factory", operation: "activationIntegration" });
+      expect(leases.rows).toEqual([{ count: "0" }]);
+    } finally {
+      closeLcmConnection();
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+      await dropActivationRole(db);
+    }
+  });
+}, 240_000);

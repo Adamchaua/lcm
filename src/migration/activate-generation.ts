@@ -60,6 +60,7 @@ import {
   acquireActivationLease,
   releaseActivationLease,
   renewActivationLease,
+  resolveActivationLeaseFence,
   takeoverActivationLease,
   type ActivationLeaseAcquireResult,
   type ActivationLeaseFence,
@@ -1058,13 +1059,37 @@ async function continueLease(ctx: Context): Promise<LeaseContinuation> {
   return { kind: "lost", detail: renewed.detail };
 }
 
-/** Re-read the lease row to continue from (re-entry): the row this generation holds. */
-async function readOwnFence(ctx: Context): Promise<Readonly<{ fence: ActivationLeaseFence } | { fence: null; detail: string }>> {
-  const fence = await ctx.guard!.read({ projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
-  if (fence === null) return { fence: null, detail: "no fenced lease row exists for this generation" };
-  if (fence.publicationId !== ctx.publicationId) return { fence: null, detail: "the fenced lease row names another publication" };
-  return { fence };
+type OwnFenceRead =
+  | Readonly<{ kind: "own"; fence: ActivationLeaseFence }>
+  | Readonly<{ kind: "absent"; detail: string }>
+  | Readonly<{ kind: "foreign"; detail: string }>
+  | Readonly<{ kind: "unresolvable"; detail: string }>;
+
+/** Re-read the lease row to continue from (re-entry): the row this
+ * generation holds (released or not), positively no row, a row of another
+ * publication or evidence digest (foreign: always lease-lost), or a read
+ * that cannot be attributed. */
+async function readOwnFence(ctx: Context): Promise<OwnFenceRead> {
+  const resolved = await resolveActivationLeaseFence(ctx.guard!, { projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
+  if (resolved.kind === "absent") return { kind: "absent", detail: "no fenced lease row exists for this generation" };
+  if (resolved.kind === "identity-mismatch") return { kind: "foreign", detail: resolved.detail };
+  if (resolved.kind === "unresolvable") return { kind: "unresolvable", detail: resolved.detail };
+  if (resolved.fence.publicationId !== ctx.publicationId) return { kind: "foreign", detail: "the fenced lease row names another publication" };
+  return { kind: "own", fence: resolved.fence };
 }
+
+/**
+ * Version-2 journal phases the orchestrator drives without a live fence of
+ * its own: the coordinator is releasing (or has released) the fences
+ * itself, so the drive skips its fence precheck for them
+ * (activation-publication.ts RELEASE_TAIL_PHASES / ABORT_FAMILY_PHASES,
+ * plan-v7 A3) and the two terminal phases have released by design. An
+ * absent own row is therefore not a lost lease here, and no lease
+ * continuation runs before the drive.
+ */
+const NO_OWN_FENCE_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new Set([
+  "releasing", "released", "completed", "aborting", "config-restoring", "map-restoring", "abort-releasing", "aborted",
+]);
 
 /**
  * Release the S2 lease of a run that ends before any durable effect (the
@@ -1493,10 +1518,10 @@ async function stepDrive(ctx: Context): Promise<Step<ActivationPublicationResult
   } catch (error) {
     return interrupted(ctx, "S13b", "journal-unexpected", "the publication journal could not be read: " + (error as Error).message);
   }
-  const releaseTail = v2 !== null && v2.publicationId === ctx.publicationId
-    && (v2.phase === "releasing" || v2.phase === "released" || v2.phase === "completed");
-  if (!releaseTail) {
-    // A3: no lease acquire or takeover once the publication is releasing.
+  const coordinatorOwnsFences = v2 !== null && v2.publicationId === ctx.publicationId && NO_OWN_FENCE_PHASES.has(v2.phase);
+  if (!coordinatorOwnsFences) {
+    // A3: no lease acquire or takeover once the publication is releasing
+    // (or unwinding); the coordinator reconciles its own fences there.
     const continued = await continueLease(ctx);
     if (continued.kind === "lost") return interrupted(ctx, "S13b", "lease-lost", continued.detail);
     if (continued.kind === "unresolvable") return interrupted(ctx, "S13b", "lease-unresolvable", continued.detail);
@@ -1789,11 +1814,15 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
     if (isExit(adopted)) return adopted.exit;
     ctx.resumedFrom = ownV2 !== null ? "publication-journal" : v3!.phase === "selection-prepared" ? "selection-prepared" : "selection-completed-unbound";
     const own = await readOwnFence(ctx);
-    if (own.fence === null) {
-      // A completed v2 journal has released its fences by design.
-      if (!(ownV2 !== null && ownV2.phase === "completed")) return interrupted(ctx, "S13b", "lease-lost", own.detail).exit;
-    } else {
+    if (own.kind === "own") {
       ctx.fence = own.fence;
+    } else if (own.kind === "unresolvable") {
+      return interrupted(ctx, "S13b", "lease-unresolvable", own.detail).exit;
+    } else if (own.kind === "foreign" || !(ownV2 !== null && NO_OWN_FENCE_PHASES.has(ownV2.phase))) {
+      // A row of another publication is always a lost lease. An absent row
+      // is lost unless the coordinator owns the fences for this phase
+      // (NO_OWN_FENCE_PHASES): then stepDrive continues without one.
+      return interrupted(ctx, "S13b", "lease-lost", own.detail).exit;
     }
     // A selection is recorded only after S10 began publish-activation, and
     // the effect is completed only by S16 (which also settles the manifest
