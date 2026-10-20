@@ -188,14 +188,17 @@ import {
  *   S12 and before S13b.
  * - The S2 lease is released again when the run ends without this
  *   activation having begun a durable effect: every refusal after S2 and
- *   every error thrown before S9 began prepare-activation (see
- *   releaseAbandonedLease). acquireActivationLease never displaces an
+ *   every S9 begin failure or thrown error for which an authenticated
+ *   manifest readback proves nothing was written (headPositivelyUnbegun;
+ *   a begin that committed and then threw keeps its lease). See
+ *   releaseAbandonedLease. acquireActivationLease never displaces an
  *   unreleased row of another generation, expired or not, so a refused run
  *   that kept its row would block every other generation of the project
- *   for good. A release failure never changes the outcome vocabulary: a
- *   refusal carries it appended to its detail, a thrown error is rethrown
- *   unchanged (a same-generation re-run reacquires or takes over the row
- *   and ends it the same way). Once an effect has begun the row is kept:
+ *   for good. The release is best effort: a failure never changes the
+ *   outcome vocabulary (a refusal or S9 interruption carries it appended to
+ *   its detail, a thrown error is rethrown unchanged), and a same-generation
+ *   re-run reacquires or takes over a row that was left behind and ends it
+ *   the same way. Once an effect has begun the row is kept:
  *   the generation is committed to roll forward on the next call (A2
  *   reacquire / takeover) and the coordinator's own release phase frees it.
  * - S3 quiescence, S4 coverage then G8, S4b (amendment 1) compose material
@@ -1083,9 +1086,31 @@ async function releaseAbandonedLease(ctx: Context): Promise<string | null> {
   }
 }
 
-/** A refusal after S2 releases the lease; a failure to release rides the refusal's detail. */
-async function refusedWithLeaseReleased(ctx: Context, outcome: MigrationActivationOutcome): Promise<MigrationActivationOutcome> {
-  if (outcome.status !== "refused" || ctx.fence === null) return outcome;
+/**
+ * Authenticated manifest readback under the retained barrier, deciding
+ * pre-effect lease cleanup where ctx.effectBegun cannot: that flag flips
+ * only after an S9 update returns, so a begin that committed and then threw
+ * leaves it false, and a begin that failed before writing returns an S9
+ * interruption with effectBegun false. True only when the head is still the
+ * verified manifest with no pending effect (nothing of ours was written);
+ * an effect, another phase or a failed readback keeps the lease.
+ */
+function headPositivelyUnbegun(ctx: Context): boolean {
+  try {
+    const head = ctx.deps.manifestStore.read(ctx.generationId);
+    return head.phase === "verified" && head.pendingEffect === null;
+  } catch {
+    return false;
+  }
+}
+
+/** A refusal after S2 releases the lease, and so does an S9 interruption
+ * whose begin positively did not write (headPositivelyUnbegun); a failure
+ * to release rides the outcome's detail. */
+async function withPreEffectLeaseReleased(ctx: Context, outcome: MigrationActivationOutcome): Promise<MigrationActivationOutcome> {
+  if (ctx.fence === null) return outcome;
+  const unbegunInterruption = outcome.status === "interrupted" && outcome.step === "S9" && !outcome.effectBegun && headPositivelyUnbegun(ctx);
+  if (outcome.status !== "refused" && !unbegunInterruption) return outcome;
   const failure = await releaseAbandonedLease(ctx);
   if (failure === null) return outcome;
   return { ...outcome, detail: outcome.detail + "; the activation lease was not released: " + failure };
@@ -1613,10 +1638,11 @@ export async function runMigrationActivation(
     return await deps.withAppendBarrier(input.homeDir, async (token) => {
       ctx.token = token;
       try {
-        return await refusedWithLeaseReleased(ctx, await runUnderBarrier(ctx, scratchParent));
+        return await withPreEffectLeaseReleased(ctx, await runUnderBarrier(ctx, scratchParent));
       } catch (error) {
-        // Best effort, before the effect began: the original error is the outcome.
-        if (ctx.fence !== null && !ctx.effectBegun) await releaseAbandonedLease(ctx);
+        // Best effort, only when readback proves no effect began (a commit
+        // that then threw keeps its lease): the original error is the outcome.
+        if (ctx.fence !== null && headPositivelyUnbegun(ctx)) await releaseAbandonedLease(ctx);
         throw error;
       } finally {
         if (ctx.ordinary !== null) await ctx.ordinary.close();

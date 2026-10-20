@@ -1520,7 +1520,17 @@ describe("runMigrationActivation: refusal rows reached only through injected che
     f.manifestStore.update(GENERATION, verified.checksumSha256, (m) => beginMigrationEffect(m, { effectId: "prepare-activation-foreign", kind: "prepare-activation", inputSha256: HASH_A, startedAt: "2026-10-16T13:30:00.000Z" }));
     expect(await f.run()).toMatchObject({ status: "refused", step: "S0", reason: "pending-effect-foreign" });
     const g = await fixture();
-    expect(await g.run({ manifestStore: countedStore(g, { updateAt: [1, () => { throw new MigrationProtocolError("unexpected-state", "injected"); }] }) })).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: false, applied: "no" });
+    const unbegun = await g.run({ manifestStore: countedStore(g, { updateAt: [1, () => { throw new MigrationProtocolError("unexpected-state", "injected"); }] }) });
+    expect(unbegun).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: false, applied: "no" });
+    // The begin failed before writing: the head is still the verified manifest
+    // with no pending effect, so the S2 lease was released (round-3 S1) and a
+    // different generation can acquire the project.
+    expect((unbegun as { detail: string }).detail).not.toContain("lease was not released");
+    expect(g.manifestStore.read(GENERATION)).toMatchObject({ phase: "verified", pendingEffect: null });
+    expect(g.guard.rows.get(REMOTE)!.releasedAt).not.toBeNull();
+    await expect(g.guard.acquire({
+      projectId: REMOTE, machineId: MACHINE, publicationId: "another-generation", targetBackend: "postgresql", evidenceSha256: "d".repeat(64), ttlMs: 60_000,
+    })).resolves.toMatchObject({ publicationId: "another-generation", releasedAt: null });
     const h = await fixture();
     await stopAt(h, "after-prepare-complete");
     expect(await h.run({ manifestStore: countedStore(h, { updateAt: [1, () => { throw new MigrationProtocolError("unexpected-state", "injected"); }] }) })).toMatchObject({ status: "interrupted", step: "S10", cause: "state-unresolvable", effectBegun: true });
@@ -1960,5 +1970,61 @@ describe("runMigrationActivation: an S0-S8 re-check that fails on an effect-begu
     f.manifestStore.update(GENERATION, verified.checksumSha256, (m) => beginMigrationEffect(m, { effectId: "prepare-activation-foreign", kind: "prepare-activation", inputSha256: HASH_A, startedAt: "2026-10-16T13:30:00.000Z" }));
     expect(await f.run()).toMatchObject({ status: "refused", step: "S0", reason: "pending-effect-foreign", effectBegun: false });
     expect(row(f).releasedAt).not.toBeNull();
+  });
+});
+
+describe("runMigrationActivation: pre-effect lease cleanup is decided by manifest readback (candidate round 3, S1)", () => {
+  const row = (f: Fixture) => f.guard.rows.get(REMOTE)!;
+  const protocolFailure = () => { throw new MigrationProtocolError("unexpected-state", "injected"); };
+
+  it("an S9 begin that commits and then throws keeps the lease although effectBegun never flipped, and the next call rolls forward", async () => {
+    const f = await fixture();
+    const store = f.manifestStore;
+    let updates = 0;
+    const commitThenThrow: MigrationActivationDependencies["manifestStore"] = {
+      read: (id) => store.read(id),
+      update: (id, checksum, fn) => { const updated = store.update(id, checksum, fn); if (++updates === 1) throw new Error("thrown after the begin committed"); return updated; },
+    };
+    await expect(f.run({ manifestStore: commitThenThrow })).rejects.toThrow("thrown after the begin committed");
+    expect(f.manifestStore.read(GENERATION).pendingEffect).toMatchObject({ kind: "prepare-activation" });
+    expect(f.guard.calls.filter((c) => c === "release")).toHaveLength(0);
+    expect(row(f).releasedAt).toBeNull();
+    const token = row(f).fencingToken;
+    expectActivated(f, await f.run(), "prepare-activation-pending");
+    expect(row(f).fencingToken).toBe(token);
+  });
+
+  it("a release failure after the unbegun S9 interruption rides its detail and preserves the outcome", async () => {
+    const f = await fixture();
+    f.guard.release = async () => { throw new Error("the lease connection dropped"); };
+    const outcome = await f.run({ manifestStore: countedStore(f, { updateAt: [1, protocolFailure] }) });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: false, applied: "no" });
+    expect((outcome as { detail: string }).detail).toMatch(/^prepare-activation could not be driven: injected; the activation lease was not released: the lease connection dropped$/u);
+    expect(row(f).releasedAt).toBeNull();
+  });
+
+  it("a readback that fails after the begin failure keeps the lease (uncertain is not unbegun)", async () => {
+    const f = await fixture();
+    const store = f.manifestStore;
+    let updates = 0;
+    const unreadableAfterFailure: MigrationActivationDependencies["manifestStore"] = {
+      read: (id) => { if (updates > 0) throw new MigrationProtocolError("unexpected-state", "readback failed"); return store.read(id); },
+      update: () => { updates += 1; return protocolFailure(); },
+    };
+    const outcome = await f.run({ manifestStore: unreadableAfterFailure });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: false });
+    expect((outcome as { detail: string }).detail).not.toContain("lease was not released");
+    expect(f.guard.calls.filter((c) => c === "release")).toHaveLength(0);
+    expect(row(f).releasedAt).toBeNull();
+    // The same generation recovers by take-over on its next call.
+    expectActivated(f, await f.run(), "fresh");
+  });
+
+  it("a throw after S9 completed keeps the lease by readback (the head is activating, not verified)", async () => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-complete");
+    expect(f.manifestStore.read(GENERATION)).toMatchObject({ phase: "activating", pendingEffect: null });
+    expect(f.guard.calls.filter((c) => c === "release")).toHaveLength(0);
+    expect(row(f).releasedAt).toBeNull();
   });
 });

@@ -1119,10 +1119,14 @@ stretch that outlives it is not silently continued. An expired lease is taken
 over on the next run, which mints a new attempt if no selection exists yet
 and otherwise continues the recorded one, reporting the advanced fencing
 token on the outcome. A run that ends before any effect began (a refusal, or
-an error before `prepare-activation`) releases the lease again, so another
-generation of the same project can activate; a refusal whose release failed
-says so in its detail. Once an effect has begun the lease is kept for the
-next run to continue.
+a failure before `prepare-activation` was written, as an authenticated
+manifest readback proves) releases the lease again on a best-effort basis,
+so another generation of the same project can activate; a refusal or
+interruption whose release failed says so in its detail. A cleanup failure
+or a cancelled run can still leave the row behind, and a write whose result
+is uncertain keeps it; the same generation recovers by taking the row over
+on its next run. Once an effect has begun the lease is kept for the next run
+to continue.
 
 ### The daemon restart
 
