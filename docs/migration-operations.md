@@ -150,9 +150,15 @@ PostgreSQL project and alias rows are created only after `--confirm-generation` 
 capture span and after that span's own re-check of the confirmed candidate against the live state,
 so `confirmation-generation-moved` never leaves identity behind; a missing or mismatched token
 leaves them, and the home, as they were. A refusal that can still follow the mint (a failed hold
-entry, a capture, genesis or copy failure) reports `applied: true` with `localProject` (`minted` or
-`persisted`) and `destinationProject` (`created`, `exists` or `not-created`) in its evidence; the
-next `apply` reads both as already present. While a hold exists, `apply` never
+entry, a capture, genesis or copy failure, or an unclassified throw) carries what the identity
+step actually did in its evidence: `localProject` is `minted` (written by this run), `persisted`
+(already there, reused), `not-persisted` or `unknown`; `destinationProject` is `created`,
+`exists` (reused, including a concurrent creator's row), `not-created` or `unknown` (the step
+threw before that stage could report, so its outcome is not known). `applied` is `true` whenever a
+stage reports a real write. On the next `apply`, a minted local entry is read as persisted, and
+the destination is read as present only when the evidence said `created` or `exists`; otherwise
+that run creates it (or reuses whatever an interrupted write left, which `plan` previews as
+`exists`). While a hold exists, `apply` never
 creates either: it reads the persisted local identity and selects the destination project, and
 refuses `local-identity-not-persisted` or `destination-project-absent` (exit 5) rather than
 mint under a hold. Run every command on an existing generation from the migrated project's
