@@ -54,7 +54,6 @@ export type MigrationRouteManifest =
 export type MigrationRouteSnapshot = "absent" | "partial" | "complete" | "replaced" | "tampered" | "unresolvable";
 
 export type MigrationRouteLink =
-  | Readonly<{ kind: "unavailable" }>
   | Readonly<{ kind: "absent" }>
   | Readonly<{ kind: "unresolvable" }>
   | Readonly<{ kind: "present"; publicationId: string }>;
@@ -107,7 +106,7 @@ const EFFECT_KINDS: readonly MigrationEffectKind[] = [
   "publish-activation", "prepare-rollback", "publish-rollback", "abort",
 ];
 const SNAPSHOTS: readonly MigrationRouteSnapshot[] = ["absent", "partial", "complete", "replaced", "tampered", "unresolvable"];
-const LINK_KINDS: readonly string[] = ["unavailable", "absent", "unresolvable", "present"];
+const LINK_KINDS: readonly string[] = ["absent", "unresolvable", "present"];
 const ABORTABLE_PHASES: readonly MigrationPhase[] = ["planned", "dry-run-verified", "copying", "copied", "verified"];
 
 function assertKnown<T extends string>(kind: string, value: unknown, known: readonly T[]): asserts value is T {

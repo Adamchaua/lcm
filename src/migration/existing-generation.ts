@@ -3,12 +3,14 @@ import { observeMigrationMaintenanceJournal, type MigrationJournalObservation } 
 import { MigrationManifestStore } from "./manifest-store.js";
 import { MigrationProtocolError, type MigrationManifest } from "./protocol.js";
 import { classifySqliteSnapshotArtifact } from "./sqlite-snapshot.js";
+import { readActivationGenerationLink, type ActivationGenerationLinkReadResult } from "./activation-artifact-store.js";
 import {
   routeMigrationGeneration,
   type MigrationRoute,
   type MigrationRouteCommand,
   type MigrationRouteInput,
   type MigrationRouteJournal,
+  type MigrationRouteLink,
   type MigrationRouteManifest,
   type MigrationRouteSnapshot,
 } from "./routing.js";
@@ -19,9 +21,10 @@ import {
  * observations the router consumes, and route.
  *
  * Every read here is lock-free and writes nothing: the journal observation,
- * the manifest probe and read, and the snapshot classification. The
- * activation link has no reader on this branch yet (#625), so it is always
- * `unavailable`, which the router treats like `absent`.
+ * the manifest probe and read, the snapshot classification and #625's
+ * three-valued activation link reader. A resolved link names the generation's
+ * own v2 publication, an authoritatively absent one is `absent`, and anything
+ * else is `unresolvable` (exit 5).
  *
  * Fresh plan, apply and standalone dry-run never come through here.
  */
@@ -33,6 +36,8 @@ export type ExistingGenerationContext = Readonly<{
   manifest: MigrationManifest | null;
   /** The snapshot class the route consumed, so `report` can show it. */
   snapshot: MigrationRouteSnapshot;
+  /** The activation link read the route consumed, so `report` can show it. */
+  activationLink: ActivationGenerationLinkReadResult;
   route: MigrationRoute;
 }>;
 
@@ -43,6 +48,7 @@ export type ExistingGenerationResolution =
 export type ExistingGenerationOperations = Readonly<{
   observeJournal: typeof observeMigrationMaintenanceJournal;
   classifySnapshot: typeof classifySqliteSnapshotArtifact;
+  readLink: typeof readActivationGenerationLink;
 }>;
 
 export type ExistingGenerationInput = Readonly<{
@@ -68,11 +74,17 @@ function routeJournal(observation: MigrationJournalObservation): MigrationRouteJ
   return { kind: observation.kind };
 }
 
+function routeLink(result: ActivationGenerationLinkReadResult): MigrationRouteLink {
+  if (result.state === "resolved") return { kind: "present", publicationId: result.link.publicationId };
+  return { kind: result.state === "authoritatively-absent" ? "absent" : "unresolvable" };
+}
+
 export async function resolveExistingMigrationGeneration(
   input: ExistingGenerationInput,
 ): Promise<ExistingGenerationResolution> {
   const observeJournal = input._operationsForTesting?.observeJournal ?? observeMigrationMaintenanceJournal;
   const classifySnapshot = input._operationsForTesting?.classifySnapshot ?? classifySqliteSnapshotArtifact;
+  const readLink = input._operationsForTesting?.readLink ?? readActivationGenerationLink;
   const store = input.manifestStore ?? new MigrationManifestStore({ homeDir: input.homeDir });
 
   const observation = observeJournal({ homeDir: input.homeDir });
@@ -120,12 +132,23 @@ export async function resolveExistingMigrationGeneration(
     snapshot = "unresolvable";
   }
 
+  let activationLink: ActivationGenerationLinkReadResult;
+  try {
+    activationLink = readLink({ homeDir: input.homeDir, generationId });
+  } catch (error) {
+    // The reader is lock-free and three-valued; a raw failure is unresolvable evidence, never absence.
+    activationLink = {
+      state: "unresolvable", reason: "read-unresolvable",
+      detail: error instanceof Error ? error.name : "unknown-link-read-failure",
+    };
+  }
+
   const routeInput: MigrationRouteInput = {
-    journal, resolvedGenerationId: generationId, manifest: manifestRoute, snapshot, link: { kind: "unavailable" },
+    journal, resolvedGenerationId: generationId, manifest: manifestRoute, snapshot, link: routeLink(activationLink),
   };
   return {
     status: "resolved",
-    context: { generationId, journal: observation, manifest, snapshot, route: routeMigrationGeneration(routeInput) },
+    context: { generationId, journal: observation, manifest, snapshot, activationLink, route: routeMigrationGeneration(routeInput) },
   };
 }
 

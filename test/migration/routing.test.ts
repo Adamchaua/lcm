@@ -41,7 +41,6 @@ const ROW_CELLS: ReadonlyArray<readonly [string, MigrationRouteInput, Expectatio
   ["1 snapshot unresolvable", cell({ snapshot: "unresolvable" }), { row: 1, primary: "none", allowed: [], exit: 5 }],
   ["1 link unresolvable", cell({ link: { kind: "unresolvable" } }), { row: 1, primary: "none", allowed: [], exit: 5 }],
   ["2 foreign in-flight publication (link absent)", cell({ journal: publication("map-publishing") }), { row: 2, primary: "none", allowed: [], exit: 4 }],
-  ["2 foreign in-flight publication (link unavailable)", cell({ journal: publication("prepared"), link: { kind: "unavailable" } }), { row: 2, primary: "none", allowed: [], exit: 4 }],
   ["2 foreign in-flight publication (link names another)", cell({ journal: publication("prepared"), link: { kind: "present", publicationId: "other" } }), { row: 2, primary: "none", allowed: [], exit: 4 }],
   ["3 foreign completed publication", cell({ journal: publication("completed") }), { row: 3, primary: "none", allowed: [], exit: 5 }],
   ["3 foreign aborted publication", cell({ journal: publication("aborted") }), { row: 3, primary: "none", allowed: [], exit: 5 }],
@@ -156,7 +155,7 @@ function* everyCell(): Generator<MigrationRouteInput> {
     for (const effect of EFFECTS) manifests.push(manifest(phase, effect));
   }
   const links: MigrationRouteLink[] = [
-    { kind: "unavailable" }, NO_LINK, { kind: "unresolvable" }, OWN_LINK, { kind: "present", publicationId: "other" },
+    NO_LINK, { kind: "unresolvable" }, OWN_LINK, { kind: "present", publicationId: "other" },
   ];
   for (const journal of journals) {
     for (const manifestValue of manifests) {
@@ -210,8 +209,8 @@ describe("totality: every cell of journal x manifest x snapshot x link maps to a
       expect(route.primary).not.toBe("report");
       expect(route.allowed).not.toContain("report");
     }
-    expect(cells).toBe((2 + HOLD_PHASES.length * 2 + PUBLICATION_PHASES.length) * (2 + PHASES_MANIFEST.length * (1 + EFFECTS.length)) * SNAPSHOTS.length * 5);
-    // An exhaustive in-process enumeration (about 86,000 cells), so it is given an explicit budget
+    expect(cells).toBe((2 + HOLD_PHASES.length * 2 + PUBLICATION_PHASES.length) * (2 + PHASES_MANIFEST.length * (1 + EFFECTS.length)) * SNAPSHOTS.length * 4);
+    // An exhaustive in-process enumeration (about 69,000 cells), so it is given an explicit budget
     // rather than the 5 s default, which coverage instrumentation exceeds.
   }, 120_000);
 

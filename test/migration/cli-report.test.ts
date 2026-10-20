@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { writeFileSync } from "node:fs";
+import { createServer } from "node:net";
+import { join } from "node:path";
 import {
   NOT_AVAILABLE_IN_THIS_BUILD,
   performMigrationReportCommand,
@@ -250,6 +253,13 @@ describe("report: the restart matrix, with the PID evidence and the daemon backe
 
   it("with the real checker and presence classifier, an empty home has no daemon and is satisfied", async () => {
     const home = await selected();
+    // The home's own configured port must be one nothing answers on, or a daemon running on the host's default port is observed instead.
+    const server = createServer();
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("expected a TCP listener");
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    writeFileSync(join(home, ".lcm", "config.json"), JSON.stringify({ daemon: { port: address.port } }), { mode: 0o600 });
     const result = await performMigrationReportCommand({ homeDir: home, _resolution: resolution });
     expect(result.reason).toBeUndefined();
     expect(result.restart).toEqual({ answer: "satisfied", presence: "absent" });

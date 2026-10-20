@@ -178,12 +178,74 @@ describe("resolveExistingMigrationGeneration", () => {
     const result = await resolveExistingMigrationGeneration({ homeDir: home(), generation: GEN });
     expect(result).toEqual({ status: "refuse", reason: "generation-unknown" });
   });
+
+  describe("the activation link feeds the router (plan-v5 Part B (1))", () => {
+    const ownPublication = (phase: "releasing" | "completed"): MigrationJournalObservation =>
+      ({ kind: "publication", publicationId: "pub-1", phase });
+    const linkResult = (publicationId: string) => ({
+      state: "resolved" as const, path: "/ignored",
+      link: { version: 1, generationId: GEN, publicationId, identityDigest: "d".repeat(64), epochManifestRevision: 4, epochManifestChecksumSha256: "e".repeat(64) },
+    }) as never;
+
+    async function resolveWith(readLink: () => never, observation: MigrationJournalObservation) {
+      const homeDir = home();
+      const store = new MigrationManifestStore({ homeDir });
+      store.create(planned());
+      const result = await resolveExistingMigrationGeneration({
+        homeDir, generation: GEN, manifestStore: store,
+        _operationsForTesting: { observeJournal: () => observation, classifySnapshot: absentSnapshot, readLink },
+      });
+      if (result.status !== "resolved") throw new Error("unreachable");
+      return result.context;
+    }
+
+    it("a resolved link naming the journal's publication makes it the generation's own (a foreign one is row 2)", async () => {
+      const own = await resolveWith(() => linkResult("pub-1"), ownPublication("releasing"));
+      expect(own.activationLink.state).toBe("resolved");
+      expect(own.route.row).not.toBe(2);
+      const foreign = await resolveWith(() => linkResult("other"), ownPublication("releasing"));
+      expect(foreign.route.row).toBe(2);
+    });
+
+    it("an authoritatively absent link routes as absent", async () => {
+      const context = await resolveWith(() => ({ state: "authoritatively-absent", detail: "none" }) as never, ownPublication("releasing"));
+      expect(context.activationLink.state).toBe("authoritatively-absent");
+      expect(context.route.row).toBe(2);
+    });
+
+    it("an unresolvable link is row 1 (exit 5), never absence", async () => {
+      const context = await resolveWith(
+        () => ({ state: "unresolvable", reason: "multi-link", detail: "x" }) as never, ownPublication("releasing"),
+      );
+      expect(context.route.row).toBe(1);
+    });
+
+    it("a reader that throws is unresolvable evidence carrying only the error name", async () => {
+      const context = await resolveWith(() => { throw new TypeError("boom with /secret/path"); }, ownPublication("releasing"));
+      expect(context.activationLink).toEqual({ state: "unresolvable", reason: "read-unresolvable", detail: "TypeError" });
+      expect(context.route.row).toBe(1);
+      const unnamed = await resolveWith(() => { throw "not an error"; }, ownPublication("releasing"));
+      expect(unnamed.activationLink).toMatchObject({ detail: "unknown-link-read-failure" });
+    });
+
+    it("reads the real link store when none is injected: an empty home has none", async () => {
+      const homeDir = home();
+      const store = new MigrationManifestStore({ homeDir });
+      store.create(planned());
+      const result = await resolveExistingMigrationGeneration({
+        homeDir, generation: GEN, manifestStore: store,
+        _operationsForTesting: { observeJournal: () => hold("maintenance-held"), classifySnapshot: complete },
+      });
+      if (result.status !== "resolved") throw new Error("unreachable");
+      expect(result.context.activationLink.state).toBe("authoritatively-absent");
+    });
+  });
 });
 
 describe("refuseUnlessRouted", () => {
   const base: MigrationRouteInput = {
     journal: { kind: "hold", phase: "maintenance-held", generationId: GEN }, resolvedGenerationId: GEN,
-    manifest: { kind: "absent" }, snapshot: "absent", link: { kind: "unavailable" },
+    manifest: { kind: "absent" }, snapshot: "absent", link: { kind: "absent" },
   };
   const route = (overrides: Partial<MigrationRouteInput>) => routeMigrationGeneration({ ...base, ...overrides });
 
