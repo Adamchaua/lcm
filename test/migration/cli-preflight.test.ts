@@ -547,6 +547,14 @@ describe("resolveMigrationExpectedIdentity (the minting step, taken only after a
     expect(ops.lookupTargetProject).not.toHaveBeenCalled();
   });
 
+  it("fresh: a caller already inside the append barrier hands its token to the local mint instead of taking the consumer lock", async () => {
+    const ops = mintOps();
+    const token = { barrier: true };
+    const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", publicationLockToken: token, _operationsForTesting: ops });
+    expect(result).toMatchObject({ status: "resolved" });
+    expect(ops.resolveLocalIdentity).toHaveBeenCalledWith("/c", { homeDir: "/h", _publicationLockToken: token });
+  });
+
   it("fresh: propagates the destination resolver's own refusal", async () => {
     const ops = mintOps({ resolveTargetIdentity: async () => ({ status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" }) });
     const result = await resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops });

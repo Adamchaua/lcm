@@ -166,7 +166,10 @@ export function renderMigrationApplyEnvelope(outcome: MigrationApplyOutcome): Mi
       command: "apply",
       reason: outcome.reason,
       evidenceDetail: outcome.evidence,
-      applied: APPLY_REASONS_WITH_DURABLE_MUTATION.has(outcome.reason),
+      // A refusal after the identity step wrote says so itself; every other
+      // apply refusal is classified by its reason.
+      applied: outcome.applied ?? APPLY_REASONS_WITH_DURABLE_MUTATION.has(outcome.reason),
+      sections: outcome.identity,
     });
   }
   return okEnvelope({

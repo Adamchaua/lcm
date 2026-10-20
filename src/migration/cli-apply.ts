@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   resolveMigrationExpectedIdentity,
   resolveMigrationPreflight,
+  type MigrationExpectedIdentityResult,
   type MigrationIdentityPreview,
   type MigrationPreflightResult,
   migrationIdentityPreview,
@@ -54,6 +55,15 @@ import type { BackendPublicationCoordinator } from "../storage/backend-publicati
  * the envelope reports the confirmed candidate with `applied: false`,
  * proved not to reach a mutating seam because `performMigrationApplyThroughCapture`
  * is never called on that path.
+ *
+ * **The identity step runs inside the capture span** (plan-v5 Part B (3)).
+ * For a fresh generation the span mints the local map entry and the
+ * destination project only after its own re-check of the confirmed
+ * candidate, so `confirmation-generation-moved` never leaves identity
+ * behind. The refusals that can still follow a mint (a failed hold entry,
+ * a capture, genesis or copy failure) carry what was minted: the envelope
+ * then reports `applied: true` with `localProject` and `destinationProject`
+ * evidence, and the next `apply` reads both as already persisted.
  */
 
 export const DEFAULT_MIGRATION_APPLY_MAX_RECORDS = 500;
@@ -76,7 +86,48 @@ export type MigrationApplyOutcome =
     /** Present only for `--dry-run`: what apply would mint, reported without minting it. */
     identityPreview?: MigrationIdentityPreview;
   }>
-  | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
+  | Readonly<{
+    status: "refuse";
+    reason: string;
+    evidence?: string;
+    /** Set when the identity step already wrote durably before this refusal. */
+    applied?: boolean;
+    /** What the identity step left behind, whenever it ran on the fresh path. */
+    identity?: MigrationApplyIdentityMutation;
+  }>;
+
+/**
+ * What a fresh `apply`'s identity step left behind, derived from the
+ * preview taken before it ran and its own answer: a local map entry that was
+ * `not-persisted` is `minted` once the step ran at all (the local write
+ * precedes the destination resolution), and a destination that
+ * `will-be-created-at-apply` is `created` only when the step resolved.
+ */
+export type MigrationApplyIdentityMutation = Readonly<{
+  localProject: "minted" | "persisted";
+  destinationProject: "created" | "exists" | "not-created";
+}>;
+
+export function migrationApplyIdentityMutation(
+  preview: MigrationIdentityPreview,
+  result: MigrationExpectedIdentityResult,
+): MigrationApplyIdentityMutation {
+  return {
+    localProject: preview.localProject === "persisted" ? "persisted" : "minted",
+    destinationProject: preview.destinationProject === "exists"
+      ? "exists"
+      : result.status === "resolved" ? "created" : "not-created",
+  };
+}
+
+type ApplyRefusal = Extract<MigrationApplyOutcome, { status: "refuse" }>;
+
+/** A refusal after the identity step reports what the step wrote, and `applied` when it wrote at all. */
+function withIdentityMutation(refusal: ApplyRefusal, mutation: MigrationApplyIdentityMutation | undefined): ApplyRefusal {
+  if (mutation === undefined) return refusal;
+  const wrote = mutation.localProject === "minted" || mutation.destinationProject === "created";
+  return { ...refusal, ...(wrote ? { applied: true } : {}), identity: mutation };
+}
 
 export type MigrationApplyOperations = Readonly<{
   performCapture: typeof performMigrationApplyThroughCapture;
@@ -153,10 +204,12 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
     };
   }
 
-  // Only now, past the fence, may anything be minted (plan-v5 Part B (3)).
-  const identity = await resolveExpectedIdentity({ preflight, cwd: input.cwd, homeDir: input.homeDir });
-  if (identity.status === "refuse") return identity;
-
+  // Past the fence, the capture span runs the identity step under its own
+  // token, after its re-check of the confirmed candidate (plan-v5 Part B
+  // (3)). The span names the path it actually found; a held journal only
+  // reads. The fresh mint is recorded here so every later refusal reports it.
+  const preview = migrationIdentityPreview(preflight);
+  let mutation: MigrationApplyIdentityMutation | undefined;
   const captureResult: MigrationApplyThroughCaptureOutcome = await performCapture({
     cwd: input.cwd,
     homeDir: input.homeDir,
@@ -165,9 +218,25 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
     coordinator: input.coordinator,
     manifestStore: input.manifestStore,
     now: input.now,
+    resolveExpectedIdentity: async (token, path) => {
+      const result = await resolveExpectedIdentity({
+        preflight: path === "fresh" ? preflight : { ...preflight, candidate: { disposition: "continue-held" } },
+        cwd: input.cwd,
+        homeDir: input.homeDir,
+        publicationLockToken: token,
+      });
+      if (path === "fresh") mutation = migrationApplyIdentityMutation(preview, result);
+      return result;
+    },
   });
   if (captureResult.status === "refuse") {
-    return captureResult;
+    return withIdentityMutation(captureResult, mutation);
+  }
+  const expectedIdentity = captureResult.expectedIdentity;
+  if (expectedIdentity === undefined) {
+    // The span never ran the identity step it was given. Unreachable through
+    // the real span; refused rather than copying under an unknown identity.
+    return withIdentityMutation({ status: "refuse", reason: MIGRATION_UNEXPECTED_FAILURE_REASON, evidence: "identity-not-resolved" }, mutation);
   }
 
   const ownerProcessId = mintOwnerProcessId();
@@ -178,7 +247,7 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
     maintenanceChecksumSha256: captureResult.maintenanceChecksumSha256,
     settings: preflight.targetConfig.postgresql,
     expectedOwner: preflight.targetConfig.postgresql.migrationRole,
-    expectedIdentity: identity.expectedIdentity,
+    expectedIdentity,
     ownerProcessId,
     maxRecords: input.maxRecords ?? DEFAULT_MIGRATION_APPLY_MAX_RECORDS,
     maxBytes: input.maxBytes ?? DEFAULT_MIGRATION_APPLY_MAX_BYTES,
@@ -186,7 +255,7 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
     now: input.now,
   });
   if (genesisCopyResult.status === "refuse") {
-    return genesisCopyResult;
+    return withIdentityMutation(genesisCopyResult, mutation);
   }
 
   // Plan section 5.1 / round-1 A-16: the manifest head is read back, and the
@@ -196,14 +265,14 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
   try {
     head = manifestStore.read(captureResult.generationId);
   } catch (error) {
-    return {
+    return withIdentityMutation({
       status: "refuse",
       reason: "manifest-unresolvable",
       evidence: error instanceof MigrationProtocolError ? `manifest-${error.reason}` : "manifest-internal-error",
-    };
+    }, mutation);
   }
   if (head.phase !== genesisCopyResult.result.phase) {
-    return { status: "refuse", reason: "copy-failed", evidence: "manifest-readback-mismatch" };
+    return withIdentityMutation({ status: "refuse", reason: "copy-failed", evidence: "manifest-readback-mismatch" }, mutation);
   }
 
   return {

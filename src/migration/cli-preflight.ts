@@ -4,6 +4,7 @@ import { hashProjectPath, normalizeProjectPath, readProjectMapIdentity, resolveP
 import { resolveGitProjectAnchor } from "../git-project.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import type { ResolvedPostgreSqlConfig } from "../daemon/config.js";
+import type { BackendPublicationLockToken } from "../storage/backend-publication.js";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
 import { PostgreSqlIdentityRepository } from "../storage/postgresql/identity-repository.js";
 import { requireMachineIdentity, MachineIdentityFileError } from "../machine-identity.js";
@@ -285,7 +286,9 @@ export type MigrationExpectedIdentityResult =
  * - **fresh**: no hold exists, so this is the only place anything is minted.
  *   The local map entry is written with the home passed through
  *   (`resolveProjectIdentity` with `homeDir`), then the destination project
- *   is resolved or created.
+ *   is resolved or created. `apply` runs this inside its capture span, under
+ *   the span's own publication token, only after the span re-checked the
+ *   confirmed candidate, so a moved candidate refuses before either mint.
  * - **recover-entering** and **continue-held**: a hold is live, so nothing is
  *   minted under it. The local identity must already be persisted
  *   (`readProjectMapIdentity`: no consumer lock, no write, no backfill), and
@@ -302,6 +305,12 @@ export async function resolveMigrationExpectedIdentity(input: Readonly<{
     & Readonly<{ candidate: Pick<Extract<MigrationPreflightResult, { status: "ready" }>["candidate"], "disposition"> }>;
   cwd: string;
   homeDir: string;
+  /**
+   * The publication token of a caller already inside the append barrier
+   * (`apply`'s capture span). The fresh mint then reuses that admission
+   * instead of taking the consumer lock the barrier already holds.
+   */
+  publicationLockToken?: BackendPublicationLockToken;
   /** @internal Deterministic failure-injection seam for tests only. */
   _operationsForTesting?: Partial<MigrationExpectedIdentityOperations>;
 }>): Promise<MigrationExpectedIdentityResult> {
@@ -316,7 +325,10 @@ export async function resolveMigrationExpectedIdentity(input: Readonly<{
 
   let local: Readonly<{ id: string; canonical: string }>;
   if (fresh) {
-    local = resolveLocalIdentity(input.cwd, { homeDir: input.homeDir });
+    local = resolveLocalIdentity(input.cwd, {
+      homeDir: input.homeDir,
+      ...(input.publicationLockToken === undefined ? {} : { _publicationLockToken: input.publicationLockToken }),
+    });
   } else {
     let persisted: ReturnType<typeof readProjectMapIdentity>;
     try {

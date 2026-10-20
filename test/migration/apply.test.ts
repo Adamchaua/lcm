@@ -6,7 +6,9 @@ import {
   performMigrationApplyThroughCapture,
   maintenanceOnlyDriver,
   MIGRATION_DRIVER_NOT_INVOKED_MESSAGE,
+  type MigrationApplyIdentityResolver,
 } from "../../src/migration/apply.js";
+import { resolveMigrationExpectedIdentity } from "../../src/migration/cli-preflight.js";
 import { resolveMigrationApplyCandidate } from "../../src/migration/candidate.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import {
@@ -38,7 +40,7 @@ import {
   type BackendPublicationRecoveryMaterial,
 } from "../../src/storage/backend-publication.js";
 import { closeLcmConnection } from "../../src/db/connection.js";
-import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
+import { clearProjectMapCache, projectMapPath, readProjectMapIdentity } from "../../src/project-map.js";
 import type { IdentityRepository } from "../../src/identity-service.js";
 
 /**
@@ -1030,5 +1032,126 @@ describe("performMigrationApplyThroughCapture, round-1 fixes (A-3/B-2, A-7, B-5,
       _operationsForTesting: { captureSource: async () => ({}) as never },
     });
     expect(result).toEqual({ status: "refuse", reason: "capture-failed", evidence: "queue-evidence-not-rebound" });
+  });
+});
+
+describe("performMigrationApplyThroughCapture, the identity step inside the span (Codex PR #1653 P2: no mint before the span's own refusals)", () => {
+  const IDENTITY = {
+    id: "remote-project-1", localProjectId: "local-1", canonical: "/tmp/project", remoteProjectId: "remote-project-1",
+    machineId: REGISTERED_MACHINE, selectedPath: "/tmp/project",
+  };
+  function recorder(result: Awaited<ReturnType<MigrationApplyIdentityResolver>> = { status: "resolved", expectedIdentity: IDENTITY }) {
+    const calls: Array<{ path: string; token: unknown }> = [];
+    const resolve: MigrationApplyIdentityResolver = async (token, path) => { calls.push({ path, token }); return result; };
+    return { calls, resolve };
+  }
+  function occupy(homeDir: string, generationId: string): void {
+    new MigrationManifestStore({ homeDir }).create(createMigrationManifest({
+      generationId,
+      source: manifestWitness("1".repeat(64)),
+      destination: manifestWitness("2".repeat(64), "postgresql"),
+      parentGenerationId: null,
+      preservedSourceGenerationId: generationId,
+      createdAt: "2026-08-12T12:00:00.000Z",
+    }));
+  }
+  class ThrowingEnterCoordinator extends BackendPublicationCoordinator {
+    constructor(homeDir: string, private readonly failure: Error) {
+      super({ homeDir, driver: maintenanceOnlyDriver() });
+    }
+    override async enterMaintenance(): Promise<BackendMaintenanceJournal> {
+      throw this.failure;
+    }
+  }
+
+  it("a moved confirmed candidate (real occupier) refuses before the identity step ever runs", async () => {
+    const fixture = await enrolled();
+    const confirmed = `${fixture.base}-0`;
+    occupy(fixture.homeDir, confirmed);
+    const identity = recorder();
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      confirmGenerationId: confirmed, resolveExpectedIdentity: identity.resolve,
+    });
+    expect(result).toEqual({ status: "refuse", reason: "confirmation-generation-moved" });
+    expect(identity.calls).toEqual([]);
+    expect(readProjectMapIdentity({ homeDir: fixture.homeDir, cwd: fixture.cwd })).toBeNull();
+  });
+
+  it("a failed hold entry refuses after the fresh identity step ran exactly once under the span's token, so the caller can report the mint", async () => {
+    const fixture = await enrolled();
+    const identity = recorder();
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base,
+      coordinator: new ThrowingEnterCoordinator(fixture.homeDir, new PrivateMutationLockContentionError("contended")),
+      resolveExpectedIdentity: identity.resolve,
+    });
+    expect(result).toEqual({ status: "refuse", reason: "hold-entry-contention", evidence: "lock-contention" });
+    expect(identity.calls.map((call) => call.path)).toEqual(["fresh"]);
+    expect(typeof identity.calls[0]!.token).toBe("object");
+  });
+
+  it("a fresh identity refusal is the span's own refusal, before any hold is written", async () => {
+    const fixture = await enrolled();
+    const identity = recorder({ status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" });
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      resolveExpectedIdentity: identity.resolve,
+    });
+    expect(result).toEqual({ status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" });
+    expect(readBackendMaintenanceJournal(fixture.homeDir)).toBeNull();
+    const bare = recorder({ status: "refuse", reason: "local-identity-not-persisted" });
+    expect(await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      resolveExpectedIdentity: bare.resolve,
+    })).toEqual({ status: "refuse", reason: "local-identity-not-persisted" });
+  });
+
+  it("the real fresh mint runs under the barrier token: the map entry appears, the hold and capture bind to the minted selection, and the captured outcome carries the identity", async () => {
+    const fixture = await enrolled();
+    expect(readProjectMapIdentity({ homeDir: fixture.homeDir, cwd: fixture.cwd })).toBeNull();
+    const beforeMint = authenticateSqliteMigrationSource(fixture.cwd, fixture.homeDir).sourceSelectionSha256;
+    const resolveTargetIdentity = vi.fn(async () => ({ status: "resolved" as const, projectId: "minted-project" }));
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      resolveExpectedIdentity: (token, path) => resolveMigrationExpectedIdentity({
+        preflight: {
+          targetConfig: fixture.request.targetConfig, machineId: REGISTERED_MACHINE,
+          candidate: { disposition: path === "fresh" ? "fresh" : "continue-held" },
+        },
+        cwd: fixture.cwd, homeDir: fixture.homeDir, publicationLockToken: token,
+        _operationsForTesting: { createIdentityRuntime: () => ({ close: async () => undefined }) as never, resolveTargetIdentity },
+      }),
+    });
+    expect(result).toMatchObject({ status: "captured", generationId: `${fixture.base}-0`, expectedIdentity: { id: "minted-project", localProjectId: fixture.local.id, canonical: fixture.local.canonical } });
+    const persisted = readProjectMapIdentity({ homeDir: fixture.homeDir, cwd: fixture.cwd });
+    expect(persisted).toMatchObject({ id: fixture.local.id, canonical: fixture.local.canonical });
+    expect(resolveTargetIdentity).toHaveBeenCalledOnce();
+    // The hold's source selection is the minted map's, not the unmapped
+    // one the preflight-era read computed; capture itself re-authenticated
+    // under the token and verified the journal against that selection.
+    const journal = readBackendMaintenanceJournal(fixture.homeDir)!;
+    expect(journal.sourceSelectionSha256).not.toBe(beforeMint);
+    expect(journal.generationId).toBe(`${fixture.base}-0`);
+    expect((await classifySqliteSnapshotArtifact(journal.generationId, { homeDir: fixture.homeDir })).state).toBe("complete");
+  });
+
+  it("a held continuation runs the read-only identity step inside its barrier and carries its answer; its refusal stops before capture", async () => {
+    const fixture = await enrolled();
+    const coordinator = coordinatorFor(fixture.homeDir);
+    const first = await capture({ cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator });
+    expect(first).toMatchObject({ status: "captured" });
+    expect(first).not.toHaveProperty("expectedIdentity");
+    const identity = recorder();
+    const again = await capture({ cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator, resolveExpectedIdentity: identity.resolve });
+    expect(again).toMatchObject({ status: "captured", generationId: `${fixture.base}-0`, expectedIdentity: IDENTITY });
+    expect(identity.calls.map((call) => call.path)).toEqual(["held"]);
+    const refused = recorder({ status: "refuse", reason: "destination-project-absent" });
+    const captureSource = vi.fn(captureAuthenticatedSqliteMigrationSource);
+    expect(await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator, resolveExpectedIdentity: refused.resolve,
+      _operationsForTesting: { captureSource },
+    })).toEqual({ status: "refuse", reason: "destination-project-absent" });
+    expect(captureSource).not.toHaveBeenCalled();
   });
 });

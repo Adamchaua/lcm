@@ -146,8 +146,13 @@ sees the same closed vocabulary regardless of how the token went missing. The id
 rather than silently applying against a different generation.
 
 **Nothing is written before that fence.** The local project map entry and the destination
-PostgreSQL project and alias rows are created only after `--confirm-generation` matches; a missing
-or mismatched token leaves them, and the home, as they were. While a hold exists, `apply` never
+PostgreSQL project and alias rows are created only after `--confirm-generation` matches, inside the
+capture span and after that span's own re-check of the confirmed candidate against the live state,
+so `confirmation-generation-moved` never leaves identity behind; a missing or mismatched token
+leaves them, and the home, as they were. A refusal that can still follow the mint (a failed hold
+entry, a capture, genesis or copy failure) reports `applied: true` with `localProject` (`minted` or
+`persisted`) and `destinationProject` (`created`, `exists` or `not-created`) in its evidence; the
+next `apply` reads both as already present. While a hold exists, `apply` never
 creates either: it reads the persisted local identity and selects the destination project, and
 refuses `local-identity-not-persisted` or `destination-project-absent` (exit 5) rather than
 mint under a hold. Run every command on an existing generation from the migrated project's

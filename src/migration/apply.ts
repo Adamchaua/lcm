@@ -31,6 +31,8 @@ import { PrivateMutationLockContentionError } from "../private-mutation-lock.js"
 import { classifyMigrationAbortGate } from "./abort.js";
 import { MigrationManifestStore } from "./manifest-store.js";
 import type { AuthenticatedSqliteMigrationSnapshot } from "./queue-evidence.js";
+import type { MigrationExpectedIdentityResult } from "./cli-preflight.js";
+import type { StorageIdentityContext } from "../storage/contracts.js";
 
 /**
  * The section 4.2-4.8 entry point through capture: journal resolution
@@ -117,8 +119,26 @@ export function maintenanceOnlyDriver(): BackendPublicationDriver {
 
 
 export type MigrationApplyThroughCaptureOutcome =
-  | Readonly<{ status: "captured"; generationId: string; maintenanceChecksumSha256: string; snapshot: AuthenticatedSqliteMigrationSnapshot }>
+  | Readonly<{
+    status: "captured";
+    generationId: string;
+    maintenanceChecksumSha256: string;
+    snapshot: AuthenticatedSqliteMigrationSnapshot;
+    /** The identity step's answer, present whenever `resolveExpectedIdentity` was given. */
+    expectedIdentity?: StorageIdentityContext;
+  }>
   | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
+
+/**
+ * Which span the identity step runs in: `fresh` mints (plan-v5 Part B (3)),
+ * `held` only reads. The span decides, from the journal it actually found,
+ * never the preflight's earlier disposition.
+ */
+export type MigrationApplyIdentityPath = "fresh" | "held";
+export type MigrationApplyIdentityResolver = (
+  token: BackendPublicationLockToken,
+  path: MigrationApplyIdentityPath,
+) => Promise<MigrationExpectedIdentityResult>;
 
 export type MigrationApplyOperations = Readonly<{
   resolveHoldContinuation: typeof resolveMigrationHoldContinuation;
@@ -146,6 +166,18 @@ export type MigrationApplyThroughCaptureInput = Readonly<{
   now?: Date;
   coordinator?: BackendPublicationCoordinator;
   /**
+   * The identity step (plan-v5 Part B (3)), run exactly once under the
+   * span's own token before the first authenticated source read. On the
+   * fresh path it runs only after the confirmed candidate was re-checked
+   * against the live probe, so `confirmation-generation-moved` and every
+   * journal-resolution refusal happen before anything is minted; the
+   * authenticated read that follows then sees the minted map entry, which
+   * is what the hold's source selection and capture's witness are bound to.
+   * Its refusal is returned as this span's own. Absent, nothing is resolved
+   * and the captured outcome carries no identity.
+   */
+  resolveExpectedIdentity?: MigrationApplyIdentityResolver;
+  /**
    * @internal Deterministic failure-injection seam for tests only, matching
    * the `_operationsForTesting` convention used elsewhere in
    * `src/migration/` (see `sqlite-snapshot.ts`, `maintenance.ts`,
@@ -160,18 +192,45 @@ export type MigrationApplyThroughCaptureInput = Readonly<{
   _operationsForTesting?: Partial<MigrationApplyOperations>;
 }>;
 
+type IdentityStep =
+  | Readonly<{ status: "resolved"; expectedIdentity?: StorageIdentityContext }>
+  | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
+
+async function resolveIdentityUnderBarrier(
+  input: MigrationApplyThroughCaptureInput,
+  token: BackendPublicationLockToken,
+  path: MigrationApplyIdentityPath,
+): Promise<IdentityStep> {
+  if (input.resolveExpectedIdentity === undefined) return { status: "resolved" };
+  const identity = await input.resolveExpectedIdentity(token, path);
+  if (identity.status === "refuse") {
+    return { status: "refuse", reason: identity.reason, ...(identity.evidence === undefined ? {} : { evidence: identity.evidence }) };
+  }
+  return { status: "resolved", expectedIdentity: identity.expectedIdentity };
+}
+
 /**
  * The shared tail every disposition eventually reaches: authenticate under
  * the retained token, capture, and report. Never called on a journal that
  * has not just been durably confirmed `maintenance-held` by its caller —
- * this function does not itself write or verify the hold.
+ * this function does not itself write or verify the hold. A held caller
+ * leaves `identity` undefined and the read-only identity step runs here;
+ * the fresh path resolved (minted) before its hold and passes the answer.
  */
 async function captureUnderBarrier(
   input: MigrationApplyThroughCaptureInput,
   generationId: string,
   maintenanceChecksumSha256: string,
   token: BackendPublicationLockToken,
+  identity?: Extract<IdentityStep, { status: "resolved" }>,
 ): Promise<MigrationApplyThroughCaptureOutcome> {
+  let resolved = identity;
+  if (resolved === undefined) {
+    const step = await resolveIdentityUnderBarrier(input, token, "held");
+    if (step.status === "refuse") return step;
+    resolved = step;
+  }
+  const expectedIdentity = resolved.expectedIdentity;
   try {
     const authority = authenticateSqliteMigrationSource(input.cwd, input.homeDir, token);
     const expectedSourceBytes = await authenticateSqliteMigrationSourceBytes(authority, {
@@ -201,7 +260,10 @@ async function captureUnderBarrier(
     if (rebound === null || rebound.queueEvidenceSha256 === sentinel) {
       return { status: "refuse", reason: "capture-failed", evidence: "queue-evidence-not-rebound" };
     }
-    return { status: "captured", generationId, maintenanceChecksumSha256, snapshot };
+    return {
+      status: "captured", generationId, maintenanceChecksumSha256, snapshot,
+      ...(expectedIdentity === undefined ? {} : { expectedIdentity }),
+    };
   } catch (error) {
     // Round-1 A-9: classify by the actual failure, not by the fact that
     // something threw. Contention is a retry (exit 4), a journal failure
@@ -276,6 +338,13 @@ async function freshCutoverUnderBarrier(
     return { status: "refuse", reason: "confirmation-generation-moved" };
   }
 
+  // Plan-v5 Part B (3): only now, with the confirmed candidate re-checked
+  // and nothing else left to refuse before the hold needs the map, may the
+  // identity be minted. The authenticated read below must see the minted
+  // entry: the hold's source selection and capture's witness bind to it.
+  const identity = await resolveIdentityUnderBarrier(input, token, "fresh");
+  if (identity.status === "refuse") return identity;
+
   const authority = authenticateSqliteMigrationSource(input.cwd, input.homeDir, token);
   if (authority.projectIdentity.scope !== "local") {
     // Section 4.4: a multi-machine installation is refused with a distinct
@@ -311,7 +380,7 @@ async function freshCutoverUnderBarrier(
     return { status: "refuse", reason: "hold-entry-readback-mismatch" };
   }
 
-  return captureUnderBarrier(input, heldJournal.generationId, heldJournal.checksumSha256, token);
+  return captureUnderBarrier(input, heldJournal.generationId, heldJournal.checksumSha256, token, identity);
 }
 
 /**

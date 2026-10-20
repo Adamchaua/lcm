@@ -131,6 +131,24 @@ describe("renderMigrationApplyEnvelope", () => {
     const envelope = renderMigrationApplyEnvelope({ status: "refuse", reason: "confirmation-missing" });
     expect(envelope.applied).toBe(false);
   });
+
+  it("a refusal that says the identity step wrote reports applied: true and what it left behind, overriding the reason's own class (Codex PR #1653 P2)", () => {
+    const envelope = renderMigrationApplyEnvelope({
+      status: "refuse", reason: "hold-entry-contention", evidence: "lock-contention", applied: true,
+      identity: { localProject: "minted", destinationProject: "created" },
+    });
+    expect(envelope.applied).toBe(true);
+    expect(envelope.exitCode).toBe(4);
+    expect(envelope.evidence).toEqual({ localProject: "minted", destinationProject: "created", detail: "lock-contention" });
+  });
+
+  it("a refusal that found the identity already present keeps the reason's class and still names what it read", () => {
+    const envelope = renderMigrationApplyEnvelope({
+      status: "refuse", reason: "hold-entry-contention", identity: { localProject: "persisted", destinationProject: "exists" },
+    });
+    expect(envelope.applied).toBe(false);
+    expect(envelope.evidence).toEqual({ localProject: "persisted", destinationProject: "exists" });
+  });
 });
 
 describe("renderMigrationApplyEnvelope, applied and presence evidence (round-1 A-2/B-6, A-8)", () => {
