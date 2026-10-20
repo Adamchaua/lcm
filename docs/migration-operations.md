@@ -558,6 +558,12 @@ pre-checks nor softens it. Moving several projects at once is separate, planned 
 `activate` likewise refuses a machine that has stored data for more than one project
 (`uncovered-projects`).
 
+**Which role it connects as.** `rollback` opens PostgreSQL with the configured `storage.postgresql`
+settings and holds them to the daemon's readiness rules, so it is meant to run after the grant swap,
+as the runtime role. A role that does not pass that readiness check, such as the transfer role
+before the swap, makes it refuse `rollback-refused-evidence` (the evidence names
+`unexpected-state`) with nothing changed.
+
 After a rollback the daemon must run on SQLite again. `rollback` runs the same two-observation
 restart check `report` does, against `sqlite`; exit 8 means a running daemon still holds
 `postgresql`.
