@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
+import { withBackendPublicationAppendBarrierAsync } from "../storage/backend-publication.js";
 import { MigrationManifestStore } from "./manifest-store.js";
 import { MigrationProtocolError, type MigrationManifest } from "./protocol.js";
 import {
@@ -239,8 +240,9 @@ async function buildFreshInputs(args: Readonly<{
   const destination = await (ops?.resolveDestination ?? resolveMigrationDestination)({ cwd: input.cwd, homeDir: input.homeDir });
   if (destination.status === "refuse") return refuse(destination.reason, destination.evidence);
   const { expectedIdentity } = destination;
+  const { localProjectId, remoteProjectId } = expectedIdentity;
   // A resolved identity always names its local project; this guards the type, not a reachable state.
-  if (expectedIdentity.localProjectId === undefined || expectedIdentity.remoteProjectId === undefined) {
+  if (localProjectId === undefined || remoteProjectId === undefined) {
     return refuse("verify-invalid-input", "identity-incomplete");
   }
 
@@ -261,13 +263,18 @@ async function buildFreshInputs(args: Readonly<{
 
   let projectMapWitnessSha256: string;
   try {
-    projectMapWitnessSha256 = (ops?.computeProjectMapWitness ?? computeMigrationProjectMapWitnessSha256)({
-      homeDir: input.homeDir,
-      localProjectId: expectedIdentity.localProjectId,
-      remoteProjectId: expectedIdentity.remoteProjectId,
-      mode: "pre-publication",
-    });
+    // Under a maintenance hold the project map is read under the source append barrier's token,
+    // exactly as the activation reads the same witness; without it the consumer lock is fenced.
+    projectMapWitnessSha256 = await withBackendPublicationAppendBarrierAsync(input.homeDir, (token) =>
+      (ops?.computeProjectMapWitness ?? computeMigrationProjectMapWitnessSha256)({
+        homeDir: input.homeDir,
+        localProjectId,
+        remoteProjectId,
+        mode: "pre-publication",
+        publicationLockToken: token,
+      }));
   } catch (error) {
+    if (error instanceof PrivateMutationLockContentionError) return refuse("verify-contention");
     if (error instanceof MigrationProjectMapWitnessError) {
       return refuse(error.reason === "project-map-drift" ? "verify-project-map-drift"
         : error.reason === "project-map-unresolvable" ? "verify-project-map-unresolvable" : "verify-invalid-input");

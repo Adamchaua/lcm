@@ -244,8 +244,10 @@ describe("verify row 22: the fresh computation (plan-v4 section 5), every input 
       evidence: { cell: 22, activationEligible: true, coordinationEffects: "verification-lease,source-append-barrier" },
     });
     expect(existsSync(scratch)).toBe(false);
+    // Read under the source append barrier's token, as the activation reads the same witness.
     expect(witness).toHaveBeenCalledWith({
       homeDir: home, localProjectId: IDENTITY.localProjectId, remoteProjectId: IDENTITY.remoteProjectId, mode: "pre-publication",
+      publicationLockToken: expect.anything(),
     });
     expect(verify.mock.calls[0]![0]).toEqual({
       generationId: FIXTURE_GENERATION,
@@ -362,6 +364,12 @@ describe("verify row 22: the fresh computation (plan-v4 section 5), every input 
     expect(result).toEqual({ status: "refuse", reason, generationId: FIXTURE_GENERATION });
   });
 
+  it("a contended source append barrier while reading the witness is verify-contention (exit 4)", async () => {
+    const { home } = await copied();
+    const result = await run(home, { _operationsForTesting: ops({ computeProjectMapWitness: () => { throw new PrivateMutationLockContentionError("busy"); } }) });
+    expect(result).toEqual({ status: "refuse", reason: "verify-contention", generationId: FIXTURE_GENERATION });
+  });
+
   it("lets an unrecognised witness failure reach the boundary", async () => {
     const { home } = await copied();
     const result = await run(home, { _operationsForTesting: ops({ computeProjectMapWitness: () => { throw new TypeError("boom"); } }) });
@@ -412,9 +420,9 @@ describe("verify row 22: the fresh computation (plan-v4 section 5), every input 
     // The real snapshot reader finds no captured snapshot in this home.
     expect(await run(home, { _operationsForTesting: { resolveDestination: ops().resolveDestination! } }))
       .toEqual({ status: "refuse", reason: "snapshot-unresolvable", generationId: FIXTURE_GENERATION });
-    // The real witness cannot read a project map this home does not have.
+    // The real witness, read under the barrier token, finds no project-map entry for the local project.
     expect(await run(home, { _operationsForTesting: { resolveDestination: ops().resolveDestination!, inspectSnapshot: ops().inspectSnapshot! } }))
-      .toEqual({ status: "refuse", reason: "verify-project-map-unresolvable", generationId: FIXTURE_GENERATION });
+      .toEqual({ status: "refuse", reason: "verify-project-map-drift", generationId: FIXTURE_GENERATION });
   });
 
   it("calls the real driver entry points when none are injected (they refuse here: no PostgreSQL, no snapshot)", async () => {
