@@ -58,12 +58,14 @@ import {
 } from "./activation-coverage.js";
 import {
   acquireActivationLease,
+  releaseActivationLease,
   renewActivationLease,
   takeoverActivationLease,
   type ActivationLeaseAcquireResult,
   type ActivationLeaseFence,
   type ActivationLeasePublicationGuard,
   type ActivationLeaseRenewResult,
+  type ActivationLeaseReleaseResult,
   type ActivationLeaseTakeoverResult,
 } from "./activation-lease.js";
 import {
@@ -186,6 +188,18 @@ import {
  *   attempt and returns successorFencingToken on the outcome only).
  *   ttlMs is MIGRATION_ACTIVATION_LEASE_TTL_MS; renewed after S7, before
  *   S12 and before S13b.
+ * - The S2 lease is released again when the run ends without this
+ *   activation having begun a durable effect: every refusal after S2 and
+ *   every error thrown before S9 began prepare-activation (see
+ *   releaseAbandonedLease). acquireActivationLease never displaces an
+ *   unreleased row of another generation, expired or not, so a refused run
+ *   that kept its row would block every other generation of the project
+ *   for good. A release failure never changes the outcome vocabulary: a
+ *   refusal carries it appended to its detail, a thrown error is rethrown
+ *   unchanged (a same-generation re-run reacquires or takes over the row
+ *   and ends it the same way). Once an effect has begun the row is kept:
+ *   the generation is committed to roll forward on the next call (A2
+ *   reacquire / takeover) and the coordinator's own release phase frees it.
  * - S3 quiescence, S4 coverage then G8, S4b (amendment 1) compose material
  *   and freeze the verified manifest's revision/checksum IN MEMORY; the
  *   link is written only after the artifact at S11.
@@ -1004,6 +1018,45 @@ async function readOwnFence(ctx: Context): Promise<Readonly<{ fence: ActivationL
   return { fence };
 }
 
+/**
+ * Release the S2 lease of a run that ends before any durable effect (the
+ * activation driver's own abort-before-handoff path, activation-lease.ts).
+ * Expiry is not release: an expired own row is taken over first and the
+ * fresh fence released (rollback-session.ts does the same). Returns null
+ * when no live row of this generation remains (released, already released
+ * or absent), otherwise the failure detail; never throws.
+ */
+async function releaseAbandonedLease(ctx: Context): Promise<string | null> {
+  const mutation = {
+    projectId: ctx.remoteProjectId,
+    machineId: ctx.machineId,
+    publicationId: ctx.publicationId,
+    targetBackend: "postgresql" as const,
+    evidenceSha256: ctx.evidenceSha256!,
+    signal: ctx.input.signal,
+  };
+  try {
+    let released: ActivationLeaseReleaseResult = await releaseActivationLease(ctx.guard!, { ...mutation, fencingToken: ctx.fence!.fencingToken });
+    if (released.status === "expired") {
+      const took = await takeoverActivationLease(ctx.guard!, { ...mutation, ttlMs: ctx.deps.leaseTtlMs, expectedFencingToken: released.fence.fencingToken });
+      if (took.status !== "took-over") return took.detail;
+      released = await releaseActivationLease(ctx.guard!, { ...mutation, fencingToken: took.fence.fencingToken });
+    }
+    if (released.status === "released" || released.status === "already-released" || released.status === "not-found") return null;
+    return released.detail;
+  } catch (error) {
+    return (error as Error).message;
+  }
+}
+
+/** A refusal after S2 releases the lease; a failure to release rides the refusal's detail. */
+async function refusedWithLeaseReleased(ctx: Context, outcome: MigrationActivationOutcome): Promise<MigrationActivationOutcome> {
+  if (outcome.status !== "refused" || ctx.fence === null) return outcome;
+  const failure = await releaseAbandonedLease(ctx);
+  if (failure === null) return outcome;
+  return { ...outcome, detail: outcome.detail + "; the activation lease was not released: " + failure };
+}
+
 async function stepQuiescence(ctx: Context): Promise<Step<ActivationQuiescenceResult>> {
   const result = await ctx.deps.checkQuiescence({ homeDir: ctx.homeDir, lockToken: ctx.token }, { now: ctx.now });
   if (result.status === "satisfied") return ok(result);
@@ -1526,7 +1579,11 @@ export async function runMigrationActivation(
     return await deps.withAppendBarrier(input.homeDir, async (token) => {
       ctx.token = token;
       try {
-        return await runUnderBarrier(ctx, scratchParent);
+        return await refusedWithLeaseReleased(ctx, await runUnderBarrier(ctx, scratchParent));
+      } catch (error) {
+        // Best effort, before the effect began: the original error is the outcome.
+        if (ctx.fence !== null && !ctx.effectBegun) await releaseAbandonedLease(ctx);
+        throw error;
       } finally {
         if (ctx.ordinary !== null) await ctx.ordinary.close();
       }

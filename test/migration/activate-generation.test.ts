@@ -213,7 +213,10 @@ class FakeLeaseGuard implements ActivationLeasePublicationGuard {
   async release(input: PostgreSqlBackendPublicationMutationInput): Promise<PostgreSqlBackendPublicationFence> {
     this.calls.push("release");
     const row = this.rows.get(input.projectId);
-    if (row === undefined || row.fencingToken !== input.fencingToken) this.error(input.projectId, "release", "fence-mismatch");
+    // The real UPDATE requires an unexpired, unreleased row under the caller's token.
+    if (row === undefined || row.fencingToken !== input.fencingToken || row.releasedAt !== null || row.databaseExpired) {
+      this.error(input.projectId, "release", "fence-mismatch");
+    }
     const released = { ...row, releasedAt: "2026-10-16T00:00:02.000Z" };
     this.rows.set(input.projectId, released);
     return released;
@@ -1772,3 +1775,140 @@ describe("previewMigrationActivation (A11): non-predictive and read-only", () =>
   });
 });
 
+
+describe("runMigrationActivation: the S2 lease is released on every pre-effect exit (PR #1628 review, Codex P1)", () => {
+  const row = (f: Fixture) => f.guard.rows.get(REMOTE)!;
+  const releases = (f: Fixture) => f.guard.calls.filter((c) => c === "release").length;
+  /** acquireActivationLease never displaces an unreleased row of another generation, so this is the proof that matters. */
+  const anotherGenerationAcquires = (f: Fixture) => f.guard.acquire({
+    projectId: REMOTE, machineId: MACHINE, publicationId: "another-generation", targetBackend: "postgresql", evidenceSha256: "d".repeat(64), ttlMs: 60_000,
+  });
+
+  it("a refusal after S2 (S4 uncovered-projects) releases the row and a different generation can acquire it; the refusal is unchanged", async () => {
+    const f = await fixture({ extraProjectWithData: true });
+    const outcome = await f.run();
+    expect(outcome).toMatchObject({ status: "refused", step: "S4", reason: "uncovered-projects", effectBegun: false });
+    expect((outcome as { detail: string }).detail).not.toContain("lease was not released");
+    expect(releases(f)).toBe(1);
+    expect(row(f).releasedAt).not.toBeNull();
+    await expect(anotherGenerationAcquires(f)).resolves.toMatchObject({ publicationId: "another-generation", releasedAt: null });
+  });
+
+  it.each([
+    ["S6", async (f: Fixture) => { f.deps.health.push({ status: "unhealthy", reason: "schema-mismatch", detail: "fake", sqlState: null } as MigrationTargetHealthResult); }],
+    ["S8", async (f: Fixture) => { f.deps.destinationCensus = domainCensus("drifted"); }],
+  ] as const)("a refusal at %s releases the row", async (_step, arrange) => {
+    const f = await fixture();
+    await arrange(f);
+    expect((await f.run()).status).toBe("refused");
+    expect(row(f).releasedAt).not.toBeNull();
+    await expect(anotherGenerationAcquires(f)).resolves.toMatchObject({ publicationId: "another-generation" });
+  });
+
+  it("a refusal before or at S2 releases nothing: there is no row of ours to release", async () => {
+    const f = await fixture({ held: false });
+    expect(await f.run()).toMatchObject({ status: "refused", step: "S3", reason: "maintenance-not-held" });
+    expect(releases(f)).toBe(0);
+    expect(f.guard.rows.size).toBe(0);
+    const g = await fixture();
+    g.guard.seed({ projectId: REMOTE, publicationId: "someone-else" });
+    expect(await g.run()).toMatchObject({ status: "refused", step: "S2", reason: "lease-conflict" });
+    expect(releases(g)).toBe(0);
+    expect(row(g)).toMatchObject({ publicationId: "someone-else", releasedAt: null });
+  });
+
+  it("an error thrown after S2 and before S9 is rethrown unchanged and the row is released", async () => {
+    const f = await fixture();
+    // S7's census read, after S2: the S0 identity read runs before any lease exists.
+    await expect(f.run({ readDestinationCensus: async () => { throw new RangeError("raw"); } })).rejects.toBeInstanceOf(RangeError);
+    expect(releases(f)).toBe(1);
+    expect(row(f).releasedAt).not.toBeNull();
+  });
+
+  it("an error thrown once the effect began keeps the row for the roll-forward, which reacquires it", async () => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-begin");
+    expect(releases(f)).toBe(0);
+    expect(row(f).releasedAt).toBeNull();
+    const token = row(f).fencingToken;
+    const outcome = await f.run();
+    expectActivated(f, outcome, "prepare-activation-pending");
+    // The same row continued (no new token) until the coordinator's own release phase freed it.
+    expect(f.bindings.resolveMigrationWitnessBindings({ homeDir: f.homeDir, generationId: GENERATION })).toMatchObject({ state: "resolved" });
+    expect(row(f).fencingToken).toBe(token);
+    expect(row(f).releasedAt).not.toBeNull();
+  });
+
+  it("an expired own row is taken over and then released (expiry is not release)", async () => {
+    const f = await fixture();
+    f.deps.destinationCensus = domainCensus("drifted");
+    const release = f.guard.release.bind(f.guard);
+    f.guard.release = async (input) => { f.guard.expire(input.projectId); f.guard.release = release; return release(input); };
+    const outcome = await f.run();
+    expect(outcome).toMatchObject({ status: "refused", step: "S8", reason: "census-drift" });
+    expect((outcome as { detail: string }).detail).not.toContain("lease was not released");
+    expect(releases(f)).toBe(2);
+    expect(row(f)).toMatchObject({ publicationId: f.publicationId, databaseExpired: false });
+    expect(row(f).releasedAt).not.toBeNull();
+  });
+
+  it("a release failure never changes the refusal, it rides the detail: takeover conflict, stale token, guard error", async () => {
+    const f = await fixture();
+    f.deps.destinationCensus = domainCensus("drifted");
+    const acquire = f.guard.acquire.bind(f.guard);
+    f.guard.release = async (input) => { f.guard.expire(input.projectId); throw new PostgreSqlBackendPublicationGuardError(input.projectId, "release", "fence-mismatch"); };
+    f.guard.acquire = async (input) => {
+      if (input.expectedFencingToken !== undefined) throw new PostgreSqlBackendPublicationGuardError(input.projectId, "acquire", "publication-conflict");
+      return acquire(input);
+    };
+    const conflict = await f.run();
+    expect(conflict).toMatchObject({ status: "refused", step: "S8", reason: "census-drift", effectBegun: false });
+    expect((conflict as { detail: string }).detail).toMatch(/^the recomputed destination census differs .*; the activation lease was not released: .*different publication generation/u);
+
+    const g = await fixture();
+    g.deps.destinationCensus = domainCensus("drifted");
+    g.guard.release = async (input) => {
+      const current = g.guard.rows.get(input.projectId)!;
+      g.guard.rows.set(input.projectId, { ...current, fencingToken: current.fencingToken + 7n });
+      throw new PostgreSqlBackendPublicationGuardError(input.projectId, "release", "fence-mismatch");
+    };
+    const stale = await g.run();
+    expect(stale).toMatchObject({ status: "refused", step: "S8", reason: "census-drift" });
+    expect((stale as { detail: string }).detail).toContain("the activation lease was not released: release failed because the caller's known fencingToken");
+    expect(row(g).releasedAt).toBeNull();
+
+    const h = await fixture();
+    h.deps.destinationCensus = domainCensus("drifted");
+    h.guard.release = async () => { throw new Error("the lease connection dropped"); };
+    const thrown = await h.run();
+    expect(thrown).toMatchObject({ status: "refused", step: "S8", reason: "census-drift" });
+    expect((thrown as { detail: string }).detail).toContain("the activation lease was not released: the lease connection dropped");
+  });
+
+  it("a row already released or vanished counts as released: S8 lost because the row was released, then the row deleted", async () => {
+    const f = await fixture();
+    const renew = f.guard.renew.bind(f.guard);
+    f.guard.renew = async (input) => {
+      const current = f.guard.rows.get(input.projectId)!;
+      f.guard.rows.set(input.projectId, { ...current, releasedAt: "2026-10-16T00:00:01.500Z" });
+      return renew(input);
+    };
+    const released = await f.run();
+    expect(released).toMatchObject({ status: "refused", step: "S8", reason: "lease-conflict" });
+    expect((released as { detail: string }).detail).not.toContain("lease was not released");
+
+    const g = await fixture();
+    g.deps.destinationCensus = domainCensus("drifted");
+    g.guard.release = async (input) => { g.guard.rows.delete(input.projectId); throw new PostgreSqlBackendPublicationGuardError(input.projectId, "release", "fence-mismatch"); };
+    const vanished = await g.run();
+    expect(vanished).toMatchObject({ status: "refused", step: "S8", reason: "census-drift" });
+    expect((vanished as { detail: string }).detail).not.toContain("lease was not released");
+  });
+
+  it("a release failure after a thrown error does not mask the error", async () => {
+    const f = await fixture();
+    f.guard.release = async () => { throw new Error("the lease connection dropped"); };
+    await expect(f.run({ readDestinationCensus: async () => { throw new RangeError("raw"); } })).rejects.toBeInstanceOf(RangeError);
+    expect(row(f).releasedAt).toBeNull();
+  });
+});

@@ -1114,7 +1114,11 @@ selection and the publication. The lease time to live is 15 minutes; a
 stretch that outlives it is not silently continued. An expired lease is taken
 over on the next run, which mints a new attempt if no selection exists yet
 and otherwise continues the recorded one, reporting the advanced fencing
-token on the outcome.
+token on the outcome. A run that ends before any effect began (a refusal, or
+an error before `prepare-activation`) releases the lease again, so another
+generation of the same project can activate; a refusal whose release failed
+says so in its detail. Once an effect has begun the lease is kept for the
+next run to continue.
 
 ### The daemon restart
 

@@ -23,7 +23,9 @@
  * One refusal row is included: a second project with stored data makes the
  * single-project G8 verdict refuse "uncovered-projects" (#1544 owns the
  * multi-project cutover); with that project removed the same generation then
- * activates, proving the refusal left no effect behind.
+ * activates, proving the refusal left no effect behind. The refusal also
+ * releases its S2 lease row on lcm.fenced_leases, proven by a different
+ * generation acquiring the project through the real guard in between.
  *
  * Role topology follows plan-v7.2 B1/B3: activation runs entirely under ONE
  * transfer-profile role, provisioned here under a per-run unique name with
@@ -81,6 +83,7 @@ import {
 } from "../../src/migration/activate-generation.js";
 import { readActivationGenerationLink } from "../../src/migration/activation-artifact-store.js";
 import { readMigrationActivationEvidence } from "../../src/migration/activation-evidence-store.js";
+import { acquireActivationLease, releaseActivationLease } from "../../src/migration/activation-lease.js";
 import { deriveActivationPublicationId } from "../../src/migration/activation-publication-id.js";
 import { readMigrationActivationReport } from "../../src/migration/activation-report.js";
 import { inspectSqliteMigrationCopy, runSqliteMigrationCopy } from "../../src/migration/batch-copy.js";
@@ -446,6 +449,30 @@ it("activates a real verified SQLite copy through the production dependencies: r
       expect(readActivationGenerationLink({ homeDir: home, generationId: GENERATION_ID }).state).toBe("authoritatively-absent");
       expect(readMigrationActivationEvidence({ homeDir: home, generationId: GENERATION_ID })).toEqual({ state: "authoritatively-absent" });
       expect(readConfigBackend(home)).toBe("sqlite");
+      // The refused run released its S2 lease row (PR #1628 review): the
+      // real guard never displaces an unreleased row of another generation,
+      // so a different generation must be able to acquire the project now.
+      const refusedLeases = await db.migrator.query<{ released: boolean }>({
+        text: "SELECT released_at IS NOT NULL AS released FROM lcm.fenced_leases "
+          + "WHERE project_id = $1 AND operation LIKE 'backend-publication:postgresql:%'",
+        values: [installation.remoteProjectId],
+      }, { domain: "factory", operation: "activationIntegration" });
+      expect(refusedLeases.rows).toEqual([{ released: true }]);
+      const otherRuntime = deps.createOrdinaryRuntime(transfer);
+      try {
+        const guard = otherRuntime.backendPublicationGuard();
+        const otherGeneration = {
+          projectId: installation.remoteProjectId, machineId: deps.machineId(home),
+          publicationId: deriveActivationPublicationId("other-generation"), targetBackend: "postgresql" as const,
+          evidenceSha256: "d".repeat(64),
+        };
+        const acquired = await acquireActivationLease(guard, { ...otherGeneration, ttlMs: 60_000 });
+        expect(acquired.status, acquired.status === "acquired" ? "" : acquired.detail).toBe("acquired");
+        if (acquired.status !== "acquired") return;
+        expect(await releaseActivationLease(guard, { ...otherGeneration, fencingToken: acquired.fence.fencingToken })).toMatchObject({ status: "released" });
+      } finally {
+        await otherRuntime.close();
+      }
       rmSync(join(projectsDir(home), otherHash), { recursive: true });
       writeFileSync(projectMapPath(home), JSON.stringify(map) + "\n", { mode: 0o600 });
       clearProjectMapCache();
