@@ -214,6 +214,96 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+/** Structural path from the document root: object member names and array indices. */
+export type CodexHooksJsonPath = ReadonlyArray<string | number>;
+
+export interface CodexHooksJson {
+  /** What JSON.parse returns; a repeated member keeps its last value. */
+  readonly value: unknown;
+  /**
+   * One entry per repeated member name, compared after unescaping, with the path of the object that
+   * repeats it. Objects deeper than every typed object (more than TYPED_OBJECT_PATH_DEPTH segments)
+   * contribute only their first repeat in the document, so the list stays small on adversarial input.
+   */
+  readonly duplicates: ReadonlyArray<{ readonly path: CodexHooksJsonPath; readonly name: string }>;
+  /**
+   * True when the number written at path is not an unsigned integer token (a sign, fraction or exponent).
+   * Only paths up to TRACKED_PATH_DEPTH segments (the handler count fields) are tracked; deeper ones are false.
+   */
+  readonly nonIntegerNumberAt: (path: CodexHooksJsonPath) => boolean;
+}
+
+const UNSIGNED_INTEGER_TOKEN = /^(?:0|[1-9][0-9]*)$/;
+const NUMBER_TOKEN_CHAR = /[0-9eE+\-.]/;
+/** hooks / event / group / hooks / handler / field: the deepest number the connector reads. */
+const TRACKED_PATH_DEPTH = 6;
+/** root, hooks, group and handler objects: the deepest object path the connector checks. */
+const TYPED_OBJECT_PATH_DEPTH = 5;
+
+/**
+ * Read hooks.json text with JSON.parse for syntax and values, then walk the same text
+ * once, iteratively, for what JSON.parse discards: repeated member names and how each
+ * number was written. Undefined means the text is not valid JSON.
+ */
+export function parseCodexHooksJson(content: string): CodexHooksJson | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return undefined;
+  }
+  type Frame = { readonly object: boolean; readonly names: Set<string>; key: string; index: number; expectKey: boolean };
+  const segment = (frame: Frame): string | number => (frame.object ? frame.key : frame.index);
+  const stack: Frame[] = [];
+  const duplicates: Array<{ path: CodexHooksJsonPath; name: string }> = [];
+  let deepDuplicateSeen = false;
+  const nonInteger = new Set<string>();
+  let at = 0;
+  while (at < content.length) {
+    const char = content[at];
+    const top = stack[stack.length - 1];
+    if (char === "{" || char === "[") {
+      stack.push({ object: char === "{", names: new Set(), key: "", index: 0, expectKey: char === "{" });
+      at += 1;
+    } else if (char === "}" || char === "]") {
+      stack.pop();
+      at += 1;
+    } else if (char === ",") {
+      if (top.object) top.expectKey = true;
+      else top.index += 1;
+      at += 1;
+    } else if (char === '"') {
+      let end = at + 1;
+      while (content[end] !== '"') end += content[end] === "\\" ? 2 : 1;
+      if (top?.object && top.expectKey) {
+        const name = JSON.parse(content.slice(at, end + 1)) as string;
+        if (top.names.has(name) && (stack.length - 1 <= TYPED_OBJECT_PATH_DEPTH || !deepDuplicateSeen)) {
+          if (stack.length - 1 > TYPED_OBJECT_PATH_DEPTH) deepDuplicateSeen = true;
+          duplicates.push({ path: stack.slice(0, -1).map(segment), name });
+        }
+        top.names.add(name);
+        top.key = name;
+        top.expectKey = false;
+      }
+      at = end + 1;
+    } else if (char === "-" || (char >= "0" && char <= "9")) {
+      let end = at + 1;
+      while (end < content.length && NUMBER_TOKEN_CHAR.test(content[end])) end += 1;
+      if (stack.length <= TRACKED_PATH_DEPTH && !UNSIGNED_INTEGER_TOKEN.test(content.slice(at, end))) {
+        nonInteger.add(JSON.stringify(stack.map(segment)));
+      }
+      at = end;
+    } else {
+      at += 1;
+    }
+  }
+  return {
+    value,
+    duplicates,
+    nonIntegerNumberAt: (path) => path.length <= TRACKED_PATH_DEPTH && nonInteger.has(JSON.stringify(path)),
+  };
+}
+
 function normalizeHooksConfig(value: unknown): CodexHooksConfig {
   const config = isObject(value) ? { ...value } : {};
   if (!isObject(config.hooks)) {
@@ -286,6 +376,29 @@ function refusal(event: string, detail: string): string {
     + "move/remove the LCM handler manually or run lcm connectors remove codex first";
 }
 
+type HooksRead = { readonly config: CodexHooksConfig; readonly refusal?: undefined }
+  | { readonly config?: undefined; readonly refusal: string };
+
+/**
+ * Read existing hooks.json text for rewriting. Only empty or JSON-whitespace text starts
+ * from nothing; invalid JSON, or any object that repeats a member name at any depth, is a
+ * refusal because rewriting would drop the user's other hooks or the shadowed member.
+ */
+function readHooksConfigFromContent(content: string): HooksRead {
+  if (/^[ \t\r\n]*$/.test(content)) return { config: normalizeHooksConfig(undefined) };
+  const parsed = parseCodexHooksJson(content);
+  const why = parsed === undefined ? "is not valid JSON"
+    : parsed.duplicates.length > 0 ? "repeats the key " + JSON.stringify(parsed.duplicates[0].name)
+    : undefined;
+  if (why !== undefined) {
+    return {
+      refusal: "LCM cannot update hooks.json: it " + why + ", so LCM left it unchanged; "
+        + "fix the file or move it aside, then rerun lcm connectors install codex",
+    };
+  }
+  return { config: normalizeHooksConfig(parsed!.value) };
+}
+
 /**
  * Merge LCM handlers in place. Codex keys per-hook enablement and trust by
  * (event, group index, handler index), so every existing LCM handler keeps its
@@ -296,7 +409,9 @@ export function planCodexHooksMerge(
   transport: ConnectorTransport = "cli",
   expected: Record<string, CodexHookGroup[]> = codexLcmHooks(transport),
 ): CodexHooksMergePlan {
-  const config = readHooksConfigFromContent(content);
+  const read = readHooksConfigFromContent(content);
+  if (read.refusal !== undefined) return { content, refusal: read.refusal };
+  const config = read.config;
   const roleKey = (event: string, role: string): string => event + "\u0000" + role;
   const expectedRoles = new Set<string>();
   for (const [event, groups] of Object.entries(expected)) {
@@ -395,27 +510,22 @@ export function mergeCodexHooksContent(
 
 /** Pure content operation for removing LCM hooks. */
 export function removeCodexHooksContent(content: string): { state: "unchanged" | "rewrite" | "remove"; content: string } {
-  const { config, removed } = stripLcmHooks(readHooksConfigFromContent(content));
+  const read = readHooksConfigFromContent(content);
+  if (read.refusal !== undefined) return { state: "unchanged", content };
+  const { config, removed } = stripLcmHooks(read.config);
   if (!removed) return { state: "unchanged", content };
   if (!hasAnyHookGroups(config) && !hasNonHookKeys(config)) return { state: "remove", content: "" };
   return { state: "rewrite", content: JSON.stringify(config, null, 2) + "\n" };
 }
 
 export function hasCodexHooksContent(content: string): boolean {
-  const config = readHooksConfigFromContent(content);
-  return Object.values(config.hooks).some((groups) =>
+  const read = readHooksConfigFromContent(content);
+  if (read.refusal !== undefined) return false;
+  return Object.values(read.config.hooks).some((groups) =>
     Array.isArray(groups) && groups.some((group) =>
       Array.isArray(group.hooks) && group.hooks.some((hook) => isLcmHookCommand(hook.command)),
     ),
   );
-}
-
-function readHooksConfigFromContent(content: string): CodexHooksConfig {
-  try {
-    return normalizeHooksConfig(JSON.parse(content));
-  } catch {
-    return { hooks: {} };
-  }
 }
 
 export function enableCodexHooksFeature(configPath: string): void {

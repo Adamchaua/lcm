@@ -165,7 +165,7 @@ Codex can actually run it. The report appears when you name the agent
 | modified | The hook definition differs from the one you trusted, so Codex requires a new review. | Review and trust it again in Codex `/hooks` |
 | state unknown | `config.toml` is not valid TOML, or its hook state uses a form LCM cannot read. | Check Codex `/hooks` |
 | feature disabled | `[features] hooks` is `false`; no LCM lifecycle hook can run. LCM leaves your setting unchanged. | Enable the feature if you want LCM hooks |
-| hooks file unreadable | `hooks.json` is unreadable or does not match the schema Codex expects. | Fix the file or reinstall |
+| hooks file unreadable | `hooks.json` is unreadable or does not match the schema Codex expects. That includes a key repeated in the file, in a group, or in a handler, and a `timeout` or `additionalContextLimit` written as anything other than a whole number such as `30` (not `30.0` or `3e1`). | Fix the file (or move it aside), then reinstall |
 | failing / degraded | A recent LCM-local observation (below) shows a nonzero exit, a thrown error, or logged hook errors. | Run `lcm doctor` and check `~/.lcm/logs/events.log` |
 
 When several statuses apply, the first of these wins: hooks file unreadable,
@@ -192,6 +192,13 @@ group that also holds other hooks), install stops before writing either file
 and explains how to proceed. An explicit `[features] hooks = false` is left
 as you set it, and install says so. Install ends with a reminder to open Codex
 `/hooks` and trust the LCM hooks.
+
+Install also stops before writing either file when `hooks.json` is not valid
+JSON (for example a trailing comma) or repeats a key anywhere in the file,
+because rewriting it would discard your other hooks. The message names the
+reason; fix the file or move it aside, then rerun
+`lcm connectors install codex`. An empty or whitespace-only file is treated
+as having no hooks. Uninstall leaves such a file unchanged as well.
 
 When Codex runs an LCM hook, LCM also persists the outcome of a completed run
 for each event under `~/.lcm/state/codex-hooks/` (outcome and time only, no

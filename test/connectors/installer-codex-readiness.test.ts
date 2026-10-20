@@ -46,6 +46,29 @@ describe("Codex connector install preserves Codex per-hook choices", () => {
     expect(existsSync(join(home, ".lcm", "config.json"))).toBe(false);
   });
 
+  it("refuses a malformed or repeated-key hooks file on every install path before writing anything", () => {
+    const original = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]}],}}';
+    const cases: Array<[string, string, string]> = [
+      ["a trailing comma (#1586)", original, "is not valid JSON"],
+      ["trailing literal backslash-n text (#1606)", '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}' + "\\n", "is not valid JSON"],
+      ["a repeated key", '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]}]},"hooks":{}}', 'repeats the key "hooks"'],
+    ];
+    for (const [name, content, reason] of cases) {
+      writeFileSync(hooksPath, content);
+      writeFileSync(configPath, "model = 'x'\n");
+      for (const attempt of [
+        () => installConnector("codex", "hook", home),
+        () => installConnector("codex", undefined as never, home),
+        bundle,
+      ]) {
+        expect(attempt, name).toThrow(reason);
+        expect(readFileSync(hooksPath, "utf-8"), name).toBe(content);
+        expect(readFileSync(configPath, "utf-8"), name).toBe("model = 'x'\n");
+      }
+    }
+    expect(existsSync(join(home, ".lcm", "config.json"))).toBe(false);
+  });
+
   it("keeps LCM handlers in their slots and never touches Codex hook state", () => {
     const state = '\n[hooks.state."' + hooksPath + ':session_start:0:1"]\nenabled = false\ntrusted_hash = "sha256:user"\n';
     const config = "[features]\nhooks = true\n" + state;
