@@ -62,7 +62,7 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   }),
   Object.freeze({
     reason: "local-identity-not-persisted", exitClass: "refused-evidence",
-    remedy: "A maintenance hold exists but this project has no persisted identity, and nothing is minted under a hold. Run `lcm doctor`; `lcm migration abort` releases the hold.",
+    remedy: "A maintenance hold exists but the current directory has no persisted project identity, and nothing is minted under a hold. Run the command from the migrated project's directory; if it is already there, run `lcm doctor`. `lcm migration abort` releases the hold.",
   }),
   Object.freeze({
     reason: "destination-project-absent", exitClass: "refused-evidence",

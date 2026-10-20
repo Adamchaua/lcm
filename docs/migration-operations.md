@@ -150,7 +150,9 @@ PostgreSQL project and alias rows are created only after `--confirm-generation` 
 or mismatched token leaves them, and the home, as they were. While a hold exists, `apply` never
 creates either: it reads the persisted local identity and selects the destination project, and
 refuses `local-identity-not-persisted` or `destination-project-absent` (exit 5) rather than
-mint under a hold.
+mint under a hold. Run every command on an existing generation from the migrated project's
+directory: the persisted identity is read from the current directory, so another directory reports
+`local-identity-not-persisted`.
 
 `--dry-run` stops immediately after the confirmation fence, before the hold is taken or anything is
 captured. The emitted envelope reports the confirmed candidate with `applied: false`.
@@ -879,7 +881,7 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
     {
       "reason": "local-identity-not-persisted",
       "exitClass": "refused-evidence",
-      "remedy": "A maintenance hold exists but this project has no persisted identity, and nothing is minted under a hold. Run `lcm doctor`; `lcm migration abort` releases the hold."
+      "remedy": "A maintenance hold exists but the current directory has no persisted project identity, and nothing is minted under a hold. Run the command from the migrated project's directory; if it is already there, run `lcm doctor`. `lcm migration abort` releases the hold."
     },
     {
       "reason": "destination-project-absent",
