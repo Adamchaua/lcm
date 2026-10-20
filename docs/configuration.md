@@ -181,11 +181,14 @@ guidance, plus native hooks where implemented. There is no fallback between
 MCP and CLI guidance. Removal is whole-bundle and clears the stored choice
 after the bundle is removed.
 
-For Codex, choose MCP explicitly with
-`lcm connectors install codex --transport mcp`. LCM uses the native `codex mcp`
-commands for that bundle; no TOML editing is required. Return to the
-default CLI bundle with `lcm connectors install codex --transport cli`. The
-explicit MCP bundle does not retain or install the CLI-only managed
+For Codex, choose MCP explicitly: first register the server with
+`codex mcp add lcm -- lcm mcp`, then run
+`lcm connectors install codex --transport mcp`. LCM verifies the existing
+registration but does not add or remove it automatically. To return to the
+default CLI bundle, first run `codex mcp remove lcm`, then
+`lcm connectors install codex --transport cli`; while the registration remains,
+convergence refuses (the removal direction is source-backed, not natively run).
+The explicit MCP bundle does not retain or install the CLI-only managed
 `~/.codex/AGENTS.md` entry.
 
 On Linux, the nested native `codex mcp` commands receive the current user's
@@ -511,6 +514,16 @@ enter Codex's own history, and Codex may spill oversized hook output (default
   needs 3.5), and a result scoring 0 (for example a stale memory when
   `allowStaleOnStrongMatch` is off) is never admitted by the relief. Prompt
   recall is unchanged.
+
+### Snapshot throttle (Codex)
+
+`hooks.snapshotIntervalSec` (default `60`) sets the minimum interval between ordinary
+`Stop` snapshots of the same Codex session. A `Stop` inside the interval skips
+transcript ingestion. A later eligible `Stop` or `PreCompact` can attempt to ingest that
+session's remaining delta. `Interrupt` and `SessionEnd` instead make a best-effort
+terminal handoff to an already-running verified daemon. `SubagentStop` bypasses the
+throttle for the child's own transcript; it does not save a skipped parent
+snapshot. Recovery can fail or be skipped.
 
 ### Leaf chunk tokens
 
