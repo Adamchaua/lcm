@@ -342,18 +342,20 @@ async function runMigrationReportCommand(input: MigrationReportCommandInput): Pr
 
   const restart = await restartEvidence(context, input.homeDir, ops);
   const readers = activationAndRollbackSections(context, input.homeDir, ops);
+  const verification = verificationEvidence(context, reportStore);
   const evidence: MigrationEvidence = {
     ...journalEvidence(context),
     snapshot: context.snapshot,
     ...manifestEvidence(context),
-    ...verificationEvidence(context, reportStore),
+    ...verification,
     cell: route.row,
     primary: route.primary,
     allowed: route.allowed.join(","),
     ...restart.evidence,
     ...readers.evidence,
   };
-  const reason = REPORT_ROW_REASONS[route.row] ?? (readers.unresolved ? "report-evidence-unresolvable" : undefined) ?? restart.reason;
+  const unresolved = readers.unresolved || verification.verificationReport === "unreadable";
+  const reason = REPORT_ROW_REASONS[route.row] ?? (unresolved ? "report-evidence-unresolvable" : undefined) ?? restart.reason;
   return {
     ...(reason === undefined ? {} : { reason }),
     generationId: context.generationId,

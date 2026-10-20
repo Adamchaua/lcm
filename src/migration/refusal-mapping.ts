@@ -442,7 +442,7 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   }),
   Object.freeze({
     reason: "report-evidence-unresolvable", exitClass: "refused-evidence",
-    remedy: "A reader of the activation or rollback evidence could not give an answer, or a report the manifest references is missing. The report still prints every section it read; run `lcm doctor` and inspect the evidence named as unresolvable or missing.",
+    remedy: "A reader of the activation or rollback evidence could not give an answer, or a report the manifest references (including the verification report) is missing or unreadable. The report still prints every section it read; run `lcm doctor` and inspect the evidence named as unresolvable or missing.",
   }),
   Object.freeze({
     reason: "abort-carried-effect-mismatch", exitClass: "refused-evidence",

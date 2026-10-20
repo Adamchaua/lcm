@@ -233,9 +233,9 @@ The activation and rollback evidence is read with lock-free, three-valued reader
 shown as `present`, `absent` or `unresolvable`: the activation link, the activation report the
 manifest names, the generation bindings, the activation epoch, attempt and witness store
 (`rollbackEvidence`), the rollback report the manifest names, and the rollback authority artifact. A
-reader that could not answer, or a report the manifest names that is missing, is shown as such and
-makes the report exit 5 (`report-evidence-unresolvable`); an unresolvable entry is never read as
-absence.
+reader that could not answer, a report the manifest names that is missing, or a verification report
+the manifest references that cannot be read (shown as `unreadable`), is shown as such and makes the
+report exit 5 (`report-evidence-unresolvable`); an unresolvable entry is never read as absence.
 
 A non-zero exit still prints everything it read: 2 when no generation can be resolved, 4 for a
 foreign publication in flight, 5 for contradictory or unreadable evidence (including either restart
@@ -417,7 +417,8 @@ knowing by name:
   `copied`. `verify-project-map-drift` / `verify-project-map-unresolvable` (exit 5): the project map
   does not match, or cannot be read for, the verification witness.
 - `report-evidence-unresolvable` (exit 5): a reader of the activation or rollback evidence could not
-  answer, or a report the manifest names is missing; the report still prints what it read.
+  answer, or a report the manifest names is missing or (verification) unreadable; the report still
+  prints what it read.
 - `generation-required` / `generation-unknown` (exit 2), `generation-invalid` (exit 1): pass
   `--generation` naming a generation that exists.
 - `abort-nothing-to-abort` (exit 2): there is no hold to leave. Nothing to do.
@@ -1293,7 +1294,7 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
     {
       "reason": "report-evidence-unresolvable",
       "exitClass": "refused-evidence",
-      "remedy": "A reader of the activation or rollback evidence could not give an answer, or a report the manifest references is missing. The report still prints every section it read; run `lcm doctor` and inspect the evidence named as unresolvable or missing."
+      "remedy": "A reader of the activation or rollback evidence could not give an answer, or a report the manifest references (including the verification report) is missing or unreadable. The report still prints every section it read; run `lcm doctor` and inspect the evidence named as unresolvable or missing."
     },
     {
       "reason": "abort-carried-effect-mismatch",

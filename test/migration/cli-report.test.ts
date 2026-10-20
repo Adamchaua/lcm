@@ -122,6 +122,7 @@ describe("report: a read-only account of one generation", () => {
     createFixtureManifest(new MigrationManifestStore({ homeDir: home }), "verified", { report });
     const result = await performMigrationReportCommand({ homeDir: home, _resolution: resolution });
     expect(result.evidence).toMatchObject({ verificationReport: "unreadable", verificationReportSha256: report.reportSha256 });
+    expect(result.reason).toBe("report-evidence-unresolvable");
   });
 
   it("uses the terminal journal's own generation when none is named, so a report after an abort needs no flag", async () => {
@@ -340,6 +341,7 @@ describe("report: the activation and rollback readers (#625 and #626), all lock-
 
   function activeFixture() {
     const home = makeFixtureHome(roots);
+    persistFixtureReport(home, fixtureVerificationReport());
     createFixtureManifest(new MigrationManifestStore({ homeDir: home }), "active");
     const observation = { kind: "publication" as const, publicationId: "pub-1", phase: "completed" as const };
     const resolutionOwn = { _operationsForTesting: { observeJournal: () => observation, classifySnapshot: complete, readLink: () => link() } };
