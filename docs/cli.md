@@ -517,6 +517,45 @@ no recalled-text previews (`topRecalled`), transcript or memory payloads, raw
 errors, SQL values, connection URLs, role names, CA paths, or arbitrary local
 paths. Verbose output follows the same boundary.
 
+### Query statistics
+
+PostgreSQL snapshots include `telemetry.statements`, a bounded aggregate of
+numeric `pg_stat_statements` counters for a packaged starter catalog of LCM
+operations. The family is always labelled `scope: aggregate`, including when
+the rest of the request selects one project. It never emits query text, SQL
+literals, parameter values, query identifiers, role or database names, or
+utility statements. SQLite reports `not-applicable`.
+
+The text summary reports the family status and how many cataloged operations
+have a valid call counter. `observed` means the current cumulative values are
+complete; `reset` means a long-lived daemon observed an epoch change;
+`partial` means a mapped entry or field was lost or a bound was reached.
+One-shot CLI processes do not retain a prior comparison, so reset and
+comparison-derived partial states normally appear only in daemon responses.
+`disabled` means `pg_stat_statements.track` is `none`. `timeout`,
+`permission-denied`, `stale`, and `unavailable` affect production
+certification, but they do not change application startup or backend health.
+
+For `disabled`, enable statement tracking through the database provider's
+normal configuration process and reconnect, then retry. For `timeout`, check
+database responsiveness and retry. For `stale`, repeat the observation; if it
+persists, check for a server restart or concurrent statistics reset. For
+`partial` or `reset`, take another observation in the same daemon process and
+compare only values that remain in one epoch. For `unavailable`, verify that
+PostgreSQL 18 has the required extension loaded and computes query identifiers.
+LCM never enables settings or resets statistics.
+
+If an operator deliberately revoked the collector function privilege, restore
+the extension's supported boundary as an administrator:
+
+```sql
+GRANT EXECUTE ON FUNCTION public.pg_stat_statements(boolean)
+  TO "your_lcm_runtime_role";
+```
+
+Replace `your_lcm_runtime_role` with the configured LCM runtime role. Do not grant
+`pg_monitor` or `pg_read_all_stats`; the collector does not require them.
+
 Publication and configuration are authenticated before and after asynchronous
 probes. If their witnesses differ, the result is `stale-publication` and the
 collected metrics are discarded. This is an optimistic observation of matching

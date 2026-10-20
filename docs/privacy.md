@@ -4,6 +4,13 @@ Long Context Manager (LCM) stores your conversation history locally by default
 to enable memory across sessions. This document explains exactly what is
 stored, what leaves your machine, and how to control sensitive data.
 
+PostgreSQL query diagnostics expose only allowlisted operation names and
+bounded numeric `pg_stat_statements` counters. The collector never reads
+statement text. It uses raw query identifiers only as bounded in-process mapping
+keys and never emits or logs them. SQL literals, parameter values, utility
+statements, role names, database names, and connection metadata are likewise
+never emitted or logged by this family.
+
 ## What is stored locally
 
 With the default SQLite backend, all storage is on your machine:
