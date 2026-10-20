@@ -345,12 +345,26 @@ export async function persistCodexLineage(
   const { source, full, child } = request;
   const conversations = repositories.conversations;
   if (full.length === 0) {
-    if (child === undefined) return { persisted: null, history: undefined };
     // Nothing can be appended, so no conversation is created just to inspect it.
     const conversation = await conversations.getConversationBySessionId(sessionId);
     await linkParent(conversation);
-    const stored = conversation === null ? 0 : (await conversations.getTranscriptSlotSnapshot(sessionId)).transcriptCount;
-    return { persisted: null, history: stored === 0 ? "filtered" : "lineage-mismatch" };
+    const snapshot = conversation === null ? null : await conversations.getTranscriptSlotSnapshot(sessionId);
+    const stored = snapshot?.transcriptCount ?? 0;
+    if (child !== undefined) return { persisted: null, history: stored === 0 ? "filtered" : "lineage-mismatch" };
+    if (stored === 0) return { persisted: null, history: undefined };
+    // A file that is not a copied fork must not follow a session whose rows
+    // are a copied fork's own messages, and an unreadable marker stops it too.
+    const first = await firstSessionTranscriptRow(
+      conversations,
+      sessionId,
+      conversation!.conversationId,
+      new Set(snapshot!.events.map((event) => event.messageId)),
+    );
+    const marker = first === undefined ? "invalid" : await readCodexLineageMarker(conversations, first.messageId);
+    return {
+      persisted: null,
+      history: marker === "invalid" || marker === "boundary" ? "lineage-mismatch" : undefined,
+    };
   }
 
   const slot = await prepareSessionTranscript(conversations, sessionId);
@@ -502,10 +516,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
             if (parentSessionId === undefined || conversation === null || conversation.parentSessionId !== null) return;
             await repositories.conversations.setParentSessionIdIfNull(conversation.conversationId, parentSessionId);
           };
-          if (resolvedMessages.length === 0 && filteredMessages === undefined && lineage?.child === undefined) {
-            if (parentSessionId !== undefined) {
-              await linkParent(await repositories.conversations.getConversationBySessionId(session_id));
-            }
+          if (resolvedMessages.length === 0 && filteredMessages === undefined && lineage === undefined) {
             return { persisted: null, history: undefined };
           }
 

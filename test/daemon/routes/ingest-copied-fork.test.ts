@@ -607,6 +607,49 @@ describe("Codex copied fork history on ingest", () => {
     });
   });
 
+  it("stops a boundary session on a rollout with no messages and no copied-fork boundary", async () => {
+    await withWorld(async (world) => {
+      world.write(copied([message("user", "parent")], [message("user", "own 1")]));
+      await world.ingest();
+      world.exec(eventRow(1, unconsumed));
+      const records = world.nativeRecords();
+      const other = join(world.cwd, "other.jsonl");
+      world.write(lines(fork({ forked_from_id: undefined })), other);
+      expect(await world.ingest({ transcript_path: other })).toEqual(NOTHING);
+      expect(world.nativeRecords()).toBe(records);
+      expect(world.messages()).toEqual(["own 1"]);
+      expect(logs.error).toHaveBeenCalledTimes(1);
+      expect(String(logs.error.mock.calls[0]![0])).toBe("ingest");
+
+      expect((await world.compact({ transcript_path: other })).status).toBe(200);
+      expect(logs.error).toHaveBeenCalledTimes(2);
+      expect(String(logs.error.mock.calls[1]![0])).toBe("compact");
+    });
+  });
+
+  it("still records an empty plain rollout over an array or legacy session", async () => {
+    for (const client of ["codex", "claude"] as const) {
+      await withWorld(async (world) => {
+        await world.seed(client, ["user", "stored"]);
+        world.write(lines(fork({ forked_from_id: undefined })));
+        expect(await world.ingest()).toEqual(NOTHING);
+        expect(world.nativeRecords()).toBe(1);
+        expect(logs.error).not.toHaveBeenCalled();
+      });
+    }
+  });
+
+  it("stops an empty plain rollout when the stored marker is unreadable", async () => {
+    await withWorld(async (world) => {
+      await world.seed("codex", ["user", "stored"]);
+      world.exec("UPDATE message_parts SET metadata = '{\"lcmCodexLineage\":1}' WHERE metadata LIKE '%lcmCodexLineage%'");
+      world.write(lines(fork({ forked_from_id: undefined })));
+      expect(await world.ingest()).toEqual(NOTHING);
+      expect(world.nativeRecords()).toBe(0);
+      expect(logs.error).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("accepts an empty fork over a conversation that holds no transcript rows", async () => {
     await withWorld(async (world) => {
       await world.seed("claude", ["user", "x"]);
@@ -796,6 +839,29 @@ describe("Codex lineage marker", () => {
     ["no mode", { [CODEX_LINEAGE_METADATA_KEY]: { version: 1 } }],
   ])("reads %s as malformed", (_name, value) => {
     expect(parseCodexLineageMarker(JSON.stringify(value))).toBe("malformed");
+  });
+
+  it("stops an empty plain rollout when no first transcript row can be found for a stored session", async () => {
+    const conversation = { conversationId: 7, sessionId: "s", parentSessionId: null };
+    const conversations = {
+      getConversationBySessionId: async () => conversation,
+      getTranscriptSlotSnapshot: async () => ({ transcriptCount: 2, events: [] }),
+      getMessageCount: async () => 1,
+      getMessageCountBySessionId: async () => 2,
+      listConversations: async () => [],
+      getMessages: vi.fn(),
+      appendMessages: vi.fn(),
+    };
+    const result = await persistCodexLineage(
+      { conversations } as never,
+      "s",
+      { source: "file", full: [] },
+      undefined,
+      async () => undefined,
+    );
+    expect(result).toEqual({ persisted: null, history: "lineage-mismatch" });
+    expect(conversations.getMessages).not.toHaveBeenCalled();
+    expect(conversations.appendMessages).not.toHaveBeenCalled();
   });
 
   it("stops a message list when no first transcript row can be found for a stored session", async () => {
