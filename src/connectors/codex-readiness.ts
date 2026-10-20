@@ -6,7 +6,13 @@ import { dirname, join } from "node:path";
 import { readBoundedRegularFileWithStat } from "../security-files.js";
 import { readCodexHookReceipts, type CodexHookReceipt } from "../hooks/codex-hook-receipts.js";
 import { classifyCodexHooksFeatureScan, scanCodexConfigToml, type CodexTomlScan } from "./codex-config-toml.js";
-import { codexLcmHookRole, codexLcmHooks, type CodexHookGroup } from "./codex-hooks.js";
+import {
+  codexLcmHookRole,
+  codexLcmHooks,
+  parseCodexHooksJson,
+  type CodexHookGroup,
+  type CodexHooksJsonPath,
+} from "./codex-hooks.js";
 import type { ConnectorTransport } from "./types.js";
 
 export const CODEX_MIN_VERSION = "0.163.0";
@@ -188,9 +194,19 @@ function tomlRepresentable(value: unknown): boolean {
   return isRecord(value) && Object.values(value).every(tomlRepresentable);
 }
 
-function validHandler(handler: unknown): handler is Record<string, unknown> {
+/** A timeout or limit must be a safe unsigned integer written as one (no sign, fraction or exponent). */
+function optionalCount(handler: Record<string, unknown>, field: string, notIntegerToken: (field: string) => boolean): boolean {
+  return optional(handler[field], (value) => isCount(value) && !notIntegerToken(field));
+}
+
+function validHandler(handler: unknown, notIntegerToken: (field: string) => boolean): handler is Record<string, unknown> {
   if (!isRecord(handler) || typeof handler.type !== "string" || !KNOWN_HANDLER_TYPES.has(handler.type)) return false;
-  if (!optional(handler.timeout, isCount) || !optional(handler.statusMessage, isString)) return false;
+  // Codex defines prompt and agent handlers as empty variants and ignores their timeout, so only
+  // command and mcp_tool timeouts need the integer token.
+  const timeoutValid = handler.type === "command" || handler.type === "mcp_tool"
+    ? optionalCount(handler, "timeout", notIntegerToken)
+    : optional(handler.timeout, isCount);
+  if (!timeoutValid || !optional(handler.statusMessage, isString)) return false;
   if (handler.type === "mcp_tool") {
     return isString(handler.server) && isString(handler.tool)
       && (handler.input === undefined || (isRecord(handler.input) && tomlRepresentable(handler.input)));
@@ -202,17 +218,23 @@ function validHandler(handler: unknown): handler is Record<string, unknown> {
     && optional(handler.command_windows, isString)
     && (handler.commandWindows === undefined || handler.command_windows === undefined)
     && (handler.async === undefined || typeof handler.async === "boolean")
-    && optional(handler.additionalContextLimit, isCount);
+    && optionalCount(handler, "additionalContextLimit", notIntegerToken);
+}
+
+/** The objects Codex deserializes into typed structs: the root, hooks, each group and each handler. */
+function typedObjectPath(path: CodexHooksJsonPath): boolean {
+  if (path.length === 0) return true;
+  if (path[0] !== "hooks") return false;
+  return path.length === 1
+    || (path.length === 3 && typeof path[2] === "number")
+    || (path.length === 5 && typeof path[2] === "number" && path[3] === "hooks" && typeof path[4] === "number");
 }
 
 /** Parse hooks.json with the strictness of Codex's typed schema; undefined means Codex would reject it. */
 function parseInstalledHandlers(content: string): InstalledHandler[] | undefined {
-  let value: unknown;
-  try {
-    value = JSON.parse(content);
-  } catch {
-    return undefined;
-  }
+  const strict = parseCodexHooksJson(content);
+  if (strict === undefined || strict.duplicates.some(({ path }) => typedObjectPath(path))) return undefined;
+  const value = strict.value;
   if (!isRecord(value)) return undefined;
   if (Object.keys(value).some((key) => key !== "hooks" && key !== "description")) return undefined;
   if (!optional(value.description, isString)) return undefined;
@@ -226,7 +248,8 @@ function parseInstalledHandlers(content: string): InstalledHandler[] | undefined
       if (!isRecord(group) || !optional(group.matcher, isString)) return undefined;
       if (group.hooks !== undefined && !Array.isArray(group.hooks)) return undefined;
       for (const [handlerIndex, handler] of (group.hooks ?? []).entries()) {
-        if (!validHandler(handler)) return undefined;
+        const handlerPath: CodexHooksJsonPath = ["hooks", event, groupIndex, "hooks", handlerIndex];
+        if (!validHandler(handler, (field) => strict.nonIntegerNumberAt([...handlerPath, field]))) return undefined;
         const role = codexLcmHookRole(handler.command);
         if (role !== undefined) {
           found.push({
@@ -426,7 +449,7 @@ export function formatCodexReadiness(report: CodexReadinessReport): { lines: str
   const featureOff = report.rows.some((row) => row.status === "feature-disabled");
   const unavailable = new Set<string>();
   if (unreadable) {
-    lines.push("  ✗ Codex: " + report.hooksPath + " is unreadable or malformed; fix or reinstall (Codex ignores it with a warning)");
+    lines.push("  ✗ Codex: " + report.hooksPath + " is unreadable or malformed; fix the file (or move it aside), then reinstall (Codex ignores it with a warning)");
     failures += 1;
     for (const row of report.rows) unavailable.add(capability(row.event));
   } else if (featureOff) {

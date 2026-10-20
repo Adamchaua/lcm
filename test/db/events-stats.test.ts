@@ -447,3 +447,55 @@ describe("collectEventStats", () => {
     expect(stats.recentErrors.some((entry) => entry.error.includes("detailed failure"))).toBe(true);
   });
 });
+
+
+describe("read-only sidecar oldest pending capture time", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "events-pending-test-"));
+    mockEventsDir = dir;
+    mockProjectsDir = join(dir, "projects");
+    mkdirSync(mockProjectsDir, { recursive: true });
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function seed(file: string, rows: Array<[string, string]>): void {
+    const db = new EventsDb(join(dir, file));
+    for (const [index] of rows.entries()) {
+      db.insertEvent("s", { type: "decision", category: "decision", data: "d" + index, priority: 1 }, "PostToolUse");
+    }
+    db.close();
+    const raw = new DatabaseSync(join(dir, file));
+    raw.exec("PRAGMA journal_mode = WAL");
+    const ids = (raw.prepare("SELECT event_id FROM events ORDER BY event_id").all() as Array<{ event_id: number }>).map(row => row.event_id);
+    rows.forEach(([createdAt, state], index) => {
+      raw.exec("UPDATE events SET created_at = '" + createdAt + "', delivery_state = '" + state + "'" +
+        (state === "quarantined" ? ", quarantine_reason = 'seeded'" : "") + " WHERE event_id = " + ids[index]);
+    });
+    raw.close();
+  }
+
+  it("reads the oldest pending or retry row without changing the delivery minimum", async () => {
+    seed("one.db", [
+      ["2019-01-01 00:00:00", "quarantined"],
+      ["2026-02-03 10:00:00", "pending"],
+      ["2026-02-03 09:00:00", "retry"],
+    ]);
+    const [sidecar] = await collectEventSidecars({ pruneOrphanSidecars: false });
+    expect(sidecar!.scanError).toBeUndefined();
+    expect(sidecar!.oldestPendingAt).toBe("2026-02-03 09:00:00");
+    expect(sidecar!.oldestDeliveryAt).toBe("2019-01-01 00:00:00");
+    expect((await collectEventStats({ pruneOrphanSidecars: false })).oldestPendingAt).toBe("2026-02-03 09:00:00");
+  });
+  it("reports a complete read with no qualifying row as null", async () => {
+    seed("none.db", [["2019-01-01 00:00:00", "quarantined"]]);
+    expect((await collectEventStats({ pruneOrphanSidecars: false })).oldestPendingAt).toBeNull();
+  });
+  it("leaves the value unknown on the writable scan path", async () => {
+    seed("writable.db", [["2026-02-03 10:00:00", "pending"]]);
+    const [sidecar] = await collectEventSidecars({ pruneOrphanSidecars: true });
+    expect(sidecar!.oldestPendingAt).toBeUndefined();
+    expect((await collectEventStats({ pruneOrphanSidecars: true })).oldestPendingAt).toBeUndefined();
+  });
+});
+
