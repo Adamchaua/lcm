@@ -218,14 +218,14 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
     coordinator: input.coordinator,
     manifestStore: input.manifestStore,
     now: input.now,
-    resolveExpectedIdentity: async (token, path) => {
+    resolveExpectedIdentity: async (step) => {
       const result = await resolveExpectedIdentity({
-        preflight: path === "fresh" ? preflight : { ...preflight, candidate: { disposition: "continue-held" } },
+        preflight: step.path === "fresh" ? preflight : { ...preflight, candidate: { disposition: "continue-held" } },
         cwd: input.cwd,
         homeDir: input.homeDir,
-        ...(token === null ? {} : { publicationLockToken: token }),
+        ...(step.path === "fresh" ? { publicationLockToken: step.token } : {}),
       });
-      if (path === "fresh") mutation = migrationApplyIdentityMutation(preview, result);
+      if (step.path === "fresh") mutation = migrationApplyIdentityMutation(preview, result);
       return result;
     },
   });

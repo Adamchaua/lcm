@@ -441,7 +441,7 @@ describe("performMigrationApply: identity is minted only after the fence (plan-v
         },
         performCapture: async (captureInput) => {
           events.push("capture");
-          const identity = await captureInput.resolveExpectedIdentity!(token, "fresh");
+          const identity = await captureInput.resolveExpectedIdentity!({ path: "fresh", token });
           if (identity.status !== "resolved") throw new Error("unreachable");
           return { ...await captured(), expectedIdentity: identity.expectedIdentity };
         },
@@ -463,7 +463,7 @@ describe("performMigrationApply: identity is minted only after the fence (plan-v
         resolveExpectedIdentity: async (input) => { disposition = input.preflight.candidate.disposition; token = input.publicationLockToken; return { status: "refuse", reason: "destination-project-absent" }; },
         performCapture: async (captureInput) => {
           // The entering-recovery path reads before any barrier exists and passes no token.
-          const identity = await captureInput.resolveExpectedIdentity!(null, "held");
+          const identity = await captureInput.resolveExpectedIdentity!({ path: "held" });
           return identity.status === "refuse" ? identity : captured();
         },
       },
@@ -483,7 +483,7 @@ describe("performMigrationApply: identity is minted only after the fence (plan-v
         _operationsForTesting: {
           resolveExpectedIdentity: undefined,
           performCapture: async (captureInput) => {
-            const identity = await captureInput.resolveExpectedIdentity!({}, "held");
+            const identity = await captureInput.resolveExpectedIdentity!({ path: "held" });
             return identity.status === "refuse" ? identity : captured();
           },
         },
@@ -503,7 +503,7 @@ describe("performMigrationApply: a refusal after the fresh identity step reports
   function refusingSpan(reason: string, mint: boolean, evidence?: string) {
     return async (captureInput: Parameters<NonNullable<Parameters<typeof performMigrationApply>[0]["_operationsForTesting"]>["performCapture"]>[0]): Promise<MigrationApplyThroughCaptureOutcome> => {
       if (mint) {
-        const identity = await captureInput.resolveExpectedIdentity!({}, "fresh");
+        const identity = await captureInput.resolveExpectedIdentity!({ path: "fresh", token: {} });
         if (identity.status === "refuse") return identity;
       }
       return { status: "refuse", reason, ...(evidence === undefined ? {} : { evidence }) };
@@ -574,7 +574,7 @@ describe("performMigrationApply: a refusal after the fresh identity step reports
       _operationsForTesting: {
         resolveExpectedIdentity: resolveIdentity,
         performCapture: async (captureInput) => {
-          const identity = await captureInput.resolveExpectedIdentity!({}, "fresh");
+          const identity = await captureInput.resolveExpectedIdentity!({ path: "fresh", token: {} });
           if (identity.status !== "resolved") throw new Error("unreachable");
           return { ...await captured(), expectedIdentity: identity.expectedIdentity };
         },

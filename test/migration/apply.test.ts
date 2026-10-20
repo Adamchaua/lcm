@@ -7,6 +7,7 @@ import {
   maintenanceOnlyDriver,
   MIGRATION_DRIVER_NOT_INVOKED_MESSAGE,
   type MigrationApplyIdentityResolver,
+  type MigrationApplyIdentityStep,
 } from "../../src/migration/apply.js";
 import { resolveMigrationExpectedIdentity } from "../../src/migration/cli-preflight.js";
 import { resolveMigrationApplyCandidate } from "../../src/migration/candidate.js";
@@ -1040,8 +1041,8 @@ describe("performMigrationApplyThroughCapture, the identity step inside the span
     machineId: REGISTERED_MACHINE, selectedPath: "/tmp/project",
   };
   function recorder(result: Awaited<ReturnType<MigrationApplyIdentityResolver>> = { status: "resolved", expectedIdentity: IDENTITY }) {
-    const calls: Array<{ path: string; token: unknown }> = [];
-    const resolve: MigrationApplyIdentityResolver = async (token, path) => { calls.push({ path, token }); return result; };
+    const calls: MigrationApplyIdentityStep[] = [];
+    const resolve: MigrationApplyIdentityResolver = async (step) => { calls.push(step); return result; };
     return { calls, resolve };
   }
   function occupy(homeDir: string, generationId: string): void {
@@ -1087,7 +1088,7 @@ describe("performMigrationApplyThroughCapture, the identity step inside the span
     });
     expect(result).toEqual({ status: "refuse", reason: "hold-entry-contention", evidence: "lock-contention" });
     expect(identity.calls.map((call) => call.path)).toEqual(["fresh"]);
-    expect(typeof identity.calls[0]!.token).toBe("object");
+    expect(identity.calls[0]).toMatchObject({ path: "fresh", token: expect.any(Object) });
   });
 
   it("a fresh identity refusal is the span's own refusal, before any hold is written", async () => {
@@ -1113,12 +1114,12 @@ describe("performMigrationApplyThroughCapture, the identity step inside the span
     const resolveTargetIdentity = vi.fn(async () => ({ status: "resolved" as const, projectId: "minted-project" }));
     const result = await capture({
       cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
-      resolveExpectedIdentity: (token, path) => resolveMigrationExpectedIdentity({
+      resolveExpectedIdentity: (step) => resolveMigrationExpectedIdentity({
         preflight: {
           targetConfig: fixture.request.targetConfig, machineId: REGISTERED_MACHINE,
-          candidate: { disposition: path === "fresh" ? "fresh" : "continue-held" },
+          candidate: { disposition: step.path === "fresh" ? "fresh" : "continue-held" },
         },
-        cwd: fixture.cwd, homeDir: fixture.homeDir, publicationLockToken: token,
+        cwd: fixture.cwd, homeDir: fixture.homeDir, ...(step.path === "fresh" ? { publicationLockToken: step.token } : {}),
         _operationsForTesting: { createIdentityRuntime: () => ({ close: async () => undefined }) as never, resolveTargetIdentity },
       }),
     });
@@ -1173,13 +1174,13 @@ describe("performMigrationApplyThroughCapture, recover-entering runs the held id
 
   it("a held identity refusal leaves the real entering journal untouched: no promotion to maintenance-held, the refusal is the resolver's own", async () => {
     const { fixture, coordinator, before } = await enteringJournal();
-    const calls: Array<{ path: string; token: unknown }> = [];
+    const calls: MigrationApplyIdentityStep[] = [];
     const result = await capture({
       cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
-      resolveExpectedIdentity: async (token, path) => { calls.push({ path, token }); return { status: "refuse", reason: "local-identity-not-persisted" }; },
+      resolveExpectedIdentity: async (step) => { calls.push(step); return { status: "refuse", reason: "local-identity-not-persisted" }; },
     });
     expect(result).toEqual({ status: "refuse", reason: "local-identity-not-persisted" });
-    expect(calls).toEqual([{ path: "held", token: null }]);
+    expect(calls).toEqual([{ path: "held" }]);
     expect(readBackendMaintenanceJournal(fixture.homeDir)!.phase).toBe("maintenance-entering");
     expect(readFileSync(backendPublicationJournalPath(fixture.homeDir)).equals(before)).toBe(true);
   });
@@ -1190,7 +1191,7 @@ describe("performMigrationApplyThroughCapture, recover-entering runs the held id
     const IDENTITY = { id: "r", localProjectId: "l", canonical: fixture.cwd, remoteProjectId: "r", machineId: REGISTERED_MACHINE, selectedPath: fixture.cwd };
     const result = await capture({
       cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
-      resolveExpectedIdentity: async (_token, path) => { calls.push(`${path}:${readBackendMaintenanceJournal(fixture.homeDir)!.phase}`); return { status: "resolved", expectedIdentity: IDENTITY }; },
+      resolveExpectedIdentity: async (step) => { calls.push(`${step.path}:${readBackendMaintenanceJournal(fixture.homeDir)!.phase}`); return { status: "resolved", expectedIdentity: IDENTITY }; },
     });
     expect(result).toMatchObject({ status: "captured", generationId, expectedIdentity: IDENTITY });
     expect(calls).toEqual(["held:maintenance-entering"]);

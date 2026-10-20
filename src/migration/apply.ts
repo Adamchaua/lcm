@@ -132,15 +132,16 @@ export type MigrationApplyThroughCaptureOutcome =
 /**
  * Which span the identity step runs in: `fresh` mints (plan-v5 Part B (3)),
  * `held` only reads. The span decides, from the journal it actually found,
- * never the preflight's earlier disposition. The token is `null` on the
- * entering-recovery path, which reads before any barrier exists; the held
- * read is lock-free and never needs one.
+ * never the preflight's earlier disposition. Only the fresh step carries a
+ * token: its mint reuses the barrier's admission. The held step is a
+ * lock-free read (readProjectMapIdentity plus a SELECT) and runs on the
+ * entering-recovery path before any barrier exists, so it has none.
  */
 export type MigrationApplyIdentityPath = "fresh" | "held";
-export type MigrationApplyIdentityResolver = (
-  token: BackendPublicationLockToken | null,
-  path: MigrationApplyIdentityPath,
-) => Promise<MigrationExpectedIdentityResult>;
+export type MigrationApplyIdentityStep =
+  | Readonly<{ path: "fresh"; token: BackendPublicationLockToken }>
+  | Readonly<{ path: "held" }>;
+export type MigrationApplyIdentityResolver = (step: MigrationApplyIdentityStep) => Promise<MigrationExpectedIdentityResult>;
 
 export type MigrationApplyOperations = Readonly<{
   resolveHoldContinuation: typeof resolveMigrationHoldContinuation;
@@ -200,11 +201,10 @@ type IdentityStep =
 
 async function resolveIdentityUnderBarrier(
   input: MigrationApplyThroughCaptureInput,
-  token: BackendPublicationLockToken | null,
-  path: MigrationApplyIdentityPath,
+  step: MigrationApplyIdentityStep,
 ): Promise<IdentityStep> {
   if (input.resolveExpectedIdentity === undefined) return { status: "resolved" };
-  const identity = await input.resolveExpectedIdentity(token, path);
+  const identity = await input.resolveExpectedIdentity(step);
   if (identity.status === "refuse") {
     return { status: "refuse", reason: identity.reason, ...(identity.evidence === undefined ? {} : { evidence: identity.evidence }) };
   }
@@ -228,7 +228,7 @@ async function captureUnderBarrier(
 ): Promise<MigrationApplyThroughCaptureOutcome> {
   let resolved = identity;
   if (resolved === undefined) {
-    const step = await resolveIdentityUnderBarrier(input, token, "held");
+    const step = await resolveIdentityUnderBarrier(input, { path: "held" });
     if (step.status === "refuse") return step;
     resolved = step;
   }
@@ -344,7 +344,7 @@ async function freshCutoverUnderBarrier(
   // and nothing else left to refuse before the hold needs the map, may the
   // identity be minted. The authenticated read below must see the minted
   // entry: the hold's source selection and capture's witness bind to it.
-  const identity = await resolveIdentityUnderBarrier(input, token, "fresh");
+  const identity = await resolveIdentityUnderBarrier(input, { path: "fresh", token });
   if (identity.status === "refuse") return identity;
 
   const authority = authenticateSqliteMigrationSource(input.cwd, input.homeDir, token);
@@ -403,7 +403,7 @@ async function recoverEnteringThenCapture(
   // leaves the journal maintenance-entering, so the next apply recovers it
   // again instead of continuing a hold this invocation wrote and then
   // reported as not applied.
-  const identity = await resolveIdentityUnderBarrier(input, null, "held");
+  const identity = await resolveIdentityUnderBarrier(input, { path: "held" });
   if (identity.status === "refuse") return identity;
   let heldJournal: BackendMaintenanceJournal;
   try {
