@@ -1327,14 +1327,15 @@ export function parseBackendCutoverSetManifest(value: unknown): BackendCutoverSe
       || !HASH_PATTERN.test(item.physicalProjectId)
       || typeof item.generationId !== "string"
       || !PUBLICATION_ID_PATTERN.test(item.generationId)
-      || !HASH_PATTERN.test(String(item.sourceSelectionSha256))
+      || typeof item.sourceSelectionSha256 !== "string"
+      || !HASH_PATTERN.test(item.sourceSelectionSha256)
     ) {
       return fail("malformed-journal", `backend cutover-set member[${index}] is malformed`);
     }
     return {
       physicalProjectId: item.physicalProjectId,
       generationId: item.generationId,
-      sourceSelectionSha256: item.sourceSelectionSha256 as string,
+      sourceSelectionSha256: item.sourceSelectionSha256,
     };
   });
   if (members.some((member, index) => index > 0 && members[index - 1]!.physicalProjectId >= member.physicalProjectId)) {
@@ -1359,7 +1360,8 @@ function parseCutoverSetBindings(
       !isRecord(item)
       || !exactKeys(item, ["generationId", "queueEvidenceSha256", "roster"])
       || item.generationId !== manifest.members[index]!.generationId
-      || !HASH_PATTERN.test(String(item.queueEvidenceSha256))
+      || typeof item.queueEvidenceSha256 !== "string"
+      || !HASH_PATTERN.test(item.queueEvidenceSha256)
     ) {
       return fail("malformed-journal", `backend cutover-set binding[${index}] is malformed`);
     }
@@ -1373,7 +1375,7 @@ function parseCutoverSetBindings(
     }
     return {
       generationId: item.generationId,
-      queueEvidenceSha256: item.queueEvidenceSha256 as string,
+      queueEvidenceSha256: item.queueEvidenceSha256,
       roster,
     };
   });

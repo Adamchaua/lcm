@@ -182,6 +182,9 @@ describe("cutover-set journal", () => {
       ["a malformed member generation id", /member\[1\] is malformed/, (p) => { p.cutoverSet.manifest.members[1].generationId = "bad id"; }],
       ["a non-string member generation id", /member\[1\] is malformed/, (p) => { p.cutoverSet.manifest.members[1].generationId = 7; }],
       ["a malformed member source hash", /member\[1\] is malformed/, (p) => { p.cutoverSet.manifest.members[1].sourceSelectionSha256 = "x"; }],
+      ["a single-element array as member source hash", /member\[1\] is malformed/, (p) => {
+        p.cutoverSet.manifest.members[1].sourceSelectionSha256 = [p.cutoverSet.manifest.members[1].sourceSelectionSha256];
+      }],
       ["unsorted members", /not uniquely sorted by project/, (p) => { p.cutoverSet.manifest.members.reverse(); }],
       ["duplicate members", /not uniquely sorted by project/, (p) => {
         p.cutoverSet.manifest.members[1].physicalProjectId = p.cutoverSet.manifest.members[0].physicalProjectId;
@@ -198,6 +201,9 @@ describe("cutover-set journal", () => {
       ["a non-object binding", /binding\[0\] is malformed/, (p) => { p.cutoverSet.bindings[0] = 7; }],
       ["misaligned binding order", /binding\[0\] is malformed/, (p) => { p.cutoverSet.bindings.reverse(); }],
       ["malformed binding evidence", /binding\[0\] is malformed/, (p) => { p.cutoverSet.bindings[0].queueEvidenceSha256 = "x"; }],
+      ["a single-element array as binding evidence", /binding\[0\] is malformed/, (p) => {
+        p.cutoverSet.bindings[0].queueEvidenceSha256 = [p.cutoverSet.bindings[0].queueEvidenceSha256];
+      }],
       ["an empty binding roster", /roster is empty or malformed/, (p) => { p.cutoverSet.bindings[0].roster = []; }],
       ["two binding roster rows", /binding\[0\] roster is inconsistent/, (p) => {
         p.cutoverSet.bindings[0].roster.push({ ...p.cutoverSet.bindings[0].roster[0], machineId: "ffffffff-1234-7abc-8def-1234567890ab" });
