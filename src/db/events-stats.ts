@@ -20,6 +20,12 @@ export interface EventStats {
   deliveryAwaitingRemotePrune: number;
   deliveryQuarantined: number;
   oldestDeliveryAt: string | null;
+  /**
+   * Internal diagnostic input; never serialized. Oldest pending or retry
+   * capture time, null when every sidecar was read and none qualifies, and
+   * undefined when any sidecar did not report it.
+   */
+  oldestPendingAt?: string | null;
 }
 
 export interface DetailedEventStats extends EventStats {
@@ -49,6 +55,16 @@ export interface DetailedEventStats extends EventStats {
 }
 
 export type EventStatsOptions = number | EventSidecarScanOptions;
+
+/** An unread source makes the aggregate unknown; unknown never becomes "none". */
+function foldOldestPendingAt(
+  current: string | null | undefined,
+  next: string | null | undefined,
+): string | null | undefined {
+  if (current === undefined || next === undefined) return undefined;
+  if (next === null) return current;
+  return current === null || next < current ? next : current;
+}
 
 function normalizeStatsOptions(options: EventStatsOptions = {}): EventSidecarScanOptions {
   if (typeof options === "number") return { timeoutMs: options };
@@ -81,6 +97,7 @@ export async function collectEventStats(options: EventStatsOptions = {}): Promis
     deliveryAwaitingRemotePrune: 0,
     deliveryQuarantined: 0,
     oldestDeliveryAt: null,
+    oldestPendingAt: null,
   };
 
   for (const sidecar of await collectEventSidecars(scanOptions)) {
@@ -91,6 +108,7 @@ export async function collectEventStats(options: EventStatsOptions = {}): Promis
     }
     if (sidecar.scanSkipped) {
       result.scanSkipped = result.scanSkipped! + (sidecar.scanSkippedCount ?? 1);
+      result.oldestPendingAt = undefined;
       continue;
     }
     result.captured += sidecar.captured;
@@ -108,6 +126,7 @@ export async function collectEventStats(options: EventStatsOptions = {}): Promis
     ) {
       result.oldestDeliveryAt = sidecar.oldestDeliveryAt;
     }
+    result.oldestPendingAt = foldOldestPendingAt(result.oldestPendingAt, sidecar.oldestPendingAt);
     if (sidecar.scanError) {
       result.scanErrors = result.scanErrors! + 1;
     } else {
@@ -139,6 +158,7 @@ export async function collectDetailedEventStats(options: EventStatsOptions = {})
     deliveryReplicated: 0, deliveryAcknowledged: 0, deliveryAwaitingRemotePrune: 0,
     deliveryQuarantined: 0,
     oldestDeliveryAt: null,
+    oldestPendingAt: null,
     projects: [], recentErrors: [],
   };
 
@@ -148,6 +168,7 @@ export async function collectDetailedEventStats(options: EventStatsOptions = {})
       result.prunedSidecars = result.prunedSidecars! + 1;
     } else if (sidecar.scanSkipped) {
       result.scanSkipped = result.scanSkipped! + (sidecar.scanSkippedCount ?? 1);
+      result.oldestPendingAt = undefined;
     } else {
       result.captured += sidecar.captured;
       result.unprocessed += sidecar.unprocessed;
@@ -164,6 +185,7 @@ export async function collectDetailedEventStats(options: EventStatsOptions = {})
       ) {
         result.oldestDeliveryAt = sidecar.oldestDeliveryAt;
       }
+      result.oldestPendingAt = foldOldestPendingAt(result.oldestPendingAt, sidecar.oldestPendingAt);
       if (sidecar.scanError) {
         result.scanErrors = result.scanErrors! + 1;
       } else {

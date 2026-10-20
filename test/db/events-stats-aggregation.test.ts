@@ -152,3 +152,45 @@ describe("event stats aggregation boundaries", () => {
     });
   });
 });
+
+
+describe("internal oldest pending capture time", () => {
+  beforeEach(() => sidecarMock.mockReset());
+  const readers = [
+    ["collectEventStats", (): Promise<{ oldestPendingAt?: string | null }> => collectEventStats(1)],
+    ["collectDetailedEventStats", (): Promise<{ oldestPendingAt?: string | null }> => collectDetailedEventStats(1)],
+  ] as const;
+
+  it.each(readers)("%s reports a proven empty source as null", async (_name, read) => {
+    sidecarMock.mockResolvedValue([]);
+    expect((await read()).oldestPendingAt).toBeNull();
+    sidecarMock.mockResolvedValue([sidecar({ oldestPendingAt: null }), sidecar({ file: "b.db", oldestPendingAt: null })]);
+    expect((await read()).oldestPendingAt).toBeNull();
+  });
+  it.each(readers)("%s selects the minimum across complete sidecars and ignores pruned ones", async (_name, read) => {
+    sidecarMock.mockResolvedValue([
+      sidecar({ oldestPendingAt: "2026-02-03 10:00:00" }),
+      sidecar({ file: "none.db", oldestPendingAt: null }),
+      sidecar({ file: "older.db", oldestPendingAt: "2026-01-01 00:00:00" }),
+      sidecar({ file: "newer.db", oldestPendingAt: "2026-03-01 00:00:00" }),
+      sidecar({ file: "pruned.db", pruned: true }),
+    ]);
+    expect((await read()).oldestPendingAt).toBe("2026-01-01 00:00:00");
+  });
+  it.each(readers)("%s makes the aggregate unknown when any source did not report it", async (_name, read) => {
+    for (const unread of [
+      sidecar({ file: "legacy.db" }),
+      sidecar({ file: "failed.db", scanError: "bad" }),
+      sidecar({ file: "skipped.db", scanSkipped: "budget", scanSkippedCount: 2 }),
+    ]) {
+      for (const order of [[unread, sidecar({ oldestPendingAt: "2026-01-01 00:00:00" })], [sidecar({ oldestPendingAt: "2026-01-01 00:00:00" }), unread]]) {
+        sidecarMock.mockResolvedValue(order);
+        expect((await read()).oldestPendingAt).toBeUndefined();
+      }
+    }
+  });
+  it("never adds the value to a detailed project record", async () => {
+    sidecarMock.mockResolvedValue([sidecar({ oldestPendingAt: "2026-01-01 00:00:00" })]);
+    expect(Object.keys((await collectDetailedEventStats(1)).projects[0]!)).not.toContain("oldestPendingAt");
+  });
+});

@@ -40,6 +40,12 @@ export interface EventSidecarSummary {
   deliveryAwaitingRemotePrune: number;
   deliveryQuarantined: number;
   oldestDeliveryAt: string | null;
+  /**
+   * Internal diagnostic input; never serialized. A string is the oldest
+   * pending or retry capture time, null is a complete read with no such row,
+   * and an absent value means the source was not read.
+   */
+  oldestPendingAt?: string | null;
   recentErrors?: Array<{ created_at: string; hook: string; error: string }>;
   scanError?: string;
   scanSkipped?: string;
@@ -48,6 +54,9 @@ export interface EventSidecarSummary {
   pruned?: boolean;
   pruneReason?: string;
 }
+
+/** Read-only diagnostic row; the shared outbox health type and writer SQL are unchanged. */
+type DiagnosticOutboxHealth = LocalHookOutboxHealth & { oldestPendingAt?: string | null };
 
 export interface EventSidecarScanOptions {
   publicationLockToken?: BackendPublicationLockToken;
@@ -136,7 +145,8 @@ function readOnlySidecarFactory(
             COUNT(*) FILTER (WHERE delivery_state = 'acknowledged') AS deliveryAcknowledged,
             COUNT(*) FILTER (WHERE delivery_state = 'acknowledged' AND remote_inbox_id IS NOT NULL AND remote_pruned_at IS NULL) AS deliveryAwaitingRemotePrune,
             COUNT(*) FILTER (WHERE delivery_state = 'quarantined') AS deliveryQuarantined,
-            MIN(created_at) FILTER (WHERE delivery_state <> 'acknowledged') AS oldestDeliveryAt
+            MIN(created_at) FILTER (WHERE delivery_state <> 'acknowledged') AS oldestDeliveryAt,
+            MIN(created_at) FILTER (WHERE delivery_state IN ('pending', 'retry')) AS oldestPendingAt
           FROM events
         `,
       }, {
@@ -162,8 +172,8 @@ function readOnlySidecarFactory(
       return {
         async getHealthStats(
           _publicationLockToken?: BackendPublicationLockToken,
-        ): Promise<LocalHookOutboxHealth> {
-          const totals = rows[0] as Omit<LocalHookOutboxHealth, "errors" | "lastError">;
+        ): Promise<DiagnosticOutboxHealth> {
+          const totals = rows[0] as Omit<DiagnosticOutboxHealth, "errors" | "lastError">;
           const errors = rows[1] as { errors: number; lastError: string | null };
           return { ...totals, ...errors };
         },
@@ -525,6 +535,7 @@ async function scanEventSidecars(options: EventSidecarScanOptions): Promise<Even
               deliveryAwaitingRemotePrune: stats.deliveryAwaitingRemotePrune,
               deliveryQuarantined: stats.deliveryQuarantined,
               oldestDeliveryAt: stats.oldestDeliveryAt,
+              oldestPendingAt: (stats as DiagnosticOutboxHealth).oldestPendingAt,
               recentErrors,
             };
           } finally {
