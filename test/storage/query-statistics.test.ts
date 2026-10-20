@@ -247,6 +247,33 @@ describe("PostgreSQL query statistics", () => {
     expect(collectorStatements.join("\n")).not.toMatch(/\b(?:RESET|SET)\b/u);
   });
 
+  it("records observedAt when a successful status is decided", async () => {
+    let clock = 100;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      const observation = await createPostgreSqlQueryStatisticsCollector().collect(
+        executorFixture({ onQuery: () => { clock += 10; } }),
+        { publicationWitness: "witness-a" },
+      );
+      expect(observation.family).toMatchObject({ status: "observed", observedAt: 260 });
+    } finally { now.mockRestore(); }
+  });
+
+  it("records observedAt when a failed status is decided", async () => {
+    let clock = 300;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      const observation = await createPostgreSqlQueryStatisticsCollector().collect(
+        executorFixture({
+          contextError: new Error("private"),
+          onQuery: () => { clock = 420; },
+        }),
+        { publicationWitness: "witness-a" },
+      );
+      expect(observation.family).toMatchObject({ status: "unavailable", observedAt: 420 });
+    } finally { now.mockRestore(); }
+  });
+
   it("reports disabled without mapping or reading statement rows", async () => {
     const executor = executorFixture({ track: "none" });
     const observation = await createPostgreSqlQueryStatisticsCollector().collect(executor, {
@@ -410,6 +437,9 @@ describe("PostgreSQL query statistics", () => {
     "{}",
     "[]",
     '[{"Query Identifier":"not-an-integer"}]',
+    '[{"Query Identifier":123.5}]',
+    '[{"Query Identifier":123e5}]',
+    '[{"Query Identifier":123,"Query Identifier":124}]',
     '[{"Query Identifier":9223372036854775808}]',
     '[{"unterminated}',
     '[{"Plan":{}',
@@ -444,6 +474,22 @@ describe("PostgreSQL query statistics", () => {
     );
     expect(observation.family.status).toBe("partial");
     expect(observation.family.operations?.[4]?.omitted).toEqual(allMetricReasons("permission-denied"));
+  });
+
+  it("does not let a mapping cap clobber a ranked multi-template failure", async () => {
+    const rows = QUERY_OPERATION_CATALOG.slice(0, 4)
+      .map((_, index) => sourceRow(String(index + 100)));
+    const observation = await createPostgreSqlQueryStatisticsCollector().collect(
+      executorFixture({
+        probeErrors: new Map([[4, storageError("42501")]]),
+        rows,
+      }),
+      { publicationWitness: "witness-a", _limits: { maxMappingProbes: 5 } },
+    );
+    expect(observation.family.status).toBe("partial");
+    expect(observation.family.operations?.[4]?.omitted).toEqual(
+      allMetricReasons("permission-denied"),
+    );
   });
 
   it("uses the highest-ranked failure when every mapping probe fails", async () => {

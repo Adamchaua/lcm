@@ -286,12 +286,15 @@ function parsePlanIdentifier(source: string): string | null {
       if (depth === 1 && expectKey && source[index] === ":") {
         index = skipWhitespace(source, index + 1);
         if (parsed.value === "Query Identifier") {
+          if (identifier !== null) throw new Error("duplicate identifier");
           const match = /^-?[0-9]+/u.exec(source.slice(index));
           if (!match) throw new Error("malformed identifier");
           const value = BigInt(match[0]);
           if (value < MIN_QUERY_ID || value > MAX_QUERY_ID) throw new Error("identifier range");
           identifier = value.toString();
           index += match[0].length;
+          const delimiter = source[skipWhitespace(source, index)];
+          if (delimiter !== "," && delimiter !== "}") throw new Error("malformed identifier");
           expectKey = false;
           continue;
         }
@@ -490,10 +493,10 @@ export function createPostgreSqlQueryStatisticsCollector() {
       executor: PostgreSqlQueryExecutor,
       options: QueryStatisticsCollectOptions,
     ): Promise<QueryStatisticsObservation> {
-      const observedAt = options.observedAt ?? Date.now();
+      const now = (): number => options.observedAt ?? Date.now();
       const startSequence = sequence;
       const cap = limits(options._limits);
-      if (options.signal?.aborted) return noCommit(createQueryStatisticsFamily("timeout", observedAt));
+      if (options.signal?.aborted) return noCommit(createQueryStatisticsFamily("timeout", now()));
 
       let contextRow: ContextRow;
       try {
@@ -503,20 +506,20 @@ export function createPostgreSqlQueryStatisticsCollector() {
         if (result.rows.length !== 1) throw new Error("context shape");
         contextRow = result.rows[0]!;
       } catch (error) {
-        return noCommit(createQueryStatisticsFamily(failureStatus(error, options.signal), observedAt));
+        return noCommit(createQueryStatisticsFamily(failureStatus(error, options.signal), now()));
       }
       const track = stringSetting(contextRow.track);
-      if (track === "none") return noCommit(createQueryStatisticsFamily("disabled", observedAt));
-      if (track !== "top" && track !== "all") return noCommit(createQueryStatisticsFamily("unavailable", observedAt));
+      if (track === "none") return noCommit(createQueryStatisticsFamily("disabled", now()));
+      if (track !== "top" && track !== "all") return noCommit(createQueryStatisticsFamily("unavailable", now()));
       const roleOid = oid(contextRow.role_oid);
       const databaseOid = oid(contextRow.database_oid);
       const postmasterStart = timestamp(contextRow.postmaster_start);
       if (roleOid === null || databaseOid === null || postmasterStart === null) {
-        return noCommit(createQueryStatisticsFamily("unavailable", observedAt));
+        return noCommit(createQueryStatisticsFamily("unavailable", now()));
       }
       const statsReset = contextRow.stats_reset === null ? null : timestamp(contextRow.stats_reset);
       if (contextRow.stats_reset !== null && statsReset === null) {
-        return noCommit(createQueryStatisticsFamily("unavailable", observedAt));
+        return noCommit(createQueryStatisticsFamily("unavailable", now()));
       }
       const planning = contextRow.track_planning === "on" ? "on"
         : contextRow.track_planning === "off" ? "off" : "unknown";
@@ -537,7 +540,9 @@ export function createPostgreSqlQueryStatisticsCollector() {
       for (const operation of catalog) {
         for (const template of operation.templates) {
           if (probeCount >= cap.maxMappingProbes) {
-            operationFailures.set(operation.id, "unavailable");
+            if (!operationFailures.has(operation.id)) {
+              operationFailures.set(operation.id, "unavailable");
+            }
             continue;
           }
           probeCount += 1;
@@ -578,11 +583,11 @@ export function createPostgreSqlQueryStatisticsCollector() {
       const identifiers = [...new Set([...operationIds.values()].flat())];
       if (identifiers.length === 0) {
         if (successfulWithoutIdentifier.size > 0 || collided.size > 0) {
-          return noCommit(createQueryStatisticsFamily("unavailable", observedAt));
+          return noCommit(createQueryStatisticsFamily("unavailable", now()));
         }
         const failures = [...operationFailures.values()];
         const status = failures.sort((a, b) => operationFailureRank(b) - operationFailureRank(a))[0]!;
-        return noCommit(createQueryStatisticsFamily(status, observedAt));
+        return noCommit(createQueryStatisticsFamily(status, now()));
       }
 
       const key = comparisonKey(options.publicationWitness, roleOid, databaseOid, operationIds);
@@ -595,12 +600,12 @@ export function createPostgreSqlQueryStatisticsCollector() {
         }, { domain: "factory", operation: "queryStatisticsRows", signal: options.signal });
         resultRows = result.rows;
       } catch (error) {
-        return noCommit(createQueryStatisticsFamily(failureStatus(error, options.signal), observedAt));
+        return noCommit(createQueryStatisticsFamily(failureStatus(error, options.signal), now()));
       }
-      if (resultRows.length === 0) return noCommit(createQueryStatisticsFamily("unavailable", observedAt));
+      if (resultRows.length === 0) return noCommit(createQueryStatisticsFamily("unavailable", now()));
       const sentinel = resultRows.length === 1 && resultRows[0]?.queryid === null;
       if (resultRows.some((row) => row.queryid === null) && !sentinel) {
-        return noCommit(createQueryStatisticsFamily("unavailable", observedAt));
+        return noCommit(createQueryStatisticsFamily("unavailable", now()));
       }
       const epochs = resultRows.map((row) => {
         const rowPostmasterStart = timestamp(row.postmaster_start);
@@ -611,15 +616,15 @@ export function createPostgreSqlQueryStatisticsCollector() {
         return { postmasterStart: rowPostmasterStart, statsReset: rowStatsReset };
       });
       if (epochs.some((epoch) => epoch === null)) {
-        return noCommit(createQueryStatisticsFamily("unavailable", observedAt));
+        return noCommit(createQueryStatisticsFamily("unavailable", now()));
       }
       const firstEpoch = epochs[0]!;
       if (epochs.some((epoch) => epoch!.postmasterStart !== firstEpoch.postmasterStart
           || epoch!.statsReset !== firstEpoch.statsReset)) {
-        return noCommit(createQueryStatisticsFamily("unavailable", observedAt));
+        return noCommit(createQueryStatisticsFamily("unavailable", now()));
       }
       if (firstEpoch.postmasterStart !== postmasterStart || firstEpoch.statsReset !== statsReset) {
-        return noCommit(createQueryStatisticsFamily("stale", observedAt));
+        return noCommit(createQueryStatisticsFamily("stale", now()));
       }
       const candidates = sentinel ? [] : resultRows.slice(0, cap.maxCandidateRows);
       const truncated = !sentinel && resultRows.length > cap.maxCandidateRows;
@@ -631,7 +636,7 @@ export function createPostgreSqlQueryStatisticsCollector() {
           ? parsedId.toString() : null;
         if (id === null || !identifiers.includes(id) || rows.has(id)
             || timestamp(row.stats_since) === null || timestamp(row.minmax_stats_since) === null) {
-          return noCommit(createQueryStatisticsFamily("unavailable", observedAt));
+          return noCommit(createQueryStatisticsFamily("unavailable", now()));
         }
         rows.set(id, row);
       }
@@ -686,7 +691,7 @@ export function createPostgreSqlQueryStatisticsCollector() {
       const status: QueryStatisticsStatus = resetFact ? "reset"
         : structuralPartial || comparisonPartial ? "partial" : "observed";
       const family: QueryStatisticsFamily = {
-        status, observedAt, scope: "aggregate",
+        status, observedAt: now(), scope: "aggregate",
         ...(dealloc === null ? {} : { statementsDeallocTotal: dealloc }),
         ...(statsReset === null ? {} : { statementsStatsReset: statsReset }),
         ...(blockSize === null ? {} : { blockSize }),

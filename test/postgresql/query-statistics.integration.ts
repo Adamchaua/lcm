@@ -132,6 +132,28 @@ function encodedForms(value: string): string[] {
   ];
 }
 
+async function captureProcessStreams<T>(
+  action: () => Promise<T>,
+): Promise<{ value: T; stdout: string; stderr: string }> {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+    stdout.push(String(chunk));
+    return true;
+  });
+  const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+    stderr.push(String(chunk));
+    return true;
+  });
+  try {
+    const value = await action();
+    return { value, stdout: stdout.join(""), stderr: stderr.join("") };
+  } finally {
+    stdoutSpy.mockRestore();
+    stderrSpy.mockRestore();
+  }
+}
+
 describe("PostgreSQL 18 query statistics", () => {
   it("maps every packaged template through real repository executions", async () => {
     await withPostgreSqlTestDatabase("query-statistics-map", async database => {
@@ -256,73 +278,69 @@ describe("PostgreSQL 18 query statistics", () => {
           text: `SET application_name = '${sensitive.utilityLiteral}'`,
         }, context);
 
-        const started = performance.now();
-        const measured = await collector.collect(runtime, {
-          publicationWitness: "integration-witness",
-        });
-        const elapsed = performance.now() - started;
-        expect(measured.family.status).toMatch(/^(observed|partial|reset)$/u);
-        expect(elapsed).toBeLessThan(750);
-        process.stdout.write(
-          `QUERY_STATISTICS_ELAPSED_MS=${elapsed.toFixed(1)} `
-          + `SNAPSHOT_SHARE_PERCENT=${(elapsed / 2000 * 100).toFixed(1)}\n`,
-        );
-
-        const snapshot = backendDiagnosticFailure(undefined, "postgresql");
-        snapshot.classification = "healthy";
-        snapshot.telemetry.statements = measured.family;
-        const rendered = renderBackendDiagnostics(snapshot);
         const home = mkdtempSync(join(tmpdir(), "lcm-query-statistics-doctor-"));
         mkdirSync(join(home, ".lcm"), { mode: 0o700 });
         writeFileSync(join(home, ".lcm", "config.json"), "{}", { mode: 0o600 });
-        let doctorMessage: string;
         try {
-          const doctor = await runDoctor({
-            homedir: home,
-            cwd: home,
-            fetch: vi.fn(),
-            spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }),
-            collectBackendSnapshot: vi.fn().mockResolvedValue(snapshot),
+          const captured = await captureProcessStreams(async () => {
+            const started = performance.now();
+            const measured = await collector.collect(runtime, {
+              publicationWitness: "integration-witness",
+            });
+            const elapsed = performance.now() - started;
+            expect(measured.family.status).toMatch(/^(observed|partial|reset)$/u);
+            expect(elapsed).toBeLessThan(750);
+
+            const snapshot = backendDiagnosticFailure(undefined, "postgresql");
+            snapshot.classification = "healthy";
+            snapshot.telemetry.statements = measured.family;
+            const rendered = renderBackendDiagnostics(snapshot);
+            const doctor = await runDoctor({
+              homedir: home,
+              cwd: home,
+              fetch: vi.fn(),
+              spawnSync: vi.fn().mockReturnValue({ status: 0, stdout: "", stderr: "" }),
+              collectBackendSnapshot: vi.fn().mockResolvedValue(snapshot),
+            });
+            const doctorMessage = doctor.find(row => row.name === "query-statistics")!.message;
+            return { measured, elapsed, rendered, doctorMessage };
           });
-          doctorMessage = doctor.find(row => row.name === "query-statistics")!.message;
+          const { measured, elapsed, rendered, doctorMessage } = captured.value;
+          process.stdout.write(
+            `QUERY_STATISTICS_ELAPSED_MS=${elapsed.toFixed(1)} `
+            + `SNAPSHOT_SHARE_PERCENT=${(elapsed / 2000 * 100).toFixed(1)}\n`,
+          );
+
+          const connection = new URL(database.runtimeUrl);
+          const caFile = settings(database.runtimeUrl).caFile;
+          const canaries = [
+            "message-literal-canary", "session-parameter-canary", "summary-parameter-canary",
+            ...Object.values(sensitive), applicationName, database.name, "lcm_test_runtime",
+            connection.hostname, connection.password, readFileSync(caFile, "utf8"),
+          ];
+          const surfaces = [JSON.stringify(measured.family), rendered, doctorMessage,
+            captured.stdout, captured.stderr].join("\n");
+          for (const canary of canaries) {
+            for (const form of encodedForms(canary)) expect(surfaces).not.toContain(form);
+          }
+          expect(surfaces).not.toMatch(/queryid|Query Identifier/u);
         } finally {
           rmSync(home, { recursive: true, force: true });
         }
-        const stdout: string[] = [];
-        const stderr: string[] = [];
-        const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
-          stdout.push(String(chunk));
-          return true;
-        });
-        const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
-          stderr.push(String(chunk));
-          return true;
-        });
-        try {
-          process.stdout.write(`${JSON.stringify(measured.family)}\n${rendered}\n${doctorMessage}\n`);
-          process.stderr.write(`${doctorMessage}\n`);
-        } finally {
-          stdoutSpy.mockRestore();
-          stderrSpy.mockRestore();
-        }
-
-        const connection = new URL(database.runtimeUrl);
-        const caFile = settings(database.runtimeUrl).caFile;
-        const canaries = [
-          "message-literal-canary", "session-parameter-canary", "summary-parameter-canary",
-          ...Object.values(sensitive), applicationName, database.name, "lcm_test_runtime",
-          connection.hostname, connection.password, readFileSync(caFile, "utf8"),
-        ];
-        const surfaces = [JSON.stringify(measured.family), rendered, doctorMessage,
-          stdout.join(""), stderr.join("")].join("\n");
-        for (const canary of canaries) {
-          for (const form of encodedForms(canary)) expect(surfaces).not.toContain(form);
-        }
-        expect(surfaces).not.toMatch(/queryid|Query Identifier/u);
       } finally {
         await runtime.close();
       }
     });
+  });
+
+  it("captures writes emitted while an observation is running", async () => {
+    const canary = "stream-capture-canary";
+    const captured = await captureProcessStreams(async () => {
+      process.stdout.write(canary);
+      process.stderr.write(canary);
+      return true;
+    });
+    expect(captured).toEqual({ value: true, stdout: canary, stderr: canary });
   });
 
   it("reports a fresh database as observed with all operations no-entry", async () => {

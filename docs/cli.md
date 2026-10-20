@@ -518,10 +518,11 @@ If an operator deliberately revoked the collector function privilege, restore
 the extension's supported boundary as an administrator:
 
 ```sql
-GRANT EXECUTE ON FUNCTION public.pg_stat_statements(boolean) TO lcm_test_runtime;
+GRANT EXECUTE ON FUNCTION public.pg_stat_statements(boolean)
+  TO "your_lcm_runtime_role";
 ```
 
-Replace `lcm_test_runtime` with the configured LCM runtime role. Do not grant
+Replace `your_lcm_runtime_role` with the configured LCM runtime role. Do not grant
 `pg_monitor` or `pg_read_all_stats`; the collector does not require them.
 
 Publication and configuration are authenticated before and after asynchronous

@@ -347,6 +347,10 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
       }
     } catch (error) {
       snapshot.classification = controller.signal.aborted ? "timeout" : classifyFailure(error);
+      if (backend === "postgresql" && snapshot.classification === "timeout"
+          && statementObservation === undefined) {
+        snapshot.telemetry.statements = createQueryStatisticsFamily("timeout");
+      }
       delete snapshot.metrics;
       snapshot.project = { scope, status: "unavailable" };
     }

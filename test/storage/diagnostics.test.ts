@@ -84,7 +84,9 @@ describe('bounded authenticated probe', () => {
     dependencies.readMetrics=vi.fn(async()=>{throw new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'factory',operation:'test'},code,false);});
     const result=await collectBackendDiagnostics({_dependencies:dependencies});
     expect(result.classification).toBe(code==='57014'?'timeout':code==='08006'?'unavailable':'permission-denied');
+    expect(result.telemetry.statements.status).toBe(code==='57014'?'timeout':'unavailable');
     expect(result.metrics).toBeUndefined();
+    expect(dependencies.readStatements).not.toHaveBeenCalled();
     expect(JSON.stringify(result)).not.toContain(code);
   });
   it('never probes after publication admission refusal',async()=>{

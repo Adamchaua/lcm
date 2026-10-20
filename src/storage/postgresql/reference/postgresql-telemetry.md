@@ -275,8 +275,11 @@ cancellation preflight, the current catalog therefore uses at most 32 wire
 statements: two statements for each of 16 signalled calls, plus at most one
 `pg_cancel_backend` call after cancellation. Plan output is accepted only up to
 256 KiB. The counter read accepts at most 64 candidate rows, and retained
-comparison state accepts at most 64 entries. Reaching a cap reports `partial`;
-state that exceeds the comparison cap is not committed.
+comparison state accepts at most 64 entries. Reaching either of those caps
+reports `partial`. A catalog or mapping-probe cap reports `partial` only when at
+least one effective identifier keeps the observation usable. If no effective
+mapping remains, the unusable family follows the no-mapping rule below. State
+that exceeds the comparison cap is not committed.
 
 A statement-family observation is usable only when the counter read succeeds
 and at least one operation produces an effective query identifier. A successful

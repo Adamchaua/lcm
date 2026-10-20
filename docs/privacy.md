@@ -5,9 +5,11 @@ to enable memory across sessions. This document explains exactly what is
 stored, what leaves your machine, and how to control sensitive data.
 
 PostgreSQL query diagnostics expose only allowlisted operation names and
-bounded numeric `pg_stat_statements` counters. LCM never reads or emits stored
-statement text, SQL literals, parameter values, query identifiers, utility
-statements, role names, database names, or connection metadata for this family.
+bounded numeric `pg_stat_statements` counters. The collector never reads
+statement text. It uses raw query identifiers only as bounded in-process mapping
+keys and never emits or logs them. SQL literals, parameter values, utility
+statements, role names, database names, and connection metadata are likewise
+never emitted or logged by this family.
 
 ## What is stored locally
 
