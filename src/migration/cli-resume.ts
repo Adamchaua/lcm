@@ -9,12 +9,15 @@ import { DEFAULT_MIGRATION_APPLY_MAX_BYTES, DEFAULT_MIGRATION_APPLY_MAX_RECORDS 
 import { performMigrationGenesisDryRun } from "./apply-genesis-copy.js";
 import { runSqliteMigrationCopy } from "./batch-copy.js";
 import { MigrationManifestStore } from "./manifest-store.js";
+import { performMigrationActivateCommand } from "./cli-activate.js";
+import { performMigrationRollbackCommand } from "./cli-rollback.js";
+import type { MigrationCutoverCommandOutcome } from "./cli-cutover.js";
 import { MigrationProtocolError } from "./protocol.js";
 import { completePendingMigrationVerification } from "./verify-generation.js";
 import { MigrationVerificationReportStore } from "./verification-store.js";
 import { resolveMigrationTargetConfig } from "./target-config.js";
 import { MIGRATION_UNEXPECTED_FAILURE_REASON, unexpectedFailureEvidence, withMigrationBoundary } from "./boundary.js";
-import type { MigrationEvidence } from "./envelope.js";
+import type { MigrationEnvelopeRestart, MigrationEvidence } from "./envelope.js";
 import type { ExistingGenerationInput } from "./existing-generation.js";
 
 /**
@@ -33,8 +36,13 @@ import type { ExistingGenerationInput } from "./existing-generation.js";
  *   `verify` also uses; no destination is contacted.
  * - **Row 6** (journal aborted, pending `abort`): the abort command's carried
  *   effect completion; the journal is not aborted again.
- * - **Rows 11 and 12** (activation and rollback re-entry) belong to #625 and
- *   #626. Until they merge they refuse exit 7 and change nothing.
+ * - **Rows 11 and 12** (activation and rollback re-entry) call the same
+ *   callees as `activate` and `rollback`: this command's
+ *   `--confirm-generation` is the fence, and the backend literal is taken
+ *   from the manifest (the re-entry of a begun cutover needs no second
+ *   confirmation of a direction the manifest already fixes). Their outcomes,
+ *   including the restart observation and the grant-swap instruction, come
+ *   back unchanged.
  *
  * `--dry-run` is route-only: it names the cell and does not call genesis,
  * copy, verify, activate, rollback or abort. It claims no would-be migration
@@ -52,6 +60,7 @@ export type MigrationResumeCommandOutcome =
     applied: boolean;
     next: string | null;
     evidence: MigrationEvidence;
+    restart?: MigrationEnvelopeRestart | null;
   }>
   | Readonly<{
     status: "refuse";
@@ -61,6 +70,9 @@ export type MigrationResumeCommandOutcome =
     next?: string | null;
     /** True only when a durable write preceded this refusal. */
     applied?: true;
+    /** Everything a cutover callee read or was told before it refused. */
+    sections?: MigrationEvidence;
+    restart?: MigrationEnvelopeRestart | null;
   }>;
 
 export type MigrationResumeCommandOperations = Readonly<{
@@ -72,6 +84,8 @@ export type MigrationResumeCommandOperations = Readonly<{
   copy: typeof runSqliteMigrationCopy;
   completePendingVerification: typeof completePendingMigrationVerification;
   abort: typeof performMigrationAbortCommand;
+  activate: typeof performMigrationActivateCommand;
+  rollback: typeof performMigrationRollbackCommand;
   mintOwnerProcessId: () => string;
 }>;
 
@@ -119,17 +133,25 @@ async function runMigrationResumeCommand(input: MigrationResumeCommandInput): Pr
   const unconfirmed = refuseUnlessConfirmed({ expectedGenerationId: generationId, confirmGenerationId: input.confirmGenerationId });
   if (unconfirmed !== null) return unconfirmed;
 
-  // Rows 11 and 12 are #625's and #626's. They are listed as cells resume may
-  // run, and there is nothing in this build to run.
-  if (row === 11) return { status: "refuse", reason: "route-requires-activation", generationId, next: context.route.nextAction };
-  if (row === 12) return { status: "refuse", reason: "route-requires-rollback", generationId, next: context.route.nextAction };
-
   if (input.dryRun === true) {
     return {
       status: "ok", generationId, manifestPhase: context.manifest!.phase, applied: false,
       next: "resume (drop --dry-run to run this cell)",
       evidence: { cell: row, primary: context.route.primary, predictive: false, coordinationEffects: "none" },
     };
+  }
+
+  if (row === 11 || row === 12) {
+    const cutover: MigrationCutoverCommandOutcome = row === 11
+      ? await (ops?.activate ?? performMigrationActivateCommand)({
+        cwd: input.cwd, homeDir: input.homeDir, generation: generationId, confirmGenerationId: generationId,
+        confirmBackend: context.manifest!.destination.backend, manifestStore, _resolution: input._resolution,
+      })
+      : await (ops?.rollback ?? performMigrationRollbackCommand)({
+        homeDir: input.homeDir, generation: generationId, confirmGenerationId: generationId,
+        confirmBackend: context.manifest!.source.backend, manifestStore, _resolution: input._resolution,
+      });
+    return cutover;
   }
 
   if (row === 23) {

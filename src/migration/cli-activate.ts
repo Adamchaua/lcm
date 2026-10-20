@@ -84,7 +84,7 @@ export type MigrationActivateCommandInput = Readonly<{
   signal?: AbortSignal;
   manifestStore?: MigrationManifestStore;
   /** @internal Test-only seam into the generation resolver. */
-  _resolution?: Pick<ExistingGenerationInput, "_operationsForTesting">;
+  _resolution?: Pick<ExistingGenerationInput, "_operationsForTesting"> | undefined;
   /** @internal Deterministic failure-injection seam for tests only. */
   _operationsForTesting?: Partial<MigrationActivateCommandOperations>;
 }>;

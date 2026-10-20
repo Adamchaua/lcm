@@ -280,8 +280,6 @@ describe("renderMigrationResumeEnvelope", () => {
   });
 
   it.each([
-    ["route-requires-activation", 7],
-    ["route-requires-rollback", 7],
     ["genesis-dry-run-effect-mismatch", 5],
     ["genesis-dry-run-unexpected-state", 2],
     ["resume-readback-mismatch", 5],

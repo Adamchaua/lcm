@@ -81,14 +81,6 @@ export type MigrationRoute = Readonly<{
   nextAction: MigrationRoutePrimary | "report";
 }>;
 
-/** The two dependencies whose callees do not exist on this branch yet: their rows exit 7 until they merge. */
-export type MigrationRouteAvailability = Readonly<{ activation: boolean; rollback: boolean }>;
-
-export const MIGRATION_ROUTE_AVAILABILITY: MigrationRouteAvailability = Object.freeze({
-  activation: false,
-  rollback: false,
-});
-
 const HOLD_PHASES: readonly BackendMaintenancePhase[] = [
   "maintenance-entering", "maintenance-held", "selection-prepared", "selection-completed", "maintenance-aborted",
 ];
@@ -136,7 +128,7 @@ type Row = Readonly<{
   allowed: Allowed | ((input: MigrationRouteInput) => Allowed);
   nextAction?: MigrationRoutePrimary | "report";
   /** The refusal for a command outside primary and allowed. */
-  exit: (input: MigrationRouteInput, availability: MigrationRouteAvailability) => MigrationRouteExit;
+  exit: (input: MigrationRouteInput) => MigrationRouteExit;
 }>;
 
 function fixed(code: MigrationRouteExit): Row["exit"] {
@@ -207,7 +199,7 @@ const ROWS: readonly Row[] = [
     matches: (i) => isOwnPublication(i) && i.journal.kind === "publication" && i.journal.phase === "completed"
       && present(i)?.phase === "active" && present(i)?.pending === null },
   { row: 11, primary: "activate", allowed: ["resume"],
-    exit: (i, availability) => !availability.activation ? 7 : present(i)?.pending !== null ? 6 : 2,
+    exit: (i) => present(i)?.pending !== null ? 6 : 2,
     matches: (i) => ((isOwnPublication(i) && (publicationInFlight(i) || (i.journal.kind === "publication" && i.journal.phase === "aborted")))
         || holdPhaseIn(i, ["selection-prepared", "selection-completed"]))
       && present(i) !== null
@@ -215,7 +207,7 @@ const ROWS: readonly Row[] = [
         || present(i)!.phase === "activating"
         || present(i)!.pending === "prepare-activation" || present(i)!.pending === "publish-activation") },
   { row: 12, primary: "rollback", allowed: ["resume"],
-    exit: (_i, availability) => !availability.rollback ? 7 : 6,
+    exit: fixed(6),
     matches: (i) => present(i) !== null
       && (present(i)!.phase === "rolling-back"
         || present(i)!.pending === "prepare-rollback" || present(i)!.pending === "publish-rollback") },
@@ -252,7 +244,7 @@ const ROWS: readonly Row[] = [
   { row: 23, primary: "verify", allowed: ["resume"], exit: fixed(6),
     matches: (i) => holdMatches(i, ["maintenance-held"]) && present(i)?.pending === "verify-generation" },
   { row: 24, primary: "activate", allowed: ["rollback", "abort", "verify"],
-    exit: (_i, availability) => availability.activation ? 2 : 7,
+    exit: fixed(2),
     matches: (i) => holdMatches(i, ["maintenance-held"]) && present(i)?.phase === "verified"
       && present(i)?.pending === null && i.snapshot === "complete" },
   { row: 25, primary: "none", allowed: [], exit: fixed(5), matches: () => true },
@@ -264,16 +256,13 @@ export function matchingMigrationRouteRows(input: MigrationRouteInput): readonly
   return ROWS.filter((row) => row.matches(input)).map((row) => row.row);
 }
 
-export function routeMigrationGeneration(
-  input: MigrationRouteInput,
-  availability: MigrationRouteAvailability = MIGRATION_ROUTE_AVAILABILITY,
-): MigrationRoute {
+export function routeMigrationGeneration(input: MigrationRouteInput): MigrationRoute {
   validate(input);
   const row = ROWS.find((candidate) => candidate.matches(input))!;
   return Object.freeze({
     primary: row.primary,
     allowed: Object.freeze([...(typeof row.allowed === "function" ? row.allowed(input) : row.allowed)]),
-    exitIfRefused: row.exit(input, availability),
+    exitIfRefused: row.exit(input),
     row: row.row,
     nextAction: row.nextAction ?? row.primary,
   });

@@ -361,14 +361,6 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     remedy: "This generation has durably begun work that only `lcm migration resume` (or `verify` where this refusal names it) can finish. Nothing was changed.",
   }),
   Object.freeze({
-    reason: "route-requires-activation", exitClass: "failed-operator-required",
-    remedy: "This generation is verified and awaits activation, which this build does not register. Nothing was changed; run `lcm migration report`.",
-  }),
-  Object.freeze({
-    reason: "route-requires-rollback", exitClass: "failed-operator-required",
-    remedy: "This generation is past activation and only rollback can settle it, which this build does not register. Nothing was changed; run `lcm migration report`.",
-  }),
-  Object.freeze({
     reason: "route-operator-required", exitClass: "failed-operator-required",
     remedy: "No automatic command settles this generation's state. Nothing was changed; run `lcm migration report` and inspect the evidence.",
   }),

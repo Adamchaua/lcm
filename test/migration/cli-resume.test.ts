@@ -291,29 +291,96 @@ describe("resume rows 23 and 6: the cells that never reach the destination", () 
   });
 });
 
-describe("resume rows 11 and 12 wait for #625 and #626", () => {
-  it("row 11 refuses exit 7 naming activate, and changes nothing", async () => {
+describe("resume rows 11 and 12 call the same callees as activate and rollback", () => {
+  async function selectionPrepared() {
     const home = makeFixtureHome(roots);
     await heldFixtureJournal(home);
     createFixtureManifest(new MigrationManifestStore({ homeDir: home }), "verified");
-    const before = snapshotHome(home);
-    const result = await run(home, { _resolution: { _operationsForTesting: {
+    const resolutionAtRow11 = { _operationsForTesting: {
       classifySnapshot: complete,
-      observeJournal: () => ({ kind: "hold", journal: { phase: "selection-prepared", generationId: FIXTURE_GENERATION } as never }),
-    } } });
-    expect(result).toEqual({ status: "refuse", reason: "route-requires-activation", generationId: FIXTURE_GENERATION, next: "activate" });
-    expect(snapshotHome(home)).toEqual(before);
-  });
+      observeJournal: () => ({ kind: "hold" as const, journal: { phase: "selection-prepared", generationId: FIXTURE_GENERATION } as never }),
+    } };
+    return { home, resolutionAtRow11 };
+  }
 
-  it("row 12 refuses exit 7 naming rollback, and changes nothing", async () => {
+  async function rollingBack() {
     const home = makeFixtureHome(roots);
     await heldFixtureJournal(home);
     const verified = createFixtureManifest(new MigrationManifestStore({ homeDir: home }), "verified");
-    const rollingBack = { ...verified, phase: "rolling-back" };
-    const result = await run(home, {
-      manifestStore: { probeManifestPresence: () => ({ status: "present" as const }), read: () => rollingBack } as unknown as MigrationManifestStore,
+    const store = { probeManifestPresence: () => ({ status: "present" as const }), read: () => ({ ...verified, phase: "rolling-back" }) } as unknown as MigrationManifestStore;
+    return { home, store };
+  }
+
+  it("row 11 runs the activate command with this command's token and the manifest's backend, and returns its outcome unchanged", async () => {
+    const { home, resolutionAtRow11 } = await selectionPrepared();
+    const outcome = {
+      status: "ok" as const, generationId: FIXTURE_GENERATION, manifestPhase: "active", applied: true, next: "swap-grants-then-start-daemon",
+      evidence: { grantSwap: "required-before-daemon-start" }, restart: { answer: "satisfied" as const, presence: "absent" as const },
+    };
+    const activate = vi.fn(async () => outcome);
+    const rollback = vi.fn();
+    const result = await run(home, { _resolution: resolutionAtRow11, _operationsForTesting: { activate, rollback } as never });
+    expect(result).toBe(outcome);
+    expect(activate).toHaveBeenCalledWith(expect.objectContaining({
+      cwd: "/tmp/project", homeDir: home, generation: FIXTURE_GENERATION, confirmGenerationId: FIXTURE_GENERATION, confirmBackend: "postgresql",
+      _resolution: resolutionAtRow11,
+    }));
+    expect(rollback).not.toHaveBeenCalled();
+  });
+
+  it("row 12 runs the rollback command with the manifest's source backend, and returns its refusal with its sections and restart", async () => {
+    const { home, store } = await rollingBack();
+    const refusal = {
+      status: "refuse" as const, reason: "cutover-restart-required", generationId: FIXTURE_GENERATION, applied: true as const,
+      sections: { selectedBackend: "sqlite" }, restart: { answer: "unsatisfied" as const, presence: "running" as const },
+    };
+    const rollback = vi.fn(async () => refusal);
+    const activate = vi.fn();
+    const result = await run(home, { manifestStore: store, _operationsForTesting: { activate, rollback } as never });
+    expect(result).toBe(refusal);
+    expect(rollback).toHaveBeenCalledWith(expect.objectContaining({
+      homeDir: home, generation: FIXTURE_GENERATION, confirmGenerationId: FIXTURE_GENERATION, confirmBackend: "sqlite", manifestStore: store,
+    }));
+    expect(activate).not.toHaveBeenCalled();
+  });
+
+  it("passes no resolution seam to the callee when none was given (rows 11 and 12 on the real resolver)", async () => {
+    const { home, store } = await rollingBack();
+    const rollback = vi.fn(async () => ({ status: "refuse" as const, reason: "rollback-refused-evidence" }));
+    await performMigrationResumeCommand({
+      cwd: "/tmp/project", homeDir: home, generation: FIXTURE_GENERATION, confirmGenerationId: FIXTURE_GENERATION, manifestStore: store,
+      _resolution: { _operationsForTesting: { classifySnapshot: complete } }, _operationsForTesting: { rollback } as never,
     });
-    expect(result).toEqual({ status: "refuse", reason: "route-requires-rollback", generationId: FIXTURE_GENERATION, next: "rollback" });
+    expect(rollback).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the real activate and rollback commands when none are injected (an empty home has no target, and no capture)", async () => {
+    const { home, resolutionAtRow11 } = await selectionPrepared();
+    expect(await run(home, { _resolution: resolutionAtRow11 })).toMatchObject({ status: "refuse", reason: "migration-target-missing", generationId: FIXTURE_GENERATION });
+    const { home: home12, store } = await rollingBack();
+    expect(await run(home12, { manifestStore: store })).toMatchObject({ status: "refuse", generationId: FIXTURE_GENERATION });
+  });
+
+  it("the fence comes first: a missing token refuses before either callee runs", async () => {
+    const { home, resolutionAtRow11 } = await selectionPrepared();
+    const activate = vi.fn();
+    const result = await run(home, { confirmGenerationId: undefined, _resolution: resolutionAtRow11, _operationsForTesting: { activate } as never });
+    expect(result).toEqual({ status: "refuse", reason: "existing-confirmation-missing", generationId: FIXTURE_GENERATION });
+    expect(activate).not.toHaveBeenCalled();
+  });
+
+  it("--dry-run is route-only at both rows: neither callee runs, nothing is predicted, nothing is written", async () => {
+    const { home, resolutionAtRow11 } = await selectionPrepared();
+    const before = snapshotHome(home);
+    const spies = { activate: vi.fn(), rollback: vi.fn() };
+    const result = await run(home, { dryRun: true, _resolution: resolutionAtRow11, _operationsForTesting: spies as never });
+    expect(result).toMatchObject({ status: "ok", applied: false, evidence: { cell: 11, primary: "activate", predictive: false, coordinationEffects: "none" } });
+    expect(spies.activate).not.toHaveBeenCalled();
+    expect(snapshotHome(home)).toEqual(before);
+    const { home: home12, store } = await rollingBack();
+    const twelve = await run(home12, { dryRun: true, manifestStore: store, _operationsForTesting: spies as never });
+    expect(twelve).toMatchObject({ status: "ok", applied: false, evidence: { cell: 12, primary: "rollback" } });
+    expect(spies.rollback).not.toHaveBeenCalled();
   });
 });
 

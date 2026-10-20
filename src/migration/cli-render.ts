@@ -226,6 +226,8 @@ export function renderMigrationResumeEnvelope(outcome: MigrationResumeCommandOut
       applied: outcome.applied ?? false,
       generation: outcome.generationId,
       next: outcome.next,
+      sections: outcome.sections,
+      restart: outcome.restart,
     });
   }
   return okEnvelope({
@@ -235,6 +237,7 @@ export function renderMigrationResumeEnvelope(outcome: MigrationResumeCommandOut
     manifestPhase: outcome.manifestPhase,
     next: outcome.next,
     evidence: outcome.evidence,
+    restart: outcome.restart,
   });
 }
 

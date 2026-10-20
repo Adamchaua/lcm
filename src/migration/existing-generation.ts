@@ -169,8 +169,6 @@ export function refuseUnlessRouted(command: MigrationRouteCommand, route: Migrat
     case 4: return { status: "refuse", reason: "route-publication-in-flight", next };
     case 6: return { status: "refuse", reason: "route-resume-required", next };
     case 7:
-      if (route.row === 12) return { status: "refuse", reason: "route-requires-rollback", next };
-      if (route.row === 11 || route.row === 24) return { status: "refuse", reason: "route-requires-activation", next };
       return { status: "refuse", reason: "route-operator-required", next };
     default:
       if (route.row === 1) return { status: "refuse", reason: "route-unresolvable", next };

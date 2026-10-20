@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  MIGRATION_ROUTE_AVAILABILITY,
   matchingMigrationRouteRows,
   routeMigrationGeneration,
   type MigrationRouteInput,
@@ -29,8 +28,6 @@ function cell(overrides: Partial<MigrationRouteInput>): MigrationRouteInput {
   };
 }
 
-const BOTH_MERGED = { activation: true, rollback: true } as const;
-
 type Expectation = Readonly<{
   row: number; primary: string; allowed: readonly string[]; exit: number; next?: string;
 }>;
@@ -56,12 +53,12 @@ const ROW_CELLS: ReadonlyArray<readonly [string, MigrationRouteInput, Expectatio
   ["9 aborted hold, active manifest", cell({ journal: held("maintenance-aborted"), manifest: manifest("active") }), { row: 9, primary: "none", allowed: [], exit: 5 }],
   ["9 aborted hold, pending prepare-activation", cell({ journal: held("maintenance-aborted"), manifest: manifest("verified", "prepare-activation") }), { row: 9, primary: "none", allowed: [], exit: 5 }],
   ["10 own completed publication, active manifest", cell({ journal: publication("completed"), manifest: manifest("active"), link: OWN_LINK }), { row: 10, primary: "none", allowed: ["activate", "rollback"], exit: 2, next: "report" }],
-  ["11 own in-flight publication, verified", cell({ journal: publication("releasing"), manifest: manifest("verified"), link: OWN_LINK }), { row: 11, primary: "activate", allowed: ["resume"], exit: 7 }],
-  ["11 own aborted publication, verified", cell({ journal: publication("aborted"), manifest: manifest("verified"), link: OWN_LINK }), { row: 11, primary: "activate", allowed: ["resume"], exit: 7 }],
-  ["11 selection-prepared hold, activating", cell({ journal: held("selection-prepared"), manifest: manifest("activating") }), { row: 11, primary: "activate", allowed: ["resume"], exit: 7 }],
-  ["11 selection-completed hold, pending publish-activation", cell({ journal: held("selection-completed"), manifest: manifest("activating", "publish-activation") }), { row: 11, primary: "activate", allowed: ["resume"], exit: 7 }],
-  ["12 rolling-back manifest", cell({ manifest: manifest("rolling-back"), journal: held("selection-completed") }), { row: 12, primary: "rollback", allowed: ["resume"], exit: 7 }],
-  ["12 pending prepare-rollback", cell({ manifest: manifest("verified", "prepare-rollback") }), { row: 12, primary: "rollback", allowed: ["resume"], exit: 7 }],
+  ["11 own in-flight publication, verified", cell({ journal: publication("releasing"), manifest: manifest("verified"), link: OWN_LINK }), { row: 11, primary: "activate", allowed: ["resume"], exit: 2 }],
+  ["11 own aborted publication, verified", cell({ journal: publication("aborted"), manifest: manifest("verified"), link: OWN_LINK }), { row: 11, primary: "activate", allowed: ["resume"], exit: 2 }],
+  ["11 selection-prepared hold, activating", cell({ journal: held("selection-prepared"), manifest: manifest("activating") }), { row: 11, primary: "activate", allowed: ["resume"], exit: 2 }],
+  ["11 selection-completed hold, pending publish-activation", cell({ journal: held("selection-completed"), manifest: manifest("activating", "publish-activation") }), { row: 11, primary: "activate", allowed: ["resume"], exit: 6 }],
+  ["12 rolling-back manifest", cell({ manifest: manifest("rolling-back"), journal: held("selection-completed") }), { row: 12, primary: "rollback", allowed: ["resume"], exit: 6 }],
+  ["12 pending prepare-rollback", cell({ manifest: manifest("verified", "prepare-rollback") }), { row: 12, primary: "rollback", allowed: ["resume"], exit: 6 }],
   ["13 rolled-back manifest", cell({ manifest: manifest("rolled-back"), journal: held("selection-completed") }), { row: 13, primary: "none", allowed: ["rollback"], exit: 2, next: "report" }],
   ["14 entering hold, no manifest, no snapshot", cell({ journal: held("maintenance-entering") }), { row: 14, primary: "apply", allowed: ["abort"], exit: 2 }],
   ["14 entering hold, no manifest, complete snapshot", cell({ journal: held("maintenance-entering"), snapshot: "complete" }), { row: 14, primary: "apply", allowed: ["abort"], exit: 2 }],
@@ -79,7 +76,7 @@ const ROW_CELLS: ReadonlyArray<readonly [string, MigrationRouteInput, Expectatio
   ["21 held, pending complete-copy", cell({ snapshot: "complete", manifest: manifest("copying", "complete-copy") }), { row: 21, primary: "resume", allowed: [], exit: 6 }],
   ["22 held, copied, no pending", cell({ snapshot: "complete", manifest: manifest("copied") }), { row: 22, primary: "verify", allowed: ["abort"], exit: 2 }],
   ["23 held, pending verify-generation (snapshot not consulted)", cell({ snapshot: "absent", manifest: manifest("copied", "verify-generation") }), { row: 23, primary: "verify", allowed: ["resume"], exit: 6 }],
-  ["24 held, verified, complete snapshot", cell({ snapshot: "complete", manifest: manifest("verified") }), { row: 24, primary: "activate", allowed: ["rollback", "abort", "verify"], exit: 7 }],
+  ["24 held, verified, complete snapshot", cell({ snapshot: "complete", manifest: manifest("verified") }), { row: 24, primary: "activate", allowed: ["rollback", "abort", "verify"], exit: 2 }],
   ["25 held, manifest present but snapshot absent (snapshot-absent implies manifest-absent)", cell({ manifest: manifest("copied") }), { row: 25, primary: "none", allowed: [], exit: 5 }],
   ["25 absent journal with a manifest", cell({ journal: { kind: "absent" }, manifest: manifest("copied"), snapshot: "complete" }), { row: 25, primary: "none", allowed: [], exit: 5 }],
 ];
@@ -106,26 +103,14 @@ describe("routeMigrationGeneration, one concrete cell per plan-v5 row", () => {
   });
 });
 
-describe("rows that depend on #625 and #626 (7 until their callees exist, then the non-owner classes)", () => {
-  it("defaults to both unmerged", () => {
-    expect(MIGRATION_ROUTE_AVAILABILITY).toEqual({ activation: false, rollback: false });
-  });
-
+describe("rows 11, 12 and 24 are live: the non-owner exit is 6 when a pending effect exists, otherwise 2", () => {
   it.each([
     ["row 11 with a pending effect", cell({ journal: publication("prepared"), link: OWN_LINK, manifest: manifest("verified", "prepare-activation") }), 6],
     ["row 11 without one", cell({ journal: publication("prepared"), link: OWN_LINK, manifest: manifest("verified") }), 2],
     ["row 12", cell({ manifest: manifest("rolling-back") }), 6],
     ["row 24", cell({ snapshot: "complete", manifest: manifest("verified") }), 2],
-  ])("%s once its dependency has merged", (_name, input, exit) => {
-    expect(routeMigrationGeneration(input, { activation: false, rollback: false }).exitIfRefused).toBe(7);
-    expect(routeMigrationGeneration(input, BOTH_MERGED).exitIfRefused).toBe(exit);
-  });
-
-  it("is independent per dependency: rollback merged does not unlock activation rows, and the reverse", () => {
-    const activation = cell({ snapshot: "complete", manifest: manifest("verified") });
-    const rollback = cell({ manifest: manifest("rolling-back") });
-    expect(routeMigrationGeneration(activation, { activation: false, rollback: true }).exitIfRefused).toBe(7);
-    expect(routeMigrationGeneration(rollback, { activation: true, rollback: false }).exitIfRefused).toBe(7);
+  ])("%s", (_name, input, exit) => {
+    expect(routeMigrationGeneration(input).exitIfRefused).toBe(exit);
   });
 });
 
@@ -172,7 +157,6 @@ describe("totality: every cell of journal x manifest x snapshot x link maps to a
     for (const input of everyCell()) {
       cells += 1;
       const { journal, manifest: m, snapshot, link } = input;
-      const available = routeMigrationGeneration(input, BOTH_MERGED);
       const route = routeMigrationGeneration(input);
       expect(route.row).toBeGreaterThanOrEqual(1);
       expect(route.row).toBeLessThanOrEqual(25);
@@ -180,7 +164,7 @@ describe("totality: every cell of journal x manifest x snapshot x link maps to a
       expect(matching[0]).toBe(route.row);
       expect(matching.at(-1)).toBe(25);
       expect([2, 4, 5, 6, 7]).toContain(route.exitIfRefused);
-      expect([2, 4, 5, 6, 7]).toContain(available.exitIfRefused);
+      expect([2, 4, 5, 6, 7]).toContain(route.exitIfRefused);
       // Any unresolvable observation is exit 5, never exit 2.
       if (journal.kind === "unresolvable" || m.kind === "unresolvable" || snapshot === "unresolvable" || link.kind === "unresolvable") {
         expect(route.row).toBe(1);
@@ -202,7 +186,7 @@ describe("totality: every cell of journal x manifest x snapshot x link maps to a
       }
       // Exit 6 only ever points at a durably begun, non-terminal state that resume (or its owner) finishes:
       // a pending effect, or the rolling-back phase #626's re-entry finishes.
-      if (available.exitIfRefused === 6) {
+      if (route.exitIfRefused === 6) {
         expect(m.kind === "present" && (m.pending !== null || m.phase === "rolling-back")).toBe(true);
       }
       // Report is never an owner.
