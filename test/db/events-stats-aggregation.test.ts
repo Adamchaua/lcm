@@ -194,4 +194,3 @@ describe("internal oldest pending capture time", () => {
     expect(Object.keys((await collectDetailedEventStats(1)).projects[0]!)).not.toContain("oldestPendingAt");
   });
 });
-

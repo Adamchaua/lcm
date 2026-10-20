@@ -280,4 +280,3 @@ describe("PostgreSQL runtime health telemetry", () => {
     });
   });
 });
-

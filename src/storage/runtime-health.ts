@@ -382,4 +382,3 @@ export function queueTelemetry(reads: QueueReads, localQuarantined: number | und
   const health = deriveHealth(status, evidence.quarantined || evidence.backlog);
   return { status, observedAt, health, omitted, ...values, remediation: queueAction(health, facts) };
 }
-

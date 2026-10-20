@@ -55,6 +55,7 @@ import { PostgreSqlStorageOperationError } from '../../src/storage/postgresql/er
 import type { BackendDiagnosticDependencies, BackendDiagnosticObservation, BackendDiagnosticRuntime } from '../../src/storage/diagnostics.js';
 import type { PostgreSqlRuntimeHealth } from '../../src/storage/postgresql/contracts.js';
 import type { PostgreSqlDiagnosticMetrics } from '../../src/storage/postgresql/diagnostics.js';
+import { createQueryStatisticsFamily } from '../../src/storage/postgresql/query-statistics.js';
 
 const machineId = '01912345-1234-7123-8123-123456789abc';
 const metrics: PostgreSqlDiagnosticMetrics = { projects:1,conversations:2,compactedConversations:1,messages:4,summaries:2,maxDepth:1,rawTokens:200,summaryTokens:100,ratio:2,promotedCount:1,redactionCounts:{builtIn:1,global:2,project:3,total:6},recallStats:{memoriesSurfaced:3,memoriesActedUpon:1,recallPrecision:1/3} };
@@ -67,14 +68,14 @@ function fixture() {
   const observation: BackendDiagnosticObservation = {config,witness:'a',machineId,mapContent:null};
   const health = {status:'healthy',backend:'postgresql',tls:true,serverMajorVersion:18,serverEncoding:'UTF8',timezone:'UTC',role:'secret-role',extensions:['pg_stat_statements','pg_trgm','pgcrypto','unaccent'].map(name => ({name,status:'current',installedVersion:'1.0',defaultVersion:'1.0'})),searchConfiguration:{ready:true}} as PostgreSqlRuntimeHealth;
   const runtime: BackendDiagnosticRuntime = {query:vi.fn(),health:vi.fn(async()=>health),poolDiagnostics:vi.fn(()=>({configuredMax:5,total:1,idle:1,waiting:0,failed:false})),close:vi.fn(async()=>{})};
-  const dependencies: BackendDiagnosticDependencies = {observePublication:vi.fn(()=>observation),createRuntime:vi.fn(()=>runtime),verifySchema:vi.fn(async()=>({} as never)),readMetrics:vi.fn(async()=>metrics),readOutbox:vi.fn(async()=>outbox),readMigrationHistory:vi.fn(async()=>ledger),readQueue:vi.fn(async()=>queueRead)};
+  const dependencies: BackendDiagnosticDependencies = {observePublication:vi.fn(()=>observation),createRuntime:vi.fn(()=>runtime),verifySchema:vi.fn(async()=>({} as never)),readMetrics:vi.fn(async()=>metrics),readOutbox:vi.fn(async()=>outbox),readStatements:vi.fn(async()=>({family:createQueryStatisticsFamily('observed',1234),commit:vi.fn(()=>true)})),readMigrationHistory:vi.fn(async()=>ledger),readQueue:vi.fn(async()=>queueRead)};
   return {observation,runtime,dependencies,health};
 }
 describe('bounded authenticated probe', () => {
   it('returns only safe verified fields and closes its probe exactly once', async()=>{
     const {dependencies,runtime}=fixture();
     const result=await collectBackendDiagnostics({_dependencies:dependencies});
-    expect(result).toMatchObject({classification:'healthy',schema:'ready',tls:'ready',pool:{origin:'diagnostic-probe',total:1},identity:{machineId},metrics,outbox:{status:'ready',captured:3}});
+    expect(result).toMatchObject({classification:'healthy',schema:'ready',tls:'ready',pool:{origin:'diagnostic-probe',total:1},identity:{machineId},metrics,outbox:{status:'ready',captured:3},telemetry:{statements:{status:'observed',observedAt:1234,scope:'aggregate'}}});
     expect(JSON.stringify(result)).not.toMatch(/secret|postgresql:\/\/|sqlState|serverEncoding|role/);
     expect(runtime.close).toHaveBeenCalledTimes(1);
     expect(dependencies.observePublication).toHaveBeenCalledTimes(2);
@@ -85,7 +86,9 @@ describe('bounded authenticated probe', () => {
     dependencies.readMetrics=vi.fn(async()=>{throw new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'factory',operation:'test'},code,false);});
     const result=await collectBackendDiagnostics({_dependencies:dependencies});
     expect(result.classification).toBe(code==='57014'?'timeout':code==='08006'?'unavailable':'permission-denied');
+    expect(result.telemetry.statements.status).toBe(code==='57014'?'timeout':'unavailable');
     expect(result.metrics).toBeUndefined();
+    expect(dependencies.readStatements).not.toHaveBeenCalled();
     expect(JSON.stringify(result)).not.toContain(code);
   });
   it('never probes after publication admission refusal',async()=>{
@@ -145,6 +148,90 @@ describe('bounded authenticated probe', () => {
     const {dependencies}=fixture(); dependencies.readOutbox=async()=>({...outbox,scanErrors:1});
     expect(await collectBackendDiagnostics({_dependencies:dependencies})).toMatchObject({classification:'unavailable',outbox:{status:'unavailable'}});
   });
+  it('runs query statistics after outbox handling and commits only after the final witness',async()=>{
+    const {dependencies}=fixture();
+    let familySignal: AbortSignal | undefined;
+    const commit=vi.fn(()=>{
+      expect(familySignal?.aborted).toBe(false);
+      return true;
+    });
+    dependencies.readStatements=vi.fn(async(_runtime,options)=>{
+      familySignal=options.signal;
+      return {family:createQueryStatisticsFamily('observed',5),commit};
+    });
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.telemetry.statements.status).toBe('observed');
+    expect(dependencies.readOutbox.mock.invocationCallOrder[0]).toBeLessThan(dependencies.readStatements.mock.invocationCallOrder[0]);
+    expect(dependencies.readStatements.mock.invocationCallOrder[0]).toBeLessThan(dependencies.observePublication.mock.invocationCallOrder[1]);
+    expect(dependencies.observePublication.mock.invocationCallOrder[1]).toBeLessThan(commit.mock.invocationCallOrder[0]);
+    expect(dependencies.readStatements).toHaveBeenCalledWith(runtimeLike(),expect.objectContaining({publicationWitness:'a',signal:expect.any(AbortSignal)}));
+  });
+  it('keeps a hanging statement family local to telemetry and clears its deadline',async()=>{
+    vi.useFakeTimers();
+    try {
+      const {dependencies}=fixture();
+      dependencies.readStatements=vi.fn(()=>new Promise(()=>{}));
+      const work=collectBackendDiagnostics({_dependencies:dependencies});
+      await vi.advanceTimersByTimeAsync(751);
+      const result=await work;
+      expect(result.classification).toBe('healthy');
+      expect(result.telemetry.statements.status).toBe('timeout');
+      expect(dependencies.observePublication).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+  it('uses the remaining-time launch guard without starting statement probes',async()=>{
+    const {dependencies}=fixture();
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,_deadlineMs:50});
+    expect(result.classification).toBe('healthy');
+    expect(result.telemetry.statements.status).toBe('timeout');
+    expect(dependencies.readStatements).not.toHaveBeenCalled();
+  });
+  it('propagates parent cancellation to the child family and classifies a synchronous throw as timeout',async()=>{
+    const {dependencies}=fixture();
+    const controller=new AbortController();
+    dependencies.readStatements=vi.fn((_runtime,options)=>{
+      controller.abort();
+      expect(options.signal?.aborted).toBe(true);
+      throw new Error('PRIVATE ABORT');
+    });
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,signal:controller.signal});
+    expect(result.telemetry.statements.status).toBe('timeout');
+    expect(JSON.stringify(result)).not.toContain('PRIVATE');
+  });
+  it('ignores a statement result that arrives after the child deadline',async()=>{
+    vi.useFakeTimers();
+    try {
+      const {dependencies}=fixture();
+      const commit=vi.fn(()=>true);
+      let resolveFamily!: (value: {family:ReturnType<typeof createQueryStatisticsFamily>;commit:()=>boolean})=>void;
+      dependencies.readStatements=vi.fn(()=>new Promise(resolve=>{resolveFamily=resolve;}));
+      const work=collectBackendDiagnostics({_dependencies:dependencies});
+      await vi.advanceTimersByTimeAsync(751);
+      const result=await work;
+      resolveFamily({family:createQueryStatisticsFamily('observed'),commit});
+      await Promise.resolve();
+      expect(result.telemetry.statements.status).toBe('timeout');
+      expect(commit).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+  it('contains an unexpected statement collector failure without changing backend health',async()=>{
+    const {dependencies}=fixture();
+    dependencies.readStatements=vi.fn(async()=>{throw new Error('PRIVATE QUERY PLAN');});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('healthy');
+    expect(result.telemetry.statements.status).toBe('unavailable');
+    expect(JSON.stringify(result)).not.toContain('PRIVATE');
+  });
+  it('does not commit statement context when publication changes',async()=>{
+    const {dependencies,observation}=fixture();
+    const commit=vi.fn(()=>true);
+    dependencies.readStatements=vi.fn(async()=>({family:createQueryStatisticsFamily('observed'),commit}));
+    dependencies.observePublication=vi.fn().mockReturnValueOnce(observation).mockReturnValue({...observation,witness:'changed'});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('stale-publication');
+    expect(commit).not.toHaveBeenCalled();
+    expect(result.telemetry.statements.status).toBe('unavailable');
+  });
   it('uses authenticated SQLite policy and detects config replacement during reads',async()=>{
     const home=mkdtempSync(join(tmpdir(),'lcm-diagnostic-'));homes.push(home);mkdirSync(join(home,'.lcm'),{mode:0o700});
     const path=join(home,'.lcm','config.json');writeFileSync(path,'{}',{mode:0o600});
@@ -189,8 +276,9 @@ describe('diagnostic boundary failures and scope',()=>{
   });
   it('keeps selected remote outbox unverified when no local binding was observed',async()=>{
     const {dependencies}=fixture();
-    expect(await collectBackendDiagnostics({_dependencies:dependencies,projectId:machineId})).toMatchObject({classification:'unavailable',outbox:{status:'unverified'}});
+    expect(await collectBackendDiagnostics({_dependencies:dependencies,projectId:machineId})).toMatchObject({classification:'unavailable',outbox:{status:'unverified'},telemetry:{statements:{status:'observed',scope:'aggregate'}}});
     expect(dependencies.readOutbox).not.toHaveBeenCalled();
+    expect(dependencies.readStatements).toHaveBeenCalledOnce();
   });
   it.each(['extensions-absent','extensions-bad','search-absent','search-bad','health-failed','health-degraded'] as const)('reports live readiness outcome %s',async mode=>{
     const {dependencies,health}=fixture();
@@ -217,6 +305,8 @@ describe('diagnostic boundary failures and scope',()=>{
     expect((await collectBackendDiagnostics({_dependencies:dependencies,_deadlineMs:10})).classification).toBe('timeout');
   });
 });
+
+function runtimeLike() { return expect.objectContaining({query:expect.any(Function)}); }
 
 
 it('refuses a dangling root symlink without following or repairing it',async()=>{
@@ -480,7 +570,7 @@ const sqliteFixture = () => { const parts = fixture(); parts.observation.config.
 const typedFailure = (code: string) => new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'factory',operation:'test'},code,false);
 
 describe('runtime health telemetry on a healthy PostgreSQL probe', () => {
-  it('observes all four families and reads in the documented order', async () => {
+  it('observes all five families and reads in the documented order', async () => {
     const {dependencies,runtime}=fixture();
     const result=await collectBackendDiagnostics({_dependencies:dependencies});
     expect(result.classification).toBe('healthy');
@@ -488,10 +578,13 @@ describe('runtime health telemetry on a healthy PostgreSQL probe', () => {
     expect(result.telemetry.migration).toMatchObject({status:'observed',health:'healthy',historyStatus:'current',appliedCount:2,expectedCount:2});
     expect(result.telemetry.extensions).toMatchObject({status:'observed',health:'healthy',entries:[{name:'pg_stat_statements',status:'current',installedVersion:'1.0',defaultVersion:'1.0'},expect.anything(),expect.anything(),expect.anything()]});
     expect(result.telemetry.queue).toMatchObject({status:'observed',health:'healthy',inboxClaimed:0,inboxQuarantined:0});
+    expect(result.telemetry.statements).toMatchObject({status:'observed',scope:'aggregate'});
     for (const family of Object.values(result.telemetry)) expect(Number.isSafeInteger((family as {observedAt:number}).observedAt)).toBe(true);
     const order = (fn: unknown) => vi.mocked(fn as () => unknown).mock.invocationCallOrder[0];
     expect(order(dependencies.readMigrationHistory)).toBeLessThan(order(dependencies.readMetrics));
     expect(order(dependencies.verifySchema)).toBeLessThan(order(dependencies.readQueue));
+    expect(order(dependencies.readQueue)).toBeLessThan(order(dependencies.readOutbox));
+    expect(order(dependencies.readOutbox)).toBeLessThan(order(dependencies.readStatements));
     expect(dependencies.readMigrationHistory).toHaveBeenCalledExactlyOnceWith(runtime,expect.any(AbortSignal));
     expect(dependencies.readQueue).toHaveBeenCalledExactlyOnceWith(runtime,expect.any(AbortSignal),undefined);
     expect(runtime.close).toHaveBeenCalledTimes(1);
@@ -607,7 +700,7 @@ describe('invalid pool counters at the real observation boundary', () => {
     expect(result.pool).toEqual({origin:'diagnostic-probe',status:'unverified'});
     expect(result.telemetry.pool).toMatchObject(unavailable);
     expect(result.telemetry.extensions).toMatchObject({status:'observed'});
-    expect(statusesOf(result).filter(status=>status==='unavailable')).toHaveLength(3);
+    expect(statusesOf(result).filter(status=>status==='unavailable')).toHaveLength(4);
     expect(dependencies.readMigrationHistory).not.toHaveBeenCalled();
     expect(JSON.stringify(result)).not.toContain('private');
   });
@@ -706,7 +799,7 @@ describe('runtime health telemetry lifecycle', () => {
     const result=await collectBackendDiagnostics({_dependencies:dependencies});
     expect(result.classification).toBe('unavailable');
     expect(result.telemetry.extensions).toMatchObject({status:'observed'});
-    expect(statusesOf(result).filter(status=>status==='unavailable')).toHaveLength(3);
+    expect(statusesOf(result).filter(status=>status==='unavailable')).toHaveLength(4);
     expect(JSON.stringify(result)).not.toContain('private');
   });
   it.each([['42501','permission-denied'],['57014','timeout'],['08006','unavailable']] as const)('isolates a migration probe failure %s', async (code, status) => {
@@ -765,14 +858,14 @@ describe('runtime health telemetry lifecycle', () => {
     dependencies.readMigrationHistory=vi.fn(async()=>{controller.abort();throw new Error('private');});
     const result=await collectBackendDiagnostics({_dependencies:dependencies,signal:controller.signal});
     expect(result.classification).toBe('timeout');
-    expect(statusesOf(result)).toEqual(['timeout','timeout','timeout','timeout']);
+    expect(statusesOf(result)).toEqual(['timeout','timeout','timeout','timeout','timeout']);
     expect(dependencies.verifySchema).not.toHaveBeenCalled();
   });
   it('discards every telemetry family when publication changes', async () => {
     const {dependencies,observation}=fixture(); dependencies.observePublication=vi.fn().mockReturnValueOnce(observation).mockReturnValue({...observation,witness:'b'});
     const result=await collectBackendDiagnostics({_dependencies:dependencies});
     expect(result.classification).toBe('stale-publication');
-    expect(statusesOf(result)).toEqual(['unavailable','unavailable','unavailable','unavailable']);
+    expect(statusesOf(result)).toEqual(['unavailable','unavailable','unavailable','unavailable','unavailable']);
     expect(JSON.stringify(result.telemetry)).not.toMatch(/historyStatus":"current|pg_trgm":|saturationRatio":0/);
     expect((result.telemetry.extensions as {entries:unknown[]}).entries).toEqual([]);
   });
@@ -789,12 +882,12 @@ describe('runtime health timeout snapshot', () => {
       const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:factory,_deadlineMs:10});
       expect(result.classification).toBe('timeout');
       expect(result.telemetry.pool).toMatchObject({status:'observed',observedAt:1_000,saturationRatio:0.25});
-      for (const family of [result.telemetry.migration,result.telemetry.extensions,result.telemetry.queue]) expect(family).toMatchObject({status:'timeout',observedAt:5_000});
+      for (const family of [result.telemetry.migration,result.telemetry.extensions,result.telemetry.queue,result.telemetry.statements]) expect(family).toMatchObject({status:'timeout',observedAt:5_000});
     } finally { vi.useRealTimers(); }
   });
   it('reports every family as timeout without an authenticated pool', async () => {
     const {dependencies,runtime}=fixture(); runtime.health=()=>new Promise(()=>{});
-    expect(statusesOf(await collectBackendDiagnostics({_dependencies:dependencies,_deadlineMs:10}))).toEqual(['timeout','timeout','timeout','timeout']);
+    expect(statusesOf(await collectBackendDiagnostics({_dependencies:dependencies,_deadlineMs:10}))).toEqual(['timeout','timeout','timeout','timeout','timeout']);
   });
   it('retains an unverified borrowed pool as an unavailable family', async () => {
     const {dependencies,runtime}=fixture(); runtime.health=()=>new Promise(()=>{});
@@ -841,12 +934,12 @@ describe('runtime health probe launch guard', () => {
 });
 
 describe('runtime health telemetry for other backends', () => {
-  it.each(['normal','stalled','failing','published-change'] as const)('keeps four not-applicable SQLite families on the %s path', async path => {
+  it.each(['normal','stalled','failing','published-change'] as const)('keeps five not-applicable SQLite families on the %s path', async path => {
     const {dependencies,observation}=sqliteFixture();
     if (path==='published-change') dependencies.observePublication=vi.fn().mockReturnValueOnce(observation).mockReturnValue({...observation,witness:'b'});
     const collectSqlite = path==='stalled' ? vi.fn(()=>new Promise<void>(()=>{})) : path==='failing' ? vi.fn(async()=>{throw new Error('private');}) : vi.fn(async()=>{});
     const result=await collectBackendDiagnostics({_dependencies:dependencies,collectSqlite,...(path==='stalled'?{_deadlineMs:10}:{})});
-    expect(statusesOf(result)).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable']);
+    expect(statusesOf(result)).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable','not-applicable']);
     for (const family of Object.values(result.telemetry)) expect(family).not.toHaveProperty('health');
     expect(dependencies.readMigrationHistory).not.toHaveBeenCalled();
     expect(dependencies.readQueue).not.toHaveBeenCalled();
@@ -855,15 +948,15 @@ describe('runtime health telemetry for other backends', () => {
     const {dependencies}=fixture(); const controller=new AbortController(); controller.abort();
     const mismatch=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:{backend:'sqlite'} as never});
     expect(mismatch.backend).toBe('sqlite');
-    expect(statusesOf(mismatch)).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable']);
+    expect(statusesOf(mismatch)).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable','not-applicable']);
     const {dependencies:sqliteDeps}=sqliteFixture();
-    expect(statusesOf(await collectBackendDiagnostics({_dependencies:sqliteDeps,signal:controller.signal}))).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable']);
-    expect(statusesOf(backendDiagnosticFailure(new Error('x'),'sqlite'))).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable']);
+    expect(statusesOf(await collectBackendDiagnostics({_dependencies:sqliteDeps,signal:controller.signal}))).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable','not-applicable']);
+    expect(statusesOf(backendDiagnosticFailure(new Error('x'),'sqlite'))).toEqual(['not-applicable','not-applicable','not-applicable','not-applicable','not-applicable']);
   });
   it('mirrors failures for an unknown backend and never reports it as not-applicable', () => {
-    expect(statusesOf(backendDiagnosticFailure(new Error('x')))).toEqual(['unavailable','unavailable','unavailable','unavailable']);
-    expect(statusesOf(backendDiagnosticFailure(Object.assign(new Error('x'),{code:'EACCES'})))).toEqual(['permission-denied','permission-denied','permission-denied','permission-denied']);
-    expect(statusesOf(backendDiagnosticFailure(Object.assign(new Error('x'),{code:'DIAGNOSTIC_SQLITE_TIMEOUT'}),'postgresql'))).toEqual(['timeout','timeout','timeout','timeout']);
+    expect(statusesOf(backendDiagnosticFailure(new Error('x')))).toEqual(['unavailable','unavailable','unavailable','unavailable','unavailable']);
+    expect(statusesOf(backendDiagnosticFailure(Object.assign(new Error('x'),{code:'EACCES'})))).toEqual(['permission-denied','permission-denied','permission-denied','permission-denied','unavailable']);
+    expect(statusesOf(backendDiagnosticFailure(Object.assign(new Error('x'),{code:'DIAGNOSTIC_SQLITE_TIMEOUT'}),'postgresql'))).toEqual(['timeout','timeout','timeout','timeout','timeout']);
   });
 });
 
