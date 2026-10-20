@@ -87,6 +87,7 @@ describe("CI plan classification", () => {
 
   it("maps graph-invisible inputs to the tests that read them", () => {
     expect(graphInvisibleTests("docs/cli.md")).toEqual([...GRAPH_INVISIBLE_INPUTS[0].tests]);
+    expect(graphInvisibleTests("docs/incident-diagnostics.md")).toContain("test/incident-runbook.test.ts");
     expect(graphInvisibleTests("README.md")).toEqual([...GRAPH_INVISIBLE_INPUTS[0].tests]);
     expect(graphInvisibleTests("LICENSE")).toEqual([...GRAPH_INVISIBLE_INPUTS[0].tests]);
     expect(graphInvisibleTests(".changeset/x.md")).toEqual([...GRAPH_INVISIBLE_INPUTS[1].tests]);
@@ -160,6 +161,7 @@ describe("CI plan integration flags", () => {
     }
     expect(integrationFlags({ mode: "selective", changed: [], selected: [], postgresqlSelected: ["test/postgresql/a.integration.ts"] }).postgresql).toBe(true);
     for (const path of [
+      "docs/incident-diagnostics.md",
       "bin/lcm.ts", "installer/install.ts", "src/cli/x.ts", "src/daemon/server.ts", "src/storage/postgresql/runtime.ts",
       "test/postgresql/a.integration.ts", "scripts/postgresql-harness.mjs", "scripts/ci-environment.mjs",
       "scripts/test-temp-root.mjs", "vitest.postgresql.config.ts",
