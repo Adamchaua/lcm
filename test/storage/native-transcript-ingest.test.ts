@@ -2406,6 +2406,7 @@ describe("exact native transcript message resolver", () => {
       messageSequence: 0,
       role: "user",
       content: "question",
+      isCompactionEvent: false,
     };
     const newerMessage: NativeTranscriptSessionMessageRecord = {
       messageId: 10,
@@ -2413,6 +2414,7 @@ describe("exact native transcript message resolver", () => {
       messageSequence: 0,
       role: "assistant",
       content: "scrubbed",
+      isCompactionEvent: false,
     };
     const getNativeTranscriptMessageSnapshot = vi.fn(async () => [
       olderMessage,
@@ -2474,6 +2476,7 @@ describe("exact native transcript message resolver", () => {
       messageSequence: 0,
       role: "user",
       content: "question",
+      isCompactionEvent: false,
     }];
     const getNativeTranscriptMessageSnapshot = vi.fn()
       .mockImplementationOnce(() => failedLoad)
@@ -2514,6 +2517,7 @@ describe("exact native transcript message resolver", () => {
       messageSequence,
       role: "user" as const,
       content: `message-${messageId}`,
+      isCompactionEvent: false,
     });
     const input = {
       nativeSessionId: "session-1",
@@ -2556,6 +2560,81 @@ describe("exact native transcript message resolver", () => {
     ])).resolves.toBeNull();
   });
 
+  it("links transcript messages across compaction event rows and keeps the sequence contiguity check", async () => {
+    const row = (
+      conversationId: number,
+      messageId: number,
+      messageSequence: number,
+      content: string,
+      isCompactionEvent = false,
+    ): NativeTranscriptSessionMessageRecord => ({
+      conversationId,
+      messageId,
+      messageSequence,
+      role: "user",
+      content,
+      isCompactionEvent,
+    });
+    const resolverFor = (snapshot: readonly NativeTranscriptSessionMessageRecord[]) =>
+      createExactNativeTranscriptMessageResolver({
+        getNativeTranscriptMessageSnapshot: vi.fn(async () => snapshot),
+      });
+    const lookup = (sessionSequence: number, content: string) => ({
+      nativeSessionId: "session-1",
+      sessionSequence,
+      role: "user" as const,
+      content,
+    });
+
+    // t0, E, t1 in one conversation, then an event and a message in a newer one.
+    const interleaved = resolverFor([
+      row(1, 10, 0, "t0"),
+      row(1, 11, 1, "event", true),
+      row(1, 12, 2, "t1"),
+      row(2, 20, 0, "event", true),
+      row(2, 21, 1, "t2"),
+    ]);
+    await expect(interleaved.resolveExact(lookup(0, "t0")))
+      .resolves.toEqual({ conversationId: 1, messageId: 10 });
+    await expect(interleaved.resolveExact(lookup(1, "t1")))
+      .resolves.toEqual({ conversationId: 1, messageId: 12 });
+    await expect(interleaved.resolveExact(lookup(2, "t2")))
+      .resolves.toEqual({ conversationId: 2, messageId: 21 });
+    await expect(interleaved.explainMiss!(lookup(3, "t3"))).resolves.toBe("sequence-out-of-range");
+
+    // An event does not hide a real sequence gap.
+    await expect(resolverFor([
+      row(1, 10, 0, "t0"),
+      row(1, 12, 2, "t1"),
+    ]).explainMiss!(lookup(0, "t0"))).resolves.toBe("invalid-session-snapshot");
+
+    // A session holding only events has rows but no transcript message.
+    await expect(resolverFor([row(1, 11, 0, "event", true)]).explainMiss!(lookup(0, "event")))
+      .resolves.toBe("sequence-out-of-range");
+    await expect(resolverFor([]).explainMiss!(lookup(0, "event")))
+      .resolves.toBe("session-not-found");
+
+    // A repository written before the flag existed omits it; the row is a
+    // transcript message and links as before.
+    const withoutFlag = ({ isCompactionEvent: _omitted, ...rest }: NativeTranscriptSessionMessageRecord) => rest;
+    const legacy = resolverFor([
+      withoutFlag(row(1, 10, 0, "t0")),
+      row(1, 11, 1, "event", true),
+      withoutFlag(row(1, 12, 2, "t1")),
+    ]);
+    await expect(legacy.resolveExact(lookup(0, "t0")))
+      .resolves.toEqual({ conversationId: 1, messageId: 10 });
+    await expect(legacy.resolveExact(lookup(1, "t1")))
+      .resolves.toEqual({ conversationId: 1, messageId: 12 });
+
+    // A defined value must still be a boolean.
+    for (const isCompactionEvent of [1, "true", null]) {
+      await expect(resolverFor([
+        { ...row(1, 10, 0, "t0"), isCompactionEvent: isCompactionEvent as never },
+      ]).explainMiss!(lookup(0, "t0"))).resolves.toBe("invalid-session-snapshot");
+    }
+  });
+
   it("rejects invalid resolver inputs before snapshot access", async () => {
     const getNativeTranscriptMessageSnapshot = vi.fn();
     const resolver = createExactNativeTranscriptMessageResolver({
@@ -2592,6 +2671,7 @@ describe("exact native transcript message resolver", () => {
       messageSequence,
       role,
       content,
+      isCompactionEvent: false,
     });
     const sessions: Record<string, readonly NativeTranscriptSessionMessageRecord[]> = {
       ok: [row(0)],
@@ -2645,6 +2725,7 @@ describe("exact native transcript message resolver", () => {
         messageSequence: 0,
         role: "user",
         content: "question",
+        isCompactionEvent: false,
       }]);
     const resolver = createExactNativeTranscriptMessageResolver({
       getNativeTranscriptMessageSnapshot,
@@ -2831,6 +2912,7 @@ describe("native transcript backfill coordinator", () => {
           messageSequence: 0,
           role: "user",
           content: expected,
+          isCompactionEvent: false,
         }]),
       });
       const repo = repository();
@@ -2919,6 +3001,7 @@ describe("native transcript backfill coordinator", () => {
           messageSequence: 0,
           role: "assistant",
           content: expected,
+          isCompactionEvent: false,
         }]),
       }),
     })).resolves.toMatchObject({ importedCount: 1 });
@@ -2967,6 +3050,7 @@ describe("native transcript backfill coordinator", () => {
         messageSequence: 0,
         role: "user",
         content: parserContent,
+        isCompactionEvent: false,
       }]),
     });
     const repo = repository();
@@ -3043,6 +3127,7 @@ describe("native transcript backfill coordinator", () => {
           messageSequence: 0,
           role: "user",
           content: parserContent,
+          isCompactionEvent: false,
         }]),
       }),
     })).rejects.toMatchObject(linkError("content-mismatch", 0, 0));
@@ -3102,6 +3187,7 @@ describe("native transcript backfill coordinator", () => {
           messageSequence,
           role: message.role as "user" | "assistant" | "system",
           content: message.content,
+          isCompactionEvent: false,
         }),
       )),
     });
@@ -4410,6 +4496,7 @@ describe("native transcript backfill coordinator", () => {
           messageSequence,
           role: message.role as "user" | "assistant" | "system",
           content: message.content,
+          isCompactionEvent: false,
         }))),
     });
     const common = {
@@ -4916,6 +5003,7 @@ describe("native transcript backfill coordinator", () => {
       messageSequence: 0,
       role: "user",
       content: "hello",
+      isCompactionEvent: false,
       ...overrides,
     });
 
@@ -5682,6 +5770,7 @@ describe("Codex inherited subagent history option", () => {
       messageSequence: index,
       role: index % 2 === 0 ? "user" as const : "assistant" as const,
       content,
+      isCompactionEvent: false,
     }))),
   });
   const base = (content: string, resolver: ReturnType<typeof resolverFor>) => ({

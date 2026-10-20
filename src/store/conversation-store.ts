@@ -6,6 +6,7 @@ import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback
 import { validateRegex } from "./regex-safety.js";
 import { createRegexSnippet } from "./regex-snippet.js";
 import { parseStoredTimestamp } from "../db/stored-timestamp.js";
+import { parseTranscriptSlotMarker, type TranscriptSlotSnapshot } from "../storage/contracts.js";
 
 export type ConversationId = number;
 export type MessageId = number;
@@ -891,6 +892,64 @@ export class ConversationStore {
       )
       .get(conversationId) as unknown as MaxSeqRow;
     return row?.max_seq ?? 0;
+  }
+
+  async getTranscriptSlotSnapshot(sessionId: string): Promise<TranscriptSlotSnapshot> {
+    this.assertDirectTransactionUsable();
+    validateConversationText(sessionId, "session_id");
+    const hasCompactionPart = (message: string): string =>
+      `EXISTS (SELECT 1 FROM message_parts WHERE message_id = ${message}.message_id AND part_type = 'compaction')`;
+    const countRow = this.db
+      .prepare(
+        `SELECT COUNT(m.message_id) AS count
+         FROM conversations c
+         JOIN messages m ON m.conversation_id = c.conversation_id
+         WHERE c.session_id = ? AND NOT ${hasCompactionPart("m")}`,
+      )
+      .get(sessionId) as unknown as CountRow;
+    const events = this.db
+      .prepare(
+        `SELECT m.message_id AS message_id,
+                EXISTS (
+                  SELECT 1
+                  FROM conversations lc
+                  JOIN messages l ON l.conversation_id = lc.conversation_id
+                  WHERE lc.session_id = c.session_id
+                    AND NOT ${hasCompactionPart("l")}
+                    AND (lc.created_at, lc.conversation_id, l.seq, l.message_id)
+                      > (c.created_at, c.conversation_id, m.seq, m.message_id)
+                ) AS followed,
+                (SELECT COALESCE(MAX(ordinal) + 1, 0) FROM message_parts WHERE message_id = m.message_id) AS next_ordinal
+         FROM conversations c
+         JOIN messages m ON m.conversation_id = c.conversation_id
+         WHERE c.session_id = ? AND ${hasCompactionPart("m")}
+         ORDER BY c.created_at, c.conversation_id, m.seq, m.message_id`,
+      )
+      .all(sessionId) as unknown as Array<{ message_id: number; followed: number; next_ordinal: number }>;
+    const markerRows = this.db
+      .prepare(
+        `SELECT p.message_id AS message_id, p.metadata AS metadata
+         FROM conversations c
+         JOIN messages m ON m.conversation_id = c.conversation_id
+         JOIN message_parts p ON p.message_id = m.message_id
+         WHERE c.session_id = ? AND p.part_type = 'snapshot' AND ${hasCompactionPart("m")}
+         ORDER BY p.message_id, p.ordinal`,
+      )
+      .all(sessionId) as unknown as Array<{ message_id: number; metadata: string | null }>;
+    return {
+      transcriptCount: countRow.count,
+      events: events.map((event) => ({
+        messageId: event.message_id,
+        followedByTranscript: event.followed === 1,
+        nextOrdinal: event.next_ordinal,
+        slotMarkers: markerRows
+          .filter((row) => row.message_id === event.message_id)
+          .flatMap((row) => {
+            const consumed = parseTranscriptSlotMarker(row.metadata);
+            return consumed === null ? [] : [consumed];
+          }),
+      })),
+    };
   }
 
   // ── Deletion ──────────────────────────────────────────────────────────────

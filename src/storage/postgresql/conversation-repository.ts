@@ -12,7 +12,11 @@ import type {
   MessageRecord,
   MessageRole,
 } from "../../store/conversation-store.js";
-import type { ConversationRepository } from "../contracts.js";
+import {
+  parseTranscriptSlotMarker,
+  type ConversationRepository,
+  type TranscriptSlotSnapshot,
+} from "../contracts.js";
 import { StorageOperationError } from "../errors.js";
 import type {
   PostgreSqlQueryExecutor,
@@ -162,6 +166,28 @@ type CountRow = QueryResultRow & {
 type MaxSeqRow = QueryResultRow & {
   max_seq: string | number | bigint | null;
 };
+
+type SlotEventRow = QueryResultRow & {
+  message_id: string | number | bigint;
+  followed: boolean;
+  next_ordinal: string | number | bigint;
+};
+
+type SlotMarkerRow = QueryResultRow & {
+  message_id: string | number | bigint;
+  metadata: string | null;
+};
+
+function hasCompactionPart(message: string): string {
+  return `EXISTS (
+                 SELECT 1
+                 FROM lcm.message_parts AS compaction_part
+                 WHERE compaction_part.project_id = ${message}.project_id
+                   AND compaction_part.conversation_id = ${message}.conversation_id
+                   AND compaction_part.message_id = ${message}.message_id
+                   AND compaction_part.part_type = 'compaction'
+               )`;
+}
 
 type TransactionIsolationRow = QueryResultRow & {
   transaction_isolation: unknown;
@@ -742,6 +768,127 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
       }, this.context(operation));
       const value = result.rows[0]?.max_seq ?? 0;
       return safeInteger(value, this.projectId, operation, "max_seq");
+    });
+  }
+
+  /**
+   * Read the session-wide transcript slot state. Callers hold the session's
+   * advisory lock (getOrCreateConversation in the same transaction) so the
+   * three reads observe one consistent state.
+   */
+  async getTranscriptSlotSnapshot(
+    sessionId: string,
+  ): Promise<TranscriptSlotSnapshot> {
+    const operation = "getTranscriptSlotSnapshot";
+    validateNoNul(sessionId, this.projectId, operation, "session_id");
+    return this.serializedRead(operation, async (executor) => {
+      const sessionFilter = `conversation.project_id = $1
+               AND conversation.session_id_sha256 = public.digest($2, 'sha256')
+               AND conversation.session_id = $2`;
+      const counted = await executor.query<CountRow>({
+        text: `SELECT COUNT(message.message_id) AS count
+               FROM lcm.conversations AS conversation
+               INNER JOIN lcm.messages AS message
+                 ON message.project_id = conversation.project_id
+                AND message.conversation_id = conversation.conversation_id
+               WHERE ${sessionFilter}
+                 AND NOT ${hasCompactionPart("message")}`,
+        values: [this.projectId, sessionId],
+      }, this.context(operation));
+      const events = await executor.query<SlotEventRow>({
+        text: `SELECT message.message_id,
+                      EXISTS (
+                        SELECT 1
+                        FROM lcm.conversations AS later_conversation
+                        INNER JOIN lcm.messages AS later
+                          ON later.project_id = later_conversation.project_id
+                         AND later.conversation_id = later_conversation.conversation_id
+                        WHERE later_conversation.project_id = conversation.project_id
+                          AND later_conversation.session_id_sha256 =
+                            conversation.session_id_sha256
+                          AND later_conversation.session_id = conversation.session_id
+                          AND NOT ${hasCompactionPart("later")}
+                          AND (later_conversation.created_at,
+                               later_conversation.conversation_id,
+                               later.seq,
+                               later.message_id)
+                            > (conversation.created_at,
+                               conversation.conversation_id,
+                               message.seq,
+                               message.message_id)
+                      ) AS followed,
+                      (
+                        SELECT COALESCE(MAX(part.ordinal) + 1, 0)
+                        FROM lcm.message_parts AS part
+                        WHERE part.project_id = message.project_id
+                          AND part.conversation_id = message.conversation_id
+                          AND part.message_id = message.message_id
+                      ) AS next_ordinal
+               FROM lcm.conversations AS conversation
+               INNER JOIN lcm.messages AS message
+                 ON message.project_id = conversation.project_id
+                AND message.conversation_id = conversation.conversation_id
+               WHERE ${sessionFilter}
+                 AND ${hasCompactionPart("message")}
+               ORDER BY conversation.created_at,
+                        conversation.conversation_id,
+                        message.seq,
+                        message.message_id`,
+        values: [this.projectId, sessionId],
+      }, this.context(operation));
+      const markers = await executor.query<SlotMarkerRow>({
+        text: `SELECT part.message_id, part.metadata
+               FROM lcm.conversations AS conversation
+               INNER JOIN lcm.messages AS message
+                 ON message.project_id = conversation.project_id
+                AND message.conversation_id = conversation.conversation_id
+               INNER JOIN lcm.message_parts AS part
+                 ON part.project_id = message.project_id
+                AND part.conversation_id = message.conversation_id
+                AND part.message_id = message.message_id
+               WHERE ${sessionFilter}
+                 AND part.part_type = 'snapshot'
+                 AND ${hasCompactionPart("message")}
+               ORDER BY part.message_id, part.ordinal`,
+        values: [this.projectId, sessionId],
+      }, this.context(operation));
+      const markersByMessage = new Map<number, boolean[]>();
+      for (const row of markers.rows) {
+        const consumed = parseTranscriptSlotMarker(row.metadata);
+        if (consumed === null) continue;
+        const messageId = safeInteger(
+          row.message_id,
+          this.projectId,
+          operation,
+          "message_id",
+        );
+        markersByMessage.set(messageId, [
+          ...(markersByMessage.get(messageId) ?? []),
+          consumed,
+        ]);
+      }
+      return {
+        transcriptCount: this.count(counted.rows[0], operation),
+        events: events.rows.map((row) => {
+          const messageId = safeInteger(
+            row.message_id,
+            this.projectId,
+            operation,
+            "message_id",
+          );
+          return {
+            messageId,
+            followedByTranscript: row.followed,
+            nextOrdinal: safeInteger(
+              row.next_ordinal,
+              this.projectId,
+              operation,
+              "next_ordinal",
+            ),
+            slotMarkers: markersByMessage.get(messageId) ?? [],
+          };
+        }),
+      };
     });
   }
 

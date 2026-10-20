@@ -158,6 +158,7 @@ type SessionMessageRow = QueryResultRow & {
   message_sequence: unknown;
   role: unknown;
   content: unknown;
+  is_compaction_event: unknown;
 };
 
 type TransactionIsolationRow = QueryResultRow & {
@@ -1291,7 +1292,16 @@ implements
                       message.message_id,
                       message.seq AS message_sequence,
                       message.role,
-                      message.content
+                      message.content,
+                      EXISTS (
+                        SELECT 1
+                        FROM lcm.message_parts AS compaction_part
+                        WHERE compaction_part.project_id = message.project_id
+                          AND compaction_part.conversation_id =
+                            message.conversation_id
+                          AND compaction_part.message_id = message.message_id
+                          AND compaction_part.part_type = 'compaction'
+                      ) AS is_compaction_event
                FROM lcm.conversations AS conversation
                INNER JOIN lcm.messages AS message
                  ON message.project_id = conversation.project_id
@@ -1331,6 +1341,12 @@ implements
           this.projectId,
           operation,
           "content",
+        ),
+        isCompactionEvent: boolean(
+          row.is_compaction_event,
+          this.projectId,
+          operation,
+          "is_compaction_event",
         ),
       }));
     });
