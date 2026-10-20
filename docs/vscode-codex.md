@@ -269,7 +269,7 @@ the backend-publication fail-closed cases (see
 |---|---|
 | Daemon absent | `SessionStart` and `UserPromptSubmit` start it and work normally; `Interrupt` and `SessionEnd` never start it and log `daemon-unavailable`, so their tail is not saved. |
 | Another program holds the daemon port, or the verified daemon is frozen | Hooks give up on their own: `SessionStart` after about 10 s, `UserPromptSubmit` and `Stop` after about 5 s each (the first turn took about 21–22 s); terminal hooks refuse in under a second. Nothing is stored except `PostToolUse` events. |
-| `LCM_ENABLED=false` | Every hook is a no-op: nothing is stored or injected, including `PostToolUse` events, and no daemon work or hook diagnostic is produced. Ordinary hook commands read stdin before the disabled dispatch returns; terminal `Interrupt`/`SessionEnd` commands return before reading stdin. |
+| `LCM_ENABLED=false` | Every hook is a no-op: nothing is stored or injected, including `PostToolUse` events, and no daemon work is done. Ordinary hook commands read stdin first and, when `~/.lcm` already exists, still record an `exit-0` outcome under `~/.lcm/state/codex-hooks/`; terminal `Interrupt`/`SessionEnd` commands return before reading stdin and record nothing. |
 | Summarizer provider failing | Capture is unaffected; `lcm compact` reports `daemon compaction failed (HTTP 500); run lcm doctor`, creates no summary, and succeeds on a later run after recovery. |
 
 **Context and time limits.** Codex bounds hooks at their configured timeouts (30 s for
