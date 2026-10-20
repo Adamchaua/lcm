@@ -30,7 +30,7 @@ interface Deferred<T> { promise: Promise<T>; resolve(value: T): void; reject(err
 interface WorkerPaths { homeDir: string; projectPath: string; secondaryProjectPath: string }
 type CorpusCounts = { projects: number; conversations: number; messages: number; summaries: number; promotedCount: number };
 
-const SCENARIOS = ["identity", "admin", "events", "memory", "compaction", "native-import", "knowledge", "sensitive", "hooks", "promotion", "diagnostics"] as const;
+const SCENARIOS = ["identity", "admin", "migration", "events", "memory", "compaction", "native-import", "knowledge", "sensitive", "hooks", "promotion", "diagnostics"] as const;
 const FAULT_SCENARIOS = ["fault-denial", "fault-pool", "fault-cancellation", "fault-unavailable"] as const;
 type FaultScenario = typeof FAULT_SCENARIOS[number];
 const SCENARIO_TIMEOUT = 120_000;

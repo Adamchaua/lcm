@@ -14,6 +14,29 @@ import {
   type InvocationControlRequest,
   type InvocationControlResponse,
 } from "../src/daemon/client.js";
+import { performMigrationPlan } from "../src/migration/cli-plan.js";
+import { performMigrationDryRunCheck } from "../src/migration/cli-dry-run.js";
+import { performMigrationApply } from "../src/migration/cli-apply.js";
+import { performMigrationAbortCommand } from "../src/migration/cli-abort.js";
+import { performMigrationVerifyCommand } from "../src/migration/cli-verify.js";
+import { performMigrationResumeCommand } from "../src/migration/cli-resume.js";
+import { performMigrationReportCommand } from "../src/migration/cli-report.js";
+import { performMigrationActivateCommand } from "../src/migration/cli-activate.js";
+import { performMigrationRollbackCommand } from "../src/migration/cli-rollback.js";
+import {
+  renderMigrationPlanEnvelope,
+  renderMigrationDryRunEnvelope,
+  renderMigrationApplyEnvelope,
+  renderMigrationAbortEnvelope,
+  renderMigrationVerifyEnvelope,
+  renderMigrationResumeEnvelope,
+  renderMigrationReportEnvelope,
+  renderMigrationActivateEnvelope,
+  renderMigrationRollbackEnvelope,
+  renderMigrationUnexpectedFailureEnvelope,
+} from "../src/migration/cli-render.js";
+import type { MigrationCommandName } from "../src/migration/exit-classes.js";
+import { serializeMigrationEnvelope, type MigrationEnvelope } from "../src/migration/envelope.js";
 import {
   ConfigValidationError,
   DEFAULT_LLM_MAX_CONCURRENCY,
@@ -1275,7 +1298,7 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   if (topLevel && (action === "stats" || action === "doctor")) return false;
   if (topLevel && (action === "diagnose" || action === "help")) return false;
   if ((action === "list" || action === "doctor") && actionCommand.parent?.name() === "connectors") return false;
-  if (topLevel && ["daemon", "config", "machine", "project", "postgres", "events", "connectors"].includes(action)) return false;
+  if (topLevel && ["daemon", "config", "machine", "project", "postgres", "migration", "events", "connectors"].includes(action)) return false;
   return true;
 }
 
@@ -2074,6 +2097,267 @@ export function registerMachineCommand(program: Command): void {
 
   program.addCommand(machineCmd);
 }
+
+
+/**
+ * Section 3's `lcm migration` command group -- `plan`, `dry-run`, `apply`,
+ * `resume`, `verify`, `report`, `abort`, `activate` and `rollback`.
+ * Modelled on `registerPostgreSqlCommand` above.
+ *
+ * Every action handler is thin glue by design: call the orchestration
+ * function from `src/migration/cli-*.ts`, call the matching `render*`
+ * function from `src/migration/cli-render.ts` to build the section 10
+ * envelope, then emit it. All classification, evidence construction and
+ * exit-class lookup happens in those already-unit-tested modules, not
+ * here -- this function's own job is argument parsing and I/O routing.
+ *
+ * **Section 10's stream separation.** `--json` prints exactly the
+ * envelope to stdout, written once, via `writeCliOutput`; without
+ * `--json`, stdout carries one short human-readable summary line built
+ * only from already-sanitized envelope fields. Progress and diagnostic
+ * text always go to stderr via `writeCliError`, regardless of `--json`,
+ * so stdout's single document is never mixed with anything else.
+ */
+function migrationHumanSummary(envelope: MigrationEnvelope): string {
+  if (envelope.refusal !== null) {
+    const generation = envelope.generation === null ? "" : ` [generation=${envelope.generation}]`;
+    return `Refused (${envelope.outcome}, exit ${envelope.exitCode}): ${envelope.refusal.reason}${generation} -- ${envelope.refusal.remedy}`;
+  }
+  const parts = [`${envelope.command}: ok (exit 0)`];
+  if (envelope.generation !== null) parts.push(`generation=${envelope.generation}`);
+  if (envelope.manifestPhase !== null) parts.push(`phase=${envelope.manifestPhase}`);
+  parts.push(`applied=${String(envelope.applied)}`);
+  if (envelope.next !== null) parts.push(`next=${envelope.next}`);
+  return parts.join(" ");
+}
+
+function emitMigrationEnvelope(
+  command: MigrationCommandName,
+  build: () => MigrationEnvelope,
+  jsonFlag: boolean | undefined,
+): void {
+  // Rendering can itself fail (an unmapped reason, evidence the sanitizer
+  // refuses to emit). Exactly one document is still printed.
+  let envelope: MigrationEnvelope;
+  try {
+    envelope = build();
+  } catch (error) {
+    envelope = renderMigrationUnexpectedFailureEnvelope(command, error);
+  }
+  if (jsonFlag) {
+    writeCliOutput(serializeMigrationEnvelope(envelope));
+  } else {
+    writeCliOutput(`${migrationHumanSummary(envelope)}\n`);
+  }
+  process.exitCode = envelope.exitCode;
+}
+
+export function registerMigrationCommand(program: Command): void {
+  type MigrationJsonOptions = { help?: boolean; json?: boolean };
+  type MigrationApplyOptions = MigrationJsonOptions & {
+    confirmGeneration?: string;
+    confirmBackend?: string;
+    generation?: string;
+    dryRun?: boolean;
+    maxRecords?: string;
+    maxBytes?: string;
+    leaseTtlMs?: string;
+  };
+
+  const migrationCmd = new Command("migration")
+    .description("Reversible SQLite-to-PostgreSQL cutover (plan, dry-run, apply, resume, verify, report, abort, activate, rollback)");
+  migrationCmd.helpOption(false).option("-h, --help", "Show help");
+  migrationCmd.action(async () => {
+    writeCliError("Usage: lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate|rollback> [--json]\n");
+    exit(1);
+  });
+
+  migrationCmd
+    .command("plan")
+    .description("Preview the next migration generation without mutating anything")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationJsonOptions) => {
+      writeCliError("Resolving migration preflight...\n");
+      const outcome = await performMigrationPlan({ cwd: process.cwd(), homeDir: homedir() });
+      writeCliError("Migration plan finished.\n");
+      emitMigrationEnvelope("plan", () => renderMigrationPlanEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("dry-run")
+    .description("Check the SQLite migration source without touching PostgreSQL or the journal")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationJsonOptions) => {
+      writeCliError("Checking the SQLite migration source...\n");
+      const outcome = await performMigrationDryRunCheck({ cwd: process.cwd(), homeDir: homedir() });
+      writeCliError("Migration dry-run finished.\n");
+      emitMigrationEnvelope("dry-run", () => renderMigrationDryRunEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("apply")
+    .description("Apply the confirmed migration generation: capture, manifest genesis and copy")
+    .option("--confirm-generation <id>", "The exact generation id `lcm migration plan` printed")
+    .option("--dry-run", "Stop after the confirmation fence; do not capture, copy, or mutate anything")
+    .option("--max-records <n>", "Maximum records per copy batch")
+    .option("--max-bytes <n>", "Maximum bytes per copy batch")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      const maxRecords = opts.maxRecords === undefined ? undefined : parsePositiveInteger(opts.maxRecords, "--max-records");
+      const maxBytes = opts.maxBytes === undefined ? undefined : parsePositiveInteger(opts.maxBytes, "--max-bytes");
+      writeCliError("Resolving migration preflight...\n");
+      const outcome = await performMigrationApply({
+        cwd: process.cwd(),
+        homeDir: homedir(),
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+        maxRecords,
+        maxBytes,
+        onDaemonObserved: (presence) => {
+          writeCliError(
+            `A running LCM daemon was observed (pid ${presence.pid}, ${presence.storageBackend} backend). The maintenance hold fences its storage operations until the hold ends.\n`,
+          );
+        },
+      });
+      writeCliError("Migration apply finished.\n");
+      emitMigrationEnvelope("apply", () => renderMigrationApplyEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("resume")
+    .description("Run the next step of a held generation: genesis and dry-run, copy, or finishing a carried effect")
+    .option("--generation <id>", "The generation to resume (default: the live maintenance hold)")
+    .option("--confirm-generation <id>", "The resolved generation id")
+    .option("--dry-run", "Name the step resume would run; run nothing and predict nothing")
+    .option("--max-records <n>", "Maximum records per copy batch")
+    .option("--max-bytes <n>", "Maximum bytes per copy batch")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      const maxRecords = opts.maxRecords === undefined ? undefined : parsePositiveInteger(opts.maxRecords, "--max-records");
+      const maxBytes = opts.maxBytes === undefined ? undefined : parsePositiveInteger(opts.maxBytes, "--max-bytes");
+      writeCliError("Resolving the generation to resume...\n");
+      const outcome = await performMigrationResumeCommand({
+        cwd: process.cwd(),
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+        maxRecords,
+        maxBytes,
+      });
+      writeCliError("Migration resume finished.\n");
+      emitMigrationEnvelope("resume", () => renderMigrationResumeEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("verify")
+    .description("Verify a copied generation against PostgreSQL, finish a pending verification, or confirm a verified one")
+    .option("--generation <id>", "The generation to verify (default: the live maintenance hold)")
+    .option("--confirm-generation <id>", "The resolved generation id")
+    .option("--dry-run", "Compute the verification without recording it (takes and releases the verification lease)")
+    .option("--lease-ttl-ms <n>", "Verification lease time to live in milliseconds (default 300000)")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      const leaseTtlMs = opts.leaseTtlMs === undefined ? undefined : parsePositiveInteger(opts.leaseTtlMs, "--lease-ttl-ms");
+      writeCliError("Verifying the migration generation...\n");
+      const outcome = await performMigrationVerifyCommand({
+        cwd: process.cwd(),
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+        leaseTtlMs,
+      });
+      writeCliError("Migration verify finished.\n");
+      emitMigrationEnvelope("verify", () => renderMigrationVerifyEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("report")
+    .description("Read-only account of one generation: what exists, what owns it, and what to run next")
+    .option("--generation <id>", "The generation to report (default: the live or terminal journal's own)")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Reading the migration generation...\n");
+      const outcome = await performMigrationReportCommand({ homeDir: homedir(), generation: opts.generation });
+      writeCliError("Migration report finished.\n");
+      emitMigrationEnvelope("report", () => renderMigrationReportEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("abort")
+    .description("Abort a held or entering migration, completing whichever recovery write is missing")
+    .option("--generation <id>", "The generation to abort (default: the journal's own generation)")
+    .option("--confirm-generation <id>", "The generation id of the live maintenance hold")
+    .option("--dry-run", "Run every read and check, then stop before changing anything")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Aborting the migration hold...\n");
+      const outcome = await performMigrationAbortCommand({
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+      });
+      writeCliError("Migration abort finished.\n");
+      emitMigrationEnvelope("abort", () => renderMigrationAbortEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("activate")
+    .description("Switch a verified generation to PostgreSQL. Afterwards swap the grants, then start the daemon")
+    .option("--generation <id>", "The generation to activate (default: the live maintenance hold)")
+    .option("--confirm-generation <id>", "The resolved generation id")
+    .option("--confirm-backend <backend>", "The backend activation switches to: postgresql")
+    .option("--dry-run", "Read the persisted state; evaluates nothing, so it never exits 0")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Activating the migration generation...\n");
+      const outcome = await performMigrationActivateCommand({
+        cwd: process.cwd(),
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        confirmBackend: opts.confirmBackend,
+        dryRun: opts.dryRun,
+      });
+      writeCliError("Migration activate finished.\n");
+      emitMigrationEnvelope("activate", () => renderMigrationActivateEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("rollback")
+    .description("Return an activated generation to SQLite, using the runtime-role LCM_POSTGRES_URL. Refuses while any other project is remotely bound")
+    .option("--generation <id>", "The generation to roll back (default: the live maintenance hold)")
+    .option("--confirm-generation <id>", "The resolved generation id")
+    .option("--confirm-backend <backend>", "The backend rollback switches to: sqlite")
+    .option("--dry-run", "Read the route and the manifest; evaluates nothing, so it never exits 0")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Rolling back the migration generation...\n");
+      const outcome = await performMigrationRollbackCommand({
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        confirmBackend: opts.confirmBackend,
+        dryRun: opts.dryRun,
+      });
+      writeCliError("Migration rollback finished.\n");
+      emitMigrationEnvelope("rollback", () => renderMigrationRollbackEnvelope(outcome), opts.json);
+    });
+
+  program.addCommand(migrationCmd);
+}
+
 
 export function registerPostgreSqlCommand(program: Command): void {
   type PostgreSqlOptions = {
@@ -3620,6 +3904,7 @@ export async function runCli(
   registerMachineCommand(program);
   registerProjectCommand(program, runWithPublicationRetry);
   registerPostgreSqlCommand(program);
+  registerMigrationCommand(program);
   registerMemoryCommands(
     program,
     async (options) => (await createDaemonReadClientOrExit(preflightSeams, options)).client,

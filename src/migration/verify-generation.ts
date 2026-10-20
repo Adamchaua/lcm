@@ -2161,33 +2161,22 @@ export async function inspectMigrationVerification(
 }
 
 /**
- * Drives plan-v4.md section 2 end to end for one attempt. Never retries
- * internally: a connection loss or any other failure propagates to the
- * caller, and restarting means calling this function again from scratch.
- * Nothing is persisted until the fully-formed report is ready to write.
+ * The persisted-report completion that verifyMigrationGeneration performs
+ * first (plan-v5 Part B (2)): when a verify-generation effect is already
+ * pending, finish it from persisted values alone and never reopen the
+ * destination. Returns `null` when no verify-generation effect is pending,
+ * leaving the caller to do whatever it does otherwise.
  *
- * Steps 9-11 (persist, begin, complete) run in that fixed order: nothing
- * is begun until it is durably persisted, and begin always precedes
- * complete, so a resumed attempt can tell exactly how far a prior attempt
- * got from the manifest and the report store alone. If a verify-generation
- * effect is already pending when this function starts, that can only be
- * because an earlier attempt already persisted and began it -- the report
- * is already frozen, content-addressed evidence -- so this attempt reads
- * that report back and completes with it directly, without repeating any
- * of the expensive destination work below. Resume binds the frozen report
- * to the sealed manifest: it refuses unless the report's own recorded
- * destination identity equals manifest.destination.identitySha256, by
- * comparing persisted values only, and unless its recorded cluster system
- * identifier equals manifest.destination.systemIdentifier (a manifest that
- * never recorded one is refused). This is what makes a crash
- * between begin and complete resumable without recomputation, and what
- * makes destination drift after begin harmless: this path never reopens
- * the destination at all.
+ * This is an extraction of the resume block verifyMigrationGeneration has
+ * always had, with no change to its checks, so a caller that has no
+ * destination, project-map or lease inputs to offer (the `resume` and
+ * `verify` CLI commands, for a pending effect) can reach exactly the same
+ * code verifyMigrationGeneration reaches.
  */
-export async function verifyMigrationGeneration(
-  input: VerifyMigrationGenerationInput,
-  dependencies: VerifyMigrationGenerationDependencies = defaultDependencies,
-): Promise<VerifyMigrationGenerationResult> {
+export function completePendingMigrationVerification(input: Readonly<{
+  homeDir: string;
+  generationId: string;
+}>): VerifyMigrationGenerationResult | null {
   const manifestStore = new MigrationManifestStore({ homeDir: input.homeDir });
   const reportStore = new MigrationVerificationReportStore({ homeDir: input.homeDir });
   const resumeManifest = manifestStore.read(input.generationId);
@@ -2243,6 +2232,41 @@ export async function verifyMigrationGeneration(
       effectId: pending.effectId, inputSha256: pending.inputSha256,
     };
   }
+  return null;
+}
+
+/**
+ * Drives plan-v4.md section 2 end to end for one attempt. Never retries
+ * internally: a connection loss or any other failure propagates to the
+ * caller, and restarting means calling this function again from scratch.
+ * Nothing is persisted until the fully-formed report is ready to write.
+ *
+ * Steps 9-11 (persist, begin, complete) run in that fixed order: nothing
+ * is begun until it is durably persisted, and begin always precedes
+ * complete, so a resumed attempt can tell exactly how far a prior attempt
+ * got from the manifest and the report store alone. If a verify-generation
+ * effect is already pending when this function starts, that can only be
+ * because an earlier attempt already persisted and began it -- the report
+ * is already frozen, content-addressed evidence -- so this attempt reads
+ * that report back and completes with it directly, without repeating any
+ * of the expensive destination work below. Resume binds the frozen report
+ * to the sealed manifest: it refuses unless the report's own recorded
+ * destination identity equals manifest.destination.identitySha256, by
+ * comparing persisted values only, and unless its recorded cluster system
+ * identifier equals manifest.destination.systemIdentifier (a manifest that
+ * never recorded one is refused). This is what makes a crash
+ * between begin and complete resumable without recomputation, and what
+ * makes destination drift after begin harmless: this path never reopens
+ * the destination at all.
+ */
+export async function verifyMigrationGeneration(
+  input: VerifyMigrationGenerationInput,
+  dependencies: VerifyMigrationGenerationDependencies = defaultDependencies,
+): Promise<VerifyMigrationGenerationResult> {
+  const resumed = completePendingMigrationVerification({ homeDir: input.homeDir, generationId: input.generationId });
+  if (resumed !== null) return resumed;
+  const manifestStore = new MigrationManifestStore({ homeDir: input.homeDir });
+  const reportStore = new MigrationVerificationReportStore({ homeDir: input.homeDir });
   const { report, releaseLease, assertLeaseHeld } = await computeVerificationReport(input, dependencies);
   // Round-2 P3: the lease stays held across persist and is released
   // only once persist itself has settled (success or failure), so a

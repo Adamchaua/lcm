@@ -26,6 +26,7 @@ import {
   MigrationVerificationDriverError,
   assertDestinationIdentityMatches,
   assertPermanentReadOnlyGuard,
+  completePendingMigrationVerification,
   buildMigrationCanonicalDelta,
   buildMigrationCensusVector,
   inspectMigrationVerification,
@@ -3507,6 +3508,15 @@ describe("verifyMigrationGeneration: completion receipts (#1396)", () => {
       { probe: "public-listing", ran: true }, { probe: "public-search", ran: false },
     ]);
   }, 15000);
+});
+
+describe("completePendingMigrationVerification (plan-v5 Part B (2): the persisted-report completion, extracted unchanged)", () => {
+  it("returns null, touching nothing, when no verify-generation effect is pending", () => {
+    const manifest = fakeManifestStore();
+    const before = manifest.current.checksumSha256;
+    expect(completePendingMigrationVerification({ homeDir: "/tmp/lcm-verify-no-pending", generationId: MANIFEST_FIXTURE_GENERATION_ID })).toBeNull();
+    expect(manifest.current.checksumSha256).toBe(before);
+  });
 });
 
 describe("shared census and canonical-delta builders", () => {

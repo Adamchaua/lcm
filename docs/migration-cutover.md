@@ -6,6 +6,10 @@ which external effect is pending, and which immutable evidence was accepted at
 each step. A private durable journal makes an interrupted protocol run
 recoverable without guessing from timestamps or partially changed data.
 
+This document explains the mechanism. To run a migration, use the operator runbook,
+[Migration operations](migration-operations.md), which covers the `lcm migration` commands, their
+exit classes and refusals, and the maintenance hold they leave in place.
+
 The journal and immutable capture do not copy data or change the selected
 backend by themselves. The internal bounded copy API described below consumes
 those artifacts. Copy completion does not activate PostgreSQL or execute
@@ -1060,6 +1064,10 @@ rejects the transfer grants. Before starting the daemon on the new backend:
    the runtime role is the schema's only non-owner grantee;
 3. start (or restart) the daemon, which performs its own readiness check
    against the runtime role and refuses to serve until it passes.
+
+Also switch `LCM_POSTGRES_URL` from the transfer role's URL used for
+activation to the runtime role's URL before starting the daemon or running a
+rollback, and leave `migrationRole` naming the schema owner.
 
 Leaving the transfer grants in place makes the daemon's readiness refuse the
 database as `acl-shape` or `schema-fingerprint`; applying the runtime grants

@@ -1530,12 +1530,12 @@ function projectMetadataBindsCanonical(
  * message would lose that guidance. Enumeration uses the authenticated
  * predicate instead, so no surface presents a successor it cannot open.
  */
-function assertDerivableProjectIdentity(id: string, canonical: string): void {
+function assertDerivableProjectIdentity(id: string, canonical: string, homeDir?: string): void {
   const normalized = normalizeProjectPath(canonical);
   const pathHash = hashProjectPath(normalized);
   if (id === pathHash) return;
   if (isRetiredProjectIdentitySuccessor(id, pathHash, normalized)) return;
-  if (projectMetadataBindsCanonical(id, normalized)) return;
+  if (projectMetadataBindsCanonical(id, normalized, homeDir)) return;
   throw new UnauthenticatedProjectIdentityError(id, canonical);
 }
 
@@ -1543,6 +1543,7 @@ function identityForMatches(
   map: ProjectMap,
   cwd: string,
   normalized: string,
+  homeDir?: string,
 ): ProjectIdentity | null {
   const matches = findPathMatches(map, cwd);
   if (matches.size > 1) {
@@ -1551,7 +1552,7 @@ function identityForMatches(
   if (matches.size === 0) return null;
   const id = [...matches][0];
   const canonical = resolve(map[id].canonical);
-  assertDerivableProjectIdentity(id, canonical);
+  assertDerivableProjectIdentity(id, canonical, homeDir);
   return {
     id,
     canonical,
@@ -1572,10 +1573,13 @@ function resolveProjectIdentityUnlocked(
     readonly _beforeMissingIdentityLockForTesting?: () => void;
     /** @internal Resolve against metadata backfill without publishing it. */
     readonly _suppressMetadataBackfill?: boolean;
+    /** The LCM home whose map is read and written. Omitted means the ambient home. */
+    readonly homeDir?: string;
   } = {},
   publicationLockToken?: BackendPublicationLockToken,
 ): ProjectIdentity {
   const map = loadProjectMapWithMetadata({
+    homeDir: opts.homeDir,
     _suppressMetadataBackfill: opts._suppressMetadataBackfill,
     _beforeMetadataLockForTesting: opts._beforeMetadataLockForTesting,
     _beforeMetadataMutationLockForTesting: opts._beforeMetadataMutationLockForTesting,
@@ -1584,7 +1588,7 @@ function resolveProjectIdentityUnlocked(
   const gitAnchor = resolveGitProjectAnchor(cwd);
   const lookupPath = gitAnchor?.canonical ?? cwd;
   const normalized = gitAnchor?.canonical ?? normalizeProjectPath(cwd);
-  const existing = identityForMatches(map, lookupPath, normalized);
+  const existing = identityForMatches(map, lookupPath, normalized, opts.homeDir);
   if (existing) return existing;
 
   const createMissingIdentity = (): ProjectIdentity => {
@@ -1594,6 +1598,7 @@ function resolveProjectIdentityUnlocked(
       current = loadProjectMapWithMetadata({
         strict: true,
         reload: true,
+        homeDir: opts.homeDir,
         _suppressMetadataBackfill: opts._suppressMetadataBackfill,
         _publicationLockToken: publicationLockToken,
       });
@@ -1606,24 +1611,24 @@ function resolveProjectIdentityUnlocked(
     // Preserve a known-good in-memory snapshot when the file disappeared
     // between the optimistic read and the locked reload. A genuinely fresh
     // bootstrap has an empty snapshot and follows this same path.
-    if (!existsSync(projectMapPath())) current = map;
-    const raced = identityForMatches(current, lookupPath, normalized);
+    if (!existsSync(projectMapPath(opts.homeDir))) current = map;
+    const raced = identityForMatches(current, lookupPath, normalized, opts.homeDir);
     if (raced) return raced;
     const id = hashProjectPath(normalized);
     current[id] ??= { canonical: normalized, aliases: [] };
-    writeProjectMap(current, undefined, { metadataPopulated: true });
+    writeProjectMap(current, opts.homeDir, { metadataPopulated: true });
     return {
       id,
       canonical: resolve(current[id].canonical),
       ...(current[id].remoteProjectId ? { remoteProjectId: current[id].remoteProjectId } : {}),
     };
   };
-  if (activeProjectMapMutationLocks.has(projectMapMutationLockPath())) {
+  if (activeProjectMapMutationLocks.has(projectMapMutationLockPath(opts.homeDir))) {
     return createMissingIdentity();
   }
   return withProjectMapMutationLock(
     () => createMissingIdentity(),
-    undefined,
+    opts.homeDir,
     undefined,
     publicationLockToken,
   );
@@ -1638,6 +1643,8 @@ export function resolveProjectIdentity(
     readonly _beforeMissingIdentityLockForTesting?: () => void;
     /** @internal Token held by a caller that already has publication admission. */
     readonly _publicationLockToken?: BackendPublicationLockToken;
+    /** The LCM home whose map is read and written. Omitted means the ambient home. */
+    readonly homeDir?: string;
   } = {},
 ): ProjectIdentity {
   // These hooks model another process winning the race before this consumer
@@ -1656,9 +1663,37 @@ export function resolveProjectIdentity(
     return resolveWithToken(opts._publicationLockToken);
   }
   return withBackendPublicationConsumerLock(
-    undefined,
+    opts.homeDir,
     resolveWithToken,
   );
+}
+
+/**
+ * Read the persisted project identity for a cwd, and nothing else
+ * (plan-v5 Part A item 6, Part B (3)).
+ *
+ * A strict parse of the map file under `homeDir`, with no publication
+ * consumer lock, no mutation lock, no metadata backfill, no map write, no
+ * backup and no cache update. It therefore works while a maintenance hold
+ * fences every consumer read, which resolveProjectIdentity and
+ * readProjectMapSnapshot cannot do, and it can never mint an entry.
+ *
+ * Returns `null` when the map is absent or has no entry for the project:
+ * the caller decides what that means (a held migration must not mint one).
+ * An invalid map, an ambiguous path or an unauthenticated entry throws,
+ * exactly as the locked readers do.
+ */
+export function readProjectMapIdentity(opts: {
+  readonly homeDir: string;
+  readonly cwd: string;
+}): ProjectIdentity | null {
+  const file = readMapFile(projectMapPath(opts.homeDir));
+  if (file === null) return null;
+  const map = parseProjectMap(file.content);
+  const gitAnchor = resolveGitProjectAnchor(opts.cwd);
+  const lookupPath = gitAnchor?.canonical ?? opts.cwd;
+  const normalized = gitAnchor?.canonical ?? normalizeProjectPath(opts.cwd);
+  return identityForMatches(map, lookupPath, normalized, opts.homeDir);
 }
 
 export function listProjectMapEntries(

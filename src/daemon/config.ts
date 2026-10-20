@@ -901,7 +901,14 @@ const POSTGRESQL_STORAGE_OVERRIDE_KEYS = new Set([
   "caFile",
 ]);
 
-function validateStorageSection(value: unknown, allowRuntimeSecrets: boolean): void {
+/**
+ * Exported for reuse by \`resolvePostgreSqlStorageSettings\`'s migration
+ * caller (\`src/migration/target-config.ts\`), which must validate the raw
+ * storage section's shape before reading \`storage.postgresql\` regardless
+ * of the active backend. Not a general-purpose export otherwise; ordinary
+ * config loading reaches this only through \`resolveStorageConfig\`.
+ */
+export function validateStorageSection(value: unknown, allowRuntimeSecrets: boolean): void {
   const storage = validateObject("storage", value);
   rejectUnknownKeys(storage, "storage", STORAGE_KEYS);
   if (storage.backend !== undefined) {
@@ -1290,16 +1297,46 @@ function normalizePostgreSqlMigrationRole(
   return normalized;
 }
 
-/** Resolve backend selection, environment-only secrets, bounds, and PostgreSQL TLS preflight. */
-export function resolveStorageConfig(
-  value: unknown,
-  env: Record<string, string | undefined> = {},
-): ResolvedStorageConfig {
-  validateStorageSection(value, true);
-  const storage = value as Record<string, unknown>;
-  const backend = (storage.backend ?? "sqlite") as StorageBackend;
-  if (backend === "sqlite") return { backend: "sqlite" };
-
+/**
+ * Resolves \`storage.postgresql\` (plus its \`LCM_POSTGRES_*\` environment
+ * fallbacks) into a validated connection/tuning object: URL scheme, TLS CA
+ * file, and migration role, exactly as \`resolveStorageConfig\` has always
+ * validated them for the active-backend case.
+ *
+ * Exported so this validation can be reused verbatim by a caller that needs
+ * to resolve the PostgreSQL target independently of which backend is
+ * currently active (see \`src/migration/target-config.ts\`) — never
+ * duplicated, per this item's own rule that a second implementation of one
+ * decision is a second thing that can drift from the first. This function
+ * does not itself decide when it is safe to call regardless of the active
+ * backend; that decision, and its scope restriction to the migration
+ * command surface, lives entirely in the migration-specific caller.
+ */
+/**
+ * **Scope warning, read before calling this from anywhere new.** This
+ * function resolves PostgreSQL connection settings *independent of the
+ * active \`storage.backend\`* — it will happily return a usable
+ * \`ResolvedPostgreSqlConfig["postgresql"]\` even while \`storage.backend\`
+ * is \`"sqlite"\`. That is deliberate and exists for exactly one reason:
+ * issue #627's migration command surface (\`src/migration/target-config.ts\`)
+ * needs the PostgreSQL target while the project has not yet cut over.
+ *
+ * It is not safe to call from the ordinary storage path, and it must never
+ * be reached from \`loadIdentityStorageConfig\` or any other general-purpose
+ * config accessor. Doing so would let a non-migration caller reach
+ * PostgreSQL while SQLite remains selected, which breaches issue #627's own
+ * scope exclusion that SQLite stays the zero-configuration default and
+ * nothing may silently fall back from (or bypass) a configured backend
+ * selection. \`resolveStorageConfig\` below is the backend-gated function
+ * every ordinary caller must keep using; this export exists only to let the
+ * migration surface reuse its validation logic verbatim rather than forking
+ * a second copy of it, per this item's own rule against duplicated
+ * decisions.
+ */
+export function resolvePostgreSqlStorageSettings(
+  storage: Record<string, unknown>,
+  env: Record<string, string | undefined>,
+): ResolvedPostgreSqlConfig["postgresql"] {
   const postgresql = (storage.postgresql ?? {}) as Record<string, unknown>;
   const urlValue = postgresql.url ?? env.LCM_POSTGRES_URL;
   const caFileValue = postgresql.caFile ?? env.LCM_POSTGRES_CA_FILE;
@@ -1390,18 +1427,31 @@ export function resolveStorageConfig(
   );
 
   return {
-    backend: "postgresql",
-    postgresql: {
-      poolMax: (postgresql.poolMax ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.poolMax) as number,
-      connectionTimeoutMs: (postgresql.connectionTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.connectionTimeoutMs) as number,
-      idleTimeoutMs: (postgresql.idleTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.idleTimeoutMs) as number,
-      statementTimeoutMs: (postgresql.statementTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.statementTimeoutMs) as number,
-      snapshotIdleTimeoutMs: (postgresql.snapshotIdleTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.snapshotIdleTimeoutMs) as number,
-      migrationRole,
-      url,
-      caFile: resolvedCaFile,
-    },
+    poolMax: (postgresql.poolMax ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.poolMax) as number,
+    connectionTimeoutMs: (postgresql.connectionTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.connectionTimeoutMs) as number,
+    idleTimeoutMs: (postgresql.idleTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.idleTimeoutMs) as number,
+    statementTimeoutMs: (postgresql.statementTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.statementTimeoutMs) as number,
+    snapshotIdleTimeoutMs: (postgresql.snapshotIdleTimeoutMs ?? DEFAULT_POSTGRESQL_STORAGE_SETTINGS.snapshotIdleTimeoutMs) as number,
+    migrationRole,
+    url,
+    caFile: resolvedCaFile,
   };
+}
+
+/**
+ * Validates the storage section's general shape (backend enum, unknown-key
+ * rejection) and, when the resolved backend is \`postgresql\`, its full
+ * connection settings — exactly \`resolveStorageConfig\`'s own behavior.
+ */
+export function resolveStorageConfig(
+  value: unknown,
+  env: Record<string, string | undefined> = {},
+): ResolvedStorageConfig {
+  validateStorageSection(value, true);
+  const storage = value as Record<string, unknown>;
+  const backend = (storage.backend ?? "sqlite") as StorageBackend;
+  if (backend === "sqlite") return { backend: "sqlite" };
+  return { backend: "postgresql", postgresql: resolvePostgreSqlStorageSettings(storage, env) };
 }
 
 /**

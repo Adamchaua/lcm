@@ -52,6 +52,7 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
       "test/daemon/remediation-string-regression.test.ts",
       "test/external-admission-workflow.test.ts",
       "test/incident-runbook.test.ts",
+      "test/migration/runbook-conformance.test.ts",
       "test/release-workflows.test.ts",
     ]),
   }),
