@@ -1,5 +1,5 @@
 ---
-"@donadiosolutions/lcm": patch
+"@donadiosolutions/lcm": minor
 ---
 
 Store transcript messages that follow a compaction event. `/ingest` and
@@ -12,3 +12,7 @@ conversation grants' table `SELECT` on `message_parts` already covers that read
 and runtime readiness, so these column grants are the least-privilege delta for
 a role without that table `SELECT`; re-applying the transcript script is
 harmless and not required.
+
+Custom `ConversationRepository` implementations must add the new required
+`getTranscriptSlotSnapshot` method, which returns the session-wide transcript
+row count and the compaction event rows with their slot markers.
