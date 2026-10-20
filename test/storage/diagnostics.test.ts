@@ -518,27 +518,105 @@ describe('runtime health telemetry on a healthy PostgreSQL probe', () => {
   });
 });
 
-describe('negative pool counters are out of range in telemetry only', () => {
-  const outOfRange={status:'partial',health:'unavailable',omitted:[{field:'saturationRatio',reason:'out-of-range'}]};
-  it('keeps the pool unverified and omits the daemon ratio as out-of-range', async () => {
-    const {dependencies}=fixture();
-    const factory={backend:'postgresql',getDiagnosticPool:()=>({configuredMax:8,total:2,idle:-1,waiting:0,failed:false})} as never;
-    const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:factory});
-    expect(result.pool).toMatchObject({origin:'daemon',status:'unverified'});
-    expect(result.telemetry.pool).toMatchObject(outOfRange);
+import { PostgreSqlRuntime } from '../../src/storage/postgresql/runtime.js';
+import { renderBackendDiagnostics } from '../../src/storage/diagnostic-renderer.js';
+
+describe('invalid pool counters at the real observation boundary', () => {
+  const outOfRange={status:'partial',observedAt:expect.any(Number),health:'unavailable',omitted:[{field:'saturationRatio',reason:'out-of-range'}],remediation:RUNTIME_HEALTH_ACTIONS.unavailable};
+  const unavailable={status:'unavailable',health:'unavailable',omitted:[{field:'saturationRatio',reason:'unavailable'}]};
+  const invalidNumbers=[-1,1.5,Number.NaN,Number.POSITIVE_INFINITY,2**53];
+  /** The real PostgreSqlRuntime with only the underlying pg pool counters injected; health and close are stubbed. */
+  function realRuntime(counts: Record<string, unknown>, poolMax = 5) {
+    const {health}=fixture();
+    const pgPool={totalCount:2,idleCount:1,waitingCount:0,on:()=>undefined,end:async()=>undefined,...counts};
+    const runtime=new PostgreSqlRuntime({url:'postgresql://secret:secret@secret.example/secret',caFile:'/secret/ca',poolMax,connectionTimeoutMs:10000,idleTimeoutMs:30000,statementTimeoutMs:60000},{createPool:()=>pgPool as never,createClient:()=>({}) as never,buildConfig:()=>({})});
+    vi.spyOn(runtime,'health').mockResolvedValue(health);
+    vi.spyOn(runtime,'close').mockResolvedValue(undefined);
+    return runtime;
+  }
+  const daemonFactory=(runtime: PostgreSqlRuntime)=>({backend:'postgresql',getDiagnosticPool:()=>runtime.poolDiagnostics()}) as never;
+  const expectSanitizedPool=(result: Awaited<ReturnType<typeof collectBackendDiagnostics>>, origin: string)=>{
+    expect(result.pool).toEqual({origin,status:'unverified'});
+    expect(result.telemetry.pool).toEqual(outOfRange);
+    const rendered=renderBackendDiagnostics(result);
+    expect(rendered).toContain(`Pool: unverified; origin: ${origin}`);
+    expect(rendered).toContain('Pool counts: configured max: unverified; total: unverified; idle: unverified; waiting: unverified; failed: unverified');
+    expect(rendered).toContain('Telemetry pool: partial; health: unavailable; saturation ratio: unverified; omitted: saturationRatio=out-of-range');
+    return rendered;
+  };
+  it.each(invalidNumbers)('daemon delegation: counter %j finalizes only the pool family as out-of-range', async bad => {
+    const {dependencies,runtime}=fixture();
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:daemonFactory(realRuntime({idleCount:bad}))});
+    expectSanitizedPool(result,'daemon');
+    expect(result.classification).toBe('unavailable');
+    expect(result.telemetry.migration).toMatchObject({status:'observed',health:'healthy',historyStatus:'current'});
+    expect(result.telemetry.queue).toMatchObject({status:'observed',health:'healthy'});
+    expect(result.telemetry.extensions).toMatchObject({status:'observed'});
+    expect(runtime.poolDiagnostics).not.toHaveBeenCalled();
   });
-  it('omits the diagnostic-probe ratio as out-of-range', async () => {
-    const {dependencies,runtime}=fixture(); runtime.poolDiagnostics=()=>({configuredMax:-4,total:0,idle:0,waiting:0,failed:false});
+  it.each(invalidNumbers)('probe collection: counter %j keeps migration, readiness and queue running', async bad => {
+    const {dependencies}=fixture(); const probe=realRuntime({totalCount:bad});
+    dependencies.createRuntime=vi.fn(()=>probe);
     const result=await collectBackendDiagnostics({_dependencies:dependencies});
-    expect(result.pool).toMatchObject({origin:'diagnostic-probe',status:'unverified'});
-    expect(result.telemetry.pool).toMatchObject(outOfRange);
+    expectSanitizedPool(result,'diagnostic-probe');
+    expect(result.classification).toBe('unavailable');
+    expect(result).toMatchObject({schema:'ready',metrics,outbox:{status:'ready'},project:{scope:'aggregate',status:'ready'}});
+    expect(result.telemetry.migration).toMatchObject({status:'observed',health:'healthy',historyStatus:'current',appliedCount:2,expectedCount:2});
+    expect(result.telemetry.queue).toMatchObject({status:'observed',health:'healthy',inboxClaimed:0,inboxQuarantined:0});
+    expect(result.telemetry.extensions).toMatchObject({status:'observed',health:'healthy'});
+    for (const read of [dependencies.readMigrationHistory,dependencies.readMetrics,dependencies.verifySchema,dependencies.readQueue,dependencies.readOutbox]) expect(read).toHaveBeenCalledTimes(1);
+    expect(probe.close).toHaveBeenCalledTimes(1);
   });
-  it('keeps the out-of-range reason in the timeout snapshot', async () => {
+  it('probe collection: a negative configured maximum is out of range', async () => {
+    const {dependencies}=fixture(); dependencies.createRuntime=vi.fn(()=>realRuntime({},-4));
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expectSanitizedPool(result,'diagnostic-probe');
+    expect(dependencies.readQueue).toHaveBeenCalledTimes(1);
+  });
+  it('timeout DTO: keeps the authenticated out-of-range reason and nothing else from the pool', async () => {
     const {dependencies,runtime}=fixture(); runtime.health=()=>new Promise(()=>{});
-    const factory={backend:'postgresql',getDiagnosticPool:()=>({configuredMax:8,total:-2,idle:0,waiting:0,failed:false})} as never;
-    const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:factory,_deadlineMs:10});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:daemonFactory(realRuntime({waitingCount:-2})),_deadlineMs:10});
     expect(result.classification).toBe('timeout');
-    expect(result.telemetry.pool).toMatchObject(outOfRange);
+    expectSanitizedPool(result,'daemon');
+    for (const family of [result.telemetry.migration,result.telemetry.extensions,result.telemetry.queue]) expect(family).toMatchObject({status:'timeout'});
+  });
+  it('never emits the rejected counter in JSON or rendered text', async () => {
+    const {dependencies}=fixture(); const sentinel=-7919;
+    const daemon=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:daemonFactory(realRuntime({totalCount:sentinel}))});
+    dependencies.createRuntime=vi.fn(()=>realRuntime({idleCount:sentinel}));
+    const probe=await collectBackendDiagnostics({_dependencies:dependencies});
+    for (const [result,origin] of [[daemon,'daemon'],[probe,'diagnostic-probe']] as const) {
+      const rendered=expectSanitizedPool(result,origin);
+      for (const key of ['configuredMax','total','idle','waiting','failed','saturationRatio']) { expect(result.pool).not.toHaveProperty(key); expect(result.telemetry.pool).not.toHaveProperty(key); }
+      expect(JSON.stringify(result)).not.toContain('7919');
+      expect(rendered).not.toContain('7919');
+    }
+  });
+  it.each([['missing',undefined],['non-numeric','private']] as const)('daemon delegation: a %s counter stays unavailable', async (_kind, value) => {
+    const {dependencies}=fixture();
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:daemonFactory(realRuntime({totalCount:value}))});
+    expect(result.pool).toEqual({origin:'daemon',status:'unverified'});
+    expect(result.telemetry.pool).toMatchObject(unavailable);
+    expect(result.telemetry.migration).toMatchObject({status:'observed'});
+    expect(JSON.stringify(result)).not.toContain('private');
+  });
+  it.each([['missing',undefined],['non-numeric','private']] as const)('probe collection: a %s counter still fails the probe as unavailable', async (_kind, value) => {
+    const {dependencies}=fixture(); dependencies.createRuntime=vi.fn(()=>realRuntime({idleCount:value}));
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('unavailable');
+    expect(result.pool).toEqual({origin:'diagnostic-probe',status:'unverified'});
+    expect(result.telemetry.pool).toMatchObject(unavailable);
+    expect(result.telemetry.extensions).toMatchObject({status:'observed'});
+    expect(statusesOf(result).filter(status=>status==='unavailable')).toHaveLength(3);
+    expect(dependencies.readMigrationHistory).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain('private');
+  });
+  it('timeout DTO: a missing daemon counter stays unavailable', async () => {
+    const {dependencies,runtime}=fixture(); runtime.health=()=>new Promise(()=>{});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies,storageFactory:daemonFactory(realRuntime({idleCount:undefined})),_deadlineMs:10});
+    expect(result.classification).toBe('timeout');
+    expect(result.pool).toEqual({origin:'daemon',status:'unverified'});
+    expect(result.telemetry.pool).toMatchObject(unavailable);
   });
 });
 

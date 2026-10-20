@@ -1,4 +1,5 @@
 import type { PostgreSqlExtensionReadiness } from "./postgresql/contracts.js";
+import type { PostgreSqlDiagnosticPoolRejection } from "./postgresql/errors.js";
 
 /** Closed observation statuses shared by every telemetry family. */
 export const TELEMETRY_STATUSES = [
@@ -191,18 +192,11 @@ export function poolAction(health: TelemetryHealth, facts: PoolFacts | undefined
     : evidence?.saturated === true ? RUNTIME_HEALTH_ACTIONS.poolSaturated : RUNTIME_HEALTH_ACTIONS.unavailable;
   return selectAction(health, action);
 }
-/** A counter that is a number but not an exact non-negative safe integer is out of range, not unverified. */
-function poolCounterOutOfRange(raw: unknown): boolean {
-  return isRecord(raw) && ["configuredMax", "total", "idle", "waiting"].some(key => {
-    const value = ownValue(raw, key);
-    return typeof value === "number" && safeCount(value) === undefined;
-  });
-}
-/** raw is the unsanitized counter record, used only to tell an out-of-range counter from an unverified pool. */
-export function poolTelemetry(pool: unknown, observedAt: number, raw?: unknown): PoolTelemetry {
+/** rejection is the closed reason the pool observation boundary refused the counters, if it did. */
+export function poolTelemetry(pool: unknown, observedAt: number, rejection?: PostgreSqlDiagnosticPoolRejection): PoolTelemetry {
   const facts = poolFacts(pool);
   if (facts === undefined) {
-    if (!poolCounterOutOfRange(raw)) return failureFamily("pool", "unavailable", observedAt);
+    if (rejection !== "out-of-range") return failureFamily("pool", "unavailable", observedAt);
     const omitted: TelemetryOmission[] = [{ field: "saturationRatio", reason: "out-of-range" }];
     return { status: deriveStatus(omitted, 1), observedAt, health: "unavailable", omitted, remediation: RUNTIME_HEALTH_ACTIONS.unavailable };
   }

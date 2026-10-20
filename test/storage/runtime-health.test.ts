@@ -117,17 +117,14 @@ describe("pool interpretation", () => {
     expect(poolTelemetry(readyPool({ configuredMax: 0 }), 1)).toMatchObject({ omitted: [{ field: "saturationRatio", reason: "invalid-input" }] });
     expect(poolTelemetry(readyPool({ total: 2, idle: 3 }), 1)).toMatchObject({ status: "partial", omitted: [{ field: "saturationRatio", reason: "invalid-input" }] });
   });
-  it("omits the ratio as out-of-range for a counter that is not a safe count, and as unavailable otherwise", () => {
+  it("omits the ratio as out-of-range only for the boundary's out-of-range rejection, and as unavailable otherwise", () => {
     const unverified = readyPool({ status: "unverified" });
-    for (const bad of [-1, Number.NaN, 1.5, Number.POSITIVE_INFINITY, 2 ** 53]) {
-      expect(poolTelemetry(unverified, 3, { configuredMax: 4, total: 2, idle: bad, waiting: 0 })).toEqual({
-        status: "partial", observedAt: 3, health: "unavailable", remediation: ACTIONS.unavailable,
-        omitted: [{ field: "saturationRatio", reason: "out-of-range" }],
-      });
-    }
-    expect(poolTelemetry(unverified, 3, { configuredMax: -1 })).toMatchObject({ status: "partial" });
-    for (const raw of [undefined, null, "text", { configuredMax: 4, total: 2, idle: undefined, waiting: 0 }, { configuredMax: "-1" }]) {
-      expect(poolTelemetry(unverified, 3, raw)).toMatchObject({ status: "unavailable", omitted: [{ field: "saturationRatio", reason: "unavailable" }] });
+    expect(poolTelemetry(unverified, 3, "out-of-range")).toEqual({
+      status: "partial", observedAt: 3, health: "unavailable", remediation: ACTIONS.unavailable,
+      omitted: [{ field: "saturationRatio", reason: "out-of-range" }],
+    });
+    for (const rejection of [undefined, "unavailable"] as const) {
+      expect(poolTelemetry(unverified, 3, rejection)).toMatchObject({ status: "unavailable", omitted: [{ field: "saturationRatio", reason: "unavailable" }] });
     }
   });
   it("selects guidance only from validated evidence", () => {

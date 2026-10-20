@@ -381,7 +381,7 @@ or error text is emitted.
 
 | Family | Field (JSON) | Type and unit | Source | Omission reasons | Labels and finite bound |
 |---|---|---|---|---|---|
-| Pool | `pool_saturation_ratio` (`saturationRatio`) | number, unitless | `(total - idle) / configuredMax` of the origin-tagged pool counters. It is not clamped, so it can exceed 1. | `invalid-input` when the maximum is 0 or idle exceeds total; `out-of-range` for a negative input; `unavailable` when the counters are unverified | origin, scope; 1 value |
+| Pool | `pool_saturation_ratio` (`saturationRatio`) | number, unitless | `(total - idle) / configuredMax` of the origin-tagged pool counters. It is not clamped, so it can exceed 1. | `invalid-input` when the maximum is 0 or idle exceeds total; `out-of-range` when a counter is negative, non-finite, fractional, or not an exact safe integer; `unavailable` when a counter is missing or non-numeric, or the counters are otherwise unverified | origin, scope; 1 value |
 | Migration | `migration_applied_count` (`appliedCount`) | count | rows of an ordered ledger read capped at the packaged count plus one | `limit-reached` when the cap is reached; `unavailable` for a malformed ledger | scope; 1 value |
 | Migration | `migration_expected_count` (`expectedCount`) | count | the verified packaged migration list | the family failure reason when the family fails before the probe | scope; 1 value |
 | Migration | `migration_history_status` (`historyStatus`) | closed enum | positional comparison of ledger IDs and checksums with the packaged list | none; `unavailable` is a value | scope; 1 value |

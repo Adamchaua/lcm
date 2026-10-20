@@ -21,7 +21,7 @@ import type { StorageBackendFactory } from "./contracts.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlRuntimeHealth } from "./postgresql/contracts.js";
 import { readPostgreSqlDiagnosticMetrics, type PostgreSqlDiagnosticMetrics } from "./postgresql/diagnostics.js";
 import { readPostgreSqlMigrationLedger, readPostgreSqlQueueHealth } from "./postgresql/runtime-health.js";
-import { PostgreSqlStorageOperationError } from "./postgresql/errors.js";
+import { PostgreSqlDiagnosticPoolError, PostgreSqlStorageOperationError, type PostgreSqlDiagnosticPoolRejection } from "./postgresql/errors.js";
 import { areRequiredPostgreSqlExtensionsReady } from "./postgresql/extensions.js";
 import { PostgreSqlRuntime } from "./postgresql/runtime.js";
 import { verifyPostgreSqlRuntimeSchema } from "./postgresql/runtime-readiness.js";
@@ -190,6 +190,10 @@ function safeSqlitePool(value: ReturnType<typeof getPoolStats>, origin: BackendD
   if (![value.totalConnections, value.idleConnections].every(finiteCount)) return { origin, status: "unverified" };
   return { origin, status: "ready", total: value.totalConnections, idle: value.idleConnections };
 }
+/** The closed reason of a refused pool observation; any other failure carries no reason. */
+function poolRejectionOf(error: unknown): PostgreSqlDiagnosticPoolRejection | undefined {
+  return error instanceof PostgreSqlDiagnosticPoolError ? error.reason : undefined;
+}
 function safeOutbox(value: EventStats): BackendDiagnosticOutbox {
   const counts = [value.captured, value.unprocessed, value.errors, value.deliveryPending, value.deliveryClaimed, value.deliveryRetry, value.deliveryReplicated, value.deliveryAcknowledged, value.deliveryAwaitingRemotePrune, value.deliveryQuarantined];
   if ((value.scanErrors ?? 0) > 0 || (value.scanSkipped ?? 0) > 0 || !counts.every(finiteCount)) return { status: "unavailable" };
@@ -221,14 +225,14 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
   let poolObservation: BackendDiagnosticPool | undefined;
   // Capture time of the pool counters, reused by the timeout DTO.
   let poolObservedAt = Date.now();
-  // Unsanitized counters, kept only so telemetry can tell an out-of-range value from an unverified pool.
-  let poolRaw: ReturnType<BackendDiagnosticRuntime["poolDiagnostics"]> | undefined;
+  // Why the boundary refused the counters, kept only so telemetry can tell an out-of-range value from an unverified pool.
+  let poolRejection: PostgreSqlDiagnosticPoolRejection | undefined;
   if (backend === "postgresql" && options.storageFactory !== undefined) {
     const factory = options.storageFactory as StorageBackendFactory & {
       getDiagnosticPool?: () => ReturnType<BackendDiagnosticRuntime["poolDiagnostics"]> | undefined;
     };
-    try { poolRaw = factory.getDiagnosticPool?.(); poolObservation = safePool(poolRaw, "daemon"); }
-    catch { poolObservation = { origin: "daemon", status: "unverified" }; }
+    try { poolObservation = safePool(factory.getDiagnosticPool?.(), "daemon"); }
+    catch (error) { poolObservation = { origin: "daemon", status: "unverified" }; poolRejection = poolRejectionOf(error); }
   } else if (backend === "sqlite") {
     const origin = options.storageFactory === undefined ? "local" : "daemon";
     try { poolObservation = safeSqlitePool(getPoolStats(), origin); }
@@ -246,7 +250,7 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
       } catch (error) { return scoped(backendDiagnosticFailure(error, backend)); }
       snapshot.publication = "ready";
       snapshot.pool = poolObservation;
-      if (backend === "postgresql") snapshot.telemetry.pool = poolTelemetry(poolObservation, poolObservedAt, poolRaw);
+      if (backend === "postgresql") snapshot.telemetry.pool = poolTelemetry(poolObservation, poolObservedAt, poolRejection);
     }
     return snapshot;
   };
@@ -290,10 +294,17 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
         snapshot.tls = health.tls === true ? "ready" : "unavailable";
         snapshot.extensions = health.extensions === undefined ? "unverified" : areRequiredPostgreSqlExtensionsReady(health.extensions) ? "ready" : "unavailable";
         snapshot.search = health.searchConfiguration === undefined ? "unverified" : health.searchConfiguration.ready ? "ready" : "unavailable";
-        if (poolObservation === undefined) poolRaw = runtime.poolDiagnostics();
-        snapshot.pool = poolObservation ?? safePool(poolRaw, "diagnostic-probe");
-        if (poolObservation === undefined) poolObservedAt = Date.now();
-        snapshot.telemetry.pool = poolTelemetry(snapshot.pool, poolObservedAt, poolRaw);
+        if (poolObservation === undefined) {
+          try { snapshot.pool = safePool(runtime.poolDiagnostics(), "diagnostic-probe"); }
+          catch (error) {
+            // Only an out-of-range counter is a pool-local fact; any other failure still fails the probe.
+            poolRejection = poolRejectionOf(error);
+            if (poolRejection !== "out-of-range") throw error;
+            snapshot.pool = { origin: "diagnostic-probe", status: "unverified" };
+          }
+          poolObservedAt = Date.now();
+        }
+        snapshot.telemetry.pool = poolTelemetry(snapshot.pool, poolObservedAt, poolRejection);
         finished.add("pool");
         if (health.status !== "healthy" && health.status !== "degraded") throw health.error;
         if (!probeBudget()) snapshot.telemetry.migration = failedFamilies("timeout").migration;
