@@ -3377,6 +3377,20 @@ function materialFromJson(value: unknown, field: string): BackendPublicationReco
   };
 }
 
+/**
+ * The exact bytes sealMaterial writes for a publication's recovery
+ * material. Exported, with no behaviour change, so a caller holding its own
+ * durable copy of the same material (the migration activation artifact)
+ * can compare a sealed file byte-for-byte against that copy instead of
+ * re-deriving the serialization.
+ */
+export function backendPublicationMaterialContent(
+  publicationId: string,
+  material: BackendPublicationRecoveryMaterial,
+): string {
+  return materialJson(publicationId, material);
+}
+
 function materialJson(
   publicationId: string,
   material: BackendPublicationRecoveryMaterial,
