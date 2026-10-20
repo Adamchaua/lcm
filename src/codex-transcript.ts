@@ -104,14 +104,25 @@ export function parseCodexTranscript(transcriptPath: string): ParsedMessage[] {
 }
 
 /**
- * Where a forked Codex subagent's own history starts. Records persisted before
- * `start` (by their top-level ordinal) are the parent's inherited context.
+ * Where the history a Codex rollout inherited from its parent ends.
+ *
+ * - `ordinal`: a forked subagent. Records persisted before `start` (by their
+ *   top-level ordinal) are the parent's inherited context.
+ * - `copied-fork` with `startRecord`: a user fork that copied its parent's
+ *   rollout. Records before the first thread_settings_applied event of the
+ *   fork's own thread (by native source ordinal) are the parent's.
+ * - `copied-fork` with `pending`: a user fork that has not written that event
+ *   yet. Every record is still the parent's.
  */
-export interface CodexInheritedBoundary {
-  readonly start: number;
-  /** Only a paginated rollout reliably stamps every persisted record with an ordinal. */
-  readonly paginated: boolean;
-}
+export type CodexInheritedBoundary =
+  | {
+    readonly kind: "ordinal";
+    readonly start: number;
+    /** Only a paginated rollout reliably stamps every persisted record with an ordinal. */
+    readonly paginated: boolean;
+  }
+  | { readonly kind: "copied-fork"; readonly startRecord: number; readonly pending?: undefined }
+  | { readonly kind: "copied-fork"; readonly pending: true; readonly startRecord?: undefined };
 
 function isCodexOrdinal(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -128,10 +139,83 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 export function readCodexInheritedBoundary(raw: string): CodexInheritedBoundary | undefined {
   const payload = firstSessionMetaPayload(raw);
-  if (payload === undefined) return undefined;
-  const start = payload.subagent_history_start_ordinal;
-  if (!isCodexOrdinal(start)) return undefined;
-  return { start, paginated: payload.history_mode === "paginated" };
+  const start = payload?.subagent_history_start_ordinal;
+  // A valid subagent ordinal wins; anything else falls through to a copied fork.
+  if (payload !== undefined && isCodexOrdinal(start)) {
+    return { kind: "ordinal", start, paginated: payload.history_mode === "paginated" };
+  }
+  return readCopiedForkBoundary(raw);
+}
+
+/**
+ * Largest line the native transcript reader accepts. It still counts a longer
+ * line as a record, so this number only matters for blank lines of that size.
+ */
+const NATIVE_RECORD_BYTE_LIMIT = 10 * 1024 * 1024;
+
+/**
+ * The physical lines the native transcript reader counts, with the position it
+ * gives each one (its sourceOrdinal). A line counts unless every byte is a tab,
+ * a carriage return or a space; malformed, non-container, duplicate-key and
+ * oversized lines all count. This is deliberately not String.trim(), which also
+ * treats VT, FF, NBSP and other Unicode spaces as blank.
+ */
+function* nativeSourceLines(raw: string): Generator<{ position: number; line: string; oversized: boolean }> {
+  let position = 0;
+  for (const line of raw.split("\n")) {
+    const oversized = line.length * 3 > NATIVE_RECORD_BYTE_LIMIT
+      && Buffer.byteLength(line, "utf8") > NATIVE_RECORD_BYTE_LIMIT;
+    if (!oversized && /^[\t\r ]*$/u.test(line)) continue;
+    yield { position, line, oversized };
+    position += 1;
+  }
+}
+
+/** One counted line as JSON, or undefined when the native reader could not use it. */
+function parseNativeSourceLine(line: string, oversized: boolean): unknown {
+  if (oversized) return undefined;
+  try {
+    // The native decoder drops a byte order mark before parsing each record.
+    return JSON.parse(line.charCodeAt(0) === 0xfeff ? line.slice(1) : line);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The boundary of a user fork that copied its parent's rollout. Positions are
+ * native source ordinals so the stored messages and the native links of one
+ * fork always agree on which records are inherited. Anything uncertain returns
+ * undefined, which keeps today's full parse.
+ */
+function readCopiedForkBoundary(raw: string): CodexInheritedBoundary | undefined {
+  let threadId: string | undefined;
+  for (const { position, line, oversized } of nativeSourceLines(raw)) {
+    const record = parseNativeSourceLine(line, oversized);
+    if (position === 0) {
+      // Only the first counted line may be the fork's session_meta; no scanning ahead.
+      const meta = isRecord(record) && record.type === "session_meta" && isRecord(record.payload)
+        ? record.payload
+        : undefined;
+      if (meta === undefined) return undefined;
+      const { id, forked_from_id: forkedFromId, history_base: historyBase } = meta;
+      if (
+        typeof id !== "string" || id === ""
+        || typeof forkedFromId !== "string" || forkedFromId === "" || forkedFromId === id
+        // A referenced fork keeps its history elsewhere, so nothing is copied.
+        || (historyBase !== undefined && historyBase !== null)
+      ) return undefined;
+      threadId = id;
+      continue;
+    }
+    if (!isRecord(record) || record.type !== "event_msg" || !isRecord(record.payload)
+      || record.payload.type !== "thread_settings_applied") continue;
+    const settingsThreadId = record.payload.thread_id;
+    // A settings event that does not name its thread cannot be attributed.
+    if (typeof settingsThreadId !== "string" || settingsThreadId === "") return undefined;
+    if (settingsThreadId === threadId) return { kind: "copied-fork", startRecord: position };
+  }
+  return threadId === undefined ? undefined : { kind: "copied-fork", pending: true };
 }
 
 /** A Codex rollout's first session_meta identifies the rollout and its immediate parent. */
@@ -174,23 +258,68 @@ function firstSessionMetaPayload(raw: string): Record<string, unknown> | undefin
   return undefined;
 }
 
+function isInheritedByOrdinal(
+  record: unknown,
+  boundary: Extract<CodexInheritedBoundary, { kind: "ordinal" }>,
+): boolean {
+  const ordinal = isRecord(record) ? record.ordinal : undefined;
+  return isCodexOrdinal(ordinal) ? ordinal < boundary.start : boundary.paginated;
+}
+
 /**
- * True when a parsed record belongs to the parent history a forked subagent
- * inherited. The boundary ordinal itself is the subagent's first own record.
- * Only numeric fields are consulted, so scrubbing cannot change the outcome.
+ * True when a parsed record belongs to the parent history a rollout inherited.
+ * A subagent's boundary ordinal itself is its first own record and only numeric
+ * fields are consulted, so scrubbing cannot change the outcome. A copied fork
+ * is classified by `position`, the record's native source ordinal, and ignores
+ * the record's own ordinal.
  */
 export function isInheritedSubagentRecord(
   record: unknown,
   boundary: CodexInheritedBoundary | undefined,
+  position: number,
 ): boolean {
   if (boundary === undefined) return false;
-  const ordinal = isRecord(record) ? record.ordinal : undefined;
-  return isCodexOrdinal(ordinal) ? ordinal < boundary.start : boundary.paginated;
+  if (boundary.kind === "ordinal") return isInheritedByOrdinal(record, boundary);
+  return boundary.pending === true || position < boundary.startRecord;
 }
 
 export interface CodexParseOptions {
   /** Drop the parent history a forked subagent inherited. */
   readonly excludeInheritedSubagentHistory?: boolean;
+}
+
+/** The user or assistant message a response_item line carries, if any. */
+function codexMessageOf(obj: CodexLine): ParsedMessage | undefined {
+  const payload = obj.payload as CodexResponseItemPayload | undefined;
+  if (!payload || payload.type !== "message") return undefined;
+
+  const role = payload.role;
+  if (!role || !["user", "assistant"].includes(role)) return undefined;
+
+  const content = extractCodexText(payload.content);
+  if (!content.trim()) return undefined;
+
+  return { role, content, tokenCount: estimateTokens(content) };
+}
+
+/**
+ * The messages a copied fork wrote itself. Lines are counted as the native
+ * reader counts them, and a line that is not a record contributes nothing
+ * instead of failing the walk.
+ */
+export function parseCodexCopiedForkMessages(
+  raw: string,
+  boundary: Extract<CodexInheritedBoundary, { kind: "copied-fork" }>,
+): ParsedMessage[] {
+  const messages: ParsedMessage[] = [];
+  for (const { position, line, oversized } of nativeSourceLines(raw)) {
+    if (isInheritedSubagentRecord(undefined, boundary, position)) continue;
+    const obj = parseNativeSourceLine(line, oversized);
+    if (!isRecord(obj) || obj.type !== "response_item") continue;
+    const message = codexMessageOf(obj);
+    if (message !== undefined) messages.push(message);
+  }
+  return messages;
 }
 
 /** Parse already-bound transcript bytes without reopening a pathname. */
@@ -199,6 +328,7 @@ export function parseCodexTranscriptText(raw: string, options: CodexParseOptions
   const boundary = options.excludeInheritedSubagentHistory === true
     ? readCodexInheritedBoundary(raw)
     : undefined;
+  if (boundary?.kind === "copied-fork") return parseCodexCopiedForkMessages(raw, boundary);
 
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
@@ -213,18 +343,10 @@ export function parseCodexTranscriptText(raw: string, options: CodexParseOptions
 
     // Only response_item lines carry user/assistant messages
     if (obj.type !== "response_item") continue;
-    if (isInheritedSubagentRecord(obj, boundary)) continue;
+    if (boundary !== undefined && isInheritedByOrdinal(obj, boundary)) continue;
 
-    const payload = obj.payload as CodexResponseItemPayload | undefined;
-    if (!payload || payload.type !== "message") continue;
-
-    const role = payload.role;
-    if (!role || !["user", "assistant"].includes(role)) continue;
-
-    const content = extractCodexText(payload.content);
-    if (!content.trim()) continue;
-
-    messages.push({ role, content, tokenCount: estimateTokens(content) });
+    const message = codexMessageOf(obj);
+    if (message !== undefined) messages.push(message);
   }
 
   return messages;

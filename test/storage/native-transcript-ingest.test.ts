@@ -17,7 +17,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseCodexTranscriptText } from "../../src/codex-transcript.js";
+import {
+  parseCodexCopiedForkMessages,
+  parseCodexTranscriptText,
+  readCodexInheritedBoundary,
+} from "../../src/codex-transcript.js";
 import { sanitizeHookErrorDiagnostic } from "../../src/hooks/hook-error-diagnostic.js";
 import { parseTranscriptText } from "../../src/transcript.js";
 import { ScrubEngine } from "../../src/scrub.js";
@@ -49,6 +53,7 @@ import {
   createNativeTranscriptMessageMapper,
   createNativeTranscriptScrubber,
   inheritedNativeSourceOrdinals,
+  NATIVE_TRANSCRIPT_MAX_RECORD_BYTES,
   NativeTranscriptConfigurationError,
   NativeTranscriptLinkError,
   NativeTranscriptSourceChangedError,
@@ -5793,7 +5798,7 @@ describe("Codex inherited subagent history option", () => {
     await runNativeTranscriptBackfill({
       ...base(content, resolverFor("own 1", "own 2", "unnumbered")),
       repository: repo,
-      codexInheritedBoundary: { start: 1, paginated: true },
+      codexInheritedBoundary: { kind: "ordinal", start: 1, paginated: true },
     });
     const linked = repo.batches.flatMap((batch) => batch.records)
       .map((record) => [record.sourceOrdinal, record.messageLinks.map((link) => link.messageId)]);
@@ -5811,9 +5816,9 @@ describe("Codex inherited subagent history option", () => {
 
   it.each([
     ["a non-object boundary", { codexInheritedBoundary: null }],
-    ["a fractional start", { codexInheritedBoundary: { start: 1.5, paginated: true } }],
-    ["a negative start", { codexInheritedBoundary: { start: -1, paginated: true } }],
-    ["a non-boolean mode", { codexInheritedBoundary: { start: 1, paginated: "yes" } }],
+    ["a fractional start", { codexInheritedBoundary: { kind: "ordinal", start: 1.5, paginated: true } }],
+    ["a negative start", { codexInheritedBoundary: { kind: "ordinal", start: -1, paginated: true } }],
+    ["a non-boolean mode", { codexInheritedBoundary: { kind: "ordinal", start: 1, paginated: "yes" } }],
   ])("rejects %s", async (_name, extra) => {
     const repo = repository();
     await expect(runNativeTranscriptBackfill({
@@ -5833,7 +5838,7 @@ describe("Codex inherited subagent history option", () => {
       ...base(content, resolverFor("own 1", "own 2")),
       repository: repo,
       globalPatterns: ["ordinal"],
-      codexInheritedBoundary: { start: 1, paginated: true },
+      codexInheritedBoundary: { kind: "ordinal", start: 1, paginated: true },
     });
     const records = repo.batches.flatMap((batch) => batch.records);
     expect(JSON.stringify(records[1]!.nativePayload)).not.toContain('"ordinal"');
@@ -5852,7 +5857,7 @@ describe("Codex inherited subagent history option", () => {
       ...base(content, resolverFor("own 1", "own 2")),
       repository: resumed,
       globalPatterns: ["ordinal"],
-      codexInheritedBoundary: { start: 1, paginated: true },
+      codexInheritedBoundary: { kind: "ordinal", start: 1, paginated: true },
     });
     expect(resumed.batches.flatMap((batch) => batch.records).map((record) => record.messageLinks.map((link) => link.messageId)))
       .toEqual([[11]]);
@@ -5864,7 +5869,7 @@ describe("Codex inherited subagent history option", () => {
       ...base(codexMessage(0, "user", "inherited") + codexMessage(1, "user", "own"), resolverFor()),
       repository: repository(),
       messageMapper: { map },
-      codexInheritedBoundary: { start: 1, paginated: true },
+      codexInheritedBoundary: { kind: "ordinal", start: 1, paginated: true },
     });
     expect(map).toHaveBeenCalledTimes(1);
   });
@@ -5875,7 +5880,7 @@ describe("Codex inherited subagent history option", () => {
     const withBoundary = await collect(byteChunks(bytes), {
       format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
       scrubber,
-      codexInheritedBoundary: { start: 1, paginated: true },
+      codexInheritedBoundary: { kind: "ordinal", start: 1, paginated: true },
     });
     expect(withBoundary.map((outcome) => outcome.kind === "record" ? outcome.inheritedHistory : undefined))
       .toEqual([true, false]);
@@ -5883,10 +5888,10 @@ describe("Codex inherited subagent history option", () => {
     expect(without.every((outcome) => outcome.kind === "record" && !("inheritedHistory" in outcome))).toBe(true);
     await expect(collect(byteChunks(bytes), {
       format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
-      codexInheritedBoundary: { start: -1, paginated: true },
+      codexInheritedBoundary: { kind: "ordinal", start: -1, paginated: true },
     })).rejects.toThrowError(NativeTranscriptConfigurationError);
     await expect(collect(byteChunks(bytes), {
-      codexInheritedBoundary: { start: 1, paginated: true },
+      codexInheritedBoundary: { kind: "ordinal", start: 1, paginated: true },
     })).rejects.toThrowError(NativeTranscriptConfigurationError);
   });
 
@@ -5896,7 +5901,7 @@ describe("Codex inherited subagent history option", () => {
       + "{bad\n\n"
       + codexMessage(1, "user", "own")
       + JSON.stringify({ type: "response_item", ordinal: 0, payload: { type: "function_call" } }) + "\n";
-    expect([...await inheritedNativeSourceOrdinals(Buffer.from(bytes), { start: 1, paginated: false })]).toEqual([1, 4]);
+    expect([...await inheritedNativeSourceOrdinals(Buffer.from(bytes), { kind: "ordinal", start: 1, paginated: false })]).toEqual([1, 4]);
   });
 
   it("rejects the option for a non-Codex format", async () => {
@@ -5905,7 +5910,82 @@ describe("Codex inherited subagent history option", () => {
       quarantine: quarantineFor("claude-code"),
       format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
       repository: repository(),
-      codexInheritedBoundary: { start: 1, paginated: true },
+      codexInheritedBoundary: { kind: "ordinal", start: 1, paginated: true },
     })).rejects.toThrowError(NativeTranscriptConfigurationError);
+  });
+
+  it("classifies a copied fork by source position and ignores each record's own ordinal", async () => {
+    const repo = repository();
+    const content = codexMessage(7, "user", "inherited 1")
+      + "{not json\n"
+      + codexMessage(0, "user", "own 1")
+      + codexMessage(undefined, "assistant", "own 2");
+    await runNativeTranscriptBackfill({
+      ...base(content, resolverFor("own 1", "own 2")),
+      repository: repo,
+      codexInheritedBoundary: { kind: "copied-fork", startRecord: 2 },
+    });
+    const linked = repo.batches.flatMap((batch) => batch.records)
+      .map((record) => [record.sourceOrdinal, record.messageLinks.map((link) => link.messageId)]);
+    expect(linked).toEqual([[0, []], [2, [10]], [3, [11]]]);
+  });
+
+  it("stores every record of a pending copied fork unlinked", async () => {
+    const repo = repository();
+    await runNativeTranscriptBackfill({
+      ...base(codexMessage(0, "user", "inherited") + codexMessage(1, "assistant", "also"), resolverFor()),
+      repository: repo,
+      codexInheritedBoundary: { kind: "copied-fork", pending: true },
+    });
+    expect(repo.batches.flatMap((batch) => batch.records).map((record) => record.messageLinks.length)).toEqual([0, 0]);
+  });
+
+  it.each([
+    ["an unknown kind", { kind: "other", start: 1, paginated: true }],
+    ["a missing kind", { start: 1, paginated: true }],
+    ["a copied fork without a position", { kind: "copied-fork" }],
+    ["a fractional start record", { kind: "copied-fork", startRecord: 1.5 }],
+    ["a negative start record", { kind: "copied-fork", startRecord: -1 }],
+    ["an unsafe start record", { kind: "copied-fork", startRecord: 2 ** 60 }],
+    ["a pending fork with a start record", { kind: "copied-fork", pending: true, startRecord: 1 }],
+    ["a falsy pending marker", { kind: "copied-fork", pending: false }],
+    ["a start record with a pending marker", { kind: "copied-fork", pending: false, startRecord: 1 }],
+  ])("rejects %s", async (_name, codexInheritedBoundary) => {
+    const repo = repository();
+    await expect(runNativeTranscriptBackfill({
+      ...base("", resolverFor()),
+      repository: repo,
+      codexInheritedBoundary,
+    } as never)).rejects.toThrowError(NativeTranscriptConfigurationError);
+    expect(repo.ingestBatch).not.toHaveBeenCalled();
+  });
+
+  it("gives a copied fork's parser and its native reader the same positions", async () => {
+    const fork = (payload: Record<string, unknown>): string => JSON.stringify({ type: "session_meta", payload }) + "\n";
+    const settings = JSON.stringify({ type: "event_msg", payload: { type: "thread_settings_applied", thread_id: "child" } }) + "\n";
+    // VT and NBSP lines, malformed JSON, a null, a duplicate key and an oversized
+    // line each take one position in both counts; tab, CR and space lines take none.
+    const bytes = fork({ id: "child", forked_from_id: "parent" })
+      + "\u000b\n\u00a0\n{broken\nnull\n[]\n{\"a\":1,\"a\":2}\n \t\r\n"
+      + "x".repeat(10 * 1024 * 1024 + 1) + "\n"
+      + codexMessage(0, "user", "inherited")
+      + settings
+      + codexMessage(1, "user", "own");
+    // The parser's oversized-line rule restates the reader's limit.
+    expect(NATIVE_TRANSCRIPT_MAX_RECORD_BYTES).toBe(10 * 1024 * 1024);
+    const boundary = readCodexInheritedBoundary(bytes);
+    expect(boundary).toEqual({ kind: "copied-fork", startRecord: 9 });
+    expect(parseCodexCopiedForkMessages(bytes, boundary as never).map((message) => message.content)).toEqual(["own"]);
+    // Positions 0 (session_meta), 5 ([]) and 8 (the parent message) are records before the cut.
+    expect([...await inheritedNativeSourceOrdinals(Buffer.from(bytes), boundary!)]).toEqual([0, 5, 8]);
+
+    const repo = repository();
+    await runNativeTranscriptBackfill({
+      ...base(bytes, resolverFor("own")),
+      repository: repo,
+      codexInheritedBoundary: boundary!,
+    });
+    const records = repo.batches.flatMap((batch) => batch.records);
+    expect(records.filter((record) => record.messageLinks.length > 0).map((record) => record.sourceOrdinal)).toEqual([10]);
   });
 });

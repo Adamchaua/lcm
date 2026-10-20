@@ -601,6 +601,13 @@ A `SubagentStop` payload without a valid `agent_id` or without
   changing a sensitive pattern (or a built-in scrubber change) after a subagent
   was stored changes how its text is redacted, so it has the same effect for
   that subagent.
+- A user fork that copied its parent's rollout (first record `session_meta`
+  with `forked_from_id`, no `history_base` and no subagent boundary) stores only
+  the messages after its own `thread_settings_applied` event, in `/ingest` and
+  `/compact` alike. The first messages a session stores decide which reading it
+  follows, and a rollout or message list that contradicts it stores and links
+  nothing; a session stored earlier keeps its copied history. A fork without
+  its own settings event yet stores only native records.
 - When one session id has several stored conversations, ingest continues to
   append to the most recent one, as it does for every other client.
 - Sibling subagents count as distinct sessions for passive pattern

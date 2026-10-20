@@ -9,6 +9,7 @@ import {
   parseCodexTranscript,
   parseCodexTranscriptText,
   readCodexInheritedBoundary,
+  parseCodexCopiedForkMessages,
   readCodexSessionParent,
   isInheritedSubagentRecord,
   extractCodexSessionCwd,
@@ -541,11 +542,11 @@ describe("inherited subagent history", () => {
   const join_ = (...lines: string[]): string => lines.join("\n") + "\n";
 
   it.each([
-    ["a paginated start", { subagent_history_start_ordinal: 3, history_mode: "paginated" }, { start: 3, paginated: true }],
-    ["a zero start", { subagent_history_start_ordinal: 0, history_mode: "paginated" }, { start: 0, paginated: true }],
-    ["a legacy mode", { subagent_history_start_ordinal: 3, history_mode: "legacy" }, { start: 3, paginated: false }],
-    ["a missing mode", { subagent_history_start_ordinal: 3 }, { start: 3, paginated: false }],
-    ["a mode that is not exactly paginated", { subagent_history_start_ordinal: 3, history_mode: "Paginated" }, { start: 3, paginated: false }],
+    ["a paginated start", { subagent_history_start_ordinal: 3, history_mode: "paginated" }, { kind: "ordinal", start: 3, paginated: true }],
+    ["a zero start", { subagent_history_start_ordinal: 0, history_mode: "paginated" }, { kind: "ordinal", start: 0, paginated: true }],
+    ["a legacy mode", { subagent_history_start_ordinal: 3, history_mode: "legacy" }, { kind: "ordinal", start: 3, paginated: false }],
+    ["a missing mode", { subagent_history_start_ordinal: 3 }, { kind: "ordinal", start: 3, paginated: false }],
+    ["a mode that is not exactly paginated", { subagent_history_start_ordinal: 3, history_mode: "Paginated" }, { kind: "ordinal", start: 3, paginated: false }],
   ])("reads %s", (_name, payload, expected) => {
     expect(readCodexInheritedBoundary(join_("", "  ", meta(payload)))).toEqual(expected);
     expect(readCodexInheritedBoundary(meta(payload))).toEqual(expected);
@@ -596,16 +597,16 @@ describe("inherited subagent history", () => {
   });
 
   it("classifies records by numeric ordinal only", () => {
-    const paginated = { start: 2, paginated: true };
-    const legacy = { start: 2, paginated: false };
-    expect(isInheritedSubagentRecord({ ordinal: 1 }, undefined)).toBe(false);
-    expect(isInheritedSubagentRecord({ ordinal: 1 }, paginated)).toBe(true);
-    expect(isInheritedSubagentRecord({ ordinal: 2 }, paginated)).toBe(false);
-    expect(isInheritedSubagentRecord({ ordinal: 3 }, paginated)).toBe(false);
-    expect(isInheritedSubagentRecord({ ordinal: 1 }, legacy)).toBe(true);
+    const paginated = { kind: "ordinal", start: 2, paginated: true } as const;
+    const legacy = { kind: "ordinal", start: 2, paginated: false } as const;
+    expect(isInheritedSubagentRecord({ ordinal: 1 }, undefined, 0)).toBe(false);
+    expect(isInheritedSubagentRecord({ ordinal: 1 }, paginated, 9)).toBe(true);
+    expect(isInheritedSubagentRecord({ ordinal: 2 }, paginated, 0)).toBe(false);
+    expect(isInheritedSubagentRecord({ ordinal: 3 }, paginated, 0)).toBe(false);
+    expect(isInheritedSubagentRecord({ ordinal: 1 }, legacy, 9)).toBe(true);
     for (const malformed of [{}, { ordinal: "0" }, { ordinal: -1 }, { ordinal: 0.5 }, { ordinal: null }, null, [], "x"]) {
-      expect(isInheritedSubagentRecord(malformed, paginated)).toBe(true);
-      expect(isInheritedSubagentRecord(malformed, legacy)).toBe(false);
+      expect(isInheritedSubagentRecord(malformed, paginated, 0)).toBe(true);
+      expect(isInheritedSubagentRecord(malformed, legacy, 0)).toBe(false);
     }
   });
 
@@ -627,6 +628,165 @@ describe("inherited subagent history", () => {
   it("leaves a rollout without a boundary unchanged even when asked", () => {
     const raw = join_(meta({ id: "root" }), record(0, "user", "one"), record(undefined, "assistant", "two"));
     expect(parseCodexTranscriptText(raw, { excludeInheritedSubagentHistory: true })).toEqual(parseCodexTranscriptText(raw));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Copied user forks (#1578)
+// ---------------------------------------------------------------------------
+
+describe("copied user fork history", () => {
+  const meta = (payload: Record<string, unknown> = {}): string => JSON.stringify({
+    type: "session_meta", payload: { id: "child", forked_from_id: "parent", ...payload },
+  });
+  const settings = (threadId?: unknown): string => JSON.stringify({
+    type: "event_msg",
+    payload: { type: "thread_settings_applied", ...(threadId === undefined ? {} : { thread_id: threadId }) },
+  });
+  const message = (role: "user" | "assistant", text: string, ordinal?: number): string => JSON.stringify({
+    type: "response_item",
+    ...(ordinal === undefined ? {} : { ordinal }),
+    payload: { type: "message", role, content: [{ type: role === "user" ? "input_text" : "output_text", text }] },
+  });
+  const join_ = (...lines: string[]): string => lines.join("\n") + "\n";
+  const contents = (messages: { content: string }[]): string[] => messages.map((m) => m.content);
+
+  it("cuts at the first settings event of the fork's own thread", () => {
+    const raw = join_(
+      meta(),
+      message("user", "parent 1"),
+      settings("parent"),
+      message("assistant", "parent 2"),
+      settings("child"),
+      message("user", "child 1"),
+      settings("child"),
+      message("assistant", "child 2"),
+    );
+    expect(readCodexInheritedBoundary(raw)).toEqual({ kind: "copied-fork", startRecord: 4 });
+    expect(contents(parseCodexTranscriptText(raw))).toEqual(["parent 1", "parent 2", "child 1", "child 2"]);
+    expect(contents(parseCodexTranscriptText(raw, { excludeInheritedSubagentHistory: true })))
+      .toEqual(["child 1", "child 2"]);
+  });
+
+  it("is pending until the fork writes its own settings event", () => {
+    const withParentSettings = join_(meta(), message("user", "parent 1"), settings("parent"));
+    expect(readCodexInheritedBoundary(withParentSettings)).toEqual({ kind: "copied-fork", pending: true });
+    expect(readCodexInheritedBoundary(join_(meta()))).toEqual({ kind: "copied-fork", pending: true });
+    expect(parseCodexTranscriptText(withParentSettings, { excludeInheritedSubagentHistory: true })).toEqual([]);
+    expect(parseCodexTranscriptText(withParentSettings)).toHaveLength(1);
+  });
+
+  it("classifies by position and ignores the record's own ordinal", () => {
+    const cut = { kind: "copied-fork", startRecord: 2 } as const;
+    const pending = { kind: "copied-fork", pending: true } as const;
+    expect(isInheritedSubagentRecord({ ordinal: 9 }, cut, 1)).toBe(true);
+    expect(isInheritedSubagentRecord({ ordinal: 0 }, cut, 2)).toBe(false);
+    expect(isInheritedSubagentRecord(undefined, cut, 3)).toBe(false);
+    expect(isInheritedSubagentRecord({ ordinal: 99 }, pending, 99)).toBe(true);
+  });
+
+  it("lets a valid subagent ordinal win and falls through from a malformed one", () => {
+    const body = [message("user", "parent", 0), settings("child"), message("assistant", "own", 1)];
+    expect(readCodexInheritedBoundary(join_(meta({ subagent_history_start_ordinal: 1 }), ...body)))
+      .toEqual({ kind: "ordinal", start: 1, paginated: false });
+    // The ordinal cut keeps "own" and drops "parent"; the settings cut agrees on the last message only.
+    expect(contents(parseCodexTranscriptText(join_(meta({ subagent_history_start_ordinal: 2 }), ...body), {
+      excludeInheritedSubagentHistory: true,
+    }))).toEqual([]);
+    for (const bad of ["1", -1, 1.5, null, 2 ** 60]) {
+      expect(readCodexInheritedBoundary(join_(meta({ subagent_history_start_ordinal: bad }), ...body)))
+        .toEqual({ kind: "copied-fork", startRecord: 2 });
+    }
+  });
+
+  it.each([
+    ["a session that was not forked", { forked_from_id: undefined }],
+    ["an empty fork parent", { forked_from_id: "" }],
+    ["a non-string fork parent", { forked_from_id: 4 }],
+    ["a session forked from itself", { forked_from_id: "child" }],
+    ["a missing id", { id: undefined }],
+    ["an empty id", { id: "" }],
+    ["a referenced fork", { history_base: "parent" }],
+    ["an object history base", { history_base: {} }],
+  ])("keeps the full parse for %s", (_name, payload) => {
+    const raw = join_(meta(payload), message("user", "parent"), settings("child"), message("assistant", "child"));
+    expect(readCodexInheritedBoundary(raw)).toBeUndefined();
+    expect(contents(parseCodexTranscriptText(raw, { excludeInheritedSubagentHistory: true })))
+      .toEqual(["parent", "child"]);
+  });
+
+  it("accepts a null history base", () => {
+    expect(readCodexInheritedBoundary(join_(meta({ history_base: null }), settings("child"))))
+      .toEqual({ kind: "copied-fork", startRecord: 1 });
+  });
+
+  it.each([
+    ["no thread", undefined],
+    ["an empty thread", ""],
+    ["a numeric thread", 7],
+  ])("keeps the full parse when an earlier settings event has %s", (_name, threadId) => {
+    const raw = join_(meta(), message("user", "parent"), settings(threadId), settings("child"), message("assistant", "child"));
+    expect(readCodexInheritedBoundary(raw)).toBeUndefined();
+    // The same event also blocks the pending reading.
+    expect(readCodexInheritedBoundary(join_(meta(), settings(threadId)))).toBeUndefined();
+  });
+
+  it("ignores settings events after the child's and non-settings events before it", () => {
+    const raw = join_(
+      meta(),
+      JSON.stringify({ type: "event_msg", payload: { type: "other", thread_id: "child" } }),
+      JSON.stringify({ type: "event_msg", payload: "x" }),
+      JSON.stringify({ type: "turn_context", payload: { type: "thread_settings_applied", thread_id: "child" } }),
+      settings("child"),
+      settings(undefined),
+    );
+    expect(readCodexInheritedBoundary(raw)).toEqual({ kind: "copied-fork", startRecord: 4 });
+  });
+
+  it("requires the first counted line to be the session_meta", () => {
+    const body = [settings("child"), message("user", "x")];
+    for (const first of ["{broken", "null", "[]", message("user", "p"), JSON.stringify({ type: "session_meta", payload: "x" }), JSON.stringify({ type: "session_meta", payload: [] })]) {
+      expect(readCodexInheritedBoundary(join_(first, meta(), ...body))).toBeUndefined();
+    }
+    expect(readCodexInheritedBoundary("")).toBeUndefined();
+    expect(readCodexInheritedBoundary("\n\t \r\n")).toBeUndefined();
+    expect(readCodexInheritedBoundary(join_("\uFEFF" + meta(), ...body))).toEqual({ kind: "copied-fork", startRecord: 1 });
+  });
+
+  it("counts lines the way the native reader does", () => {
+    const parentLines = [
+      "\u000b",
+      "\u00a0",
+      "{broken",
+      "null",
+      "[]",
+      "7",
+      '{"a":1,"a":2}',
+      "x".repeat(10 * 1024 * 1024 + 1),
+      " ".repeat(10 * 1024 * 1024 + 1),
+    ];
+    // Tab, carriage return and space are blank; everything else takes one position.
+    const raw = "\n" + meta() + "\n \t\r\n\r\n" + parentLines.join("\n") + "\n" + settings("child") + "\n" + message("user", "child");
+    expect(readCodexInheritedBoundary(raw)).toEqual({ kind: "copied-fork", startRecord: 1 + parentLines.length + 1 - 1 });
+    expect(contents(parseCodexTranscriptText(raw, { excludeInheritedSubagentHistory: true }))).toEqual(["child"]);
+  });
+
+  it("walks a copied fork without failing on lines that are not records", () => {
+    const cut = { kind: "copied-fork", startRecord: 1 } as const;
+    const raw = join_("null", "{broken", "7", "[]", message("user", "kept"), message("assistant", "reply"), JSON.stringify({ type: "response_item", payload: { type: "message", role: "tool" } }));
+    expect(contents(parseCodexCopiedForkMessages(raw, cut))).toEqual(["kept", "reply"]);
+    expect(() => parseCodexTranscriptText(raw)).toThrow(TypeError);
+    expect(parseCodexCopiedForkMessages(raw, { kind: "copied-fork", pending: true })).toEqual([]);
+  });
+
+  it("classifies from the raw record, so a settings event is found whatever else it carries", () => {
+    const raw = join_(
+      meta(),
+      message("user", "parent"),
+      JSON.stringify({ type: "event_msg", payload: { type: "thread_settings_applied", thread_id: "child", extra: { deep: [1] } } }),
+      message("assistant", "child"),
+    );
+    expect(contents(parseCodexTranscriptText(raw, { excludeInheritedSubagentHistory: true }))).toEqual(["child"]);
   });
 });
 

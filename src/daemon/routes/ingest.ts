@@ -30,7 +30,13 @@ import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { ParsedMessage } from "../../transcript.js";
 import { normalizeTranscriptClient, parseTranscriptTextForClient, type TranscriptClient } from "../../transcript-provider.js";
-import { readCodexInheritedBoundary, readCodexSessionParent, type CodexInheritedBoundary } from "../../codex-transcript.js";
+import {
+  parseCodexCopiedForkMessages,
+  parseCodexTranscriptText,
+  readCodexInheritedBoundary,
+  readCodexSessionParent,
+  type CodexInheritedBoundary,
+} from "../../codex-transcript.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
@@ -63,15 +69,24 @@ async function chooseSubagentHistory(
   hasLinkedInheritedRecord: () => Promise<boolean>,
 ): Promise<SubagentHistory> {
   const extendsStored = (messages: readonly ParsedMessage[]): boolean =>
-    stored.length <= messages.length && stored.every((row, index) => (
-      row.role === messages[index]!.role && row.content === scrubber!.scrub(messages[index]!.content)
-    ));
+    storedIsPrefix(stored, messages, scrubber!);
   const unfilteredExtends = extendsStored(unfiltered);
   if (!extendsStored(filtered)) return unfilteredExtends ? "unfiltered" : "mismatch";
   return stored.length > 0 && unfilteredExtends && filtered.length !== unfiltered.length
     && await hasLinkedInheritedRecord()
     ? "unfiltered"
     : "filtered";
+}
+
+/** True when the stored (scrubbed) rows are an exact prefix of the messages, scrubbed the same way. */
+function storedIsPrefix(
+  stored: readonly { readonly role: string; readonly content: string }[],
+  messages: readonly ParsedMessage[],
+  scrubber: ScrubEngine,
+): boolean {
+  return stored.length <= messages.length && stored.every((row, index) => (
+    row.role === messages[index]!.role && row.content === scrubber.scrub(messages[index]!.content)
+  ));
 }
 
 function isParsedMessage(value: unknown): value is ParsedMessage {
@@ -191,6 +206,175 @@ export async function appendSessionTranscript(
   );
 }
 
+/** Metadata key of the session-scoped lineage marker on a Codex session's first transcript row. */
+export const CODEX_LINEAGE_METADATA_KEY = "lcmCodexLineage";
+
+/**
+ * Which reading of a Codex session its stored rows follow: "boundary" holds
+ * only the messages a copied fork wrote itself, "array" holds whatever message
+ * lists clients sent.
+ */
+export type CodexLineageMode = "boundary" | "array";
+
+export function encodeCodexLineageMarker(mode: CodexLineageMode): string {
+  return JSON.stringify({ [CODEX_LINEAGE_METADATA_KEY]: { version: 1, mode } });
+}
+
+/**
+ * Read a lineage marker from part metadata: null when the metadata is not a
+ * marker at all, "malformed" when it carries the marker key with an unknown
+ * shape.
+ */
+export function parseCodexLineageMarker(metadata: string | null): CodexLineageMode | "malformed" | null {
+  if (metadata === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(metadata);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  if (!(CODEX_LINEAGE_METADATA_KEY in parsed)) return null;
+  const marker: unknown = (parsed as Record<string, unknown>)[CODEX_LINEAGE_METADATA_KEY];
+  if (marker === null || typeof marker !== "object" || Array.isArray(marker)) return "malformed";
+  const { version, mode } = marker as Record<string, unknown>;
+  return version === 1 && (mode === "boundary" || mode === "array") ? mode : "malformed";
+}
+
+/** The marker on a stored row: its mode, null for none, "invalid" for a malformed or contradictory one. */
+async function readCodexLineageMarker(
+  conversations: TransactionRepositories["conversations"],
+  messageId: number,
+): Promise<CodexLineageMode | "invalid" | null> {
+  const modes = new Set<CodexLineageMode>();
+  for (const part of await conversations.getMessageParts(messageId)) {
+    const mode = parseCodexLineageMarker(part.metadata);
+    if (mode === "malformed") return "invalid";
+    if (mode !== null) modes.add(mode);
+  }
+  if (modes.size > 1) return "invalid";
+  return modes.values().next().value ?? null;
+}
+
+/** What one Codex ingest or compact presents to the lineage decision. */
+export interface CodexLineageRequest {
+  /** A message list from the request body, or a rollout file. */
+  readonly source: "array" | "file";
+  /** Every message of the rollout or list as sent. */
+  readonly full: readonly ParsedMessage[];
+  /**
+   * Set only when the rollout is a copied fork (empty while it has not written
+   * its own settings event): the messages after that event.
+   */
+  readonly child?: readonly ParsedMessage[];
+}
+
+/**
+ * The whole rollout of a copied fork, read like the child's list so a line that
+ * is not a record never fails the parent's part of it either.
+ */
+const WHOLE_COPIED_FORK = { kind: "copied-fork", startRecord: 0 } as const;
+
+/** Read a Codex rollout's text into the request its lineage is decided from. */
+export function codexLineageRequestFromText(raw: string): CodexLineageRequest {
+  const boundary = readCodexInheritedBoundary(raw);
+  return boundary?.kind === "copied-fork"
+    ? {
+      source: "file",
+      full: parseCodexCopiedForkMessages(raw, WHOLE_COPIED_FORK),
+      child: parseCodexCopiedForkMessages(raw, boundary),
+    }
+    : { source: "file", full: parseCodexTranscriptText(raw) };
+}
+
+/** "lineage-mismatch" leaves the session as it is: nothing is appended and nothing is linked. */
+export type CodexLineageHistory = "filtered" | "unfiltered" | "lineage-mismatch" | undefined;
+
+/**
+ * Store the part of a Codex session's transcript that is not stored yet,
+ * inside the caller's transaction, following the reading its first rows chose.
+ *
+ * A session whose first rows come from a copied fork's own messages ("boundary"
+ * marker) or from a message list ("array" marker) stays on that reading. Rows
+ * stored without a marker are the legacy full reading and keep following it.
+ * The marker is written once, with the session's first transcript rows, never
+ * inferred from native links or content. Whatever contradicts the stored
+ * reading, or a marker that cannot be read, is a mismatch.
+ */
+export async function persistCodexLineage(
+  repositories: Pick<TransactionRepositories, "conversations" | "redactionAdmin" | "context">,
+  sessionId: string,
+  request: CodexLineageRequest,
+  scrubber: ScrubEngine | undefined,
+  linkParent: (conversation: { conversationId: number; parentSessionId: string | null } | null) => Promise<void>,
+): Promise<{
+  persisted: Awaited<ReturnType<typeof appendTranscriptMessages>>;
+  history: CodexLineageHistory;
+}> {
+  const { source, full, child } = request;
+  const conversations = repositories.conversations;
+  if (full.length === 0) {
+    if (child === undefined) return { persisted: null, history: undefined };
+    // Nothing can be appended, so no conversation is created just to inspect it.
+    const conversation = await conversations.getConversationBySessionId(sessionId);
+    await linkParent(conversation);
+    const stored = conversation === null ? 0 : (await conversations.getTranscriptSlotSnapshot(sessionId)).transcriptCount;
+    return { persisted: null, history: stored === 0 ? "filtered" : "lineage-mismatch" };
+  }
+
+  const slot = await prepareSessionTranscript(conversations, sessionId);
+  await linkParent(slot.conversation);
+  const conversationId = slot.conversation.conversationId;
+  const append = async (list: readonly ParsedMessage[], from: number, mode: CodexLineageMode | undefined) => {
+    const persisted = await appendTranscriptMessages(repositories, conversationId, list.slice(from), scrubber!);
+    if (persisted !== null && mode !== undefined) {
+      await conversations.createMessageParts(persisted.records[0]!.messageId, [{
+        sessionId,
+        partType: "snapshot",
+        ordinal: 0,
+        metadata: encodeCodexLineageMarker(mode),
+      }]);
+    }
+    return persisted;
+  };
+  const mismatch = { persisted: null, history: "lineage-mismatch" } as const;
+  const next = slot.transcriptCount + slot.consumedCount;
+
+  if (slot.transcriptCount === 0) {
+    // The first rows choose the reading, and only they carry the marker.
+    if (child !== undefined) return { persisted: await append(child, 0, "boundary"), history: "filtered" };
+    return { persisted: await append(full, next, source === "array" ? "array" : undefined), history: undefined };
+  }
+
+  // A copied fork compares every stored row; any other ingest only needs the
+  // first one, which holds the marker, and an event row can take at most the
+  // first few places.
+  const rows = (await conversations.getMessages(
+    conversationId,
+    child === undefined ? { limit: slot.eventMessageIds.size + 1 } : undefined,
+  )).filter((message) => !slot.eventMessageIds.has(message.messageId));
+  const marker = rows.length === 0 ? null : await readCodexLineageMarker(conversations, rows[0]!.messageId);
+  if (marker === "invalid") return mismatch;
+
+  if (child === undefined) {
+    return marker === "boundary"
+      ? mismatch
+      : { persisted: await append(full, next, undefined), history: undefined };
+  }
+  // A consumed slot or a session split across conversations means the newest
+  // conversation's rows are not the session-wide prefix: leave it.
+  if (rows.length !== slot.transcriptCount || marker === "array") return mismatch;
+  if (marker === "boundary") {
+    return slot.consumedCount > 0 || !storedIsPrefix(rows, child, scrubber!)
+      ? mismatch
+      : { persisted: await append(child, slot.transcriptCount, undefined), history: "filtered" };
+  }
+  // Rows stored without a marker are the legacy full reading and stay on it.
+  return slot.consumedCount === 0 && !storedIsPrefix(rows, full, scrubber!)
+    ? mismatch
+    : { persisted: await append(full, next, undefined), history: "unfiltered" };
+}
+
 function resolveMessages(input: { client?: unknown; messages?: unknown; provider?: unknown; transcript_path?: string }, cwd: string): { messages: ParsedMessage[]; nativePath?: string; client?: TranscriptClient } {
   if (Array.isArray(input.messages)) {
     return { messages: input.messages.filter(isParsedMessage) };
@@ -271,6 +455,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         filteredMessages: ParsedMessage[] | undefined,
         hasLinkedInheritedRecord: (provenance: NativeTranscriptProvenanceRepository) => Promise<boolean>,
         parentSessionId: string | undefined,
+        lineage: Pick<CodexLineageRequest, "source" | "child"> | undefined,
       ) {
         const resolvedMessages = messages;
         return await project.transaction(async (repositories) => {
@@ -280,11 +465,21 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
             if (parentSessionId === undefined || conversation === null || conversation.parentSessionId !== null) return;
             await repositories.conversations.setParentSessionIdIfNull(conversation.conversationId, parentSessionId);
           };
-          if (resolvedMessages.length === 0 && filteredMessages === undefined) {
+          if (resolvedMessages.length === 0 && filteredMessages === undefined && lineage?.child === undefined) {
             if (parentSessionId !== undefined) {
               await linkParent(await repositories.conversations.getConversationBySessionId(session_id));
             }
             return { persisted: null, history: undefined };
+          }
+
+          if (lineage !== undefined) {
+            return await persistCodexLineage(
+              repositories,
+              session_id,
+              { source: lineage.source, full: resolvedMessages, ...(lineage.child === undefined ? {} : { child: lineage.child }) },
+              scrubber,
+              linkParent,
+            );
           }
 
           if (filteredMessages === undefined) {
@@ -371,6 +566,12 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
           let messages = resolvedMessages;
           let inheritedBoundary: CodexInheritedBoundary | undefined;
           let filteredMessages: ParsedMessage[] | undefined;
+          // Only Codex message lists and rollouts have a lineage; a subagent's
+          // own ordinal boundary keeps the filtered/unfiltered choice instead.
+          let lineage: Pick<CodexLineageRequest, "source" | "child"> | undefined = importNative === undefined
+            && normalizeTranscriptClient(input.client ?? input.provider) === "codex"
+            ? { source: "array" }
+            : undefined;
           let rolloutBytes: Buffer | undefined;
           if (importNative !== undefined) {
             snapshot = await createFileNativeTranscriptSource(dirname(importNative), basename(importNative)).openSnapshot();
@@ -396,12 +597,21 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
             rolloutBytes = bytes;
             sourceWitness = { byteLength: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") };
             const raw = bytes.toString("utf8");
-            messages = parseTranscriptTextForClient(raw, resolved.client!);
+            // The boundary is read from the same bound bytes as the parse.
+            inheritedBoundary = resolved.client === "codex" ? readCodexInheritedBoundary(raw) : undefined;
+            messages = inheritedBoundary?.kind === "copied-fork"
+              ? parseCodexCopiedForkMessages(raw, WHOLE_COPIED_FORK)
+              : parseTranscriptTextForClient(raw, resolved.client!);
             if (resolved.client === "codex") {
-              // The boundary is read from the same bound bytes as the parse.
-              inheritedBoundary = readCodexInheritedBoundary(raw);
-              if (inheritedBoundary !== undefined) {
+              if (inheritedBoundary?.kind === "ordinal") {
                 filteredMessages = parseTranscriptTextForClient(raw, "codex", { excludeInheritedSubagentHistory: true });
+              } else {
+                lineage = {
+                  source: "file",
+                  ...(inheritedBoundary === undefined
+                    ? {}
+                    : { child: parseCodexCopiedForkMessages(raw, inheritedBoundary) }),
+                };
               }
               // The immediate parent comes from the same bound bytes; only the
               // rollout whose own id is the child key may name one.
@@ -450,6 +660,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                     return linked.some((ordinal) => inherited.has(ordinal));
                   },
                   parentSessionId,
+                  lineage,
                 );
                 if (persisted) {
                   accumulated = accumulated === null ? persisted : {
@@ -464,12 +675,15 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                   };
                 }
                 throwIfAborted(signal);
-                if (history === "mismatch") {
-                  // Neither parse extends what is stored for this child, so
-                  // appending or linking could misnumber it. Leave it as is.
+                if (history === "mismatch" || history === "lineage-mismatch") {
+                  // The stored rows follow a reading this transcript no longer
+                  // offers, so appending or linking could misnumber the session.
+                  // Leave it as is.
                   await safeLogError(
                     "ingest",
-                    new Error("subagent transcript matches neither the filtered nor the unfiltered stored history"),
+                    new Error(history === "mismatch"
+                      ? "subagent transcript matches neither the filtered nor the unfiltered stored history"
+                      : "codex transcript does not continue the reading its stored history follows"),
                     { cwd, sessionId: session_id },
                   );
                 } else if (importNative !== undefined) {

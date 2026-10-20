@@ -42,7 +42,9 @@ import {
 } from "../invocation-coordinator.js";
 import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
 import { ScrubEngine } from "../../scrub.js";
-import { appendSessionTranscript } from "./ingest.js";
+import { appendSessionTranscript, codexLineageRequestFromText, persistCodexLineage } from "./ingest.js";
+import { readTranscriptFileText } from "../../transcript.js";
+import { safeLogError } from "../../hooks/hook-errors.js";
 import {
   makeSummarizerCache,
   resolveEffectiveProvider,
@@ -695,10 +697,28 @@ export function createCompactHandler(
           // Ingest new messages from the transcript into the DB.
           const safeTranscriptPath = transcript_path ? isSafeTranscriptPath(transcript_path, cwd) : false;
           if (!skip_ingest && safeTranscriptPath && existsSync(safeTranscriptPath)) {
-            const parsed = parseTranscriptForClient(safeTranscriptPath, normalizeTranscriptClient(client));
-            await withCommitAdmission(() => admittedProject.transaction(async (repositories) => {
-              await appendSessionTranscript(repositories, session_id, parsed, scrubber);
-            }));
+            const transcriptClient = normalizeTranscriptClient(client);
+            if (transcriptClient === "codex") {
+              // Same decision as /ingest: the rollout is read once and the
+              // session's stored reading says which of its lists continues.
+              const raw = readTranscriptFileText(safeTranscriptPath);
+              const request = codexLineageRequestFromText(raw ?? "");
+              const { history } = await withCommitAdmission(() => admittedProject.transaction(
+                (repositories) => persistCodexLineage(repositories, session_id, request, scrubber, async () => undefined),
+              ));
+              if (history === "lineage-mismatch") {
+                await safeLogError(
+                  "compact",
+                  new Error("codex transcript does not continue the reading its stored history follows"),
+                  { cwd, sessionId: session_id },
+                );
+              }
+            } else {
+              const parsed = parseTranscriptForClient(safeTranscriptPath, transcriptClient);
+              await withCommitAdmission(() => admittedProject.transaction(async (repositories) => {
+                await appendSessionTranscript(repositories, session_id, parsed, scrubber);
+              }));
+            }
           }
 
           // Check if there's anything to compact

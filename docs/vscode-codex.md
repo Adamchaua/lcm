@@ -355,8 +355,21 @@ Known limits:
   summarization is asynchronous.
 - Guardian review and post-turn compactions restore at the next
   `SessionStart` drain.
-- Messages copied into a fork are ingested again for the fork; this is tracked
-  in #1578.
+- A fork that copied its parent's rollout (a rollout whose first record is a
+  `session_meta` with `forked_from_id` and no `history_base`) stores only the
+  messages after the fork's own `thread_settings_applied` event, and links
+  only those records to them. Referenced forks and forked subagents are
+  unchanged. A fork that has not written that event yet archives its native
+  records but stores no messages, and starts storing them once the event
+  appears. A session that already has transcript messages and no lineage marker
+  keeps the copied parent history it stored and keeps following it. Older
+  forks whose settings events do not name their thread keep the full parse. A
+  message-list ingest and a rollout ingest of the same fork must stay on the
+  reading the session's first messages chose, so mixing them stops the fork: LCM
+  appends nothing for it and writes a diagnostic to the hook error log. A
+  scrubber change after storage, a compaction event that already took a
+  transcript position, or a session split across several conversations can also
+  stop further updates for a fork.
 
 ### Codex PostToolUse capture boundary
 
