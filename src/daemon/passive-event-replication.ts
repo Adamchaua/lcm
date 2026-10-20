@@ -7,6 +7,7 @@ import {
 import {
   PostgreSqlPassiveEventDataError,
   PostgreSqlPassiveEventRepository,
+  type PostgreSqlPassiveEventInput,
   type PostgreSqlPassiveEventRecord,
   type PostgreSqlPassiveEventReleaseResult,
 } from "../storage/postgresql/passive-event-repository.js";
@@ -116,6 +117,27 @@ function eventPayload(event: LocalHookEventRow): JsonObject {
     previousEventId: event.prev_event_id,
     createdAt: event.created_at,
   };
+}
+
+function remoteInput(event: LocalHookEventRow): PostgreSqlPassiveEventInput {
+  return {
+    eventId: event.event_uuid,
+    eventVersion: event.event_version,
+    machineId: event.machine_id!,
+    machineSequence: BigInt(event.machine_sequence),
+    eventType: event.type,
+    payload: eventPayload(event),
+  };
+}
+
+/** What the bound project holds of an upload batch. */
+interface UploadReadback {
+  readonly records: PostgreSqlPassiveEventRecord[];
+  readonly byId: ReadonlyMap<string, PostgreSqlPassiveEventRecord>;
+  /** Batch rows the bound project lacks. */
+  readonly missing: LocalHookEventRow[];
+  /** Whether any returned record differs from its local row. */
+  readonly differs: boolean;
 }
 
 function sameEnvelope(
@@ -274,21 +296,43 @@ export class PassiveEventReplicationWorker {
     const mutable = { ...summary, leaseAcquired: true };
     try {
       await admit(() => this.uploadLocal(mutable, signal));
-      const renewed = await admit(() => this.renewLease(lease.fencingToken, signal));
-      if (!renewed) return mutable;
-      const claims = await admit(() => this.dependencies.remote.claimEvents({
-        claimOwner: `${this.options.processId}:${lease.fencingToken.toString()}`,
-        limit: this.options.batchSize,
-        staleClaimMs: this.options.staleClaimMs,
-        signal,
-      }));
-      for (const claim of claims) {
-        const kept = await admit(async () => {
-          if (!await this.renewLease(lease.fencingToken, signal)) return false;
-          await this.applyClaim(claim, lease.fencingToken, mutable, signal);
-          return true;
-        });
-        if (!kept) break;
+      // The existing renewal below serves the first claim fetch.
+      if (!await admit(() => this.renewLease(lease.fencingToken, signal))) return mutable;
+      // A fetch returns at most one row per machine, because the claim query
+      // withholds a row until every earlier row of its machine is terminal.
+      // Applying a head therefore makes its successor claimable only after
+      // the fetch has run, so the pass keeps claiming while its own applies
+      // settle rows (#1530). The claimed-row budget is shared by every fetch
+      // of the pass and never refunded, which bounds the fetch count by the
+      // batch size. A fetch whose claims settle nothing ends the loop: no
+      // successor can have become claimable from this pass's own work.
+      let budget = this.options.batchSize;
+      while (budget > 0) {
+        const claims = await admit(() => this.dependencies.remote.claimEvents({
+          claimOwner: `${this.options.processId}:${lease.fencingToken.toString()}`,
+          limit: budget,
+          staleClaimMs: this.options.staleClaimMs,
+          signal,
+        }));
+        if (claims.length === 0) break;
+        budget -= claims.length;
+        // Taken here, not before uploadLocal: uploads and reconciliation also
+        // move the quarantined counter and are not claim progress.
+        const settledBefore = mutable.applied + mutable.quarantined;
+        let kept = true;
+        for (const claim of claims) {
+          kept = await admit(async () => {
+            if (!await this.renewLease(lease.fencingToken, signal)) return false;
+            await this.applyClaim(claim, lease.fencingToken, mutable, signal);
+            return true;
+          });
+          if (!kept) break;
+        }
+        if (!kept || budget <= 0) break;
+        if (mutable.applied + mutable.quarantined === settledBefore) break;
+        // The claim fetch itself is not fenced, so every further fetch needs
+        // its own renewal. A lost lease stops claiming but still reconciles.
+        if (!await admit(() => this.renewLease(lease.fencingToken, signal))) break;
       }
       await admit(() => this.reconcileLocal(mutable, signal));
       await admit(() => this.pruneAcknowledged(mutable, signal));
@@ -338,52 +382,17 @@ export class PassiveEventReplicationWorker {
       }
     }
     if (supported.length === 0) return;
+    let batch: readonly LocalHookEventRow[] = supported;
     let remote: PostgreSqlPassiveEventRecord[];
     try {
-      remote = await this.dependencies.remote.insertEvents(
-        supported.map((event) => ({
-          eventId: event.event_uuid,
-          eventVersion: event.event_version,
-          machineId: event.machine_id!,
-          machineSequence: BigInt(event.machine_sequence),
-          eventType: event.type,
-          payload: eventPayload(event),
-        })),
-        signal,
-      );
+      remote = await this.dependencies.remote.insertEvents(batch.map(remoteInput), signal);
     } catch (insertError) {
-      try {
-        remote = await this.dependencies.remote.readEvents(
-          supported.map((event) => ({
-            machineId: event.machine_id!,
-            eventId: event.event_uuid,
-          })),
-          signal,
-        );
-        const byId = new Map(remote.map((event) => [event.eventId, event]));
-        if (
-          supported.some((event) => {
-            const record = byId.get(event.event_uuid);
-            return record === undefined || !sameEnvelope(event, record);
-          })
-        ) {
-          throw insertError;
-        }
-      } catch (readbackError) {
-        for (const event of supported) {
-          const disposition = await this.recoverLocalDelivery(
-            event,
-            owner,
-            readbackError,
-          );
-          if (disposition === "quarantined") summary.quarantined += 1;
-          if (disposition === "retried") summary.retried += 1;
-        }
-        return;
-      }
+      const settled = await this.settleFailedUpload(batch, owner, insertError, summary, signal);
+      if (settled === null) return;
+      ({ batch, remote } = settled);
     }
     const byId = new Map(remote.map((event) => [event.eventId, event]));
-    for (const event of supported) {
+    for (const event of batch) {
       const record = byId.get(event.event_uuid);
       if (!record || !sameEnvelope(event, record)) {
         if (await this.retryLocal(event, owner, "remote inbox readback mismatch")) {
@@ -414,6 +423,200 @@ export class PassiveEventReplicationWorker {
           record.inboxId,
         );
       }
+    }
+  }
+
+  /**
+   * What the bound project holds of an upload batch: the records it returned,
+   * the rows it lacks, and whether any returned record differs from its row.
+   */
+  private async readBack(
+    batch: readonly LocalHookEventRow[],
+    signal?: AbortSignal,
+  ): Promise<UploadReadback> {
+    const records = await this.dependencies.remote.readEvents(
+      batch.map((event) => ({
+        machineId: event.machine_id!,
+        eventId: event.event_uuid,
+      })),
+      signal,
+    );
+    const byId = new Map(records.map((event) => [event.eventId, event]));
+    const missing: LocalHookEventRow[] = [];
+    let differs = false;
+    for (const event of batch) {
+      const record = byId.get(event.event_uuid);
+      if (record === undefined) missing.push(event);
+      else if (!sameEnvelope(event, record)) differs = true;
+    }
+    return { records, byId, missing, differs };
+  }
+
+  private async recoverRow(
+    event: LocalHookEventRow,
+    owner: string,
+    error: unknown,
+    summary: { retried: number; quarantined: number },
+  ): Promise<void> {
+    const disposition = await this.recoverLocalDelivery(event, owner, error);
+    if (disposition === "quarantined") summary.quarantined += 1;
+    if (disposition === "retried") summary.retried += 1;
+  }
+
+  private async recoverBatch(
+    batch: readonly LocalHookEventRow[],
+    owner: string,
+    error: unknown,
+    summary: { retried: number; quarantined: number },
+  ): Promise<void> {
+    for (const event of batch) await this.recoverRow(event, owner, error, summary);
+  }
+
+  /**
+   * An upload batch failed. The bound project is read back to tell an
+   * uncertain commit (every row is there: adopt it) from a failure that left
+   * rows out. A row that is out because its earlier upload committed to the
+   * project this machine was bound to before a relink, and the local record
+   * of it was lost, cannot be inserted while that copy exists and it fails
+   * the whole batch (#1511). Any failure that left rows out, with no returned
+   * row differing from its local row, therefore asks the other projects about
+   * the missing rows once and inserts the batch once more without the rows
+   * that cannot go. A differing row, a failed readback or a failed recovery
+   * query leaves every row to retry with backoff. Returns the batch and
+   * records to account for, or null when every row has been dealt with.
+   */
+  private async settleFailedUpload(
+    batch: readonly LocalHookEventRow[],
+    owner: string,
+    insertError: unknown,
+    summary: {
+      retried: number;
+      quarantined: number;
+      acknowledged: number;
+    },
+    signal?: AbortSignal,
+  ): Promise<{
+    readonly batch: readonly LocalHookEventRow[];
+    readonly remote: PostgreSqlPassiveEventRecord[];
+  } | null> {
+    let view: UploadReadback;
+    try {
+      view = await this.readBack(batch, signal);
+    } catch (readbackError) {
+      await this.recoverBatch(batch, owner, readbackError, summary);
+      return null;
+    }
+    if (view.differs) {
+      await this.recoverBatch(batch, owner, insertError, summary);
+      return null;
+    }
+    if (view.missing.length === 0) return { batch, remote: view.records };
+
+    let outcomes: PostgreSqlPassiveEventReleaseResult[];
+    try {
+      outcomes = await this.dependencies.remote.releaseFromOtherProjects(
+        view.missing.map(remoteInput),
+        { staleClaimMs: this.options.staleClaimMs, signal },
+      );
+    } catch (releaseError) {
+      await this.reportError(releaseError);
+      await this.recoverBatch(batch, owner, releaseError, summary);
+      return null;
+    }
+    const asked = new Set(view.missing.map((event) => event.event_uuid));
+    const answers = new Map<string, PostgreSqlPassiveEventReleaseResult>();
+    const repeated = new Set<string>();
+    for (const outcome of outcomes) {
+      // Only keys that were asked about are acted on, and the first answer wins.
+      if (!asked.has(outcome.eventId)) continue;
+      if (answers.has(outcome.eventId)) repeated.add(outcome.eventId);
+      else answers.set(outcome.eventId, outcome);
+    }
+    if (repeated.size > 0) {
+      await this.reportError(new Error(
+        `remote answered more than once for local rows: ${[...repeated].join(", ")}`,
+      ));
+    }
+    const retry: LocalHookEventRow[] = [];
+    const mismatched: string[] = [];
+    for (const event of batch) {
+      const eventId = event.event_uuid;
+      if (view.byId.has(eventId)) {
+        retry.push(event);
+        continue;
+      }
+      const answer = answers.get(eventId);
+      if (answer === undefined) {
+        await this.recoverRow(event, owner, insertError, summary);
+      } else if (answer.outcome === "absent" || answer.outcome === "released") {
+        retry.push(event);
+      } else if (answer.outcome === "applied") {
+        if (await this.dependencies.local.markAcknowledged(eventId, answer.inboxId)) {
+          summary.acknowledged += 1;
+        }
+      } else if (answer.outcome === "quarantined") {
+        if (await this.dependencies.local.markQuarantined(
+          eventId,
+          answer.inboxId,
+          answer.quarantineReason,
+        )) {
+          summary.quarantined += 1;
+        }
+      } else if (answer.outcome === "mismatch") {
+        mismatched.push(eventId);
+        if (event.delivery_attempts >= this.options.quarantineAfterAttempts) {
+          if (await this.dependencies.local.markDeliveryQuarantined(
+            eventId,
+            owner,
+            "remote copy in another project differs from the local row",
+          )) {
+            summary.quarantined += 1;
+          }
+        } else if (await this.retryLocal(
+          event,
+          owner,
+          "remote copy in another project differs from the local row",
+        )) {
+          summary.retried += 1;
+        }
+      } else if (await this.retryLocal(
+        event,
+        owner,
+        answer.outcome === "busy"
+          ? "remote copy in another project is claimed by another process"
+          : "remote copy appeared in the bound project",
+      )) {
+        // A live claim or a copy that raced into the bound project is left
+        // for a later pass; neither is ever quarantined from here.
+        summary.retried += 1;
+      }
+    }
+    if (mismatched.length > 0) {
+      await this.reportError(new Error(
+        `local rows differ from their copy in another remote project: ${mismatched.join(", ")}`,
+      ));
+    }
+    if (retry.length === 0) return null;
+
+    // The one bounded extra insert; a failure here is not recovered again.
+    try {
+      return {
+        batch: retry,
+        remote: await this.dependencies.remote.insertEvents(retry.map(remoteInput), signal),
+      };
+    } catch (retryError) {
+      let again: UploadReadback;
+      try {
+        again = await this.readBack(retry, signal);
+      } catch (readbackError) {
+        await this.recoverBatch(retry, owner, readbackError, summary);
+        return null;
+      }
+      if (again.differs || again.missing.length > 0) {
+        await this.recoverBatch(retry, owner, retryError, summary);
+        return null;
+      }
+      return { batch: retry, remote: again.records };
     }
   }
 

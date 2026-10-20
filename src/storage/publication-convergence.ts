@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { daemonEntrypointMatches } from "../daemon/lifecycle-scope.js";
 import { isStagedPostgreSqlHealth } from "../daemon/staged-postgresql.js";
 import { PrivateMutationLockContentionError, processStartTime, readPrivateMutationLockOwner } from "../private-mutation-lock.js";
@@ -183,8 +183,14 @@ async function retryDelay(
   const lockPath = convergence.deps.lockPath
     ?? (convergence.deps.homeDir === undefined ? undefined : join(convergence.deps.homeDir, ".lcm.backend-publication.lock"));
   if (lockPath === undefined) return undefined;
+  const contended = error.contendedLock;
   let owner;
-  try { owner = ownerReader(lockPath, "backend publication"); } catch { return undefined; }
+  if (contended !== undefined) {
+    if (resolve(contended.path) !== resolve(lockPath)) return undefined;
+    owner = contended.owner;
+  } else {
+    try { owner = ownerReader(lockPath, "backend publication"); } catch { return undefined; }
+  }
   if (owner === null || owner.pid !== convergence.identity.pid || owner.processStartTime === null) return undefined;
   const deadline = existingDeadline ?? now() + PUBLICATION_CONVERGENCE_MS;
   const remainingBirth = Math.floor(deadline - now());

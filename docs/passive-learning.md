@@ -20,7 +20,7 @@ offsets retain their stated offset.
 
 Two hooks capture events during your session:
 
-- **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output. For Codex, the native `functions.exec` and `functions.exec_command` calls are adapted into the existing Bash event semantics.
+- **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output. For Codex, shell commands (reported as `Bash`; the legacy `functions.exec` and `functions.exec_command` names are accepted as aliases) and MCP calls are adapted into the existing event semantics. The native `apply_patch`, `spawn_agent`, `request_user_input`, and `update_plan` tools produce the file, subagent, decision, and plan events described under [Codex native activity](#codex-native-activity).
 - **UserPromptSubmit** — fires on each user prompt. Detects decisions ("always use X"), role statements ("I'm a data scientist"), and intent patterns.
 
 Events are written to a **sidecar SQLite database**
@@ -48,12 +48,15 @@ new global sequences during their transactional schema upgrade.
 
 #### Codex native command capture
 
-The Codex connector recognizes only PostToolUse payloads marked with
-`client: "codex"` whose `tool_name` is exactly `functions.exec` or
-`functions.exec_command`. The adapter accepts the string `tool_input.command`
-first, or the string `tool_input.cmd` when `command` is not a string. Other
-command-like, path-like, and file-like fields are ignored; a blank `command`
-does not fall back to `cmd`.
+The Codex connector recognizes PostToolUse payloads marked with
+`client: "codex"` whose `tool_name` is `Bash` (the name current Codex uses for
+shell commands), the legacy aliases `functions.exec` and
+`functions.exec_command`, or an `mcp__<server>__<tool>` MCP tool; other native tools are covered
+under [Codex native activity](#codex-native-activity). For shell
+commands the adapter accepts the string `tool_input.command` first, or the
+string `tool_input.cmd` when `command` is not a string. Other command-like,
+path-like, and file-like fields are ignored; a blank `command` does not fall
+back to `cmd`.
 
 The adapter passes only bounded semantic information into the existing Bash
 extractor:
@@ -67,31 +70,84 @@ extractor:
   precedence is `isError`, `is_error`, `exit_code`, then `exitCode`; boolean
   values are used directly and finite numeric exit codes treat zero as
   success and any other value as an error. Invalid, nested, string, `NaN`, and
-  infinite values are ignored.
+  infinite values are ignored. When no status is present, which is the case for
+  the textual result current Codex sends for a shell command, the outcome is
+  unknown. Text is never parsed for a status.
+- An unknown outcome for a git or install command is stored as a
+  `tool_outcome_unknown` observation that names only the matched command (for
+  example `Bash outcome unknown: git commit`; arguments and messages are not
+  stored) rather than a git or environment event. It is never promoted,
+  reinforced, or correlated as the fix for an earlier error. Unknown outcomes
+  for other commands are not recorded.
+- A Codex MCP call is stored by tool name only. Ordinary shell completions,
+  including nonzero exits, are delivered without a status and recorded as
+  unknown. An MCP call that reports `isError: true`, a handler error, and an
+  aborted or interrupted tool produce no PostToolUse payload, so LCM records
+  nothing for them. See
+  [Codex native PostToolUse capture](hook-protocol.md#codex-native-posttooluse-capture)
+  for the full matrix, including poll attribution and the
+  intercepted `apply_patch` gap.
 - The raw Codex response, stdout, stderr, and unknown output fields are never
   copied into the normalized event. Shell text is not parsed into file events.
 - A command whose trimmed text begins with `lcm store` is suppressed so LCM's
   own storage activity cannot create a passive-learning feedback loop.
 
-Only events recognized by the existing Bash extractor are queued. The command
+Only events recognized by the Bash and MCP extractors are queued. The command
 itself is not stored as a transcript.
 
 | Category | Examples | Priority |
 |----------|----------|----------|
-| Decisions | User answers to AskUserQuestion, "always use TypeScript" | 1 (immediate) |
+| Decisions | User answers to AskUserQuestion or Codex `request_user_input`, "always use TypeScript" | 1 (immediate) |
 | Plan approvals | EnterPlanMode / ExitPlanMode events | 1 (immediate) |
 | Errors | Bash commands that fail (isError: true) | 1 (immediate) |
 | Git operations | Commits, merges, branch switches | 2 (batch) |
 | Environment | `npm install`, `pip install`, `brew install` | 2 (batch) |
 | File access | Read/Edit/Write/Glob/Grep with file paths | 3 (pattern-only) |
+| File changes | Files added, deleted, edited, or moved by Codex `apply_patch` (paths only) | 3 (pattern-only) |
+| Delegation | Subagent dispatches (Claude `Agent`, Codex `spawn_agent`) as a short label | 3 (pattern-only) |
+| Plan proposals | Codex `update_plan` revisions that include an explanation | 3 (pattern-only) |
 | MCP tools | Which MCP tools are used (tool name only) | 3 (pattern-only) |
 | Skills | Which skills are invoked | 3 (pattern-only) |
 
+#### Codex native activity
+
+Codex runs PostToolUse only after a tool call succeeds, so each of these tools
+is captured when it completes. A payload that flags the call with `isError`
+records only the generic tool error instead. No configuration is needed.
+
+- **`apply_patch`** records each file the patch adds, deletes, or updates, with
+  a type label (source, test, config, docs). An update that moves a file
+  records one event naming both paths. At most 20 file observations are
+  recorded per patch, and a path is skipped when either end is sensitive. Patch
+  contents and the tool response are never stored. Patches that Codex
+  intercepts from a shell command are not `apply_patch` calls and are not
+  captured.
+- **`spawn_agent`** records a short dispatch label: the task name, then the
+  nickname, then the agent type, or the generic label `agent`. The generic
+  label does not identify a distinct child. Codex multi-agent v2 reports the
+  tool as `collaborationspawn_agent`, which is captured the same way; custom
+  collaboration namespaces are not. The brief, items, model, and agent ID are
+  never stored.
+- **`request_user_input`** records each answered question as a decision, using
+  the question text and the chosen options or notes, for at most the first three
+  questions. Unanswered and secret questions are skipped, and so is
+  `request_user_input_async`, which only reports that the question was sent.
+- **`update_plan`** records a plan proposal only when the call includes an
+  explanation: the explanation and up to 10 step names, without statuses. Calls
+  without an explanation are progress updates and are not captured. Proposals
+  are promoted only when they match an existing memory; they never create a
+  preference or decision on their own.
+
+Routine coordination tools such as `send_message`, `wait_agent`,
+`list_agents`, and `close_agent` are not captured.
+
 ### What Is NOT Captured
 
-- Raw tool payload contents such as file contents, command stdout/stderr, and
-  unknown Codex response fields (only bounded semantic metadata and brief user
-  answers are stored)
+- Raw tool payload contents such as file contents, patch bodies, command
+  stdout/stderr, subagent briefs, and unknown Codex response fields (only
+  bounded semantic metadata and brief user answers are stored)
+- Unanswered or secret Codex questions, plan step statuses, and routine
+  subagent coordination calls
 - Sensitive file paths (`.env`, `.ssh/`, `credentials`, `.npmrc`)
 - LCM's own `lcm_store` calls (prevents feedback loops)
 
@@ -215,11 +271,27 @@ event-delivery worker for the local outbox, distinct from the daemon's selected
 3. inserts envelopes idempotently into the existing
    `lcm.passive_event_inbox`;
 4. applies remotely claimed events and their `applied` transition in one short
-   PostgreSQL transaction;
+   PostgreSQL transaction, and keeps claiming for as long as its own applies
+   and quarantines make the next events of a machine claimable, so a backlog
+   drains in one pass up to the batch size (100) while later events still
+   wait for earlier ones;
 5. resolves uncertain commits by exact inbox readback;
 6. durably acknowledges the local row after remote `applied` proof; and
 7. prunes only the exact applied inbox row, recording local prune completion
    after deletion or missing-row proof.
+
+A claim fetch returns at most one event per machine, because an event is
+claimable only once every earlier event of its machine is applied or
+quarantined. The batch size is therefore a budget of claimed events shared by
+all fetches of one pass, not a number of events per fetch. A pass stops
+claiming earlier when a fetched batch produces no applied or quarantined
+outcome (a batch that only schedules retries or only fails without a counter),
+when the drain lease is lost, or when a publication admission is refused. A
+mixed batch with any applied or quarantined row continues. Other ready work,
+such as another machine, a new arrival, or a retry timer, may be claimed by a
+later fetch of the same pass but is not guaranteed; it waits for the next sweep
+once the pass stops making progress. "Up to the batch size" thus means ready
+work the pass actually settles, not a guarantee about peers.
 
 Per-machine ordering is preserved within a project binding; a project relink
 is the exception (see below). Independent machines can progress
@@ -269,9 +341,10 @@ from the selected `ProjectStorage` route.
 
 Every project replicates in admitted phases rather than inside one admission
 held across the whole pass. The drain-lease acquisition runs under its own
-admission before the upload, then the upload runs under one admission, the
-claim fetch under the next, each renew-and-apply under its own, and reconcile
-and prune each under their own, using the same publication check that
+admission before the upload, then the upload runs under one admission, each
+claim fetch under its own (every fetch after the first preceded by its own
+lease renewal), each renew-and-apply under its own, and reconcile and prune
+each under their own, using the same publication check that
 promotion uses. Only the cleanup lease release runs outside admission. The
 consumer lock is released between phases so hook appends can proceed instead
 of waiting behind a whole sweep. A daemon keeps its startup backend for its
@@ -304,10 +377,12 @@ change. If the project was relinked or unbound in the meantime, the pass
 reports one error and uploads no further rows to the previous project. It
 keeps working on what that project already holds (claims, reconcile and prune)
 for the rest of the pass, so rows it uploaded there are not abandoned
-mid-pass. Rows the pass did not upload stay pending locally and upload to the
-new binding on the next sweep. A pass run without a publication admission
-checks the binding too, but without the admission's lock, so that check is
-best effort.
+mid-pass; that includes the further claims of events the old project already
+holds, while new local uploads and the withdrawal of copies from other
+projects stay withheld. Rows the pass did not upload stay pending locally and
+upload to the new binding on the next sweep. A pass run without a publication
+admission checks the binding too, but without the admission's lock, so that
+check is best effort.
 
 #### After a project relink
 
@@ -338,14 +413,42 @@ nothing awaits the previous project the recovery costs no extra query, and a
 row that stays unresolved (a live claim or a mismatch) costs one query per
 pass.
 
+A row can also have reached the previous project without the local outbox
+recording it: the upload committed but the local record was lost, so the row is
+still pending locally with no remote inbox id. The previous project's copy then
+makes every upload of that row to the new project fail, and the failure takes
+the rest of its batch with it. When an upload fails and the new project lacks
+some of the rows, the same recovery runs for those rows right away, and the
+batch is uploaded once more without the rows that cannot go:
+
+- an undelivered copy is withdrawn and the row is uploaded to the new project
+  in the same pass;
+- an applied copy is deleted and the row is acknowledged;
+- a quarantined copy stays and the row is quarantined;
+- a copy another drainer is working on is left alone and the row is retried
+  later. Until that claim ends it can hold back the rows that follow it; and
+- a copy that differs from the row is never changed. One error naming the rows
+  is reported, and once the row has been attempted the configured number of
+  times it is quarantined locally.
+
+The other rows of that batch are normally uploaded in the same pass instead of
+waiting for the row that failed it. If the new upload fails again, or the
+recovery query itself fails, the remaining rows are retried with backoff as for
+any other failed upload. This also happens when a different event from the same
+machine already holds the row's machine sequence number in the previous
+project: nothing is withdrawn, the extra upload fails, and the batch is retried
+with backoff as before. LCM never deletes that other event. This costs one
+recovery transaction and at most one extra upload, and only when an upload batch
+fails this way.
+
 Withdrawing a copy does not wait for the previous project's drain lease. That
 is safe because applying a passive event has no remote effect and a drainer
 whose claim went stale fails its completion before it applies anything.
 
 Per-machine ordering holds while a project stays bound. After a relink a
-recovered older row is uploaded after rows that were still pending locally, so
-the new project can receive a newer event before an older one from the same
-machine.
+recovered older row, or a row held back by a copy another drainer is still
+working on, is uploaded after rows that were still pending locally, so the new
+project can receive a newer event before an older one from the same machine.
 
 The storage health check receives the daemon's shutdown signal, so stopping the
 daemon cancels a health check that is still waiting on a PostgreSQL connection

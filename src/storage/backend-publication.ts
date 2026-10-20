@@ -209,7 +209,8 @@ export type BackendMaintenanceRosterEntry = Readonly<{
 export type BackendMaintenanceJournal = Readonly<{
   version: typeof BACKEND_MAINTENANCE_VERSION;
   publicationId: string;
-  sourceBackend: "sqlite";
+  /** The backend selected when the window was entered; an aborted window leaves it selected. */
+  sourceBackend: StorageBackendName;
   targetBackend: StorageBackendName | null;
   phase: BackendMaintenancePhase;
   createdAt: string;
@@ -233,6 +234,8 @@ export type EnterBackendMaintenanceInput = Readonly<{
   now?: Date;
   /** Exact entering journal observed during crash recovery. */
   expectedChecksumSha256?: string;
+  /** The backend selected when the window is entered (an activation's is sqlite, a rollback's postgresql). Defaults to sqlite. */
+  sourceBackend?: StorageBackendName;
 }>;
 
 export type PrepareBackendMaintenanceSelectionInput = Readonly<{
@@ -1256,7 +1259,7 @@ function parseMaintenanceJournal(value: Record<string, unknown>): BackendMainten
   if (
     typeof value.publicationId !== "string"
     || !PUBLICATION_ID_PATTERN.test(value.publicationId)
-    || value.sourceBackend !== "sqlite"
+    || (value.sourceBackend !== "sqlite" && value.sourceBackend !== "postgresql")
     || !(value.targetBackend === null || value.targetBackend === "sqlite" || value.targetBackend === "postgresql")
     || !MAINTENANCE_PHASES.includes(value.phase as BackendMaintenancePhase)
     || typeof value.createdAt !== "string"
@@ -1553,11 +1556,11 @@ function readPublicationJournalForAccess(
   return journal;
 }
 
-function assertTerminalPublicationEvidence(
+function authenticateTerminalPublicationEvidence(
   journal: BackendPublicationJournal,
   directoryHandle: BackendPublicationDirectoryHandle,
   homeDir?: string,
-): void {
+): BackendPublicationRecoveryMaterial | null {
   if (journal.phase !== "completed" && journal.phase !== "aborted") {
     return fail("unresolved-publication", "backend publication is unresolved; recover it before consuming local state");
   }
@@ -1569,8 +1572,9 @@ function assertTerminalPublicationEvidence(
       return fail("malformed-journal", "terminal backend publication retains an active remote fence");
     }
   }
+  let material: BackendPublicationRecoveryMaterial | null = null;
   try {
-    authenticateMaterial(homeDir, journal, directoryHandle);
+    material = authenticateMaterial(homeDir, journal, directoryHandle).material;
   } catch (error) {
     // Aborted publications remove their recovery material after the journal
     // reaches its terminal state. The journal checksum and state witnesses
@@ -1589,6 +1593,15 @@ function assertTerminalPublicationEvidence(
   ) {
     return fail("malformed-journal", "completed backend publication lacks intended-state witnesses");
   }
+  return material;
+}
+
+function assertTerminalPublicationEvidence(
+  journal: BackendPublicationJournal,
+  directoryHandle: BackendPublicationDirectoryHandle,
+  homeDir?: string,
+): void {
+  authenticateTerminalPublicationEvidence(journal, directoryHandle, homeDir);
 }
 
 function withConsumerPublicationJournal<T>(
@@ -1656,7 +1669,7 @@ function assertBackendPublicationConsumerAccessUnlocked(options: {
         return fail("unresolved-publication", "backend publication is held for migration maintenance");
       }
       const selectedBackend = maintenance.phase === "maintenance-aborted"
-        ? "sqlite"
+        ? maintenance.sourceBackend
         : maintenance.targetBackend!;
       if (options.backend !== undefined && options.backend !== selectedBackend) {
         return fail("backend-mismatch", "backend does not match terminal migration maintenance state");
@@ -1838,7 +1851,7 @@ function completeConsumerOperation<T>(
   if (outcome.error instanceof PrivateMutationLockContentionError) {
     throw new PrivateMutationLockContentionError(
       outcome.error.message,
-      { cause: aggregate },
+      { cause: aggregate, contendedLock: outcome.error.contendedLock },
     );
   }
   throw aggregate;
@@ -2594,7 +2607,7 @@ function readConsumerConfigPublicationJournal(
       if (journal.phase !== "maintenance-aborted" && journal.phase !== "selection-completed") {
         return fail("unresolved-publication", "backend publication is held for migration maintenance");
       }
-      const selectedBackend = journal.phase === "maintenance-aborted" ? "sqlite" : journal.targetBackend!;
+      const selectedBackend = journal.phase === "maintenance-aborted" ? journal.sourceBackend : journal.targetBackend!;
       if (backend !== selectedBackend) {
         return fail("backend-mismatch", "backend does not match terminal migration maintenance state");
       }
@@ -3364,6 +3377,20 @@ function materialFromJson(value: unknown, field: string): BackendPublicationReco
   };
 }
 
+/**
+ * The exact bytes sealMaterial writes for a publication's recovery
+ * material. Exported, with no behaviour change, so a caller holding its own
+ * durable copy of the same material (the migration activation artifact)
+ * can compare a sealed file byte-for-byte against that copy instead of
+ * re-deriving the serialization.
+ */
+export function backendPublicationMaterialContent(
+  publicationId: string,
+  material: BackendPublicationRecoveryMaterial,
+): string {
+  return materialJson(publicationId, material);
+}
+
 function materialJson(
   publicationId: string,
   material: BackendPublicationRecoveryMaterial,
@@ -3549,6 +3576,105 @@ function authenticateMaterial(
   }
 }
 
+/**
+ * Read and authenticate the sealed recovery material for a publication
+ * journal that already carries a recovery reference, opening and closing
+ * its own root and publication directory handles for one lock-free read.
+ *
+ * This is the ONLY authenticator for the on-disk material format. It exists
+ * so that external readers (#1433's retained-material reader, built for
+ * rollback eligibility) never reimplement path derivation, byte-cap, mode,
+ * or digest checks in a second place that would have to agree with this one.
+ * A second encoding of "what a valid material file looks like" is exactly
+ * the defect #1433 exists to close, one level down.
+ *
+ * Unlike the in-flight {@link BackendPublicationCoordinator} call sites that
+ * reach {@link authenticateMaterial} while a live journal is still being
+ * driven forward, this export REFUSES a journal whose {@link
+ * BackendPublicationJournal.recoveryReference} is `null`. Internally,
+ * {@link authenticateMaterial} tolerates a `null` reference by synthesizing
+ * one with an empty seal digest and a zero byte length, and its digest
+ * comparison is written as `reference.sealSha256 !== "" && ...`, so a
+ * synthesized reference silently skips the checksum comparison entirely.
+ * That tolerance is correct for its own caller (a publication still in the
+ * `preparing` phase, before a reference has ever been sealed) and would be
+ * wrong evidence for this one: a caller reading a journal from outside the
+ * coordinator has no other reason to expect an unauthenticated read to
+ * "succeed" silently. Refuse before calling through, rather than change
+ * {@link authenticateMaterial}'s behavior for its existing callers.
+ */
+export function readAuthenticatedBackendPublicationMaterial(
+  journal: BackendPublicationJournal,
+  homeDir?: string,
+): BackendPublicationRecoveryMaterial {
+  if (journal.recoveryReference === null) {
+    return fail(
+      "publication-evidence-missing",
+      "backend publication journal has no recovery reference to authenticate",
+    );
+  }
+  const rootHandle = openOptionalRootDirectory(homeDir);
+  let publicationHandle: BackendPublicationDirectoryHandle | undefined;
+  try {
+    publicationHandle = openOptionalPublicationDirectory(homeDir);
+    if (publicationHandle === undefined) {
+      return fail(
+        "publication-evidence-missing",
+        "backend publication directory is missing",
+      );
+    }
+    return authenticateMaterial(homeDir, journal, publicationHandle, true).material;
+  } finally {
+    publicationHandle?.close();
+    rootHandle?.close();
+  }
+}
+
+/**
+ * Read the live journal and, only when it is `completed`, the retained
+ * recovery material, validated as terminal consumer evidence: a recovery
+ * reference, no active remote fence, material that authenticates, and
+ * published hashes equal to the intended hashes. Returns `null` when the
+ * publication directory is confirmed absent or the journal is not
+ * `completed` (including `aborted`).
+ *
+ * The journal, the terminal checks and the material read share one
+ * publication directory handle, and the material is authenticated once with
+ * the strict directory checks. Afterwards the journal is re-read through the
+ * same handle: a different checksum fails with `unexpected-state` and a
+ * missing journal with `publication-evidence-missing`. This is an
+ * observation, not a snapshot; the journal can still change after the
+ * re-read. The function takes no publication lock, so a caller that already
+ * holds the consumer lock may call it.
+ */
+export function readRetainedCompletedBackendPublicationEvidence(
+  homeDir?: string,
+): Readonly<{ journal: BackendPublicationJournal; material: BackendPublicationRecoveryMaterial }> | null {
+  return withPublicationJournalForConsumer(homeDir, (journal, handle) => {
+    if (journal === null || journal.phase !== "completed") return null;
+    const rootHandle = openOptionalRootDirectory(homeDir);
+    try {
+      const material = authenticateTerminalPublicationEvidence(journal, handle!, homeDir)!;
+      const current = readJournalFromDirectory(homeDir, handle);
+      if (current === null) {
+        return fail(
+          "publication-evidence-missing",
+          "backend publication journal disappeared while reading retained material",
+        );
+      }
+      if (current.checksumSha256 !== journal.checksumSha256) {
+        return fail(
+          "unexpected-state",
+          "backend publication journal changed while reading retained material",
+        );
+      }
+      return { journal, material };
+    } finally {
+      rootHandle?.close();
+    }
+  });
+}
+
 function prospectiveJournal(
   input: PrepareBackendPublicationInput & Readonly<{ now: Date }> ,
   sourceState: BackendPublicationStateWitness,
@@ -3667,6 +3793,7 @@ export class BackendPublicationCoordinator {
         || !PUBLICATION_ID_PATTERN.test(input.generationId)
         || !HASH_PATTERN.test(input.sourceSelectionSha256)
         || !HASH_PATTERN.test(input.queueEvidenceSha256)
+        || (input.sourceBackend !== undefined && input.sourceBackend !== "sqlite" && input.sourceBackend !== "postgresql")
         || (input.now !== undefined && !Number.isFinite(input.now.getTime()))
       ) {
         return fail("invalid-input", "backend maintenance input is malformed");
@@ -3675,6 +3802,7 @@ export class BackendPublicationCoordinator {
       if (maintenance?.phase === "maintenance-entering") {
         if (maintenance.publicationId !== input.publicationId
           || maintenance.generationId !== input.generationId
+          || maintenance.sourceBackend !== (input.sourceBackend ?? "sqlite")
           || maintenance.sourceSelectionSha256 !== input.sourceSelectionSha256
           || maintenance.queueEvidenceSha256 !== input.queueEvidenceSha256
           || canonicalJson(maintenance.roster) !== canonicalJson(roster)
@@ -3700,7 +3828,7 @@ export class BackendPublicationCoordinator {
       const entering = withMaintenanceChecksum({
         version: BACKEND_MAINTENANCE_VERSION,
         publicationId: input.publicationId,
-        sourceBackend: "sqlite",
+        sourceBackend: input.sourceBackend ?? "sqlite",
         targetBackend: null,
         phase: "maintenance-entering",
         createdAt: now,

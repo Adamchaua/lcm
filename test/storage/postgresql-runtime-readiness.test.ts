@@ -2176,6 +2176,112 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
       .toEqual(expect.arrayContaining(["inspectRelationAcl", "inspectColumnAcl"]));
   });
 
+  describe("message_parts transcript column grants", () => {
+    const MESSAGE_PARTS_TRANSCRIPT_COLUMNS = [
+      "project_id",
+      "conversation_id",
+      "message_id",
+      "part_type",
+    ];
+    const withoutColumnAcls = (
+      omitted: (object: string) => boolean,
+    ): ReadyExecutorOverride => mutateRows((rows) => {
+      const kept = rows.filter(({ object_identity: object, privilege_type: privilege }) => (
+        !(privilege === "SELECT" && typeof object === "string" && omitted(object))
+      ));
+      rows.splice(0, rows.length, ...kept);
+    });
+    const isMessagePartsTranscriptColumn = (object: string): boolean => (
+      MESSAGE_PARTS_TRANSCRIPT_COLUMNS.some((column) => object === `lcm.message_parts|${column}`)
+    );
+
+    it("accepts a transcript profile granted before the message_parts column grants existed", async () => {
+      const fake = readyExecutor({
+        operationOverrides: { inspectColumnAcl: withoutColumnAcls(isMessagePartsTranscriptColumn) },
+      });
+
+      await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+        expectedOwner: "lcm_test_migrator",
+      })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+    });
+
+    it("accepts a transcript profile that applied the message_parts column grants", async () => {
+      const fake = readyExecutor();
+
+      await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+        expectedOwner: "lcm_test_migrator",
+      })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+    });
+
+    it("rejects an old transcript profile that also lacks an unrelated optional column grant", async () => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectColumnAcl: withoutColumnAcls((object) => (
+            isMessagePartsTranscriptColumn(object) || object === "lcm.messages|content"
+          )),
+        },
+      });
+
+      await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+        expectedOwner: "lcm_test_migrator",
+      })).rejects.toMatchObject({ reason: "acl-shape" });
+    });
+
+    it("rejects a new transcript profile that lacks an unrelated optional column grant", async () => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectColumnAcl: withoutColumnAcls((object) => object === "lcm.messages|content"),
+        },
+      });
+
+      await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+        expectedOwner: "lcm_test_migrator",
+      })).rejects.toMatchObject({ reason: "acl-shape" });
+    });
+
+    it("rejects an old transcript profile without effective message_parts column SELECT", async () => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectColumnAcl: withoutColumnAcls(isMessagePartsTranscriptColumn),
+          inspectEffectivePrivileges: mutateRows((rows) => {
+            const row = rows.find((candidate) => (
+              candidate.privilege_kind === "column"
+              && candidate.object_identity === "lcm.message_parts"
+              && candidate.column_name === "part_type"
+              && candidate.privilege_type === "SELECT"
+            ));
+            if (row === undefined) throw new Error("message_parts part_type row missing");
+            row.effective = false;
+          }),
+        },
+      });
+
+      await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+        expectedOwner: "lcm_test_migrator",
+      })).rejects.toMatchObject({ reason: "effective-privilege" });
+    });
+
+    it("rejects an old transcript profile without message_parts table SELECT", async () => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectColumnAcl: withoutColumnAcls(isMessagePartsTranscriptColumn),
+          inspectRelationAcl: mutateRows((rows) => {
+            const kept = rows.filter((row) => !(
+              row.object_identity === "table|message_parts"
+              && row.privilege_type === "SELECT"
+              && row.grantee_name === "lcm_test_runtime"
+            ));
+            rows.splice(0, rows.length, ...kept);
+          }),
+        },
+      });
+
+      await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+        expectedOwner: "lcm_test_migrator",
+      })).rejects.toMatchObject({ reason: "acl-shape" });
+    });
+  });
+
   it("probes tables separately from sequences and probes SELECT column privileges", async () => {
     const fake = readyExecutor();
     await verifyPostgreSqlRuntimeSchema(fake.seam, {

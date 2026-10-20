@@ -29,6 +29,8 @@ import { createDescribeHandler } from "./routes/describe.js";
 import { createStoreHandler } from "./routes/store.js";
 import { createRecentHandler } from "./routes/recent.js";
 import { createIngestHandler } from "./routes/ingest.js";
+import { createTerminalIngestQueue } from "./routes/ingest-terminal.js";
+import { settleProjectStorageExecutions } from "./routes/storage-lifecycle.js";
 import { createPromptSearchHandler } from "./routes/prompt-search.js";
 import { createStatusHandler } from "./routes/status.js";
 import { createSessionCompleteHandler } from "./routes/session-complete.js";
@@ -48,6 +50,7 @@ import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { createInvocationControlHandler } from "./routes/invocation-control.js";
 import { composeAbortSignals, throwIfAborted } from "./cancellation.js";
 import { createPublicationQueue } from "./publication-queue.js";
+import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import {
   createInvocationCoordinator,
   type InvocationCoordinator,
@@ -88,6 +91,11 @@ export type RoutePublicationAdmission = <T>(
 export type RouteExecutionContext = Readonly<{
   publicationLockToken?: BackendPublicationLockToken;
   withPublicationAdmission?: RoutePublicationAdmission;
+  /**
+   * Bounded FIFO turn on the daemon's own publication queue for a PostgreSQL
+   * read's identity/open prefix retry. Absent on SQLite and on every other route.
+   */
+  withReadAdmission?: RoutePublicationAdmission;
   signal?: AbortSignal;
   /** Narrow invocation-control seam used by invocation-aware compact routes. */
   invocationCoordinator?: InvocationCoordinator;
@@ -99,7 +107,9 @@ export type RouteHandler = (
   context?: RouteExecutionContext,
 ) => Promise<void>;
 export type RouteAdmission = "read" | "mutating";
-type BuiltInRoutePublicationMode = "retained" | "operation-scoped";
+// "enqueue-only" routes answer after a short synchronous hand-off to a
+// daemon-owned queue, so they wait for no publication work before replying.
+type BuiltInRoutePublicationMode = "retained" | "operation-scoped" | "enqueue-only";
 type BuiltInRouteResponseMode = "direct" | "buffered";
 type RequestLifecycleEvent = "received" | "cancelled" | "settled";
 type RegisteredRoute = Readonly<{
@@ -160,6 +170,8 @@ export type DaemonOptions = {
   _withBackendPublicationConsumerLockAsync?: typeof withBackendPublicationConsumerLockAsync;
   /** @internal Test-only request lifecycle observer. */
   _onRequestLifecycle?: (event: RequestLifecycleEvent, signal: AbortSignal) => void;
+  /** @internal Queue-wait budget for a PostgreSQL read's admitted retry, in milliseconds. */
+  _readAdmissionWaitMs?: number;
   /** @internal Test-only observer for the closed built-in route registry. */
   _onBuiltInRouteRegistered?: (
     key: string,
@@ -171,6 +183,7 @@ export type DaemonOptions = {
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_REQUEST_CONFIG_BYTES = 4 * 1024 * 1024;
 const MAX_BUFFERED_RESPONSE_BYTES = MAX_BODY_BYTES;
+const READ_ADMISSION_WAIT_MS = 1000;
 
 export function claudeProjectDirName(cwd: string): string {
   const sanitized = cwd
@@ -601,6 +614,35 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }
   };
   const withBackgroundPublicationAdmission: BackgroundPublicationAdmission = publicationAdmission(shutdownController.signal);
+  /**
+   * One bounded turn on the publication queue for a PostgreSQL read's retry.
+   * The deadline only bounds queue waiting: it is disarmed on callback entry,
+   * and it never aborts the request signal, which would discard the 503.
+   */
+  const boundedReadAdmission = (requestSignal: AbortSignal): RoutePublicationAdmission => async operation => {
+    const deadline = new AbortController();
+    let deadlineFired = false;
+    const timer = setTimeout(() => {
+      deadlineFired = true;
+      deadline.abort();
+    }, options?._readAdmissionWaitMs ?? READ_ADMISSION_WAIT_MS);
+    const composed = composeAbortSignals([requestSignal, deadline.signal]);
+    try {
+      return await enqueuePublication(() => {
+        clearTimeout(timer);
+        throwIfAborted(requestSignal);
+        return withConsumerPublicationLockAsync(publicationHome, publicationLockToken => operation(publicationLockToken));
+      }, composed.signal);
+    } catch (error) {
+      if (deadlineFired && !requestSignal.aborted) {
+        throw new PrivateMutationLockContentionError("daemon publication work is in progress; retry the read");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      composed.cleanup();
+    }
+  };
   const withRequestPublicationAdmission = (
     retainedToken: BackendPublicationLockToken,
   ): RoutePublicationAdmission => async (operation, signal) => {
@@ -648,12 +690,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   let constructedWatcher: ReturnType<typeof watchProjectMap> | undefined;
   let constructedIngestInterval: ReturnType<typeof setInterval> | undefined;
   let constructedIngestScan: Promise<void> | undefined;
+  let constructedTerminalDrain: (() => Promise<void>) | undefined;
   let startupCleanupStarted = false;
   let storageFactoryClosed = false;
   const closeStorageFactory = async (): Promise<void> => {
     if (storageFactoryClosed) return;
     storageFactoryClosed = true;
     try {
+      await settleProjectStorageExecutions(storageFactory);
       await storageFactory.close();
     } catch (error) {
       storageFactoryClosed = false;
@@ -691,6 +735,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     if (idleTimeoutMs <= 0) return;
     if (idleTimer) clearIdleTimeout(idleTimer);
     idleTimer = setIdleTimeout(() => {
+      // Accepted terminal snapshots keep the daemon alive until they settle.
+      if (terminalIngestQueue.busy()) {
+        resetIdleTimer();
+        return;
+      }
       idleTriggered = true;
       onIdle();
     }, idleTimeoutMs);
@@ -883,6 +932,20 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   // Periodic transcript ingestion scan
   const INGEST_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
   const ingestHandler = createIngestHandler(config, storageFactory);
+  const terminalIngestQueue = createTerminalIngestQueue({
+    ingest: ingestHandler,
+    publicationAdmission,
+    shutdownSignal: shutdownController.signal,
+    onDrained: resetIdleTimer,
+  });
+  constructedTerminalDrain = terminalIngestQueue.drained;
+  registerBuiltInRoute(
+    "POST",
+    "/ingest/terminal",
+    terminalIngestQueue.handler,
+    "mutating",
+    "enqueue-only",
+  );
 
   const scanForTranscripts = async (
     withPublicationAdmission: BackgroundPublicationAdmission,
@@ -1005,6 +1068,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         sendJsonIfWritable(res, 401, { error: "unauthorized" });
         return;
       }
+      if (key === "POST /ingest/terminal" && serverToken === null) {
+        sendJsonIfWritable(res, 401, { error: "unauthorized" });
+        return;
+      }
       if (serverToken) {
         const authHeader = (Array.isArray(rawAuth) ? rawAuth[0] : rawAuth) ?? "";
         if (!publicHealth && authHeader.trim() !== `Bearer ${serverToken}`) {
@@ -1017,6 +1084,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const body = req.method !== "GET" ? await readBody(req) : "";
       options?._onRequestLifecycle?.("received", requestSignal);
       if (route.admission === "mutating") {
+        if (route.publicationMode === "enqueue-only") {
+          await route.handler(req, res, body, { signal: requestSignal });
+          return;
+        }
         if (route.publicationMode === "operation-scoped") {
           assertDaemonNotShuttingDown();
           const withPublicationAdmission = publicationAdmission(requestSignal);
@@ -1064,6 +1135,9 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           await route.handler(req, bufferedResponse as unknown as ServerResponse, body, {
             signal: requestSignal,
             invocationCoordinator,
+            ...(config.storage.backend === "postgresql"
+              ? { withReadAdmission: boundedReadAdmission(requestSignal) }
+              : {}),
           });
           const finalWitness = assertDaemonReadStorageAdmission(
             config,
@@ -1132,6 +1206,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     await settleCleanup(() => invocationCoordinator.shutdown());
     await settleCleanup(() => clearInterval(ingestInterval));
     await settleCleanup(() => activeIngestScan);
+    await settleCleanup(() => terminalIngestQueue.drained());
     await settleCleanup(() => projectMapWatcher.close());
     await settleCleanup(() => passiveEventProcessor.stopAndWait());
     await settleCleanup(() => { idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout); });
@@ -1185,6 +1260,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
           await settleCleanup(() => clearInterval(ingestInterval));
           await settleCleanup(() => activeIngestScan);
+          await settleCleanup(() => terminalIngestQueue.drained());
           await settleCleanup(() => projectMapWatcher.close());
           await settleCleanup(() => passiveEventProcessor.stopAndWait());
           await settleCleanup(() => passiveEventReplication.close());
@@ -1222,6 +1298,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       await settleCleanup(() => clearInterval(ingestInterval));
     }
     await settleCleanup(() => constructedIngestScan);
+    await settleCleanup(() => constructedTerminalDrain?.());
     if (constructedWatcher) {
       const watcher = constructedWatcher;
       await settleCleanup(() => watcher.close());

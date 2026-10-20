@@ -27,6 +27,8 @@ import {
   assertDestinationIdentityMatches,
   assertPermanentReadOnlyGuard,
   completePendingMigrationVerification,
+  buildMigrationCanonicalDelta,
+  buildMigrationCensusVector,
   inspectMigrationVerification,
   readFencedDestinationCensus,
   readLedgerMismatches,
@@ -3514,5 +3516,21 @@ describe("completePendingMigrationVerification (plan-v5 Part B (2): the persiste
     const before = manifest.current.checksumSha256;
     expect(completePendingMigrationVerification({ homeDir: "/tmp/lcm-verify-no-pending", generationId: MANIFEST_FIXTURE_GENERATION_ID })).toBeNull();
     expect(manifest.current.checksumSha256).toBe(before);
+  });
+});
+
+describe("shared census and canonical-delta builders", () => {
+  const domains = PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => ({
+    domain, recordCount: index, prefixSha256: HASH_A, terminalIdentitySha256: index === 0 ? null : HASH_A,
+  }));
+
+  it("builds a frozen-schema census vector and canonical delta from one domain census", () => {
+    const census = buildMigrationCensusVector(domains);
+    const delta = buildMigrationCanonicalDelta(domains);
+    expect(census.domains.map((entry) => entry.domain)).toEqual([...PORTABLE_RECORD_DOMAIN_ORDER]);
+    expect(delta.domains.map((entry) => entry.recordCount)).toEqual(domains.map((entry) => entry.recordCount));
+    // A domain without a terminal identity gets the deterministic empty sentinel, never null.
+    expect(delta.domains[0]!.terminalIdentitySha256).toMatch(/^[0-9a-f]{64}$/u);
+    expect(delta.domains[1]!.terminalIdentitySha256).toBe(HASH_A);
   });
 });

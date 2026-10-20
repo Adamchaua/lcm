@@ -1,14 +1,21 @@
 import { validateAndFixHooks } from "./auto-heal.js";
+import { resolveLcmConfig } from "../db/config.js";
 import { configPath as defaultConfigPath } from "../runtime-paths.js";
 import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import {
   rethrowBackendPublicationJournalError,
 } from "./publication-fence.js";
 import type { ConnectorTransport } from "../connectors/types.js";
+import { resolveHookSessionScope } from "./subagent-scope.js";
+import type { TerminalHookContext } from "./terminal-snapshot.js";
 
-export const HOOK_COMMANDS = ["compact", "post-tool", "restore", "session-end", "session-snapshot", "user-prompt"] as const;
+export const HOOK_COMMANDS = ["compact", "post-tool", "pre-tool", "restore", "session-end", "session-snapshot", "user-prompt"] as const;
 export type HookCommand = typeof HOOK_COMMANDS[number];
-export type HookExecutionContext = Readonly<{ transport?: ConnectorTransport }>;
+export type HookExecutionContext = Readonly<{
+  transport?: ConnectorTransport;
+  /** Present only for Codex Interrupt and SessionEnd snapshots. */
+  terminal?: TerminalHookContext;
+}>;
 
 // Event names used when the dispatch-level config load is skipped by lock
 // contention; they match the names each handler logs its own contention under.
@@ -36,11 +43,28 @@ export async function dispatchHook(
   stdinText: string,
   context: HookExecutionContext = {},
 ): Promise<{ exitCode: number; stdout: string }> {
+  // Documented contract (docs/configuration.md#disabling-lcm): LCM_ENABLED=false
+  // keeps the hooks installed but makes every one of them a no-op.
+  if (!resolveLcmConfig(process.env).enabled) return { exitCode: 0, stdout: "" };
+
   let verifiedSnapshotPort: number | undefined;
+  // Terminal snapshots only hand the transcript to an already-running, verified
+  // daemon: no bootstrap, hook repair, cursor or throttle work precedes this.
+  if (command === "session-snapshot" && context.terminal !== undefined) {
+    const { handleTerminalSnapshot } = await import("./terminal-snapshot.js");
+    return handleTerminalSnapshot(stdinText, context.terminal);
+  }
   // Early return for post-tool — runs on EVERY tool call, must skip bootstrap for performance
   if (command === "post-tool") {
     const { handlePostToolUse } = await import("./post-tool.js");
     return handlePostToolUse(stdinText);
+  }
+
+  // Early return for pre-tool — opt-in, runs synchronously before every
+  // matched tool call, and must never bootstrap or start the daemon.
+  if (command === "pre-tool") {
+    const { handlePreToolUse } = await import("./pre-tool.js");
+    return handlePreToolUse(stdinText);
   }
 
   // Skip bootstrap for compact because SessionStart already ensured the daemon.
@@ -49,7 +73,10 @@ export async function dispatchHook(
   if (command !== "compact" && command !== "user-prompt") {
     // Lazy bootstrap: create config + start daemon on first hook fire per session
     try {
-      const { session_id } = JSON.parse(stdinText || "{}");
+      // A Codex child bootstraps under its tree session_id; one that lacks it
+      // is still verified under its agent_id, like any other snapshot.
+      const scope = resolveHookSessionScope(JSON.parse(stdinText || "{}"));
+      const session_id = scope.treeSessionId ?? scope.sessionId;
       if (session_id) {
         const { ensureBootstrapped, ensureCoreEndpoint } = await import("../bootstrap.js");
         // Session snapshots contain transcript paths and payload data, so they

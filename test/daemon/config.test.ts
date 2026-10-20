@@ -243,6 +243,8 @@ describe("known configuration schema validation", () => {
     [{ daemon: { idleTimeoutMs: 86_400_001 } }, "daemon.idleTimeoutMs"],
     [{ hooks: { snapshotIntervalSec: 0.5 } }, "hooks.snapshotIntervalSec"],
     [{ hooks: { disableAutoCompact: "false" } }, "hooks.disableAutoCompact"],
+    [{ hooks: { preToolRecall: "true" } }, "hooks.preToolRecall"],
+    [{ hooks: { preToolRecall: 1 } }, "hooks.preToolRecall"],
     [{ summarizer: { mock: 1 } }, "summarizer.mock"],
     [{ security: { sensitivePatterns: ["valid", 1] } }, "security.sensitivePatterns.1"],
     [{ compaction: { leafTokens: 0 } }, "compaction.leafTokens"],
@@ -952,7 +954,14 @@ describe("loadDaemonConfig", () => {
     expect(config.hooks).toEqual({
       snapshotIntervalSec: 60,
       disableAutoCompact: false,
+      preToolRecall: false,
     });
+  });
+
+  it("accepts the opt-in PreToolUse recall boolean and keeps it default off", () => {
+    expect(parseDaemonConfig(JSON.stringify({ hooks: { preToolRecall: true } })).hooks.preToolRecall).toBe(true);
+    expect(parseDaemonConfig(JSON.stringify({ hooks: { preToolRecall: false } })).hooks.preToolRecall).toBe(false);
+    expect(parseDaemonConfig(JSON.stringify({ hooks: { snapshotIntervalSec: 30 } })).hooks.preToolRecall).toBe(false);
   });
 
   it("merges user-provided hooks config", () => {

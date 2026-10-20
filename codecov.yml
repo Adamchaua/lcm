@@ -316,6 +316,8 @@ component_management:
         # synchronous-origin tokens at asynchronous coordinator seams in this
         # existing owner; #1407 is its test and documentation debt.
         - "^src/storage/backend-publication\\.ts$"
+        - "^src/storage/backend-publication-driver\\.ts$"
+        - "^src/storage/backend-publication-material\\.ts$"
         # #910 keeps shared publication retry deadlines monotonic in this owner.
         - "^src/storage/publication-convergence\\.ts$"
         - "^src/storage/capabilities\\.ts$"
@@ -484,6 +486,10 @@ component_management:
         - "^src/storage/diagnostic-renderer\\.ts$"
         - "^src/storage/diagnostic-project\\.ts$"
         - "^src/storage/postgresql/diagnostics\\.ts$"
+        - "^src/storage/postgresql/query-operations\\.ts$"
+        - "^src/storage/postgresql/query-statistics\\.ts$"
+        - "^src/storage/runtime-health\\.ts$"
+        - "^src/storage/postgresql/runtime-health\\.ts$"
         # #997 keeps doctor publication retry deadlines monotonic in this owner.
         # #619 keeps observational doctor refusal guidance in this owner.
         - "src/doctor/"
@@ -574,6 +580,7 @@ component_management:
         # #1419 keeps the fence-mismatch versus invalid-row distinction in
         # this existing PostgreSQL-coordination owner.
         - "^src/storage/postgresql/publication-guard\\.ts$"
+        - "^src/storage/postgresql/publication-remote-guard\\.ts$"
     - component_id: "integration-postgresql-identity"
       name: "Integration - PostgreSQL Identity"
       paths:

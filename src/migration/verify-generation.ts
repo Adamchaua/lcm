@@ -1380,7 +1380,7 @@ export async function readSequenceSelfConsistencyMismatches(
   return mismatches;
 }
 
-function buildCensusVector(domains: readonly MigrationVerificationDomainCensus[]): MigrationCensusVector {
+export function buildMigrationCensusVector(domains: readonly MigrationVerificationDomainCensus[]): MigrationCensusVector {
   return parseMigrationCensusVector({
     version: 1,
     domains: domains.map((entry) => ({ domain: entry.domain, recordCount: entry.recordCount, prefixSha256: entry.prefixSha256 })),
@@ -1394,7 +1394,7 @@ function buildCensusVector(domains: readonly MigrationVerificationDomainCensus[]
   });
 }
 
-function buildCanonicalDelta(domains: readonly MigrationVerificationDomainCensus[]): MigrationCanonicalDelta {
+export function buildMigrationCanonicalDelta(domains: readonly MigrationVerificationDomainCensus[]): MigrationCanonicalDelta {
   return parseMigrationCanonicalDelta({
     version: 1,
     domains: domains.map((entry) => ({
@@ -2057,8 +2057,8 @@ async function computeVerificationReport(
       await assertLeaseHeld();
 
       const destinationCensus = destinationRead.census;
-      const censusVector = buildCensusVector(destinationCensus);
-      const canonicalDelta = buildCanonicalDelta(destinationCensus);
+      const censusVector = buildMigrationCensusVector(destinationCensus);
+      const canonicalDelta = buildMigrationCanonicalDelta(destinationCensus);
       const countMismatches = await receipted<MigrationVerificationMismatch[]>(
         "count-digest", [], () => reconcileCounts(sourceCheckpoints, destinationCensus),
       );

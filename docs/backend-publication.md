@@ -52,7 +52,10 @@ process birth, token, and health identity without replaying startup or taking
 the publication lock across a wait. The initially authenticated daemon identity
 is the sole source for the retry's version, backend, entrypoint, and runtime
 digest expectations; none of those fields can be omitted from a captured
-identity. A token rotation, PID or birth mismatch, changed
+identity. The window authenticates the lock owner recorded when the
+contention occurred, so a daemon that releases the lock before it can be read
+again still qualifies; a contention reported for a different lock does not. A
+token rotation, PID or birth mismatch, changed
 runtime/version/backend/entrypoint, missing or malformed owner,
 unknown publication home, health failure, timeout, cancellation, or any other
 non-contention error fails closed. Cancellation after contention rethrows the
@@ -178,8 +181,10 @@ compare-and-swap; completion is reserved for a caller that has authoritative
 terminal readback. A source-preserving abort verifies the original selection
 evidence and never invokes the version-2 target config/map restoration path.
 
-After `maintenance-aborted`, normal configuration loading resumes for SQLite,
-including installations whose configuration file is absent. After
+After `maintenance-aborted`, normal configuration loading resumes for the
+source backend the journal recorded when the window was entered: SQLite for an
+activation's window, including installations whose configuration file is
+absent, and PostgreSQL for a rollback's. After
 `selection-completed`, it resumes for the target backend recorded in the
 journal. Entering, held, and prepared maintenance continue to block normal
 configuration reads. A terminal journal for a different backend is also refused.
@@ -272,16 +277,10 @@ pre-journal directory state, does not block durable local enqueue. Existing
 journals must still have an authenticated supported shape; malformed or unknown
 versions and unsafe paths refuse. Consumer operations remain fenced until their
 own authoritative terminal readback.
-After an authenticated abort, SQLite consumer admission resumes. After selected-
-generation completion, only the recorded target backend is admitted -- for
-*new* consumer admission checks. A daemon process already running at that
-moment does not re-read this state: it resolved its storage backend once at
-its own startup and keeps using that resolution for the rest of its process
-lifetime, regardless of what selected-generation completion now admits. A
-cutover completing while such a daemon is still running therefore leaves a
-live process holding a stale startup backend until it is restarted; durable
-state is correct, but the cutover is not reportable as successful until a
-restart is confirmed (see issue #1384).
+After an authenticated abort, consumer admission resumes for the journal's
+recorded source backend (SQLite for an activation's window, PostgreSQL for a
+rollback's). After selected-generation completion, only the recorded target
+backend is admitted.
 
 A daemon that is already running authenticates its startup backend once and
 keeps it for its whole lifetime. Changing the configured backend underneath it
@@ -530,6 +529,166 @@ ordinary doctor/retry sequence only after evidence has been safely restored or
 resolved and a valid terminal publication, or a legitimately absent directory,
 has been re-established through the supported owning flow.
 
+## Constructing a coordinator and composing publication material
+
+Library callers (the migration activation and rollback work under Epic #92)
+do not construct a coordinator, build recovery material or implement a remote
+guard by hand. Four exports in `src/storage` cover that.
+
+- `createBackendPublicationCoordinator` (`backend-publication-driver.ts`) is
+  the one production construction site. It binds the coordinator to the merged
+  permit-gated config and project-map writers and adds no file-mutation code
+  of its own. The caller must state a remote guard choice, and there is no
+  default:
+  - `{ mode: "delegated", provider }` wires the three remote-guard hooks to a
+    provider that fences each project's PostgreSQL row. Every publication
+    that binds or unbinds a project needs this, because the coordinator
+    refuses a publication that names projects without a complete remote
+    guard provider.
+  - `{ mode: "absent", acknowledged: true }` is valid only for a publication
+    that names no projects. A bare `{ mode: "absent" }` is refused.
+- `createPostgreSqlBackendPublicationRemoteGuard`
+  (`postgresql/publication-remote-guard.ts`) is the production provider over
+  the PostgreSQL fenced publication lease. It takes the guard (for example
+  `PostgreSqlRuntime#backendPublicationGuard()`), this machine's PostgreSQL
+  machine id (a UUIDv7) and the lease lifetime in milliseconds (an integer up
+  to 24 hours), and it validates all three when it is created.
+- `composeBackendPublicationMaterial` (`backend-publication-material.ts`)
+  reads the live `config.json` and `map.json` and returns
+  `{ sourceBackend, targetBackend, material, projects }`. It runs the
+  stored-config validator on the composed target config and refuses with
+  `backend publication target config is invalid for <target>` before
+  anything is prepared, so a source config that the target backend would
+  reject (for example a null `storage.postgresql.migrationRole` composed for
+  PostgreSQL) never reaches the project map.
+- `readRetainedBackendPublicationMaterial` returns the retained recovery
+  material of the last completed publication.
+
+### How the pieces fit
+
+The consumer composes once, then passes the result on without re-deriving
+anything. Activation stores the recovery material with
+`publishActivationArtifact`, and both consumers prepare the publication:
+
+```ts
+const composed = composeBackendPublicationMaterial({ homeDir, targetBackend, bindings });
+
+publishActivationArtifact({
+  homeDir,
+  material: {
+    version: 1,
+    publicationId,
+    source: composed.material.source,
+    target: composed.material.target,
+    projects: composed.projects,
+  },
+});
+
+const coordinator = createBackendPublicationCoordinator({
+  homeDir,
+  remoteGuard: {
+    mode: "delegated",
+    provider: createPostgreSqlBackendPublicationRemoteGuard({ guard, machineId, ttlMs }),
+  },
+});
+await coordinator.prepare({
+  publicationId,
+  sourceBackend: composed.sourceBackend,
+  targetBackend: composed.targetBackend,
+  material: composed.material,
+  projects: composed.projects,
+});
+```
+
+`sourceBackend` is derived from the same captured `config.json` bytes that
+become `material.source.config`, so the backend the journal records always
+describes the bytes the publication can restore. It is PostgreSQL only when
+that config selects PostgreSQL, and a target equal to it is refused. Callers
+pass these values through and do not write the backends as literals.
+
+Each binding carries its own `evidenceSha256` from the caller. The composer
+checks only its shape and does not compute or verify the digest.
+
+### What the composed project map changes
+
+The enforced invariant is that the project-map entries whose remote binding
+differs between the live map and the composed target map are exactly the
+bindings, which are exactly `projects`. The live map is parsed with the
+project map's own rules, so an entry the map layer would reject is refused
+here too. The list must be non-empty (a limit of this composer; `prepare()` itself
+still accepts a publication with no projects) and name no project or remote
+twice. A
+PostgreSQL target binds projects that are currently unbound, and a SQLite
+target unbinds projects that are currently bound to exactly the stated remote.
+A stated remote that another map entry already holds is refused.
+
+Every other entry is carried through unchanged, and its existing remote
+binding is not part of the publication and not fenced by it. "Unchanged"
+means value-identical after the project map's normalization and serialization
+(unknown fields are dropped and remote ids are lowercased). Consumers that
+compare a composed target with retained material must run both sides through
+the same normalization, which holds when both come from the composer.
+
+### The remote guard provider
+
+The consumer acquires and renews the lease for each project before it drives
+the coordinator, so the coordinator normally finds an active fence for this
+publication and adopts it by reading it. The provider never renews a lease.
+When the coordinator does ask it to acquire, the provider reads the row first:
+
+- no row, or a released row: the guard inserts or replaces it;
+- an unexpired row of this exact generation (machine, publication, target
+  backend and evidence): the guard returns it unchanged;
+- an expired, unreleased row of this exact generation: the provider takes over
+  its own lapsed lease by naming that row's token, so the token advances and
+  the new fence is recorded in the journal. The journal's earlier token is
+  never used;
+- a row that names another target backend or evidence is a different
+  generation, not a failed read, while acquiring: a released one is replaced
+  by a new generation, and an unreleased one ends in the guard's
+  `publication-conflict` below. Reading for release still reports the
+  mismatch;
+- an unreleased row of any other generation: the guard refuses with
+  `publication-conflict` and the coordinator fails closed. A foreign
+  machine's row that is still active and names this publication, target
+  backend and evidence is refused by the provider itself, so a foreign fence
+  is never journalled as ours. An inactive foreign row is returned unchanged.
+  A released one can then be reclaimed by acquiring, but an expired row that
+  was never released fails closed with `publication-conflict`.
+
+The activation step's lease assertion before it drives the coordinator is a
+fail-fast check only. The coordinator re-reads the fence independently, so a
+lease that lapses in between is taken over by the coordinator's own
+acquisition as described above rather than failing there.
+
+### Reading retained material
+
+Read the retained material before the consumer's own `prepare()`. The
+completed journal stays in the live slot only until the next `prepare()`
+archives it, and the reader never looks in `history/`, so after a new
+`prepare()` the previous publication is no longer reachable through it.
+
+`readRetainedBackendPublicationMaterial` answers `present` (with the journal
+and the authenticated material), `authoritatively-absent` (the publication
+directory is confirmed absent, or the journal is not at `completed`), or
+`unresolvable` with a reason. `present` requires a completed journal that
+passes the same terminal-evidence checks as consumer access (a recovery
+reference, no active remote fence, published hashes equal to the intended
+hashes), material that authenticates, and the same journal checksum when the
+journal is re-read after the material read. The reader takes no lock, so
+`present` does not promise that the journal is still the live one when the
+call returns. A publication directory that exists without a readable
+journal, a completed journal that fails those checks or whose material file
+is missing or fails authentication, and a journal that changes while it is
+read are `unresolvable`; none of them is treated as "nothing to reverse".
+
+### What the driver leaves to the coordinator
+
+The driver deliberately leaves `retainCompletedMaterial` and
+`cleanupAbortedMaterial` undefined. The coordinator already keeps a completed
+publication's material file and deletes an aborted one's with its own bounded,
+digest-verified removal; a driver hook would replace that removal.
+
 ## Hard limits and rejection behavior
 
 The persistence boundary is deliberately bounded. The implementation applies
@@ -638,6 +797,8 @@ fails closed. A bounded process-birth or authenticated-health probe that
 settles failed at or after the armed deadline preserves the original
 contention without another wait; the same failed evidence while time remains
 reports the later contention, and admission stays fail-closed in both cases.
+The owner recorded with the contention is authenticated by the same process
+birth and health checks, even when its lock file has since been released.
 
 If a valid lock owner removes its lock while another process is reading that
 owner record, LCM retries acquisition once only when a retained-parent check

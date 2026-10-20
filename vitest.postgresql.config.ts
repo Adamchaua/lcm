@@ -51,6 +51,12 @@ export function createPostgresqlVitestConfiguration(
       maxWorkers,
       testTimeout: 30_000,
       hookTimeout: 30_000,
+      // The harness fails closed when a child stream exceeds its 64 KiB capture cap, even for a
+      // green run. The default reporter lists every passing test that runs longer than this
+      // threshold (300 ms), which is nearly all of the integration tests and about 49 KB of the
+      // output. Raising it drops those lines from passing files; every file line with its test
+      // count and duration, every failure, and the run summary stay.
+      slowTestThreshold: 600_000,
     },
   };
 }

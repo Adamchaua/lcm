@@ -1140,11 +1140,15 @@ describe("passive-event replication pass", () => {
         machineId: "machine-uuid",
         acquireDrainLease: vi.fn().mockResolvedValue({ fencingToken }),
         renewDrainLease: vi.fn().mockResolvedValue({ fencingToken }),
-        claimEvents: vi.fn().mockResolvedValue(options.claims ?? []),
+        // The supplied claims are handed out once: completeApplied is a bare
+        // mock, so a row returned again would be applied again until the
+        // claim budget ran out.
+        claimEvents: vi.fn().mockResolvedValueOnce(options.claims ?? []).mockResolvedValue([]),
         completeApplied: vi.fn(),
         insertEvents: vi.fn().mockResolvedValue([remoteEvent("pending")]),
         readEvents: vi.fn().mockResolvedValue([remoteEvent("applied")]),
         releaseDrainLease: vi.fn().mockResolvedValue(undefined),
+        releaseFromOtherProjects: vi.fn().mockResolvedValue([]),
       };
       const harness = modules({
         resolveProjectIdentity: vi.fn(() => state.current ?? { remoteProjectId: null }),
@@ -1436,6 +1440,9 @@ describe("passive-event replication pass", () => {
         renewDrainLease: async () => ({ fencingToken: 1n }),
         releaseDrainLease: async () => undefined,
         insertEvents: async (inputs: ReadonlyArray<Omit<InboxRow, "inboxId" | "projectId" | "status">>) => {
+          // The real insert is one transaction: a row that fails rolls back
+          // every row inserted before it in the same batch.
+          const staged: InboxRow[] = [];
           const inserted = inputs.map(input => {
             const existing = find(input.machineId, input.eventId);
             if (existing !== undefined && existing.projectId !== projectId) {
@@ -1444,10 +1451,13 @@ describe("passive-event replication pass", () => {
             if (existing !== undefined) return existing;
             const row: InboxRow = { ...input, inboxId: nextInboxId, projectId, status: "pending" };
             nextInboxId += 1n;
-            rows.push(row);
-            insertions.push(`${projectId}:${input.machineSequence.toString()}`);
+            staged.push(row);
             return row;
           });
+          for (const row of staged) {
+            rows.push(row);
+            insertions.push(`${projectId}:${row.machineSequence.toString()}`);
+          }
           return inserted.map(record);
         },
         readEvents: async (keys: ReadonlyArray<{ machineId: string; eventId: string }>) =>
@@ -1507,12 +1517,17 @@ describe("passive-event replication pass", () => {
       const sidecar = join(directory, "events.db");
       const factory = new SQLiteLocalHookOutboxFactory();
       const inbox = sharedInbox(applying);
-      const state = { project: PROJECT_A };
+      const state = { project: PROJECT_A, checks: 0, movesAfter: Number.POSITIVE_INFINITY };
       const binding = () => ({ remoteProjectId: state.project });
+      // Counts the per-phase binding checks so a move can land at a chosen phase.
+      const existingBinding = () => {
+        state.checks += 1;
+        return state.checks > state.movesAfter ? { remoteProjectId: PROJECT_B } : binding();
+      };
       const harness = modules({
         readMachineIdentity: vi.fn().mockReturnValue({ ...REGISTERED_IDENTITY, machineId: MACHINE }),
         resolveProjectIdentity: vi.fn(binding),
-        resolveExistingProjectIdentity: vi.fn(binding),
+        resolveExistingProjectIdentity: vi.fn(existingBinding),
         createOutboxFactory: () => factory,
         createRepository: vi.fn((_runtime: unknown, projectId: string, machineId: string) =>
           inbox.repositoryFor(projectId, machineId)),
@@ -1558,6 +1573,24 @@ describe("passive-event replication pass", () => {
         onError,
         run: () => pass.run("/proj", undefined, sidecar),
         relink: (project: string) => { state.project = project; },
+        moveAfterChecks: (checks: number) => {
+          state.checks = 0;
+          state.movesAfter = checks;
+        },
+        forgetRemoteInboxIds: () => {
+          // The upload to the previous project committed, but the local
+          // record of it was lost: the rows are pending again.
+          const raw = new DatabaseSync(sidecar);
+          try {
+            raw.exec(
+              "UPDATE events SET delivery_state = 'pending', remote_inbox_id = NULL, "
+              + "delivery_owner = NULL, delivery_claimed_at = NULL, "
+              + "delivery_next_attempt_at = datetime('now', '-1 minute')",
+            );
+          } finally {
+            raw.close();
+          }
+        },
       };
     }
 
@@ -1630,6 +1663,53 @@ describe("passive-event replication pass", () => {
       expect(sequences[2]).toBe(sequences[0]);
     });
 
+    describe("a pending row whose earlier upload landed in the previous project (#1511)", () => {
+      async function lostRecordScenario() {
+        const scenario = await relinkScenario(new Set([PROJECT_B]));
+        await scenario.insert("unrelated row");
+        await scenario.insert("row whose local record was lost");
+        await scenario.run();
+        expect(scenario.inbox.rows.map(row => row.projectId)).toEqual([PROJECT_A, PROJECT_A]);
+        // The first row's copy is gone everywhere; the second one's copy is
+        // still pending in the previous project. Both rows are pending locally.
+        scenario.inbox.rows.shift();
+        scenario.forgetRemoteInboxIds();
+        expect(scenario.states().map(row => row.state)).toEqual(["pending", "pending"]);
+        return scenario;
+      }
+
+      it("delivers it and the rest of its batch in the same pass", async () => {
+        const scenario = await lostRecordScenario();
+        scenario.relink(PROJECT_B);
+
+        await expect(scenario.run()).resolves.toMatchObject({
+          uploaded: 2,
+          applied: 2,
+          acknowledged: 2,
+          pruned: 2,
+        });
+        // Both rows went to the new project in their local order, and the
+        // previous project no longer holds a copy.
+        expect(scenario.inbox.insertions.slice(2).map(entry => entry.split(":")[0]))
+          .toEqual([PROJECT_B, PROJECT_B]);
+        expect(scenario.inbox.rows).toEqual([]);
+        expect(scenario.states().every(row => row.state === "acknowledged" && row.pruned)).toBe(true);
+        expect(scenario.onError).not.toHaveBeenCalled();
+      });
+
+      it("sends nothing and withdraws nothing once the binding moved before the upload", async () => {
+        const scenario = await lostRecordScenario();
+        const before = scenario.inbox.insertions.length;
+        // The lease phase still sees project A; the upload phase sees B.
+        scenario.moveAfterChecks(1);
+
+        await scenario.run();
+        expect(scenario.inbox.insertions.length).toBe(before);
+        expect(scenario.inbox.rows.map(row => row.projectId)).toEqual([PROJECT_A]);
+        expect(scenario.states().map(row => row.state)).toEqual(["pending", "pending"]);
+      });
+    });
+
     function guardedRecovery(goodChecks: number) {
       const fixture = relinkHarness(goodChecks, REBOUND, { row: true });
       const replicated = { ...LOCAL_EVENT, remote_inbox_id: "41" };
@@ -1668,6 +1748,75 @@ describe("passive-event replication pass", () => {
       expect(fixture.remote.releaseFromOtherProjects).not.toHaveBeenCalled();
       expect(fixture.local.requeueReplicated).not.toHaveBeenCalled();
       expect(onError).toHaveBeenCalledWith(expect.any(ReplicationBindingChangedError));
+      await pass.close();
+    });
+
+    /**
+     * Two events of one machine already sit in the previous project's inbox.
+     * The claim fake hands out only the earliest non-terminal row and nothing
+     * while that row is unfinished, and completeApplied runs the effect and
+     * terminalizes the row, so the successor is claimable only after its
+     * predecessor has been applied (#1530).
+     */
+    function successorInbox(goodChecks: number) {
+      const fixture = guardedRecovery(goodChecks);
+      const rows = [
+        { eventId: "event-1", state: "pending" },
+        { eventId: "event-2", state: "pending" },
+      ];
+      fixture.remote.claimEvents.mockReset();
+      fixture.remote.claimEvents.mockImplementation(async () => {
+        const head = rows.find(row => row.state !== "applied");
+        if (head === undefined || head.state !== "pending") return [];
+        head.state = "claimed";
+        return [{ eventId: head.eventId, eventVersion: 1, machineId: "machine-uuid" }];
+      });
+      fixture.remote.completeApplied.mockReset();
+      fixture.remote.completeApplied.mockImplementation(async (
+        input: { claim: { eventId: string } },
+        effect: (executor: unknown, claim: unknown) => Promise<void>,
+      ) => {
+        await effect({}, input.claim);
+        rows.find(row => row.eventId === input.claim.eventId)!.state = "applied";
+      });
+      return fixture;
+    }
+
+    it("keeps claiming the old project's successors after the project is relinked between fetches (#1530)", async () => {
+      const home = publicationHome();
+      // Admissions: 1 lease, 2 upload, 3 renew, 4 first fetch, 5 first
+      // apply, 6 renew before the second fetch. The relink is first seen
+      // by the sixth binding read, which latches, so the proxy stops reading
+      // exactly there and the second fetch, second apply and everything
+      // after run with the binding already moved.
+      const fixture = successorInbox(5);
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ applied: 2 });
+      expect(fixture.resolveExistingProjectIdentity).toHaveBeenCalledTimes(6);
+      expect(fixture.remote.claimEvents).toHaveBeenCalledTimes(3);
+      expect(fixture.remote.completeApplied).toHaveBeenCalledTimes(2);
+      // No new local row goes to the old project, and the copies this
+      // machine holds in other projects are not withdrawn or requeued, even
+      // though reconcile reaches its recovery for the absent replicated row.
+      expect(fixture.local.claimDeliveries).toHaveBeenCalledTimes(1);
+      expect(fixture.remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+      expect(fixture.local.requeueReplicated).not.toHaveBeenCalled();
+      expectReportedOnce(fixture, onError);
+      await pass.close();
+    });
+
+    it("reaches the recovery of the absent replicated row when the binding does not move", async () => {
+      const home = publicationHome();
+      const fixture = successorInbox(Number.MAX_SAFE_INTEGER);
+      const onError = vi.fn();
+      const pass = admittedPass(fixture.harness, home, onError);
+      await expect(pass.run("/proj", undefined, SIDECAR)).resolves.toMatchObject({ applied: 2 });
+      expect(fixture.remote.claimEvents).toHaveBeenCalledTimes(3);
+      expect(fixture.remote.completeApplied).toHaveBeenCalledTimes(2);
+      expect(fixture.remote.releaseFromOtherProjects).toHaveBeenCalledTimes(1);
+      expect(fixture.local.requeueReplicated).toHaveBeenCalledWith("event-1", 41n);
+      expect(onError).not.toHaveBeenCalled();
       await pass.close();
     });
   });

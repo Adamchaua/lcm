@@ -23,13 +23,14 @@ import {
   fstatSync,
   lstatSync,
   openSync,
-  readFileSync,
   readSync,
   readdirSync,
+  realpathSync,
+  statSync,
 } from "node:fs";
-import { join, basename } from "node:path";
+import { join, basename, sep } from "node:path";
 import { homedir } from "node:os";
-import { estimateTokens } from "./transcript.js";
+import { estimateTokens, readTranscriptFileText } from "./transcript.js";
 import type { ParsedMessage } from "./transcript.js";
 
 // ---------------------------------------------------------------------------
@@ -96,19 +97,251 @@ function extractCodexText(content: string | CodexContentBlock[] | undefined): st
  * Returns an empty array on any read or parse error.
  */
 export function parseCodexTranscript(transcriptPath: string): ParsedMessage[] {
-  let raw: string;
-  try {
-    raw = readFileSync(transcriptPath, "utf-8");
-  } catch {
-    return [];
-  }
+  const raw = readTranscriptFileText(transcriptPath);
+  if (raw === undefined) return [];
 
   return parseCodexTranscriptText(raw);
 }
 
-/** Parse already-bound transcript bytes without reopening a pathname. */
-export function parseCodexTranscriptText(raw: string): ParsedMessage[] {
+/**
+ * Where the history a Codex rollout inherited from its parent ends.
+ *
+ * - `ordinal`: a forked subagent. Records persisted before `start` (by their
+ *   top-level ordinal) are the parent's inherited context.
+ * - `copied-fork` with `startRecord`: a user fork that copied its parent's
+ *   rollout. Records before the first thread_settings_applied event of the
+ *   fork's own thread (by native source ordinal) are the parent's.
+ * - `copied-fork` with `pending`: a user fork that has not written that event
+ *   yet. Every record is still the parent's.
+ */
+export type CodexInheritedBoundary =
+  | {
+    readonly kind: "ordinal";
+    readonly start: number;
+    /** Only a paginated rollout reliably stamps every persisted record with an ordinal. */
+    readonly paginated: boolean;
+  }
+  | { readonly kind: "copied-fork"; readonly startRecord: number; readonly pending?: undefined }
+  | { readonly kind: "copied-fork"; readonly pending: true; readonly startRecord?: undefined };
+
+/**
+ * The ordinal boundary as callers passed it before boundaries had a kind; it
+ * is still accepted and means the `ordinal` variant.
+ */
+export interface CodexOrdinalBoundaryWithoutKind {
+  readonly kind?: undefined;
+  readonly start: number;
+  readonly paginated: boolean;
+}
+
+/** What the native transcript options accept as an inherited-history boundary. */
+export type CodexInheritedBoundaryInput = CodexInheritedBoundary | CodexOrdinalBoundaryWithoutKind;
+
+function isCodexOrdinal(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Read the inherited-history boundary from already-bound transcript bytes.
+ * Codex writes a subagent's own session_meta as the first record, so only the
+ * first non-blank record is consulted; a later session_meta is ignored.
+ */
+export function readCodexInheritedBoundary(raw: string): CodexInheritedBoundary | undefined {
+  const payload = firstSessionMetaPayload(raw);
+  const start = payload?.subagent_history_start_ordinal;
+  // A valid subagent ordinal wins; anything else falls through to a copied fork.
+  if (payload !== undefined && isCodexOrdinal(start)) {
+    return { kind: "ordinal", start, paginated: payload.history_mode === "paginated" };
+  }
+  return readCopiedForkBoundary(raw);
+}
+
+/**
+ * Largest line the native transcript reader accepts. It still counts a longer
+ * line as a record, so this number only matters for blank lines of that size.
+ */
+const NATIVE_RECORD_BYTE_LIMIT = 10 * 1024 * 1024;
+
+/**
+ * The physical lines the native transcript reader counts, with the position it
+ * gives each one (its sourceOrdinal). A line counts unless every byte is a tab,
+ * a carriage return or a space; malformed, non-container, duplicate-key and
+ * oversized lines all count. This is deliberately not String.trim(), which also
+ * treats VT, FF, NBSP and other Unicode spaces as blank.
+ */
+function* nativeSourceLines(raw: string): Generator<{ position: number; line: string; oversized: boolean }> {
+  let position = 0;
+  for (const line of raw.split("\n")) {
+    const oversized = line.length * 3 > NATIVE_RECORD_BYTE_LIMIT
+      && Buffer.byteLength(line, "utf8") > NATIVE_RECORD_BYTE_LIMIT;
+    if (!oversized && /^[\t\r ]*$/u.test(line)) continue;
+    yield { position, line, oversized };
+    position += 1;
+  }
+}
+
+/** One counted line as JSON, or undefined when the native reader could not use it. */
+function parseNativeSourceLine(line: string, oversized: boolean): unknown {
+  if (oversized) return undefined;
+  try {
+    // The native decoder drops a byte order mark before parsing each record.
+    return JSON.parse(line.charCodeAt(0) === 0xfeff ? line.slice(1) : line);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The boundary of a user fork that copied its parent's rollout. Positions are
+ * native source ordinals so the stored messages and the native links of one
+ * fork always agree on which records are inherited. Anything uncertain returns
+ * undefined, which keeps today's full parse.
+ */
+function readCopiedForkBoundary(raw: string): CodexInheritedBoundary | undefined {
+  let threadId: string | undefined;
+  for (const { position, line, oversized } of nativeSourceLines(raw)) {
+    const record = parseNativeSourceLine(line, oversized);
+    if (position === 0) {
+      // Only the first counted line may be the fork's session_meta; no scanning ahead.
+      const meta = isRecord(record) && record.type === "session_meta" && isRecord(record.payload)
+        ? record.payload
+        : undefined;
+      if (meta === undefined) return undefined;
+      const { id, forked_from_id: forkedFromId, history_base: historyBase } = meta;
+      if (
+        typeof id !== "string" || id === ""
+        || typeof forkedFromId !== "string" || forkedFromId === "" || forkedFromId === id
+        // A referenced fork keeps its history elsewhere, so nothing is copied.
+        || (historyBase !== undefined && historyBase !== null)
+      ) return undefined;
+      threadId = id;
+      continue;
+    }
+    if (!isRecord(record) || record.type !== "event_msg" || !isRecord(record.payload)
+      || record.payload.type !== "thread_settings_applied") continue;
+    const settingsThreadId = record.payload.thread_id;
+    // A settings event that does not name its thread cannot be attributed.
+    if (typeof settingsThreadId !== "string" || settingsThreadId === "") return undefined;
+    if (settingsThreadId === threadId) return { kind: "copied-fork", startRecord: position };
+  }
+  return threadId === undefined ? undefined : { kind: "copied-fork", pending: true };
+}
+
+/** A Codex rollout's first session_meta identifies the rollout and its immediate parent. */
+export interface CodexSessionParent {
+  readonly id: string;
+  readonly parentThreadId: string;
+}
+
+/**
+ * Read the rollout's own id and immediate parent thread from already-bound
+ * bytes. Independent of the inherited-history boundary: only the first
+ * non-blank record is consulted, and both fields must be strings.
+ */
+export function readCodexSessionParent(raw: string): CodexSessionParent | undefined {
+  const payload = firstSessionMetaPayload(raw);
+  if (payload === undefined) return undefined;
+  const { id, parent_thread_id: parentThreadId } = payload;
+  return typeof id === "string" && typeof parentThreadId === "string"
+    ? { id, parentThreadId }
+    : undefined;
+}
+
+function firstSessionMetaPayload(raw: string): Record<string, unknown> | undefined {
+  let offset = 0;
+  while (offset <= raw.length) {
+    const newline = raw.indexOf("\n", offset);
+    const end = newline === -1 ? raw.length : newline;
+    const trimmed = raw.slice(offset, end).trim();
+    offset = end + 1;
+    if (!trimmed) continue;
+    let first: unknown;
+    try {
+      first = JSON.parse(trimmed);
+    } catch {
+      return undefined;
+    }
+    if (!isRecord(first) || first.type !== "session_meta" || !isRecord(first.payload)) return undefined;
+    return first.payload;
+  }
+  return undefined;
+}
+
+function isInheritedByOrdinal(
+  record: unknown,
+  boundary: Extract<CodexInheritedBoundary, { kind: "ordinal" }>,
+): boolean {
+  const ordinal = isRecord(record) ? record.ordinal : undefined;
+  return isCodexOrdinal(ordinal) ? ordinal < boundary.start : boundary.paginated;
+}
+
+/**
+ * True when a parsed record belongs to the parent history a rollout inherited.
+ * A subagent's boundary ordinal itself is its first own record and only numeric
+ * fields are consulted, so scrubbing cannot change the outcome. A copied fork
+ * is classified by `position`, the record's native source ordinal, and ignores
+ * the record's own ordinal.
+ */
+export function isInheritedSubagentRecord(
+  record: unknown,
+  boundary: CodexInheritedBoundary | undefined,
+  position: number,
+): boolean {
+  if (boundary === undefined) return false;
+  if (boundary.kind === "ordinal") return isInheritedByOrdinal(record, boundary);
+  return boundary.pending === true || position < boundary.startRecord;
+}
+
+export interface CodexParseOptions {
+  /** Drop the parent history a forked subagent inherited. */
+  readonly excludeInheritedSubagentHistory?: boolean;
+}
+
+/** The user or assistant message a response_item line carries, if any. */
+function codexMessageOf(obj: CodexLine): ParsedMessage | undefined {
+  const payload = obj.payload as CodexResponseItemPayload | undefined;
+  if (!payload || payload.type !== "message") return undefined;
+
+  const role = payload.role;
+  if (!role || !["user", "assistant"].includes(role)) return undefined;
+
+  const content = extractCodexText(payload.content);
+  if (!content.trim()) return undefined;
+
+  return { role, content, tokenCount: estimateTokens(content) };
+}
+
+/**
+ * The messages a copied fork wrote itself. Lines are counted as the native
+ * reader counts them, and a line that is not a record contributes nothing
+ * instead of failing the walk.
+ */
+export function parseCodexCopiedForkMessages(
+  raw: string,
+  boundary: Extract<CodexInheritedBoundary, { kind: "copied-fork" }>,
+): ParsedMessage[] {
   const messages: ParsedMessage[] = [];
+  for (const { position, line, oversized } of nativeSourceLines(raw)) {
+    if (isInheritedSubagentRecord(undefined, boundary, position)) continue;
+    const obj = parseNativeSourceLine(line, oversized);
+    if (!isRecord(obj) || obj.type !== "response_item") continue;
+    const message = codexMessageOf(obj);
+    if (message !== undefined) messages.push(message);
+  }
+  return messages;
+}
+
+/** Parse already-bound transcript bytes without reopening a pathname. */
+export function parseCodexTranscriptText(raw: string, options: CodexParseOptions = {}): ParsedMessage[] {
+  const messages: ParsedMessage[] = [];
+  const boundary = options.excludeInheritedSubagentHistory === true
+    ? readCodexInheritedBoundary(raw)
+    : undefined;
+  if (boundary?.kind === "copied-fork") return parseCodexCopiedForkMessages(raw, boundary);
 
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
@@ -123,17 +356,10 @@ export function parseCodexTranscriptText(raw: string): ParsedMessage[] {
 
     // Only response_item lines carry user/assistant messages
     if (obj.type !== "response_item") continue;
+    if (boundary !== undefined && isInheritedByOrdinal(obj, boundary)) continue;
 
-    const payload = obj.payload as CodexResponseItemPayload | undefined;
-    if (!payload || payload.type !== "message") continue;
-
-    const role = payload.role;
-    if (!role || !["user", "assistant"].includes(role)) continue;
-
-    const content = extractCodexText(payload.content);
-    if (!content.trim()) continue;
-
-    messages.push({ role, content, tokenCount: estimateTokens(content) });
+    const message = codexMessageOf(obj);
+    if (message !== undefined) messages.push(message);
   }
 
   return messages;
@@ -166,7 +392,7 @@ export function extractCodexSessionMeta(transcriptPath: string): CodexSessionMet
   let fd: number | undefined;
   let raw: string;
   try {
-    fd = openSync(transcriptPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = openSync(transcriptPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const leaf = fstatSync(fd);
     if (!leaf.isFile()) return undefined;
     const size = Math.min(leaf.size, MAX_CODEX_SESSION_META_PREFIX_BYTES);
@@ -208,6 +434,123 @@ export function extractCodexSessionMeta(transcriptPath: string): CodexSessionMet
   }
 
   return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// LCM restoration proof
+// ---------------------------------------------------------------------------
+
+/** First line of every Codex SessionStart restoration LCM prints. */
+export const LCM_RESTORATION_MARKER = "<!-- lcm-restoration -->";
+
+const MAX_LIVE_RESTORATION_WINDOW_BYTES = 64 * 1024 * 1024;
+
+/** True when the text, after leading whitespace, is the marker alone on its first line. */
+function startsWithMarkerLine(text: string): boolean {
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith(LCM_RESTORATION_MARKER)) return false;
+  const rest = trimmed.slice(LCM_RESTORATION_MARKER.length);
+  return rest === "" || rest.startsWith("\n") || rest.startsWith("\r\n");
+}
+
+/** Message text from block-array content; any other shape yields "". */
+function messageText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block: unknown) => (isRecord(block) && typeof block.text === "string" ? block.text : ""))
+    .join("\n");
+}
+
+/**
+ * Decide whether rollout text still holds an LCM restoration that is live in the
+ * model context: a developer message starting with the restoration marker that
+ * follows the last compaction and the last rollback. Compaction drops hook
+ * context and rollback removes trailing turns, so either resets the proof. A
+ * line that is not valid JSON may hide either record, so it resets it too.
+ * Valid JSON of any other shape is inert: it never throws and never counts as
+ * a marker.
+ */
+export function scanLiveCodexRestoration(raw: string): boolean {
+  let live = false;
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      live = false;
+      continue;
+    }
+    if (!isRecord(obj)) continue;
+    const payload = isRecord(obj.payload) ? obj.payload : {};
+    if (obj.type === "compacted") {
+      live = false;
+    } else if (obj.type === "event_msg" && payload.type === "thread_rolled_back") {
+      live = false;
+    } else if (
+      obj.type === "response_item"
+      && payload.type === "message"
+      && payload.role === "developer"
+      && startsWithMarkerLine(messageText(payload.content))
+    ) {
+      live = true;
+    }
+  }
+  return live;
+}
+
+function isUnder(root: string, candidate: string): boolean {
+  return candidate.startsWith(`${root}${sep}`);
+}
+
+function isCodexRolloutPath(real: string, codexHome: string): boolean {
+  return ["sessions", "archived_sessions"].some((name) => {
+    try {
+      return isUnder(realpathSync(join(codexHome, name)), real);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * Prove from a session's own rollout file that a live LCM restoration exists.
+ * Opens the given path once (a symlink leaf fails to open), then requires the
+ * descriptor to be a regular file whose identity matches the path's realpath
+ * under CODEX_HOME (default ~/.codex) sessions or archived_sessions. Reads at
+ * most the last 64 MiB. Any failure or mismatch yields false.
+ */
+export function readLiveCodexRestoration(
+  transcriptPath: unknown,
+  options: { codexHome?: string; maxBytes?: number } = {},
+): boolean {
+  if (typeof transcriptPath !== "string" || !transcriptPath) return false;
+  const codexHome = options.codexHome ?? (process.env.CODEX_HOME || join(homedir(), ".codex"));
+  const maxBytes = options.maxBytes ?? MAX_LIVE_RESTORATION_WINDOW_BYTES;
+  let fd: number | undefined;
+  try {
+    fd = openSync(transcriptPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return false;
+    const real = realpathSync(transcriptPath);
+    if (!isCodexRolloutPath(real, codexHome)) return false;
+    const current = statSync(real);
+    if (current.dev !== stat.dev || current.ino !== stat.ino) return false;
+    const start = Math.max(0, stat.size - maxBytes);
+    const buffer = Buffer.alloc(stat.size - start);
+    const read = readSync(fd, buffer, 0, buffer.length, start);
+    let raw = buffer.subarray(0, read).toString("utf8");
+    if (start > 0) {
+      const newline = raw.indexOf("\n");
+      raw = newline === -1 ? "" : raw.slice(newline + 1);
+    }
+    return scanLiveCodexRestoration(raw);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 // ---------------------------------------------------------------------------

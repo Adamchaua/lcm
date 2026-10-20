@@ -1063,10 +1063,27 @@ describe("reconcileArtifactScratchTwin: internal branch coverage", () => {
     writeFileSync(unrelatedPath, "not a writer scratch file", { mode: 0o600 });
     linkSync(unrelatedPath, finalPath);
     const looseName = "." + digest + ".material." + randomBytes(12).toString("hex") + ".tmp";
-    writeFileSync(join(directory, looseName), "wrong mode", { mode: 0o644 });
-    expect(() => publishActivationArtifact({ homeDir, material })).toThrow(
-      ActivationArtifactPresenceUnresolvableError,
-    );
+    const candidatePath = join(directory, looseName);
+    writeFileSync(candidatePath, "wrong mode", { mode: 0o644 });
+    chmodSync(candidatePath, 0o644);
+    expect(statSync(candidatePath).mode & 0o777).toBe(0o644);
+    const candidateReadErrors: unknown[] = [];
+    expect(() =>
+      publishActivationArtifact(
+        { homeDir, material },
+        {
+          readWithStat: (path: string, options: BoundedFileOptions) => {
+            try {
+              return readBoundedRegularFileWithStat(path, options);
+            } catch (error) {
+              if (path === candidatePath) candidateReadErrors.push(error);
+              throw error;
+            }
+          },
+        },
+      ),
+    ).toThrow(ActivationArtifactPresenceUnresolvableError);
+    expect(candidateReadErrors).toHaveLength(1);
   });
 
   it("is unresolvable when a name-matching candidate read is itself unresolvable", () => {

@@ -211,6 +211,7 @@ const REQUIRED_COLUMN_PRIVILEGES: readonly ColumnPrivilegeSpec[] = [
   ["conversations", "title", "INSERT"],
   ["conversations", "bootstrapped_at", "UPDATE"],
   ["conversations", "updated_at", "UPDATE"],
+  ["conversations", "parent_session_id", "UPDATE"],
   ["messages", "project_id", "INSERT"],
   ["messages", "conversation_id", "INSERT"],
   ["messages", "seq", "INSERT"],
@@ -752,6 +753,13 @@ const OPTIONAL_RELATION_PRIVILEGES: readonly RelationPrivilegeSpec[] = [
   ["ingest_checkpoints", ["SELECT"]],
 ];
 
+const MESSAGE_PARTS_TRANSCRIPT_COLUMNS = [
+  "project_id",
+  "conversation_id",
+  "message_id",
+  "part_type",
+] as const;
+
 const OPTIONAL_COLUMN_PRIVILEGES: readonly ColumnPrivilegeSpec[] = [
   ["conversations", "project_id", "SELECT"],
   ["conversations", "conversation_id", "SELECT"],
@@ -764,6 +772,10 @@ const OPTIONAL_COLUMN_PRIVILEGES: readonly ColumnPrivilegeSpec[] = [
   ["messages", "seq", "SELECT"],
   ["messages", "role", "SELECT"],
   ["messages", "content", "SELECT"],
+  ["message_parts", "project_id", "SELECT"],
+  ["message_parts", "conversation_id", "SELECT"],
+  ["message_parts", "message_id", "SELECT"],
+  ["message_parts", "part_type", "SELECT"],
   ["native_transcripts", "project_id", "INSERT"],
   ["native_transcripts", "machine_id", "INSERT"],
   ["native_transcripts", "client_name", "INSERT"],
@@ -840,6 +852,7 @@ export const POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST: PostgreSqlRuntimePrivilegeM
       ["conversations", "bootstrapped_at", "INSERT"],
       ["conversations", "created_at", "INSERT"],
       ["conversations", "updated_at", "INSERT"],
+      ["conversations", "parent_session_id", "INSERT"],
       ["messages", "created_at", "INSERT"],
       ["message_parts", "part_id", "INSERT"],
       ["message_parts", "is_ignored", "INSERT"],
@@ -3955,6 +3968,14 @@ async function verifyPostgreSqlSchema(
       ...relationOptionalPrivileges,
       ...columnOptionalPrivileges,
     ]);
+    if (observed.size !== 0) {
+      // A transcript role granted before these column grants existed reads
+      // them through its conversation table SELECT; the effective-privilege
+      // check below still proves that read.
+      for (const column of MESSAGE_PARTS_TRANSCRIPT_COLUMNS) {
+        observed.add(privilegeKey(columnEntry("message_parts", column, "SELECT")));
+      }
+    }
     const exactOptionalKeys = new Set(
       manifest.optional.map(privilegeKey),
     );
