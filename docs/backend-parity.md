@@ -33,10 +33,10 @@ The matrix uses these expectation classes:
 | `architecture-specific` | The matrix records why the outcomes differ and checks the actual counterpart result or refusal. |
 | `grammar` | The public command grammar, help, or default dispatch is checked in both configured contexts. |
 
-Control tests own root grammar and the 19 setup, service, configuration, connector,
+Control tests own root grammar and the 20 setup, service, configuration, connector,
 MCP-launch, help, and group commands named by the inventory. Data workers own the
-other 40 CLI commands, including identity, events, diagnostics, hooks, and
-sensitive-memory operations. Setup calls do not create another completion result
+other 51 CLI commands, including identity, events, migration cutover, diagnostics,
+hooks, and sensitive-memory operations. Setup calls do not create another completion result
 for a row owned by another scenario. Backend independence is an expectation to
 test, rather than permission to omit execution.
 

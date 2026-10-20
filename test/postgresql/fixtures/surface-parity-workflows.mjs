@@ -801,7 +801,7 @@ export async function runSurfaceScenario(scenario, context) {
   if (scenario === "compaction") return compaction(owned);
   if (scenario === "diagnostics") return diagnostics(owned);
   if (["native-import", "knowledge"].includes(scenario)) return runImportScenario(scenario, owned);
-  if (["identity", "admin", "events", "sensitive"].includes(scenario)) return runIdentityScenario(scenario, owned);
+  if (["identity", "admin", "migration", "events", "sensitive"].includes(scenario)) return runIdentityScenario(scenario, owned);
   if (["hooks", "promotion"].includes(scenario)) return runHookScenario(scenario, owned);
   throw new Error(`surface-parity:unknown-scenario:${scenario}`);
 }
