@@ -593,9 +593,14 @@ A `SubagentStop` payload without a valid `agent_id` or without
   prefix) extends what is already stored. If the stored messages match neither
   reading, for example after the rollout was rewritten, LCM appends nothing for
   that subagent, writes a diagnostic to the hook error log, and leaves the rest
-  of the conversation untouched. Adding, removing or changing a sensitive
-  pattern (or a built-in scrubber change) after a subagent was stored changes
-  how its text is redacted, so it has the same effect for that subagent.
+  of the conversation untouched. The same happens when a compaction event
+  written by an earlier version already took a transcript position, or when the
+  subagent's session is split across several conversations, because its stored
+  messages then no longer line up with either reading. Compaction event rows
+  are ignored when the stored messages are compared. Adding, removing or
+  changing a sensitive pattern (or a built-in scrubber change) after a subagent
+  was stored changes how its text is redacted, so it has the same effect for
+  that subagent.
 - When one session id has several stored conversations, ingest continues to
   append to the most recent one, as it does for every other client.
 - Sibling subagents count as distinct sessions for passive pattern
@@ -791,3 +796,34 @@ misses, plus `unsupported-pending-after-quarantine`,
 records. The added text contains no transcript content; the error-log row still
 carries the session ID and working directory as before. Older rows keep the
 previous fixed sentence.
+
+### Compaction events and transcript slicing
+
+A compaction pass stores an event row beside the conversation: a message whose
+parts include a compaction part. Event rows are not transcript messages. They
+occupy a message sequence number, appear in message counts such as the
+`/compact` `finalMsgCount` and the `/session-complete` total, and are excluded
+from the transcript order that native linkage uses.
+
+`/ingest` and `/compact` store only the part of a transcript that LCM has not
+stored yet. The stored part is the session's transcript messages plus the event
+rows that took one position of the transcript list at the time they were
+written, counted across every conversation of the session. New messages go to
+the newest conversation of the session. A message that arrives after a
+compaction event is therefore stored instead of being skipped, and re-sending
+the same transcript stores nothing. A recorded `/session-complete` count no
+longer stops `/ingest`; the stored transcript decides what is new.
+
+LCM remembers which events took a position with a `snapshot` part on the event
+message whose metadata carries the `lcmTranscriptSlot` key. New compaction events
+write it themselves. Events stored before this change receive it the first time
+`/ingest` or `/compact` reads the session: an event is marked as having taken a
+position when a transcript message follows it. No schema change or migration is
+involved, and other `snapshot` parts are left untouched. If one event carries
+contradictory markers, the request fails and writes nothing.
+
+Messages that earlier versions already skipped are not reconstructed. For such a
+session, a native transcript ingest can store the new tail and then fail exact
+linkage, because the skipped message leaves the stored transcript one message
+shorter than the file. Repeating the request does not duplicate messages. A
+session written after this change links normally.

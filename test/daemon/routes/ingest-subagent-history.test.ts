@@ -27,6 +27,14 @@ const meta = (payload: Record<string, unknown> = {}): string => JSON.stringify({
   type: "session_meta", payload: { id: "child-thread", cwd: "/work", ...payload },
 });
 const lines = (...records: string[]): string => records.map((record) => record + "\n").join("");
+/** A compaction event row in the newest conversation, as written before slot markers existed. */
+const legacyEvent = (conversation: string, seq: number): string => `
+  INSERT INTO messages(conversation_id, seq, role, content, token_count)
+    VALUES(${conversation}, ${seq}, 'system', 'LCM compaction leaf pass (normal): 10 -> 5', 1);
+  INSERT INTO message_parts(part_id, message_id, session_id, part_type, ordinal, metadata)
+    VALUES('event-' || last_insert_rowid(), last_insert_rowid(), 'child-thread', 'compaction', 0, '{}');`;
+const EVENT = "LCM compaction leaf pass (normal): 10 -> 5";
+const newestConversation = "(SELECT MAX(conversation_id) FROM conversations)";
 
 async function withWorld(
   run: (world: {
@@ -37,6 +45,8 @@ async function withWorld(
     ingest(extra?: Record<string, unknown>): Promise<{ status: number; body: Record<string, unknown> }>;
     ingestWith(patterns: string[]): Promise<{ status: number; body: Record<string, unknown> }>;
     seed(...rows: Array<[Role, string]>): Promise<void>;
+    exec(sql: string): void;
+    parent(): string | null | undefined;
     messages(): string[];
     links(): string[];
     nativeRecords(): number;
@@ -79,6 +89,14 @@ async function withWorld(
         const result = await call({ messages: rows.map(([role, content]) => ({ role, content, tokenCount: 1 })) });
         expect(result.status).toBe(200);
       },
+      exec: (sql) => {
+        const dbPath = projectDbPath(cwd);
+        const db = getLcmConnection(dbPath);
+        try { db.exec(sql); } finally { closeLcmConnection(dbPath); }
+      },
+      parent: () => query<{ parent_session_id: string | null }>(
+        "SELECT parent_session_id FROM conversations ORDER BY conversation_id DESC",
+      )[0]?.parent_session_id,
       messages: () => query<{ content: string }>("SELECT content FROM messages ORDER BY conversation_id, seq").map((row) => row.content),
       links: () => query<{ content: string }>(
         "SELECT m.content AS content FROM runtime_native_transcript_messages l JOIN messages m ON m.message_id = l.message_id ORDER BY l.source_ordinal",
@@ -375,6 +393,102 @@ describe("Codex forked subagent history on ingest", () => {
       await world.ingest();
       expect(world.messages()).toEqual(["one", "two"]);
       expect(world.links()).toEqual(["one", "two"]);
+    });
+  });
+});
+
+describe("Codex forked subagent history with compaction events", () => {
+  const forked = (...records: string[]): string => lines(
+    meta({ parent_thread_id: "parent-thread", subagent_history_start_ordinal: 2, history_mode: "paginated" }),
+    message(0, "user", "inherited 1"),
+    message(1, "assistant", "inherited 2"),
+    ...records,
+  );
+
+  it("continues the filtered history after a compaction event row and keeps linking exact", async () => {
+    await withWorld(async (world) => {
+      world.write(forked(message(2, "user", "own 1"), message(3, "assistant", "own 2")));
+      expect((await world.ingest()).body).toMatchObject({ ingested: 2 });
+      world.exec(legacyEvent(newestConversation, 2));
+
+      world.append(lines(message(4, "user", "own 3")));
+      expect((await world.ingest()).body).toMatchObject({ ingested: 1 });
+      expect(world.messages()).toEqual(["own 1", "own 2", EVENT, "own 3"]);
+      expect(world.links()).toEqual(["own 1", "own 2", "own 3"]);
+      expect(await world.ingest()).toEqual({ status: 200, body: { ingested: 0, totalTokens: 0 } });
+      expect(logs.error).not.toHaveBeenCalled();
+    });
+  });
+
+  it("leaves the session alone when an event already took a transcript slot", async () => {
+    await withWorld(async (world) => {
+      await world.seed(["user", "own 1"]);
+      world.exec(legacyEvent(newestConversation, 1));
+      world.exec(`INSERT INTO messages(conversation_id, seq, role, content, token_count)
+        VALUES(${newestConversation}, 2, 'user', 'own 2', 1)`);
+      world.write(forked(
+        message(2, "user", "own 1"), message(3, "user", "own 2"), message(4, "user", "own 3"),
+      ));
+
+      expect(await world.ingest()).toEqual({ status: 200, body: { ingested: 0, totalTokens: 0 } });
+      expect(world.messages()).toEqual(["own 1", EVENT, "own 2"]);
+      expect(world.nativeRecords()).toBe(0);
+      expect(logs.error).toHaveBeenCalledTimes(1);
+      expect(String(logs.error.mock.calls[0]![1])).toContain("matches neither");
+      // The slot was adopted as consumed, and the parent link is still kept.
+      expect(world.parent()).toBe("parent-thread");
+    });
+  });
+
+  it("leaves a session split across conversations alone", async () => {
+    await withWorld(async (world) => {
+      await world.seed(["user", "own 1"]);
+      world.exec(`INSERT INTO conversations(session_id, created_at) VALUES('child-thread', '2999-01-01 00:00:00');
+        INSERT INTO messages(conversation_id, seq, role, content, token_count)
+          VALUES(${newestConversation}, 0, 'user', 'own 2', 1)`);
+      world.write(forked(
+        message(2, "user", "own 1"), message(3, "user", "own 2"), message(4, "user", "own 3"),
+      ));
+
+      expect(await world.ingest()).toEqual({ status: 200, body: { ingested: 0, totalTokens: 0 } });
+      expect(world.messages()).toEqual(["own 1", "own 2"]);
+      expect(world.nativeRecords()).toBe(0);
+      expect(logs.error).toHaveBeenCalledTimes(1);
+      expect(world.parent()).toBe("parent-thread");
+    });
+  });
+
+  it("ignores a recorded session completion count", async () => {
+    await withWorld(async (world) => {
+      world.write(lines(meta({ subagent_history_start_ordinal: 0, history_mode: "paginated" })));
+      await world.ingest();
+      world.exec("INSERT INTO session_ingest_log(session_id, message_count) VALUES('child-thread', 99)");
+      world.write(forked(message(2, "user", "own 1"), message(3, "assistant", "own 2")));
+      expect((await world.ingest()).body).toMatchObject({ ingested: 2 });
+      expect(world.messages()).toEqual(["own 1", "own 2"]);
+      expect(world.links()).toEqual(["own 1", "own 2"]);
+    });
+  });
+
+  it("treats a conversation holding only an event row as an empty child", async () => {
+    await withWorld(async (world) => {
+      world.write(lines(meta({ subagent_history_start_ordinal: 0, history_mode: "paginated" })));
+      await world.ingest();
+      world.exec("INSERT INTO conversations(session_id) VALUES('child-thread')");
+      world.exec(legacyEvent(newestConversation, 0));
+      expect((await world.ingest()).body).toEqual({ ingested: 0, totalTokens: 0 });
+      expect(world.messages()).toEqual([EVENT]);
+      expect(logs.error).not.toHaveBeenCalled();
+    });
+  });
+
+  it("does not create a conversation for an empty child", async () => {
+    await withWorld(async (world) => {
+      world.write(lines(meta({ parent_thread_id: "parent-thread", subagent_history_start_ordinal: 0, history_mode: "paginated" })));
+      expect((await world.ingest()).body).toEqual({ ingested: 0, totalTokens: 0 });
+      expect(world.parent()).toBeUndefined();
+      expect(world.messages()).toEqual([]);
+      expect(logs.error).not.toHaveBeenCalled();
     });
   });
 });
