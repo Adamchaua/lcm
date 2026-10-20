@@ -315,8 +315,8 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     remedy: "The CLI constructed an invalid abort request. This is an internal defect; file an issue rather than retrying.",
   }),
   Object.freeze({
-    reason: "abort-manifest-needs-resume", exitClass: "failed-operator-required",
-    remedy: "The manifest has an in-progress copy effect that only `resume` can complete or abandon. Nothing was changed. This release does not register resume; file an issue.",
+    reason: "abort-manifest-needs-resume", exitClass: "incomplete-recoverable",
+    remedy: "A copy or verification effect began on this generation's manifest after the router chose abort. Nothing was changed. Run `lcm migration resume` to finish it, then abort if you still want to.",
   }),
   Object.freeze({
     reason: "abort-unresolvable", exitClass: "refused-evidence",

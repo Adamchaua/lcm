@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { performMigrationAbortCommand } from "../../src/migration/cli-abort.js";
 import { performMigrationAbort } from "../../src/migration/abort.js";
+import { renderMigrationAbortEnvelope } from "../../src/migration/cli-render.js";
 import {
   createFixtureManifest,
   fixtureVerificationReport,
@@ -128,6 +129,37 @@ describe("performMigrationAbortCommand: real end-to-end paths", () => {
     // Same readback, but a repeat finds both writes already made: nothing was applied.
     expect(second).toEqual({ ...first, applied: false });
     expect(first).toMatchObject({ applied: true });
+  });
+});
+
+describe("performMigrationAbortCommand: a copy effect that begins after routing (synthesis S3)", () => {
+  it("answers exit 6 naming resume when a copy effect begins between the router's read and abort's own manifest read", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    const planned = manifest(held.generationId);
+    store.create(planned);
+    const coordinator = coordinatorFor(home);
+    const result = await abortCommand({
+      confirmGenerationId: "generation-1", homeDir: home, coordinator, manifestStore: store,
+      _operationsForTesting: {
+        performAbort: async (input) => {
+          const dryRun = beginMigrationEffect(planned, { effectId: "e".repeat(64), kind: "verify-dry-run", inputSha256: "f".repeat(64), startedAt: CREATED_AT });
+          store.update("generation-1", planned.checksumSha256, () => dryRun);
+          const dryRunDone = completeMigrationEffect(dryRun, {
+            effectId: "e".repeat(64), completedAt: CREATED_AT,
+            report: { kind: "dry-run", reportId: "report-1", reportSha256: "9".repeat(64), createdAt: CREATED_AT },
+          });
+          store.update("generation-1", dryRun.checksumSha256, () => dryRunDone);
+          store.update("generation-1", dryRunDone.checksumSha256, () =>
+            beginMigrationEffect(dryRunDone, { effectId: "d".repeat(64), kind: "copy-batch", inputSha256: "f".repeat(64), startedAt: CREATED_AT }));
+          return performMigrationAbort(input);
+        },
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "abort-manifest-needs-resume", evidence: "manifest-readback", next: "resume" });
+    expect(renderMigrationAbortEnvelope(result)).toMatchObject({ exitCode: 6, outcome: "incomplete-recoverable", next: "resume" });
+    expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-held");
   });
 });
 

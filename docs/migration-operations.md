@@ -1143,8 +1143,8 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
     },
     {
       "reason": "abort-manifest-needs-resume",
-      "exitClass": "failed-operator-required",
-      "remedy": "The manifest has an in-progress copy effect that only `resume` can complete or abandon. Nothing was changed. This release does not register resume; file an issue."
+      "exitClass": "incomplete-recoverable",
+      "remedy": "A copy or verification effect began on this generation's manifest after the router chose abort. Nothing was changed. Run `lcm migration resume` to finish it, then abort if you still want to."
     },
     {
       "reason": "abort-unresolvable",

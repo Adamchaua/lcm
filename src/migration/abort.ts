@@ -338,8 +338,9 @@ export type MigrationAbortRefusalClassification = Readonly<{
  *   reflects an internal defect, never an operator-fixable precondition.
  * - `manifest-resume` / `manifest-readback`: `classifyMigrationRecovery`'s
  *   own explicit "a pending copy effect exists" answer (`protocol.ts`), not
- *   an error at all. This candidate does not implement `resume`, so neither
- *   disposition has an automatic path here.
+ *   an error at all. The router sends an ordinary pending effect to resume
+ *   before abort runs; this answer is the late case, where the effect began
+ *   after the router read, and `resume` owns it (exit 6).
  * - Everything else (`journal-publication-evidence-missing`,
  *   `journal-unsafe-storage`, `journal-malformed-journal`,
  *   `journal-checksum-mismatch`, `journal-unresolved-publication`,

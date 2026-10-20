@@ -213,6 +213,8 @@ function finishAbort(input: Readonly<{
       reason: classified.reason,
       evidence: result.evidence,
       ...(result.mutated ? { applied: true as const } : {}),
+      // A pending copy effect that began after routing is resume's: abort names it.
+      ...(classified.reason === "abort-manifest-needs-resume" ? { next: "resume" } : {}),
     };
   }
   if (result.status === "dry-run") {
