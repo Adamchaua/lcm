@@ -1030,7 +1030,7 @@ function requestSha256(authority: AuthenticatedSqliteSnapshotAuthority, generati
 
 function assertMaintenance(context: Context, authority: AuthenticatedSqliteSnapshotAuthority): BackendMaintenanceGenerationBinding {
   const journal = readBackendMaintenanceJournal(context.homeDir);
-  const view = journal === null ? null : resolveBackendMaintenanceGenerationBinding(journal, context.generationId);
+  const view = resolveBackendMaintenanceGenerationBinding(journal, context.generationId);
   if (
     journal === null
     || journal.version !== 3

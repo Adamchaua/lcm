@@ -1490,9 +1490,10 @@ function cutoverMemberBindingChecksum(
  * journal yields the member's own binding, or null for any other id.
  */
 export function resolveBackendMaintenanceGenerationBinding(
-  journal: BackendMaintenanceJournal,
+  journal: BackendMaintenanceJournal | null,
   generationId: string,
 ): BackendMaintenanceGenerationBinding | null {
+  if (journal === null) return null;
   const cutoverSet = journal.cutoverSet;
   if (cutoverSet === undefined) {
     return journal.generationId === generationId

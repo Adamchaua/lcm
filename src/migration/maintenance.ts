@@ -221,7 +221,7 @@ export async function captureAuthenticatedSqliteMigrationSource(
     const revalidate = (): void => {
       const current = authenticateSqliteMigrationSource(authority.canonicalPath, options.homeDir, token);
       const journal = readBackendMaintenanceJournal(options.homeDir);
-      const view = journal === null ? null : resolveBackendMaintenanceGenerationBinding(journal, options.generationId);
+      const view = resolveBackendMaintenanceGenerationBinding(journal, options.generationId);
       if (journal?.cutoverSet !== undefined && journal.phase === "maintenance-held"
         && (view === null || view.sourceSelectionSha256 !== authority.sourceSelectionSha256)) {
         throw new CutoverSetCaptureError(
