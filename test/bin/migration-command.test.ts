@@ -346,6 +346,18 @@ describe("lcm migration command group", () => {
     expect(JSON.parse(stdoutText(out))).toMatchObject({ command: "verify", applied: true, manifestPhase: "verified", evidence: { cell: 23 } });
   });
 
+  it("verify: --lease-ttl-ms is passed through as a number, and a non-number is a usage error before anything runs", async () => {
+    state.verify.mockResolvedValueOnce({
+      status: "ok", generationId: "gen-1", manifestPhase: "verified", applied: true, next: "activate", evidence: { cell: 22 },
+    });
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "verify", "--confirm-generation", "gen-1", "--lease-ttl-ms", "1234");
+    expect(state.verify).toHaveBeenCalledWith(expect.objectContaining({ leaseTtlMs: 1234, cwd: process.cwd() }));
+    state.verify.mockClear();
+    await expect(invoke("migration", "verify", "--lease-ttl-ms", "x")).rejects.toThrow();
+    expect(state.verify).not.toHaveBeenCalled();
+  });
+
   it("verify: the fresh path's contention refusal exits 4", async () => {
     state.verify.mockResolvedValueOnce({ status: "refuse", reason: "verify-contention", generationId: "gen-1" });
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
