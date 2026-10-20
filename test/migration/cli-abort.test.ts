@@ -237,6 +237,24 @@ describe("performMigrationAbortCommand: refusal paths", () => {
     expect(result).toEqual({ status: "refuse", reason: "abort-readback-mismatch", applied: true });
   });
 
+  it.each([
+    ["a later generation's aborted journal", (held: BackendMaintenanceJournal) => ({ ...held, phase: "maintenance-aborted" as const, generationId: "generation-2" })],
+    ["this generation's completed selection", (held: BackendMaintenanceJournal) => ({ ...held, phase: "selection-completed" as const })],
+    ["another generation's completed selection", (held: BackendMaintenanceJournal) => ({ ...held, phase: "selection-completed" as const, generationId: "generation-2" })],
+  ])("refuses abort-readback-mismatch when the readback is %s rather than this generation's maintenance-aborted journal (Codex PR #1653: any terminal journal must not pass)", async (_name, replace) => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const result = await abortCommand({
+      confirmGenerationId: "generation-1", homeDir: home, coordinator: coordinatorFor(home),
+      _operationsForTesting: {
+        observeJournal: () => ({ kind: "hold", journal: held }),
+        performAbort: async () => ({ status: "completed", mutated: true }),
+        readJournal: () => replace(held),
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "abort-readback-mismatch", applied: true });
+  });
+
   it("refuses abort-readback-mismatch when the readback journal is entirely absent despite performAbort reporting completed", async () => {
     const home = makeHome();
     const held = await heldJournal(home);

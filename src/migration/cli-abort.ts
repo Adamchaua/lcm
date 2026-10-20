@@ -249,7 +249,11 @@ function readbackSettledAbort(input: Readonly<{
     ...(applied ? { applied: true as const } : {}),
   });
   const finalJournal = input.readJournal(input.homeDir);
-  if (finalJournal === null || !isTerminalBackendMaintenancePhase(finalJournal.phase)) {
+  // The postcondition is this generation's aborted journal, read back. Any
+  // other terminal journal (a later generation that entered and settled
+  // between the write and this read, or a completed selection) is not
+  // evidence that this abort took effect.
+  if (finalJournal === null || finalJournal.phase !== "maintenance-aborted" || finalJournal.generationId !== journal.generationId) {
     return readbackRefusal("abort-readback-mismatch");
   }
 
