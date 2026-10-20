@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { DEFAULT_DAEMON_PORT, parseStoredConfig, readDaemonConfigRawSnapshot } from "../daemon/config.js";
 import { requireMachineIdentity } from "../machine-identity.js";
@@ -33,7 +33,6 @@ import { createPostgreSqlBackendPublicationRemoteGuard } from "../storage/postgr
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
 import { verifyPostgreSqlTransferSchema, type PostgreSqlRuntimeReadiness } from "../storage/postgresql/runtime-readiness.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
-import { canonicalSha256 } from "../storage/portable-record.js";
 import {
   ActivationArtifactIdentityMismatchError,
   ActivationArtifactPresenceUnresolvableError,
@@ -99,7 +98,6 @@ import {
   createMigrationActivationEpoch,
   createMigrationActivationWitness,
   createMigrationQuiescenceFence,
-  deriveMigrationActivationEpochId,
   migrationCensusVectorsEqual,
   migrationWitnessSha256,
   type MigrationActivationAttempt,
