@@ -1001,6 +1001,10 @@ grants fail native imports without falling back to SQLite; parsed messages
 committed before the native failure remain available for retry. See
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) before
 running an explicit backfill.
+The conversation grants' table `SELECT` on `message_parts` already covers the
+column reads that native linkage needs, so a role that applied an earlier
+version of the transcript grant stays ready; re-applying the script is harmless
+and only adds the column-limited `message_parts` grants.
 The memory grant permits direct use of the selected promoted-memory, recall,
 redaction-administration, and session-coordination repositories. Deletes are
 limited to their six owned mutable-state tables; generated search data is

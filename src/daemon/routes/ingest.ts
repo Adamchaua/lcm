@@ -34,8 +34,8 @@ import { readCodexInheritedBoundary, readCodexSessionParent, type CodexInherited
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
-import type { ProjectStorage, StorageBackendFactory } from "../../storage/index.js";
-import type { NativeTranscriptProvenanceRepository } from "../../storage/contracts.js";
+import type { ProjectStorage, StorageBackendFactory, TransactionRepositories } from "../../storage/index.js";
+import { encodeTranscriptSlotMarker, type NativeTranscriptProvenanceRepository } from "../../storage/contracts.js";
 import { createCommitCloseBarrier, storageRouteFailureResponse, withProjectStorage } from "./storage-lifecycle.js";
 import { isAbortError, throwIfAborted } from "../cancellation.js";
 import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
@@ -91,6 +91,104 @@ function errorCode(error: unknown): string | undefined {
     && typeof error.code === "string"
     ? error.code
     : undefined;
+}
+
+/**
+ * Store the part of a session's cumulative transcript list that is not stored
+ * yet, inside the caller's transaction.
+ *
+ * The list holds transcript messages only, so its coordinate is session-wide:
+ * stored transcript rows plus the compaction events that took one list index
+ * (consumed slot markers). Events written before markers existed are adopted
+ * here with the legacy rule, consumed when a transcript row follows them in
+ * session order, and never re-evaluated. New rows go to the newest
+ * conversation.
+ *
+ * getOrCreateConversation runs first on the transaction's repositories: on
+ * PostgreSQL its advisory transaction lock serializes every writer of the
+ * session until commit, and SQLite's immediate transaction does the same.
+ */
+export async function prepareSessionTranscript(
+  conversations: TransactionRepositories["conversations"],
+  sessionId: string,
+): Promise<{
+  conversation: Awaited<ReturnType<TransactionRepositories["conversations"]["getOrCreateConversation"]>>;
+  transcriptCount: number;
+  consumedCount: number;
+  eventMessageIds: ReadonlySet<number>;
+}> {
+  const conversation = await conversations.getOrCreateConversation(sessionId);
+  const snapshot = await conversations.getTranscriptSlotSnapshot(sessionId);
+  let consumedCount = 0;
+  for (const event of snapshot.events) {
+    const markers = new Set(event.slotMarkers);
+    if (markers.size > 1) throw new Error("conflicting transcript slot markers");
+    const consumed = markers.size === 1 ? markers.has(true) : event.followedByTranscript;
+    if (markers.size === 0) {
+      await conversations.createMessageParts(event.messageId, [{
+        sessionId,
+        partType: "snapshot",
+        ordinal: event.nextOrdinal,
+        metadata: encodeTranscriptSlotMarker(consumed),
+      }]);
+    }
+    if (consumed) consumedCount += 1;
+  }
+  return {
+    conversation,
+    transcriptCount: snapshot.transcriptCount,
+    consumedCount,
+    eventMessageIds: new Set(snapshot.events.map((event) => event.messageId)),
+  };
+}
+
+/** Scrub and append transcript messages to a conversation inside the caller's transaction. */
+async function appendTranscriptMessages(
+  repositories: Pick<TransactionRepositories, "conversations" | "redactionAdmin" | "context">,
+  conversationId: number,
+  newMessages: readonly ParsedMessage[],
+  scrubber: ScrubEngine,
+): Promise<{
+  conversationId: number;
+  records: Awaited<ReturnType<TransactionRepositories["conversations"]["appendMessages"]>>;
+  totalCounts: { gitleaks: number; builtIn: number; global: number; project: number };
+} | null> {
+  if (newMessages.length === 0) return null;
+  const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
+  const inputs = newMessages.map((m) => {
+    const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project: projectCount } = scrubber.scrubWithCounts(m.content);
+    totalCounts.gitleaks += gitleaks;
+    totalCounts.builtIn += builtIn;
+    totalCounts.global += globalCount;
+    totalCounts.project += projectCount;
+    return {
+      role: m.role as "user" | "assistant" | "system" | "tool",
+      content: scrubbedContent,
+      tokenCount: m.tokenCount,
+    };
+  });
+  const records = await repositories.conversations.appendMessages(conversationId, inputs);
+  await repositories.redactionAdmin.upsertCounts(totalCounts);
+  await repositories.context.appendContextMessages(
+    conversationId,
+    records.map((record) => record.messageId),
+  );
+  return { conversationId, records, totalCounts };
+}
+
+export async function appendSessionTranscript(
+  repositories: Pick<TransactionRepositories, "conversations" | "redactionAdmin" | "context">,
+  sessionId: string,
+  parsed: readonly ParsedMessage[],
+  scrubber: ScrubEngine,
+) {
+  const slot = await prepareSessionTranscript(repositories.conversations, sessionId);
+  return appendTranscriptMessages(
+    repositories,
+    slot.conversation.conversationId,
+    parsed.slice(slot.transcriptCount + slot.consumedCount),
+    scrubber,
+  );
 }
 
 function resolveMessages(input: { client?: unknown; messages?: unknown; provider?: unknown; transcript_path?: string }, cwd: string): { messages: ParsedMessage[]; nativePath?: string; client?: TranscriptClient } {
@@ -182,42 +280,28 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
             if (parentSessionId === undefined || conversation === null || conversation.parentSessionId !== null) return;
             await repositories.conversations.setParentSessionIdIfNull(conversation.conversationId, parentSessionId);
           };
-          const linkExistingParent = async () => {
+          if (resolvedMessages.length === 0 && filteredMessages === undefined) {
             if (parentSessionId !== undefined) {
               await linkParent(await repositories.conversations.getConversationBySessionId(session_id));
             }
-          };
-          if (resolvedMessages.length === 0 && filteredMessages === undefined) {
-            await linkExistingParent();
             return { persisted: null, history: undefined };
           }
-          // A forked subagent's history mode needs the stored rows, so it never
-          // takes the session-count shortcut below, even when nothing is new.
+
           if (filteredMessages === undefined) {
-            const row = await repositories.coordination.getSessionIngest(session_id);
-            if (row && resolvedMessages.length <= row.messageCount) {
-              await linkExistingParent();
-              return { persisted: null, history: undefined };
-            }
+            // The session-wide slot index and the session lock come first.
+            const slot = await prepareSessionTranscript(repositories.conversations, session_id);
+            await linkParent(slot.conversation);
+            const persisted = await appendTranscriptMessages(
+              repositories,
+              slot.conversation.conversationId,
+              resolvedMessages.slice(slot.transcriptCount + slot.consumedCount),
+              scrubber!,
+            );
+            return { persisted, history: undefined };
           }
 
-          // Nothing can be appended without messages, so no conversation is
-          // created just to inspect an empty subagent.
-          const conversation = resolvedMessages.length === 0
-            ? await repositories.conversations.getConversationBySessionId(session_id)
-            : await repositories.conversations.getOrCreateConversation(session_id);
-          await linkParent(conversation);
-          let history: SubagentHistory | undefined;
-          let chosen = resolvedMessages;
-          let storedCount: number;
-          if (filteredMessages === undefined) {
-            storedCount = await repositories.conversations.getMessageCount(conversation!.conversationId);
-          } else {
-            const stored = conversation === null
-              ? []
-              : await repositories.conversations.getMessages(conversation.conversationId);
-            storedCount = stored.length;
-            history = await chooseSubagentHistory(
+          const chooseHistory = (stored: readonly { readonly role: string; readonly content: string }[]) =>
+            chooseSubagentHistory(
               stored,
               filteredMessages,
               resolvedMessages,
@@ -225,34 +309,39 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
               async () => repositories.nativeProvenance !== undefined
                 && await hasLinkedInheritedRecord(repositories.nativeProvenance),
             );
-            if (history === "mismatch") return { persisted: null, history };
-            if (history === "filtered") chosen = filteredMessages;
+          if (resolvedMessages.length === 0) {
+            // Nothing can be appended without messages, so no conversation is
+            // created just to inspect an empty subagent.
+            const conversation = await repositories.conversations.getConversationBySessionId(session_id);
+            await linkParent(conversation);
+            let stored: Awaited<ReturnType<typeof repositories.conversations.getMessages>> = [];
+            if (conversation !== null) {
+              const snapshot = await repositories.conversations.getTranscriptSlotSnapshot(session_id);
+              const eventMessageIds = new Set(snapshot.events.map((event) => event.messageId));
+              stored = (await repositories.conversations.getMessages(conversation.conversationId))
+                .filter((message) => !eventMessageIds.has(message.messageId));
+            }
+            return { persisted: null, history: await chooseHistory(stored) };
           }
-          const newMessages = chosen.slice(storedCount);
-          if (newMessages.length === 0) return { persisted: null, history };
 
-          const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
-          const inputs = newMessages.map((m, i) => {
-            const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project: projectCount } = scrubber!.scrubWithCounts(m.content);
-            totalCounts.gitleaks += gitleaks;
-            totalCounts.builtIn += builtIn;
-            totalCounts.global += globalCount;
-            totalCounts.project += projectCount;
-            return {
-              conversationId: conversation!.conversationId,
-              seq: storedCount + i,
-              role: m.role as "user" | "assistant" | "system" | "tool",
-              content: scrubbedContent,
-              tokenCount: m.tokenCount,
-            };
-          });
-          const records = await repositories.conversations.createMessagesBulk(inputs);
-          await repositories.redactionAdmin.upsertCounts(totalCounts);
-          await repositories.context.appendContextMessages(
-            conversation!.conversationId,
-            records.map((record) => record.messageId),
+          const slot = await prepareSessionTranscript(repositories.conversations, session_id);
+          await linkParent(slot.conversation);
+          const stored = (await repositories.conversations.getMessages(slot.conversation.conversationId))
+            .filter((message) => !slot.eventMessageIds.has(message.messageId));
+          // A consumed slot or a session split across conversations means the
+          // newest conversation's rows are not the session-wide prefix: leave it.
+          const history: SubagentHistory = slot.consumedCount > 0 || stored.length !== slot.transcriptCount
+            ? "mismatch"
+            : await chooseHistory(stored);
+          if (history === "mismatch") return { persisted: null, history };
+          const chosen = history === "filtered" ? filteredMessages : resolvedMessages;
+          const persisted = await appendTranscriptMessages(
+            repositories,
+            slot.conversation.conversationId,
+            chosen.slice(slot.transcriptCount),
+            scrubber!,
           );
-          return { persisted: { conversationId: conversation!.conversationId, records, totalCounts }, history };
+          return { persisted, history };
         });
       }
       type PersistedIngest = NonNullable<Awaited<ReturnType<typeof persist>>["persisted"]>;

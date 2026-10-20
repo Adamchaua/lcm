@@ -1711,6 +1711,10 @@ export function createExactNativeTranscriptMessageResolver(
         || message.messageSequence < 0
         || !isMessageRole(message.role)
         || message.content.includes("\0")
+        || (
+          message.isCompactionEvent !== undefined
+          && typeof message.isCompactionEvent !== "boolean"
+        )
       ) {
         return { kind: "invalid" };
       }
@@ -1726,6 +1730,9 @@ export function createExactNativeTranscriptMessageResolver(
         return { kind: "invalid" };
       }
       expectedMessageSequence += 1;
+      // Compaction events occupy a sequence value but are not transcript
+      // messages, so they stay out of the transcript order.
+      if (message.isCompactionEvent) continue;
       sessionMessages.push({
         conversationId: message.conversationId,
         messageId: message.messageId,
