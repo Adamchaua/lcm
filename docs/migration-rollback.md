@@ -337,3 +337,7 @@ the manifest reads `rolled-back` and runs the SQLite restart check. The runbook,
 [Migration operations](migration-operations.md#rollback-and-its-limits), has the
 exit table. Rollback refuses while any other project is remotely bound, because
 the backend selection is global.
+
+Run it after the grant swap, with `LCM_POSTGRES_URL` set to the daemon's
+runtime-role connection and `migrationRole` still naming the schema owner;
+the transfer-role URL used for activation is refused.

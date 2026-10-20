@@ -543,6 +543,11 @@ it.
    refuses to serve until it passes.
 4. Run `lcm migration report` until it exits 0 (see "Restarting the daemon after a selection").
 
+Between steps 2 and 3, change the connection in the shell and service environment you will use from
+here on: `LCM_POSTGRES_URL` must name the daemon's **runtime role** (activation used the transfer
+role's URL), and `storage.postgresql.migrationRole` stays the schema owner. Both the daemon and a
+later `rollback` read these settings.
+
 `activate` prints the swap as its next step on exit 0 (`next` is `swap-grants-then-start-daemon` and
 the evidence carries `grantSwap: required-before-daemon-start`), and its exit 8 refusal repeats it.
 
@@ -563,8 +568,10 @@ pre-checks nor softens it. Moving several projects at once is separate, planned 
 
 **Which role it connects as.** `rollback` opens PostgreSQL with the configured `storage.postgresql`
 settings and holds them to the daemon's readiness rules, so it is meant to run after the grant swap,
-as the runtime role. A role that does not pass that readiness check, such as the transfer role
-before the swap, makes it refuse `rollback-refused-evidence` (the evidence names
+as the runtime role: set `LCM_POSTGRES_URL` to the runtime role's connection and keep
+`migrationRole` equal to the schema owner (do not change it to the runtime role). A role that does
+not pass that readiness check, such as the transfer role before the swap or an activation-shell URL
+left in place, makes it refuse `rollback-refused-evidence` (the evidence names
 `unexpected-state`) with nothing changed.
 
 After a rollback the daemon must run on SQLite again. `rollback` runs the same two-observation
@@ -1416,7 +1423,7 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
     {
       "reason": "rollback-refused-evidence",
       "exitClass": "refused-evidence",
-      "remedy": "Rollback could not establish a fact it needs, or found state that contradicts the generation: the evidence names which. Run `lcm doctor` and `lcm migration report` and inspect the evidence before retrying."
+      "remedy": "Rollback could not establish a fact it needs, or found state that contradicts the generation: the evidence names which. Run `lcm doctor` and `lcm migration report` and inspect the evidence before retrying. If the evidence names unexpected-state, check that LCM_POSTGRES_URL is the runtime role's connection (not the transfer role's) and that migrationRole is still the schema owner."
     },
     {
       "reason": "rollback-abandoned",

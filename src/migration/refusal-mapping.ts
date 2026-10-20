@@ -544,7 +544,7 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   }),
   Object.freeze({
     reason: "rollback-refused-evidence", exitClass: "refused-evidence",
-    remedy: "Rollback could not establish a fact it needs, or found state that contradicts the generation: the evidence names which. Run `lcm doctor` and `lcm migration report` and inspect the evidence before retrying.",
+    remedy: "Rollback could not establish a fact it needs, or found state that contradicts the generation: the evidence names which. Run `lcm doctor` and `lcm migration report` and inspect the evidence before retrying. If the evidence names unexpected-state, check that LCM_POSTGRES_URL is the runtime role's connection (not the transfer role's) and that migrationRole is still the schema owner.",
   }),
   Object.freeze({
     reason: "rollback-abandoned", exitClass: "refused-precondition",

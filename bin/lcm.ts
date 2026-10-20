@@ -2335,7 +2335,7 @@ export function registerMigrationCommand(program: Command): void {
 
   migrationCmd
     .command("rollback")
-    .description("Return an activated generation to SQLite. Refuses while any other project is remotely bound")
+    .description("Return an activated generation to SQLite, using the runtime-role LCM_POSTGRES_URL. Refuses while any other project is remotely bound")
     .option("--generation <id>", "The generation to roll back (default: the live maintenance hold)")
     .option("--confirm-generation <id>", "The resolved generation id")
     .option("--confirm-backend <backend>", "The backend rollback switches to: sqlite")

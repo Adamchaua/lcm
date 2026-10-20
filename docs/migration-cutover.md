@@ -1065,6 +1065,10 @@ rejects the transfer grants. Before starting the daemon on the new backend:
 3. start (or restart) the daemon, which performs its own readiness check
    against the runtime role and refuses to serve until it passes.
 
+Also switch `LCM_POSTGRES_URL` from the transfer role's URL used for
+activation to the runtime role's URL before starting the daemon or running a
+rollback, and leave `migrationRole` naming the schema owner.
+
 Leaving the transfer grants in place makes the daemon's readiness refuse the
 database as `acl-shape` or `schema-fingerprint`; applying the runtime grants
 before revoking the transfer grants is harmless, because readiness is only

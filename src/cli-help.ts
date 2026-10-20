@@ -165,7 +165,7 @@ const HELP: Record<string, CommandHelp> = {
       ["report [--generation <id>] [--json]", "Read-only account of one generation: its state, its owner, the next command, and the daemon restart check"],
       ["abort [--generation <id>] --confirm-generation <id> [--dry-run] [--json]", "Complete whichever recovery write (journal or manifest) is missing; repeating it only confirms"],
       ["activate [--generation <id>] --confirm-generation <id> --confirm-backend postgresql [--dry-run] [--json]", "Switch a verified generation to PostgreSQL; afterwards swap the grants (add the runtime grants, revoke the transfer grants), then start the daemon; --dry-run never exits 0"],
-      ["rollback [--generation <id>] --confirm-generation <id> --confirm-backend sqlite [--dry-run] [--json]", "Return an activated generation to SQLite; refuses while any other project is remotely bound; --dry-run never exits 0"],
+      ["rollback [--generation <id>] --confirm-generation <id> --confirm-backend sqlite [--dry-run] [--json]", "Return an activated generation to SQLite; run it with LCM_POSTGRES_URL set to the runtime role (migrationRole stays the schema owner); refuses while any other project is remotely bound; --dry-run never exits 0"],
     ],
     examples: [
       ["lcm migration plan", "Print the candidate generation id to confirm with apply"],
