@@ -28,6 +28,7 @@ import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage
 import { PostgreSqlRuntimeReadinessError, type PostgreSqlRuntimeReadiness } from "../../src/storage/postgresql/runtime-readiness.js";
 import { PORTABLE_RECORD_DOMAIN_ORDER, type PortableDomain } from "../../src/storage/portable-record.js";
 import {
+  MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS,
   MigrationActivationError,
   createMigrationActivationDependencies,
   previewMigrationActivation,
@@ -159,6 +160,11 @@ class FakeLeaseGuard implements ActivationLeasePublicationGuard {
     throw new PostgreSqlBackendPublicationGuardError(projectId, operation, reason);
   }
 
+  /** The real runtime refuses an aborted signal before it connects or queries (runtime.ts acquire / query). */
+  private admit(operation: string, signal: AbortSignal | undefined): void {
+    if (signal?.aborted) throw new Error("fake guard " + operation + " refused an aborted signal: " + String((signal.reason as Error).message ?? signal.reason));
+  }
+
   seed(fence: Partial<PostgreSqlBackendPublicationFence> & { projectId: string }): void {
     this.rows.set(fence.projectId, {
       machineId: MACHINE, publicationId: "other", targetBackend: "postgresql", evidenceSha256: EVIDENCE,
@@ -174,6 +180,7 @@ class FakeLeaseGuard implements ActivationLeasePublicationGuard {
 
   async acquire(input: PostgreSqlBackendPublicationAcquireInput): Promise<PostgreSqlBackendPublicationFence> {
     this.calls.push("acquire");
+    this.admit("acquire", input.signal);
     const current = this.rows.get(input.projectId);
     if (current !== undefined) {
       const same = current.machineId === input.machineId && current.publicationId === input.publicationId
@@ -198,6 +205,7 @@ class FakeLeaseGuard implements ActivationLeasePublicationGuard {
 
   async renew(input: PostgreSqlBackendPublicationMutationInput & { ttlMs: number }): Promise<PostgreSqlBackendPublicationFence> {
     this.calls.push("renew");
+    this.admit("renew", input.signal);
     const current = this.rows.get(input.projectId);
     if (this.expireNext && current !== undefined) { this.expireNext = false; this.rows.set(input.projectId, { ...current, databaseExpired: true }); }
     const row = this.rows.get(input.projectId);
@@ -212,6 +220,7 @@ class FakeLeaseGuard implements ActivationLeasePublicationGuard {
 
   async release(input: PostgreSqlBackendPublicationMutationInput): Promise<PostgreSqlBackendPublicationFence> {
     this.calls.push("release");
+    this.admit("release", input.signal);
     const row = this.rows.get(input.projectId);
     // The real UPDATE requires an unexpired, unreleased row under the caller's token.
     if (row === undefined || row.fencingToken !== input.fencingToken || row.releasedAt !== null || row.databaseExpired) {
@@ -224,6 +233,7 @@ class FakeLeaseGuard implements ActivationLeasePublicationGuard {
 
   async read(input: Pick<PostgreSqlBackendPublicationMutationInput, "projectId" | "targetBackend" | "evidenceSha256" | "signal">): Promise<PostgreSqlBackendPublicationFence | null> {
     this.calls.push("read");
+    this.admit("read", input.signal);
     const row = this.rows.get(input.projectId);
     if (row === undefined) return null;
     if (row.targetBackend !== input.targetBackend || row.evidenceSha256 !== input.evidenceSha256) this.error(input.projectId, "read", "fence-mismatch");
@@ -2026,5 +2036,46 @@ describe("runMigrationActivation: pre-effect lease cleanup is decided by manifes
     expect(f.manifestStore.read(GENERATION)).toMatchObject({ phase: "activating", pendingEffect: null });
     expect(f.guard.calls.filter((c) => c === "release")).toHaveLength(0);
     expect(row(f).releasedAt).toBeNull();
+  });
+});
+
+describe("runMigrationActivation: pre-effect lease cleanup runs under its own bounded signal (PR #1628 review, Bug #1641)", () => {
+  const row = (f: Fixture) => f.guard.rows.get(REMOTE)!;
+
+  it("a run cancelled through input.signal during S7 still releases its row, and another generation can acquire", async () => {
+    const f = await fixture();
+    const controller = new AbortController();
+    const cancelled = runMigrationActivation({ ...f.input, signal: controller.signal }, {
+      ...f.deps,
+      // Cancel while the census is in flight; the census surfaces the abort like the real runtime would.
+      readDestinationCensus: async () => { controller.abort(new Error("cancelled by the caller")); throw controller.signal.reason; },
+    });
+    await expect(cancelled).rejects.toThrow("cancelled by the caller");
+    expect(f.guard.calls.filter((c) => c === "release")).toHaveLength(1);
+    expect(row(f).releasedAt).not.toBeNull();
+    await expect(f.guard.acquire({
+      projectId: REMOTE, machineId: MACHINE, publicationId: "another-generation", targetBackend: "postgresql", evidenceSha256: "d".repeat(64), ttlMs: 60_000,
+    })).resolves.toMatchObject({ publicationId: "another-generation", releasedAt: null });
+  });
+
+  it("the cleanup deadline is finite: a release that never answers is abandoned, the refusal reports it, nothing hangs", async () => {
+    const f = await fixture();
+    f.deps.destinationCensus = domainCensus("drifted");
+    const signals: Array<AbortSignal | undefined> = [];
+    f.guard.release = (input) => new Promise((_resolve, reject) => {
+      signals.push(input.signal);
+      input.signal!.addEventListener("abort", () => reject(input.signal!.reason), { once: true });
+    });
+    const outcome = await f.run({ leaseCleanupTimeoutMs: 20 });
+    expect(outcome).toMatchObject({ status: "refused", step: "S8", reason: "census-drift" });
+    expect((outcome as { detail: string }).detail).toMatch(/; the activation lease was not released: .*(timeout|timed out|TimeoutError)/iu);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]!.aborted).toBe(true);
+    expect(signals[0]).not.toBe(f.input.signal);
+    expect(row(f).releasedAt).toBeNull();
+  });
+
+  it("the production dependencies carry the exported cleanup deadline", () => {
+    expect(createMigrationActivationDependencies({ homeDir: "/nonexistent" }).leaseCleanupTimeoutMs).toBe(MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS);
   });
 });

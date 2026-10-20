@@ -25,7 +25,9 @@
  * multi-project cutover); with that project removed the same generation then
  * activates, proving the refusal left no effect behind. The refusal also
  * releases its S2 lease row on lcm.fenced_leases, proven by a different
- * generation acquiring the project through the real guard in between.
+ * generation acquiring the project through the real guard in between; a run
+ * cancelled through its own signal after S2 is proven to do the same (the
+ * cleanup runs under its own signal, Bug #1641).
  *
  * Role topology follows plan-v7.2 B1/B3: activation runs entirely under ONE
  * transfer-profile role, provisioned here under a per-run unique name with
@@ -79,6 +81,7 @@ import {
   createMigrationActivationDependencies,
   previewMigrationActivation,
   runMigrationActivation,
+  type MigrationActivationDependencies,
   type MigrationActivationInput,
 } from "../../src/migration/activate-generation.js";
 import { readActivationGenerationLink } from "../../src/migration/activation-artifact-store.js";
@@ -413,6 +416,36 @@ async function prepareVerifiedInstallation(
   };
 }
 
+/** The project's only publication lease row reads back released, and a different
+ * generation acquires (then releases) it through the real guard: acquire never
+ * displaces an unreleased row of another generation, so this is the proof that
+ * an abandoned run freed the project. */
+async function expectProjectAcquirableByAnotherGeneration(
+  db: PostgreSqlTestDatabase, deps: MigrationActivationDependencies, home: string, remoteProjectId: string, transfer: PostgreSqlConnectionSettings,
+): Promise<void> {
+  const leases = await db.migrator.query<{ released: boolean }>({
+    text: "SELECT released_at IS NOT NULL AS released FROM lcm.fenced_leases "
+      + "WHERE project_id = $1 AND operation LIKE 'backend-publication:postgresql:%'",
+    values: [remoteProjectId],
+  }, { domain: "factory", operation: "activationIntegration" });
+  expect(leases.rows).toEqual([{ released: true }]);
+  const otherRuntime = deps.createOrdinaryRuntime(transfer);
+  try {
+    const guard = otherRuntime.backendPublicationGuard();
+    const otherGeneration = {
+      projectId: remoteProjectId, machineId: deps.machineId(home),
+      publicationId: deriveActivationPublicationId("other-generation"), targetBackend: "postgresql" as const,
+      evidenceSha256: "d".repeat(64),
+    };
+    const acquired = await acquireActivationLease(guard, { ...otherGeneration, ttlMs: 60_000 });
+    expect(acquired.status, acquired.status === "acquired" ? "" : acquired.detail).toBe("acquired");
+    if (acquired.status !== "acquired") return;
+    expect(await releaseActivationLease(guard, { ...otherGeneration, fencingToken: acquired.fence.fencingToken })).toMatchObject({ status: "released" });
+  } finally {
+    await otherRuntime.close();
+  }
+}
+
 it("activates a real verified SQLite copy through the production dependencies: refused while a second project holds data, then activated, published, evidenced and idempotent", async () => {
   await withPostgreSqlTestDatabase("migration-activation-e2e", async (db) => {
     const home = mkdtempSync(join(tmpdir(), "migration-activation-e2e-"));
@@ -434,6 +467,17 @@ it("activates a real verified SQLite copy through the production dependencies: r
       expect(before.checks.find((check) => check.name === "resume-point")).toMatchObject({ status: "ok", detail: "fresh" });
       expect(before.checks.find((check) => check.name === "maintenance-journal")).toMatchObject({ status: "ok" });
 
+      // A run cancelled through its own signal after S2 (Bug #1641): the real
+      // runtime refuses an aborted signal before it connects or queries, so the
+      // cleanup must release the real lease row under its own signal, leaving
+      // the project acquirable by a different generation.
+      const controller = new AbortController();
+      await expect(runMigrationActivation({ ...installation.input, signal: controller.signal }, {
+        ...deps,
+        readDestinationCensus: async () => { controller.abort(new Error("cancelled by the caller")); throw controller.signal.reason; },
+      })).rejects.toThrow("cancelled by the caller");
+      await expectProjectAcquirableByAnotherGeneration(db, deps, home, installation.remoteProjectId, transfer);
+
       // A second project with stored data: G8's single-project verdict refuses
       // (#1544 owns the multi-project cutover). Nothing durable is touched.
       const otherHash = "f".repeat(64);
@@ -449,30 +493,8 @@ it("activates a real verified SQLite copy through the production dependencies: r
       expect(readActivationGenerationLink({ homeDir: home, generationId: GENERATION_ID }).state).toBe("authoritatively-absent");
       expect(readMigrationActivationEvidence({ homeDir: home, generationId: GENERATION_ID })).toEqual({ state: "authoritatively-absent" });
       expect(readConfigBackend(home)).toBe("sqlite");
-      // The refused run released its S2 lease row (PR #1628 review): the
-      // real guard never displaces an unreleased row of another generation,
-      // so a different generation must be able to acquire the project now.
-      const refusedLeases = await db.migrator.query<{ released: boolean }>({
-        text: "SELECT released_at IS NOT NULL AS released FROM lcm.fenced_leases "
-          + "WHERE project_id = $1 AND operation LIKE 'backend-publication:postgresql:%'",
-        values: [installation.remoteProjectId],
-      }, { domain: "factory", operation: "activationIntegration" });
-      expect(refusedLeases.rows).toEqual([{ released: true }]);
-      const otherRuntime = deps.createOrdinaryRuntime(transfer);
-      try {
-        const guard = otherRuntime.backendPublicationGuard();
-        const otherGeneration = {
-          projectId: installation.remoteProjectId, machineId: deps.machineId(home),
-          publicationId: deriveActivationPublicationId("other-generation"), targetBackend: "postgresql" as const,
-          evidenceSha256: "d".repeat(64),
-        };
-        const acquired = await acquireActivationLease(guard, { ...otherGeneration, ttlMs: 60_000 });
-        expect(acquired.status, acquired.status === "acquired" ? "" : acquired.detail).toBe("acquired");
-        if (acquired.status !== "acquired") return;
-        expect(await releaseActivationLease(guard, { ...otherGeneration, fencingToken: acquired.fence.fencingToken })).toMatchObject({ status: "released" });
-      } finally {
-        await otherRuntime.close();
-      }
+      // The refused run released its S2 lease row (PR #1628 review).
+      await expectProjectAcquirableByAnotherGeneration(db, deps, home, installation.remoteProjectId, transfer);
       rmSync(join(projectsDir(home), otherHash), { recursive: true });
       writeFileSync(projectMapPath(home), JSON.stringify(map) + "\n", { mode: 0o600 });
       clearProjectMapCache();

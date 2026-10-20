@@ -198,7 +198,9 @@ import {
  *   outcome vocabulary (a refusal or S9 interruption carries it appended to
  *   its detail, a thrown error is rethrown unchanged), and a same-generation
  *   re-run reacquires or takes over a row that was left behind and ends it
- *   the same way. Once an effect has begun the row is kept:
+ *   the same way. It runs under its own bounded signal
+ *   (deps.leaseCleanupTimeoutMs), so a run cancelled through input.signal
+ *   still frees its row. Once an effect has begun the row is kept:
  *   the generation is committed to roll forward on the next call (A2
  *   reacquire / takeover) and the coordinator's own release phase frees it.
  * - S3 quiescence, S4 coverage then G8, S4b (amendment 1) compose material
@@ -352,6 +354,11 @@ export class MigrationActivationError extends Error {
 /** plan-v7.1 A2: 15 minutes. One census or publication stretch must finish
  * within it; expiry is recovered by takeover on the next call, never silently. */
 export const MIGRATION_ACTIVATION_LEASE_TTL_MS = 15 * 60 * 1000;
+
+/** The bound on the best-effort pre-effect lease cleanup (one release, or a
+ * takeover and a release), which runs under its own signal so a cancelled
+ * run still frees its row (Bug #1641). */
+export const MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS = 30 * 1000;
 
 // ---------------------------------------------------------------------------
 // Input and dependency seams
@@ -508,6 +515,8 @@ export interface MigrationActivationDependencies {
   readonly daemonPort: (homeDir: string) => number;
   readonly checkRestart: typeof checkActivationRestartAdmission;
   readonly leaseTtlMs: number;
+  /** Deadline for releaseAbandonedLease's own signal; finite, never the caller's. */
+  readonly leaseCleanupTimeoutMs: number;
   readonly crashPoint?: MigrationActivationCrashPoint;
 }
 
@@ -570,6 +579,7 @@ export function createMigrationActivationDependencies(
     daemonPort: storedDaemonPort,
     checkRestart: checkActivationRestartAdmission,
     leaseTtlMs: MIGRATION_ACTIVATION_LEASE_TTL_MS,
+    leaseCleanupTimeoutMs: MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS,
   };
 }
 
@@ -1062,6 +1072,12 @@ async function readOwnFence(ctx: Context): Promise<Readonly<{ fence: ActivationL
  * fresh fence released (rollback-session.ts does the same). Returns null
  * when no live row of this generation remains (released, already released
  * or absent), otherwise the failure detail; never throws.
+ *
+ * The cleanup runs under its own bounded signal, never the caller's: a run
+ * cancelled through input.signal reaches this path with that signal already
+ * aborted, and the PostgreSQL runtime refuses an aborted signal before it
+ * connects or queries, so inheriting it would cancel the cleanup itself and
+ * leak the row (Bug #1641). The deadline is deps.leaseCleanupTimeoutMs.
  */
 async function releaseAbandonedLease(ctx: Context): Promise<string | null> {
   const mutation = {
@@ -1070,7 +1086,7 @@ async function releaseAbandonedLease(ctx: Context): Promise<string | null> {
     publicationId: ctx.publicationId,
     targetBackend: "postgresql" as const,
     evidenceSha256: ctx.evidenceSha256!,
-    signal: ctx.input.signal,
+    signal: AbortSignal.timeout(ctx.deps.leaseCleanupTimeoutMs),
   };
   try {
     let released: ActivationLeaseReleaseResult = await releaseActivationLease(ctx.guard!, { ...mutation, fencingToken: ctx.fence!.fencingToken });
