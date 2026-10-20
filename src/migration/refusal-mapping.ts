@@ -535,6 +535,33 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     reason: "cutover-restart-unresolvable", exitClass: "refused-evidence",
     remedy: "The daemon restart check could not be made. Run `lcm daemon status`, resolve the failure, and run `lcm migration report`.",
   }),
+  // --- rollback (plan-v5 Part B (4), plan-v6.1 B2, A-P0-2). The seven
+  // MigrationRollbackError reasons collapse into three classes; the evidence
+  // names the upstream reason. ---
+  Object.freeze({
+    reason: "rollback-refused-precondition", exitClass: "refused-precondition",
+    remedy: "Rollback refused because the generation is not eligible or the installation is not quiescent: the evidence names which. Rollback also refuses while any other project is remotely bound, because the backend selection is global. Fix the named condition, then run `lcm migration rollback` again.",
+  }),
+  Object.freeze({
+    reason: "rollback-contention", exitClass: "refused-contention",
+    remedy: "The rollback lease was lost or is held by another actor. Re-running `lcm migration rollback` with the same confirmations re-enters whatever was begun.",
+  }),
+  Object.freeze({
+    reason: "rollback-refused-evidence", exitClass: "refused-evidence",
+    remedy: "Rollback could not establish a fact it needs, or found state that contradicts the generation: the evidence names which. Run `lcm doctor` and `lcm migration report` and inspect the evidence before retrying.",
+  }),
+  Object.freeze({
+    reason: "rollback-abandoned", exitClass: "refused-precondition",
+    remedy: "An interrupted publication could not be proven complete, so rollback abandoned it and the generation returned to its previous phase with an abandonment report. Nothing was rolled back; run `lcm migration rollback` again.",
+  }),
+  Object.freeze({
+    reason: "rollback-readback-mismatch", exitClass: "refused-evidence",
+    remedy: "Rollback reported a result that the manifest does not read back as rolled-back with nothing pending. Run `lcm migration report` and inspect the evidence.",
+  }),
+  Object.freeze({
+    reason: "rollback-dry-run-not-predictive", exitClass: "refused-evidence",
+    remedy: "The rollback preview reads only the route and the manifest. It does not evaluate eligibility, mode, quiescence, the lease, drift, remote bindings or the restart check, so it cannot say rollback would succeed.",
+  }),
 ] satisfies MigrationRefusalMapping[]);
 
 const REFUSAL_BY_REASON: ReadonlyMap<string, MigrationRefusalMapping> = new Map(

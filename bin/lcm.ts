@@ -22,6 +22,7 @@ import { performMigrationVerifyCommand } from "../src/migration/cli-verify.js";
 import { performMigrationResumeCommand } from "../src/migration/cli-resume.js";
 import { performMigrationReportCommand } from "../src/migration/cli-report.js";
 import { performMigrationActivateCommand } from "../src/migration/cli-activate.js";
+import { performMigrationRollbackCommand } from "../src/migration/cli-rollback.js";
 import {
   renderMigrationPlanEnvelope,
   renderMigrationDryRunEnvelope,
@@ -31,6 +32,7 @@ import {
   renderMigrationResumeEnvelope,
   renderMigrationReportEnvelope,
   renderMigrationActivateEnvelope,
+  renderMigrationRollbackEnvelope,
   renderMigrationUnexpectedFailureEnvelope,
 } from "../src/migration/cli-render.js";
 import type { MigrationCommandName } from "../src/migration/exit-classes.js";
@@ -2164,10 +2166,10 @@ export function registerMigrationCommand(program: Command): void {
   };
 
   const migrationCmd = new Command("migration")
-    .description("Reversible SQLite-to-PostgreSQL cutover (plan, dry-run, apply, resume, verify, report, abort, activate)");
+    .description("Reversible SQLite-to-PostgreSQL cutover (plan, dry-run, apply, resume, verify, report, abort, activate, rollback)");
   migrationCmd.helpOption(false).option("-h, --help", "Show help");
   migrationCmd.action(async () => {
-    writeCliError("Usage: lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate> [--json]\n");
+    writeCliError("Usage: lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate|rollback> [--json]\n");
     exit(1);
   });
 
@@ -2330,6 +2332,28 @@ export function registerMigrationCommand(program: Command): void {
       });
       writeCliError("Migration activate finished.\n");
       emitMigrationEnvelope("activate", () => renderMigrationActivateEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("rollback")
+    .description("Return an activated generation to SQLite. Refuses while any other project is remotely bound")
+    .option("--generation <id>", "The generation to roll back (default: the live maintenance hold)")
+    .option("--confirm-generation <id>", "The resolved generation id")
+    .option("--confirm-backend <backend>", "The backend rollback switches to: sqlite")
+    .option("--dry-run", "Read the route and the manifest; evaluates nothing, so it never exits 0")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Rolling back the migration generation...\n");
+      const outcome = await performMigrationRollbackCommand({
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        confirmBackend: opts.confirmBackend,
+        dryRun: opts.dryRun,
+      });
+      writeCliError("Migration rollback finished.\n");
+      emitMigrationEnvelope("rollback", () => renderMigrationRollbackEnvelope(outcome), opts.json);
     });
 
   program.addCommand(migrationCmd);

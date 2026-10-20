@@ -12,6 +12,7 @@ const state = vi.hoisted(() => ({
   verify: vi.fn(),
   report: vi.fn(),
   activate: vi.fn(),
+  rollback: vi.fn(),
 }));
 
 vi.mock("node:process", async (importOriginal) => ({
@@ -56,6 +57,10 @@ vi.mock("../../src/migration/cli-report.js", () => ({
 
 vi.mock("../../src/migration/cli-activate.js", () => ({
   performMigrationActivateCommand: state.activate,
+}));
+
+vi.mock("../../src/migration/cli-rollback.js", () => ({
+  performMigrationRollbackCommand: state.rollback,
 }));
 
 const { runCli } = await import("../../bin/lcm.js");
@@ -427,10 +432,32 @@ describe("lcm migration command group", () => {
     expect(process.exitCode).toBe(6);
   });
 
+  it("rollback: passes the generation, both confirmations and --dry-run through and prints the envelope", async () => {
+    state.rollback.mockResolvedValueOnce({
+      status: "ok", generationId: "gen-1", manifestPhase: "rolled-back", applied: true, next: "report", evidence: { rollbackMode: "pre-write" },
+      restart: { answer: "satisfied", presence: "absent" },
+    });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "rollback", "--generation", "gen-1", "--confirm-generation", "gen-1", "--confirm-backend", "sqlite", "--dry-run", "--json");
+    expect(state.rollback).toHaveBeenCalledWith(expect.objectContaining({
+      generation: "gen-1", confirmGenerationId: "gen-1", confirmBackend: "sqlite", dryRun: true,
+    }));
+    expect(process.exitCode).toBe(0);
+    expect(JSON.parse(stdoutText(out))).toMatchObject({ command: "rollback", manifestPhase: "rolled-back", restart: { answer: "satisfied", presence: "absent" } });
+  });
+
+  it("rollback: a refusal exits with its class", async () => {
+    state.rollback.mockResolvedValueOnce({ status: "refuse", reason: "rollback-refused-precondition", generationId: "gen-1" });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "rollback", "--confirm-generation", "gen-1", "--confirm-backend", "sqlite");
+    expect(process.exitCode).toBe(2);
+    expect(stdoutText(out)).toContain("rollback-refused-precondition");
+  });
+
   it("lcm migration --help routes to the custom help page rather than any subcommand action", async () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     await expect(invoke("migration", "--help")).rejects.toThrow("exit:0");
-    expect(stdoutText(out)).toContain("lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate> [--json]");
+    expect(stdoutText(out)).toContain("lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate|rollback> [--json]");
     expect(state.plan).not.toHaveBeenCalled();
   });
 });

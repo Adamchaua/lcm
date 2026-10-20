@@ -385,6 +385,12 @@ describe("renderMigrationActivateEnvelope (and the cutover renderer rollback sha
     ["activation-unexpected-state", 5],
     ["activation-dry-run-not-predictive", 5],
     ["cutover-restart-required", 8],
+    ["rollback-refused-precondition", 2],
+    ["rollback-contention", 4],
+    ["rollback-refused-evidence", 5],
+    ["rollback-abandoned", 2],
+    ["rollback-readback-mismatch", 5],
+    ["rollback-dry-run-not-predictive", 5],
     ["cutover-restart-contradiction", 5],
     ["cutover-restart-unresolvable", 5],
   ])("maps the refusal %s to exit %i", (reason, exit) => {

@@ -154,8 +154,8 @@ const HELP: Record<string, CommandHelp> = {
   },
 
   migration: {
-    summary: "Reversible SQLite-to-PostgreSQL cutover: plan, dry-run, apply, resume, verify, report, abort, activate.",
-    usage: "lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate> [--json]",
+    summary: "Reversible SQLite-to-PostgreSQL cutover: plan, dry-run, apply, resume, verify, report, abort, activate, rollback.",
+    usage: "lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate|rollback> [--json]",
     options: [
       ["plan [--json]", "Preview the next migration generation without mutating anything"],
       ["dry-run [--json]", "Check the SQLite migration source alone (no PostgreSQL, no journal)"],
@@ -165,6 +165,7 @@ const HELP: Record<string, CommandHelp> = {
       ["report [--generation <id>] [--json]", "Read-only account of one generation: its state, its owner, the next command, and the daemon restart check"],
       ["abort [--generation <id>] --confirm-generation <id> [--dry-run] [--json]", "Complete whichever recovery write (journal or manifest) is missing; repeating it only confirms"],
       ["activate [--generation <id>] --confirm-generation <id> --confirm-backend postgresql [--dry-run] [--json]", "Switch a verified generation to PostgreSQL; afterwards swap the grants (add the runtime grants, revoke the transfer grants), then start the daemon; --dry-run never exits 0"],
+      ["rollback [--generation <id>] --confirm-generation <id> --confirm-backend sqlite [--dry-run] [--json]", "Return an activated generation to SQLite; refuses while any other project is remotely bound; --dry-run never exits 0"],
     ],
     examples: [
       ["lcm migration plan", "Print the candidate generation id to confirm with apply"],
@@ -174,6 +175,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm migration resume --confirm-generation <id>", "Run the one step report named for a held generation"],
       ["lcm migration abort --confirm-generation <id>", "Abort the held or entering migration whose generation id you pass"],
       ["lcm migration activate --confirm-generation <id> --confirm-backend postgresql", "Switch the verified generation to PostgreSQL, then swap the grants before starting the daemon"],
+      ["lcm migration rollback --confirm-generation <id> --confirm-backend sqlite", "Return the activated generation to SQLite"],
     ],
     notes: "This project must not be linked to a PostgreSQL project through `lcm project create` or `lcm project link` before you migrate: migration resolves or creates the destination identity itself, and a linked project makes apply refuse multi-machine-installation. apply refuses unless --confirm-generation exactly matches the candidate a fresh plan resolves at the moment apply runs; a stale or missing token refuses rather than proceeding. Never a silent fallback: an unresolvable or unverified target, an unresolvable daemon presence, or a state that does not admit the operation all refuse with a distinct, closed reason. See docs/migration-operations.md for the full exit-class table, every refusal's remedy, and the fencing residue.",
   },
