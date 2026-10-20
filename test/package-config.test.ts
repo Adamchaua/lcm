@@ -34,6 +34,7 @@ const POSTGRESQL_REFERENCE_FILES = [
   "postgresql-schema.md",
   "postgresql-search.md",
   "postgresql-summary-context.md",
+  "postgresql-telemetry.md",
   "postgresql-transfer-grants.sql",
 ] as const;
 

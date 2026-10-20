@@ -68,6 +68,18 @@ describe("SQLite active native transcript repository", () => {
       .toEqual([[0, false], [1, true], [2, false]]);
   });
 
+  it("lists only linked source ordinals of one session and source", async () => {
+    const { repo } = fixture();
+    const input = batch();
+    const unlinked = { ...input.records[0]!, sourceOrdinal: 2, ingestKey: "d".repeat(64), nativePayload: { text: "none" }, contentSha256: createHash("sha256").update('{"text":"none"}').digest("hex"), messageLinks: [] };
+    await repo.ingestBatch({ ...input, records: [input.records[0]!, unlinked], checkpoint: { lastSourceOrdinal: 2, checkpoint: { offset: 40 } } });
+    const query = { ...key, nativeSessionId: "session" };
+    expect(await repo.listLinkedSourceOrdinals(query)).toEqual([1]);
+    expect(await repo.listLinkedSourceOrdinals({ ...query, nativeSessionId: "other" })).toEqual([]);
+    expect(await repo.listLinkedSourceOrdinals({ ...query, sourceLocator: "sessions/b.jsonl" })).toEqual([]);
+    await expect(repo.listLinkedSourceOrdinals({ ...query, sourceLocator: "../escape" })).rejects.toMatchObject({ backend: "sqlite" });
+  });
+
   it("rolls back earlier rows and checkpoint on a later invalid link", async () => {
     const { repo, db } = fixture();
     const input = batch();

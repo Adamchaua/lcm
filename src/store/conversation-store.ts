@@ -167,6 +167,7 @@ export type ConversationRecord = {
   bootstrappedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  parentSessionId: string | null;
 };
 
 export type MessageSearchInput = {
@@ -196,6 +197,7 @@ interface ConversationRow {
   bootstrapped_at: string | null;
   created_at: string;
   updated_at: string;
+  parent_session_id: string | null;
 }
 
 interface MessageRow {
@@ -285,6 +287,7 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
     bootstrappedAt: row.bootstrapped_at ? parseStoredTimestamp(row.bootstrapped_at) : null,
     createdAt: parseStoredTimestamp(row.created_at),
     updatedAt: parseStoredTimestamp(row.updated_at),
+    parentSessionId: row.parent_session_id,
   };
 }
 
@@ -498,7 +501,7 @@ export class ConversationStore {
 
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at, parent_session_id
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(Number(result.lastInsertRowid)) as unknown as ConversationRow;
@@ -510,7 +513,7 @@ export class ConversationStore {
     this.assertDirectTransactionUsable();
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at, parent_session_id
        FROM conversations WHERE conversation_id = ?`,
       )
       .get(conversationId) as unknown as ConversationRow | undefined;
@@ -523,7 +526,7 @@ export class ConversationStore {
     validateConversationText(sessionId, "session_id");
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at, parent_session_id
        FROM conversations
        WHERE session_id = ?
        ORDER BY created_at DESC, conversation_id DESC
@@ -556,11 +559,26 @@ export class ConversationStore {
       .run(conversationId);
   }
 
+  async setParentSessionIdIfNull(
+    conversationId: ConversationId,
+    parentSessionId: string,
+  ): Promise<void> {
+    this.assertDirectTransactionUsable();
+    validateConversationText(parentSessionId, "parent_session_id");
+    this.db
+      .prepare(
+        `UPDATE conversations
+       SET parent_session_id = ?
+       WHERE conversation_id = ? AND parent_session_id IS NULL`,
+      )
+      .run(parentSessionId, conversationId);
+  }
+
   async listConversations(): Promise<ConversationRecord[]> {
     this.assertDirectTransactionUsable();
     const rows = this.db
       .prepare(
-        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at
+        `SELECT conversation_id, session_id, title, bootstrapped_at, created_at, updated_at, parent_session_id
        FROM conversations
        ORDER BY created_at, conversation_id`,
       )

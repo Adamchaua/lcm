@@ -7,6 +7,7 @@ import {
   CODEX_NATIVE_TRANSCRIPT_FORMAT,
   createExactNativeTranscriptMessageResolver,
   createFileNativeTranscriptSource,
+  inheritedNativeSourceOrdinals,
   runNativeTranscriptBackfill,
   NativeTranscriptSourceChangedError,
   type NativeTranscriptSourceSnapshot,
@@ -29,14 +30,49 @@ import { sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { ParsedMessage } from "../../transcript.js";
 import { normalizeTranscriptClient, parseTranscriptTextForClient, type TranscriptClient } from "../../transcript-provider.js";
+import { readCodexInheritedBoundary, readCodexSessionParent, type CodexInheritedBoundary } from "../../codex-transcript.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
 import { safeLogError } from "../../hooks/hook-errors.js";
 import type { ProjectStorage, StorageBackendFactory, TransactionRepositories } from "../../storage/index.js";
-import { encodeTranscriptSlotMarker } from "../../storage/contracts.js";
+import { encodeTranscriptSlotMarker, type NativeTranscriptProvenanceRepository } from "../../storage/contracts.js";
 import { createCommitCloseBarrier, storageRouteFailureResponse, withProjectStorage } from "./storage-lifecycle.js";
 import { isAbortError, throwIfAborted } from "../cancellation.js";
 import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
+
+/** Which parse of a forked Codex subagent's rollout the stored conversation follows. */
+type SubagentHistory = "filtered" | "unfiltered" | "mismatch";
+
+/**
+ * Pick which parse of a forked Codex subagent's rollout the stored conversation
+ * follows: the first of [filtered, unfiltered] of which the already-stored
+ * (scrubbed) messages are an exact prefix. Because the stored rows are always a
+ * prefix of the chosen list, appending its remaining items and numbering native
+ * links by its order stay consistent from one snapshot to the next.
+ *
+ * When both lists extend the stored rows and differ, text alone cannot tell
+ * whether the rows came from the inherited-history reading, so native links
+ * that already exist decide: a stored link on a record the current bytes
+ * classify as inherited means the conversation follows the unfiltered list.
+ */
+async function chooseSubagentHistory(
+  stored: readonly { readonly role: string; readonly content: string }[],
+  filtered: readonly ParsedMessage[],
+  unfiltered: readonly ParsedMessage[],
+  scrubber: ScrubEngine | undefined,
+  hasLinkedInheritedRecord: () => Promise<boolean>,
+): Promise<SubagentHistory> {
+  const extendsStored = (messages: readonly ParsedMessage[]): boolean =>
+    stored.length <= messages.length && stored.every((row, index) => (
+      row.role === messages[index]!.role && row.content === scrubber!.scrub(messages[index]!.content)
+    ));
+  const unfilteredExtends = extendsStored(unfiltered);
+  if (!extendsStored(filtered)) return unfilteredExtends ? "unfiltered" : "mismatch";
+  return stored.length > 0 && unfilteredExtends && filtered.length !== unfiltered.length
+    && await hasLinkedInheritedRecord()
+    ? "unfiltered"
+    : "filtered";
+}
 
 function isParsedMessage(value: unknown): value is ParsedMessage {
   if (!value || typeof value !== "object") return false;
@@ -72,17 +108,15 @@ function errorCode(error: unknown): string | undefined {
  * PostgreSQL its advisory transaction lock serializes every writer of the
  * session until commit, and SQLite's immediate transaction does the same.
  */
-export async function appendSessionTranscript(
-  repositories: Pick<TransactionRepositories, "conversations" | "redactionAdmin" | "context">,
+export async function prepareSessionTranscript(
+  conversations: TransactionRepositories["conversations"],
   sessionId: string,
-  parsed: readonly ParsedMessage[],
-  scrubber: ScrubEngine,
 ): Promise<{
-  conversationId: number;
-  records: Awaited<ReturnType<TransactionRepositories["conversations"]["appendMessages"]>>;
-  totalCounts: { gitleaks: number; builtIn: number; global: number; project: number };
-} | null> {
-  const { conversations } = repositories;
+  conversation: Awaited<ReturnType<TransactionRepositories["conversations"]["getOrCreateConversation"]>>;
+  transcriptCount: number;
+  consumedCount: number;
+  eventMessageIds: ReadonlySet<number>;
+}> {
   const conversation = await conversations.getOrCreateConversation(sessionId);
   const snapshot = await conversations.getTranscriptSlotSnapshot(sessionId);
   let consumedCount = 0;
@@ -100,9 +134,26 @@ export async function appendSessionTranscript(
     }
     if (consumed) consumedCount += 1;
   }
-  const newMessages = parsed.slice(snapshot.transcriptCount + consumedCount);
-  if (newMessages.length === 0) return null;
+  return {
+    conversation,
+    transcriptCount: snapshot.transcriptCount,
+    consumedCount,
+    eventMessageIds: new Set(snapshot.events.map((event) => event.messageId)),
+  };
+}
 
+/** Scrub and append transcript messages to a conversation inside the caller's transaction. */
+async function appendTranscriptMessages(
+  repositories: Pick<TransactionRepositories, "conversations" | "redactionAdmin" | "context">,
+  conversationId: number,
+  newMessages: readonly ParsedMessage[],
+  scrubber: ScrubEngine,
+): Promise<{
+  conversationId: number;
+  records: Awaited<ReturnType<TransactionRepositories["conversations"]["appendMessages"]>>;
+  totalCounts: { gitleaks: number; builtIn: number; global: number; project: number };
+} | null> {
+  if (newMessages.length === 0) return null;
   const totalCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
   const inputs = newMessages.map((m) => {
     const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project: projectCount } = scrubber.scrubWithCounts(m.content);
@@ -116,13 +167,28 @@ export async function appendSessionTranscript(
       tokenCount: m.tokenCount,
     };
   });
-  const records = await conversations.appendMessages(conversation.conversationId, inputs);
+  const records = await repositories.conversations.appendMessages(conversationId, inputs);
   await repositories.redactionAdmin.upsertCounts(totalCounts);
   await repositories.context.appendContextMessages(
-    conversation.conversationId,
+    conversationId,
     records.map((record) => record.messageId),
   );
-  return { conversationId: conversation.conversationId, records, totalCounts };
+  return { conversationId, records, totalCounts };
+}
+
+export async function appendSessionTranscript(
+  repositories: Pick<TransactionRepositories, "conversations" | "redactionAdmin" | "context">,
+  sessionId: string,
+  parsed: readonly ParsedMessage[],
+  scrubber: ScrubEngine,
+) {
+  const slot = await prepareSessionTranscript(repositories.conversations, sessionId);
+  return appendTranscriptMessages(
+    repositories,
+    slot.conversation.conversationId,
+    parsed.slice(slot.transcriptCount + slot.consumedCount),
+    scrubber,
+  );
 }
 
 function resolveMessages(input: { client?: unknown; messages?: unknown; provider?: unknown; transcript_path?: string }, cwd: string): { messages: ParsedMessage[]; nativePath?: string; client?: TranscriptClient } {
@@ -198,19 +264,94 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         : undefined;
 
       const signal = context?.signal ?? new AbortController().signal;
-      async function persist(project: ProjectStorage, messages: ParsedMessage[], scrubber: ScrubEngine | undefined) {
+      async function persist(
+        project: ProjectStorage,
+        messages: ParsedMessage[],
+        scrubber: ScrubEngine | undefined,
+        filteredMessages: ParsedMessage[] | undefined,
+        hasLinkedInheritedRecord: (provenance: NativeTranscriptProvenanceRepository) => Promise<boolean>,
+        parentSessionId: string | undefined,
+      ) {
         const resolvedMessages = messages;
         return await project.transaction(async (repositories) => {
-          if (resolvedMessages.length === 0) return null;
-          return appendSessionTranscript(repositories, session_id, resolvedMessages, scrubber!);
+          // Keep-first parent linkage runs on every attempt, before any early
+          // return, and never creates a conversation of its own.
+          const linkParent = async (conversation: { conversationId: number; parentSessionId: string | null } | null) => {
+            if (parentSessionId === undefined || conversation === null || conversation.parentSessionId !== null) return;
+            await repositories.conversations.setParentSessionIdIfNull(conversation.conversationId, parentSessionId);
+          };
+          if (resolvedMessages.length === 0 && filteredMessages === undefined) {
+            if (parentSessionId !== undefined) {
+              await linkParent(await repositories.conversations.getConversationBySessionId(session_id));
+            }
+            return { persisted: null, history: undefined };
+          }
+
+          if (filteredMessages === undefined) {
+            // The session-wide slot index and the session lock come first.
+            const slot = await prepareSessionTranscript(repositories.conversations, session_id);
+            await linkParent(slot.conversation);
+            const persisted = await appendTranscriptMessages(
+              repositories,
+              slot.conversation.conversationId,
+              resolvedMessages.slice(slot.transcriptCount + slot.consumedCount),
+              scrubber!,
+            );
+            return { persisted, history: undefined };
+          }
+
+          const chooseHistory = (stored: readonly { readonly role: string; readonly content: string }[]) =>
+            chooseSubagentHistory(
+              stored,
+              filteredMessages,
+              resolvedMessages,
+              scrubber,
+              async () => repositories.nativeProvenance !== undefined
+                && await hasLinkedInheritedRecord(repositories.nativeProvenance),
+            );
+          if (resolvedMessages.length === 0) {
+            // Nothing can be appended without messages, so no conversation is
+            // created just to inspect an empty subagent.
+            const conversation = await repositories.conversations.getConversationBySessionId(session_id);
+            await linkParent(conversation);
+            let stored: Awaited<ReturnType<typeof repositories.conversations.getMessages>> = [];
+            if (conversation !== null) {
+              const snapshot = await repositories.conversations.getTranscriptSlotSnapshot(session_id);
+              const eventMessageIds = new Set(snapshot.events.map((event) => event.messageId));
+              stored = (await repositories.conversations.getMessages(conversation.conversationId))
+                .filter((message) => !eventMessageIds.has(message.messageId));
+            }
+            return { persisted: null, history: await chooseHistory(stored) };
+          }
+
+          const slot = await prepareSessionTranscript(repositories.conversations, session_id);
+          await linkParent(slot.conversation);
+          const stored = (await repositories.conversations.getMessages(slot.conversation.conversationId))
+            .filter((message) => !slot.eventMessageIds.has(message.messageId));
+          // A consumed slot or a session split across conversations means the
+          // newest conversation's rows are not the session-wide prefix: leave it.
+          const history: SubagentHistory = slot.consumedCount > 0 || stored.length !== slot.transcriptCount
+            ? "mismatch"
+            : await chooseHistory(stored);
+          if (history === "mismatch") return { persisted: null, history };
+          const chosen = history === "filtered" ? filteredMessages : resolvedMessages;
+          const persisted = await appendTranscriptMessages(
+            repositories,
+            slot.conversation.conversationId,
+            chosen.slice(slot.transcriptCount),
+            scrubber!,
+          );
+          return { persisted, history };
         });
       }
-      let accumulated: Awaited<ReturnType<typeof persist>> = null;
-      let ingest: (NonNullable<Awaited<ReturnType<typeof persist>>> & { totalTokens: number }) | null = null;
+      type PersistedIngest = NonNullable<Awaited<ReturnType<typeof persist>>["persisted"]>;
+      let accumulated: PersistedIngest | null = null;
+      let ingest: (PersistedIngest & { totalTokens: number }) | null = null;
       let sourceWitness: { byteLength: number; sha256: string } | undefined;
       let retryFailure: NativeTranscriptSourceChangedError | undefined;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         throwIfAborted(signal);
+        let parentSessionId: string | undefined;
         let snapshot: NativeTranscriptSourceSnapshot | undefined;
         let closeSnapshot: (() => Promise<void>) | undefined;
         let sourceClosed = false;
@@ -228,6 +369,9 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         };
         try {
           let messages = resolvedMessages;
+          let inheritedBoundary: CodexInheritedBoundary | undefined;
+          let filteredMessages: ParsedMessage[] | undefined;
+          let rolloutBytes: Buffer | undefined;
           if (importNative !== undefined) {
             snapshot = await createFileNativeTranscriptSource(dirname(importNative), basename(importNative)).openSnapshot();
             closeSnapshot = snapshot.close.bind(snapshot);
@@ -249,8 +393,24 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
             for await (const chunk of snapshot.stream()) chunks.push(Buffer.from(chunk));
             await snapshot.assertUnchanged();
             const bytes = Buffer.concat(chunks);
+            rolloutBytes = bytes;
             sourceWitness = { byteLength: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") };
-            messages = parseTranscriptTextForClient(bytes.toString("utf8"), resolved.client!);
+            const raw = bytes.toString("utf8");
+            messages = parseTranscriptTextForClient(raw, resolved.client!);
+            if (resolved.client === "codex") {
+              // The boundary is read from the same bound bytes as the parse.
+              inheritedBoundary = readCodexInheritedBoundary(raw);
+              if (inheritedBoundary !== undefined) {
+                filteredMessages = parseTranscriptTextForClient(raw, "codex", { excludeInheritedSubagentHistory: true });
+              }
+              // The immediate parent comes from the same bound bytes; only the
+              // rollout whose own id is the child key may name one.
+              const meta = readCodexSessionParent(raw);
+              if (
+                meta !== undefined && meta.id === session_id && meta.parentThreadId !== ""
+                && meta.parentThreadId !== session_id && !meta.parentThreadId.includes("\0")
+              ) parentSessionId = meta.parentThreadId;
+            }
           }
           throwIfAborted(signal);
           const scrubber = await createScrubber(messages);
@@ -271,7 +431,26 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                 }
                 await snapshot?.assertUnchanged();
                 throwIfAborted(signal);
-                const persisted = await persist(project, messages, scrubber);
+                const { persisted, history } = await persist(
+                  project,
+                  messages,
+                  scrubber,
+                  filteredMessages,
+                  // Only a tie between the two readings asks this: does a
+                  // committed native link already sit on inherited history?
+                  async (provenance: NativeTranscriptProvenanceRepository) => {
+                    const linked = await provenance.listLinkedSourceOrdinals({
+                      machineId: project.nativeTranscripts!.machineId,
+                      clientName: CODEX_NATIVE_TRANSCRIPT_FORMAT.clientName,
+                      sourceLocator: createHash("sha256").update(importNative!).digest("hex"),
+                      nativeSessionId: session_id,
+                    });
+                    if (linked.length === 0) return false;
+                    const inherited = await inheritedNativeSourceOrdinals(rolloutBytes!, inheritedBoundary!);
+                    return linked.some((ordinal) => inherited.has(ordinal));
+                  },
+                  parentSessionId,
+                );
                 if (persisted) {
                   accumulated = accumulated === null ? persisted : {
                     conversationId: persisted.conversationId,
@@ -285,7 +464,15 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                   };
                 }
                 throwIfAborted(signal);
-                if (importNative !== undefined) {
+                if (history === "mismatch") {
+                  // Neither parse extends what is stored for this child, so
+                  // appending or linking could misnumber it. Leave it as is.
+                  await safeLogError(
+                    "ingest",
+                    new Error("subagent transcript matches neither the filtered nor the unfiltered stored history"),
+                    { cwd, sessionId: session_id },
+                  );
+                } else if (importNative !== undefined) {
                   const native = project.nativeTranscripts!;
                   const format = resolved.client === "codex"
                     ? CODEX_NATIVE_TRANSCRIPT_FORMAT
@@ -306,6 +493,9 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
                       globalPatterns: config.security?.sensitivePatterns ?? [],
                       projectPatterns,
                       quarantine,
+                      ...(history === "filtered" && inheritedBoundary !== undefined
+                        ? { codexInheritedBoundary: inheritedBoundary }
+                        : {}),
                     });
                   } catch (error) {
                     backfillFailed = true;

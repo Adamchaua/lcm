@@ -48,6 +48,7 @@ import {
   createExactNativeTranscriptMessageResolver,
   createNativeTranscriptMessageMapper,
   createNativeTranscriptScrubber,
+  inheritedNativeSourceOrdinals,
   NativeTranscriptConfigurationError,
   NativeTranscriptLinkError,
   NativeTranscriptSourceChangedError,
@@ -5726,5 +5727,170 @@ describe("native transcript scrubbing residual verification", () => {
       redacted,
       JSON.stringify({ alpha: redacted }),
     ]);
+  });
+});
+
+describe("Codex inherited subagent history option", () => {
+  const codexMessage = (ordinal: number | undefined, role: "user" | "assistant", text: string): string =>
+    JSON.stringify({
+      type: "response_item",
+      ...(ordinal === undefined ? {} : { ordinal }),
+      payload: {
+        type: "message",
+        role,
+        content: [{ type: role === "user" ? "input_text" : "output_text", text }],
+      },
+    }) + "\n";
+  const quarantineFor = (clientName: string) => ({
+    clientName,
+    quarantine: vi.fn(),
+    get: vi.fn(),
+    list: vi.fn(),
+    close: vi.fn(),
+  });
+  const resolverFor = (...contents: string[]) => createExactNativeTranscriptMessageResolver({
+    getNativeTranscriptMessageSnapshot: vi.fn(async () => contents.map((content, index) => ({
+      messageId: 10 + index,
+      conversationId: 7,
+      messageSequence: index,
+      role: index % 2 === 0 ? "user" as const : "assistant" as const,
+      content,
+      isCompactionEvent: false,
+    }))),
+  });
+  const base = (content: string, resolver: ReturnType<typeof resolverFor>) => ({
+    quarantine: quarantineFor("codex"),
+    source: source(content),
+    machineId: "machine",
+    format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
+    nativeSessionId: "session-1",
+    sourceLocator: "sessions/session.jsonl",
+    messageResolver: resolver,
+  });
+
+  it("stores inherited records unlinked and numbers links by the child's own messages", async () => {
+    const repo = repository();
+    const content = codexMessage(0, "user", "inherited")
+      + "{not json\n"
+      + codexMessage(1, "user", "own 1")
+      + codexMessage(2, "assistant", "own 2")
+      + codexMessage(undefined, "user", "unnumbered");
+    await runNativeTranscriptBackfill({
+      ...base(content, resolverFor("own 1", "own 2", "unnumbered")),
+      repository: repo,
+      codexInheritedBoundary: { start: 1, paginated: true },
+    });
+    const linked = repo.batches.flatMap((batch) => batch.records)
+      .map((record) => [record.sourceOrdinal, record.messageLinks.map((link) => link.messageId)]);
+    expect(linked).toEqual([[0, []], [2, [10]], [3, [11]], [4, []]]);
+  });
+
+  it("keeps the default mapper's behavior without the option", async () => {
+    const repo = repository();
+    await runNativeTranscriptBackfill({
+      ...base(codexMessage(0, "user", "first") + codexMessage(1, "assistant", "second"), resolverFor("first", "second")),
+      repository: repo,
+    });
+    expect(repo.batches.flatMap((batch) => batch.records).map((record) => record.messageLinks.length)).toEqual([1, 1]);
+  });
+
+  it.each([
+    ["a non-object boundary", { codexInheritedBoundary: null }],
+    ["a fractional start", { codexInheritedBoundary: { start: 1.5, paginated: true } }],
+    ["a negative start", { codexInheritedBoundary: { start: -1, paginated: true } }],
+    ["a non-boolean mode", { codexInheritedBoundary: { start: 1, paginated: "yes" } }],
+  ])("rejects %s", async (_name, extra) => {
+    const repo = repository();
+    await expect(runNativeTranscriptBackfill({
+      ...base("", resolverFor()),
+      repository: repo,
+      ...extra,
+    } as never)).rejects.toThrowError(NativeTranscriptConfigurationError);
+    expect(repo.ingestBatch).not.toHaveBeenCalled();
+  });
+
+  it("links own messages when scrubbing renames the ordinal key, initially and on resume", async () => {
+    const content = codexMessage(0, "user", "inherited")
+      + codexMessage(1, "user", "own 1")
+      + codexMessage(2, "assistant", "own 2");
+    const repo = repository();
+    await runNativeTranscriptBackfill({
+      ...base(content, resolverFor("own 1", "own 2")),
+      repository: repo,
+      globalPatterns: ["ordinal"],
+      codexInheritedBoundary: { start: 1, paginated: true },
+    });
+    const records = repo.batches.flatMap((batch) => batch.records);
+    expect(JSON.stringify(records[1]!.nativePayload)).not.toContain('"ordinal"');
+    expect(records.map((record) => record.messageLinks.map((link) => link.messageId))).toEqual([[], [10], [11]]);
+
+    const resumed = repository(checkpoint({
+      version: 2,
+      byteOffset: Buffer.byteLength(codexMessage(0, "user", "inherited") + codexMessage(1, "user", "own 1")),
+      prefixSha256: digest(codexMessage(0, "user", "inherited") + codexMessage(1, "user", "own 1")),
+      scrubberVersion: createNativeTranscriptScrubber({ globalPatterns: ["ordinal"], projectPatterns: [] }).scrubberVersion,
+      nativeSessionId: "session-1",
+      format: { clientName: "codex", formatName: "codex-jsonl", formatVersion: "v1" },
+      source: { sizeBytes: 1, modifiedAtMs: 1, changedAtMs: 1 },
+    }));
+    await runNativeTranscriptBackfill({
+      ...base(content, resolverFor("own 1", "own 2")),
+      repository: resumed,
+      globalPatterns: ["ordinal"],
+      codexInheritedBoundary: { start: 1, paginated: true },
+    });
+    expect(resumed.batches.flatMap((batch) => batch.records).map((record) => record.messageLinks.map((link) => link.messageId)))
+      .toEqual([[11]]);
+  });
+
+  it("never asks a custom mapper about inherited records", async () => {
+    const map = vi.fn(() => []);
+    await runNativeTranscriptBackfill({
+      ...base(codexMessage(0, "user", "inherited") + codexMessage(1, "user", "own"), resolverFor()),
+      repository: repository(),
+      messageMapper: { map },
+      codexInheritedBoundary: { start: 1, paginated: true },
+    });
+    expect(map).toHaveBeenCalledTimes(1);
+  });
+
+  it("classifies raw records for the reader and omits the flag without a boundary", async () => {
+    const bytes = codexMessage(0, "user", "inherited") + codexMessage(1, "user", "own");
+    const scrubber = createNativeTranscriptScrubber({ globalPatterns: ["ordinal"], projectPatterns: [] });
+    const withBoundary = await collect(byteChunks(bytes), {
+      format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
+      scrubber,
+      codexInheritedBoundary: { start: 1, paginated: true },
+    });
+    expect(withBoundary.map((outcome) => outcome.kind === "record" ? outcome.inheritedHistory : undefined))
+      .toEqual([true, false]);
+    const without = await collect(byteChunks(bytes), { format: CODEX_NATIVE_TRANSCRIPT_FORMAT });
+    expect(without.every((outcome) => outcome.kind === "record" && !("inheritedHistory" in outcome))).toBe(true);
+    await expect(collect(byteChunks(bytes), {
+      format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
+      codexInheritedBoundary: { start: -1, paginated: true },
+    })).rejects.toThrowError(NativeTranscriptConfigurationError);
+    await expect(collect(byteChunks(bytes), {
+      codexInheritedBoundary: { start: 1, paginated: true },
+    })).rejects.toThrowError(NativeTranscriptConfigurationError);
+  });
+
+  it("lists the source ordinals of inherited records, counting quarantined lines", async () => {
+    const bytes = JSON.stringify({ type: "session_meta", payload: {} }) + "\n"
+      + codexMessage(0, "user", "inherited")
+      + "{bad\n\n"
+      + codexMessage(1, "user", "own")
+      + JSON.stringify({ type: "response_item", ordinal: 0, payload: { type: "function_call" } }) + "\n";
+    expect([...await inheritedNativeSourceOrdinals(Buffer.from(bytes), { start: 1, paginated: false })]).toEqual([1, 4]);
+  });
+
+  it("rejects the option for a non-Codex format", async () => {
+    await expect(runNativeTranscriptBackfill({
+      ...base("", resolverFor()),
+      quarantine: quarantineFor("claude-code"),
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT,
+      repository: repository(),
+      codexInheritedBoundary: { start: 1, paginated: true },
+    })).rejects.toThrowError(NativeTranscriptConfigurationError);
   });
 });

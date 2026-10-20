@@ -25,9 +25,12 @@ const GOLDEN = {
   promptCli: "sha256:c686e888147a6d5ab6d70a6a7f4863c3bcff608d0b3fd9fd320147efd187915e",
   promptMcp: "sha256:c58011b176453632fc6f5a0f30f97d0497892c8061413423644b6f0ec6c51ac9",
   stop: "sha256:6b95211647571f6197d0375b6230fcc37488515b048d24ad1dbc20073900ee31",
+  subagentStart: "sha256:1c72208d0824a812e642574d20a7c17ce8e3ebe6f582ece11590959dcfcbcc76",
+  subagentStop: "sha256:22c21408f46ecf3fbcadecd5dd9f1b2585a273e30ca46ae85040f199f0f44a12",
   interrupt: "sha256:8b30c34242015a60fead632bfa0f58a9a9e7561afe958f038d2c3f72eb0a4e62",
   sessionEnd: "sha256:ca7a4d92ea4a593150b9734c2018c5fe9d0e76eb77f6d62cfbebf6c41b0656d9",
   foreign: "sha256:9e559ad47195227680137c179e4b2ea8e191d4bc023e76f73f6e74fdb97b85bb",
+  preTool: "sha256:ab1f47b7396d2f3349aa0006cb6e7aff8bacc25a9fb447a0bb2edd5fbf9a6fe1",
 };
 
 type StateEntry = readonly [snakeEvent: string, group: number, handler: number, hash: string];
@@ -37,6 +40,8 @@ const TRUSTED_ALL: readonly StateEntry[] = [
   ["post_tool_use", 0, 0, GOLDEN.post],
   ["pre_compact", 0, 0, GOLDEN.pre],
   ["stop", 0, 0, GOLDEN.stop],
+  ["subagent_start", 0, 0, GOLDEN.subagentStart],
+  ["subagent_stop", 0, 0, GOLDEN.subagentStop],
   ["interrupt", 0, 0, GOLDEN.interrupt],
   ["session_end", 0, 0, GOLDEN.sessionEnd],
 ];
@@ -91,6 +96,10 @@ describe("computeCodexHookHash", () => {
     expect(hashOf("UserPromptSubmit")).toBe(GOLDEN.promptCli);
     expect(hashOf("UserPromptSubmit", "mcp")).toBe(GOLDEN.promptMcp);
     expect(hashOf("Stop")).toBe(GOLDEN.stop);
+    expect(hashOf("SubagentStart")).toBe(GOLDEN.subagentStart);
+    expect(hashOf("SubagentStop")).toBe(GOLDEN.subagentStop);
+    const preTool = codexLcmHooks("cli", { preToolRecall: true }).PreToolUse[0];
+    expect(computeCodexHookHash("PreToolUse", preTool, preTool.hooks![0], "linux")).toBe(GOLDEN.preTool);
     expect(hashOf("Interrupt")).toBe(GOLDEN.interrupt);
     expect(hashOf("SessionEnd")).toBe(GOLDEN.sessionEnd);
     expect(computeCodexHookHash(
@@ -138,7 +147,7 @@ describe("computeCodexHookHash", () => {
 describe("inspectCodexReadiness statuses", () => {
   it("reports every default role ready when enabled and trusted", () => {
     const report = inspectCodexReadiness(input());
-    expect(report.rows).toHaveLength(7);
+    expect(report.rows).toHaveLength(9);
     expect(report.rows.every((row) => row.status === "ready" && !row.drift)).toBe(true);
     expect(report.rows.find((row) => row.event === "SessionStart")?.key).toBe(HOOKS + ":session_start:0:0");
     expect(report.client).toEqual({ state: "compatible", raw: "codex-cli 0.163.0" });
@@ -147,12 +156,12 @@ describe("inspectCodexReadiness statuses", () => {
   it("reports absent, foreign-only and partial registrations as missing per role", () => {
     const absent = inspectCodexReadiness(input({ hooks: { state: "absent" } }));
     expect(new Set(absent.rows.map((row) => row.status))).toEqual(new Set(["missing"]));
-    expect(absent.rows).toHaveLength(7);
+    expect(absent.rows).toHaveLength(9);
 
     const foreignOnly = inspectCodexReadiness(input({
       hooks: { state: "content", content: JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: "echo other" }] }] } }), mtimeMs: 1 },
     }));
-    expect(foreignOnly.rows).toHaveLength(7);
+    expect(foreignOnly.rows).toHaveLength(9);
     expect(new Set(foreignOnly.rows.map((row) => row.status))).toEqual(new Set(["missing"]));
 
     const partial = inspectCodexReadiness(input({ hooks: hooksWith((hooks) => { delete hooks.SessionStart; }) }));
@@ -264,11 +273,12 @@ describe("inspectCodexReadiness statuses", () => {
       "x = 9223372036854775808\n", "x = 0x8000000000000000\n",
       "x = \"a" + C0(1) + "b\"\n", "x = 'a" + C0(0x7f) + "b'\n", 'x = """a \\q b"""\n', 'x = """a \\uD800 b"""\n',
       "# comment " + C0(1) + "\n", "# comment \r bare\n",
+      "x = 1e309\n", "x = 1_0e309\n", "x = [ -1e999 ]\n",
     ]) {
       const report = inspectCodexReadiness(input({ config: { state: "content", content: invalid + trusted } }));
       expect(new Set(report.rows.map((row) => row.status)), JSON.stringify(invalid)).toEqual(new Set(["state-unknown"]));
     }
-    for (const valid of ["x = 2024-02-29\n", "x = 23:59:60\n", "x = 9223372036854775807\n", "x = { b = 1,\n c = 2, }\n"]) {
+    for (const valid of ["x = 2024-02-29\n", "x = 23:59:60\n", "x = 9223372036854775807\n", "x = { b = 1,\n c = 2, }\n", "x = 1.7976931348623157e308\n", "x = 1e-400\n"]) {
       const report = inspectCodexReadiness(input({ config: { state: "content", content: valid + trusted } }));
       expect(new Set(report.rows.map((row) => row.status)), valid).toEqual(new Set(["ready"]));
     }
@@ -328,6 +338,8 @@ describe("inspectCodexReadiness statuses", () => {
       "PostToolUse/post-tool": "disabled",
       "PreCompact/session-snapshot": "disabled",
       "Stop/session-snapshot": "untrusted",
+      "SubagentStart/restore": "untrusted",
+      "SubagentStop/session-snapshot": "untrusted",
       "Interrupt/session-snapshot": "untrusted",
       "SessionEnd/session-snapshot": "untrusted",
     });
@@ -357,11 +369,11 @@ describe("inspectCodexReadiness statuses", () => {
 
   it("reports sibling-event handlers without ever requiring them", () => {
     const extra = inspectCodexReadiness(input({
-      hooks: hooksWith((hooks) => { hooks.SubagentStop = [{ hooks: [{ type: "command", command: "lcm session-snapshot --client codex", timeout: 2 }] }]; }),
+      hooks: hooksWith((hooks) => { hooks.PostCompact = [{ hooks: [{ type: "command", command: "lcm session-snapshot --client codex", timeout: 2 }] }]; }),
     }));
-    expect(extra.rows).toHaveLength(8);
-    expect(extra.rows.find((row) => row.event === "SubagentStop")).toMatchObject({ status: "untrusted", drift: false });
-    expect(inspectCodexReadiness(input()).rows.some((row) => row.event === "SubagentStop")).toBe(false);
+    expect(extra.rows).toHaveLength(10);
+    expect(extra.rows.find((row) => row.event === "PostCompact")).toMatchObject({ status: "untrusted", drift: false });
+    expect(inspectCodexReadiness(input()).rows.some((row) => row.event === "PostCompact")).toBe(false);
   });
 
   it("uses a test-supplied expectation, including enabled opt-in roles", () => {
@@ -373,6 +385,49 @@ describe("inspectCodexReadiness statuses", () => {
       hooks: hooksWith((hooks) => { hooks.PreToolUse = [{ matcher: "*", hooks: [{ type: "command", command: "lcm post-tool --client codex", timeout: 9 }] }]; }),
     }));
     expect(installed.rows.find((row) => row.event === "PreToolUse")).toMatchObject({ drift: true, status: "untrusted" });
+  });
+});
+
+describe("inspectCodexReadiness opt-in PreToolUse role", () => {
+  const preGroup = codexLcmHooks("cli", { preToolRecall: true }).PreToolUse[0];
+  const preHash = GOLDEN.preTool;
+  const withPre = hooksWith((hooks) => { hooks.PreToolUse = [preGroup]; });
+  const trustedWithPre = { state: "content" as const, content: trustToml([...TRUSTED_ALL, ["pre_tool_use", 0, 0, preHash]]) };
+
+  it("expects the role only while enabled", () => {
+    const disabled = inspectCodexReadiness(input());
+    expect(disabled.rows.some((row) => row.event === "PreToolUse")).toBe(false);
+    expect(formatCodexReadiness(disabled).failures).toBe(0);
+
+    const missing = inspectCodexReadiness(input({ preToolRecall: true }));
+    expect(statuses(missing)["PreToolUse/pre-tool"]).toBe("missing");
+    const text = formatCodexReadiness(missing);
+    expect(text.failures).toBe(1);
+    expect(text.lines.join("\n")).toContain("unavailable LCM capabilities: recall LCM memory before tool use");
+  });
+
+  it("reports an installed role by trust whether or not it is expected", () => {
+    const ready = inspectCodexReadiness(input({ preToolRecall: true, hooks: withPre, config: trustedWithPre }));
+    expect(ready.rows.find((row) => row.event === "PreToolUse")).toMatchObject({ role: "pre-tool", status: "ready", drift: false });
+    expect(formatCodexReadiness(ready).failures).toBe(0);
+
+    const untrusted = inspectCodexReadiness(input({ preToolRecall: true, hooks: withPre }));
+    expect(statuses(untrusted)["PreToolUse/pre-tool"]).toBe("untrusted");
+
+    const stale = hooksWith((hooks) => { hooks.PreToolUse = [{ ...preGroup, matcher: "Bash" }]; });
+    const modified = inspectCodexReadiness(input({ preToolRecall: true, hooks: stale, config: trustedWithPre }));
+    expect(modified.rows.find((row) => row.event === "PreToolUse")).toMatchObject({ status: "modified", drift: true });
+
+    const leftover = inspectCodexReadiness(input({ hooks: withPre, config: trustedWithPre }));
+    expect(leftover.rows.find((row) => row.event === "PreToolUse")).toMatchObject({ status: "ready", drift: false });
+    expect(leftover.rows).toHaveLength(10);
+  });
+
+  it("honors a deliberate disable of the installed role", () => {
+    const toml = trustToml(TRUSTED_ALL)
+      + '[hooks.state."' + HOOKS + ':pre_tool_use:0:0"]\nenabled = false\ntrusted_hash = "' + preHash + '"\n';
+    const report = inspectCodexReadiness(input({ preToolRecall: true, hooks: withPre, config: { state: "content", content: toml } }));
+    expect(statuses(report)["PreToolUse/pre-tool"]).toBe("disabled");
   });
 });
 
@@ -547,6 +602,14 @@ describe("Codex readiness on disk", () => {
     expect(failing.failures).toBe(0);
     expect(failing.lines.join("\n")).toContain("stored connector transport unreadable (could not be read)");
     expect(failing.lines.join("\n")).not.toContain("secret path");
+
+    const wanted = runCodexReadinessCheck({ ...base, readPreToolRecall: () => true });
+    expect(wanted.failures).toBe(1);
+    expect(wanted.lines.join("\n")).toContain("PreToolUse hook (recall LCM memory before tool use): not installed");
+    const unreadable = runCodexReadinessCheck({ ...base, readPreToolRecall: () => { throw new Error("secret path /y"); } });
+    expect(unreadable.failures).toBe(0);
+    expect(unreadable.lines.join("\n")).not.toContain("PreToolUse");
+    expect(runCodexReadinessCheck({ ...base, readPreToolRecall: () => false }).failures).toBe(0);
 
     const stored = runCodexReadinessCheck({ ...base, readStoredTransport: () => "cli" as const });
     expect(stored.failures).toBe(0);

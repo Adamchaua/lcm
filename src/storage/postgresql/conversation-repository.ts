@@ -35,7 +35,8 @@ const MIN_SAFE_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
 const CONVERSATION_COLUMNS =
-  "conversation_id, session_id, title, bootstrapped_at, created_at, updated_at";
+  "conversation_id, session_id, title, bootstrapped_at, created_at, updated_at, " +
+  "parent_session_id";
 const MESSAGE_COLUMNS =
   "message_id, conversation_id, seq, role, content, token_count, created_at";
 const MESSAGE_PART_COLUMNS =
@@ -78,6 +79,7 @@ type ConversationRow = QueryResultRow & {
   bootstrapped_at: Date | string | null;
   created_at: Date | string;
   updated_at: Date | string;
+  parent_session_id: string | null;
 };
 
 type MessageRow = QueryResultRow & {
@@ -237,6 +239,7 @@ function conversationFromRow(
     bootstrappedAt: row.bootstrapped_at === null ? null : date(row.bootstrapped_at),
     createdAt: date(row.created_at),
     updatedAt: date(row.updated_at),
+    parentSessionId: row.parent_session_id,
   };
 }
 
@@ -401,6 +404,30 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
                WHERE project_id = $1
                  AND conversation_id = $2`,
         values: [this.projectId, conversationId],
+      }, this.context(operation));
+    });
+  }
+
+  async setParentSessionIdIfNull(
+    conversationId: ConversationId,
+    parentSessionId: string,
+  ): Promise<void> {
+    const operation = "setParentSessionIdIfNull";
+    safeInputInteger(
+      conversationId,
+      this.projectId,
+      operation,
+      "conversation_id",
+    );
+    validateNoNul(parentSessionId, this.projectId, operation, "parent_session_id");
+    await this.scopedDirectWrite(operation, async (transaction) => {
+      await transaction.query({
+        text: `UPDATE lcm.conversations
+               SET parent_session_id = $3
+               WHERE project_id = $1
+                 AND conversation_id = $2
+                 AND parent_session_id IS NULL`,
+        values: [this.projectId, conversationId, parentSessionId],
       }, this.context(operation));
     });
   }

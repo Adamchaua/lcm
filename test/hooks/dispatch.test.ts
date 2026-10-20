@@ -29,6 +29,9 @@ vi.mock("../../src/hooks/terminal-snapshot.js", () => ({
 vi.mock("../../src/hooks/post-tool.js", () => ({
   handlePostToolUse: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
 }));
+vi.mock("../../src/hooks/pre-tool.js", () => ({
+  handlePreToolUse: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
+}));
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: vi.fn().mockImplementation(function () {
     return {};
@@ -57,6 +60,7 @@ describe("HOOK_COMMANDS", () => {
     const commandToEvent: Record<string, string> = {
       "compact": "PreCompact",
       "post-tool": "PostToolUse",
+      "pre-tool": "PreToolUse",
       "restore": "SessionStart",
       "session-end": "SessionEnd",
       "session-snapshot": "Stop",
@@ -78,6 +82,7 @@ import { handleSessionEnd } from "../../src/hooks/session-end.js";
 import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
 import { handleSessionSnapshot } from "../../src/hooks/session-snapshot.js";
 import { handlePostToolUse } from "../../src/hooks/post-tool.js";
+import { handlePreToolUse } from "../../src/hooks/pre-tool.js";
 import { handleTerminalSnapshot } from "../../src/hooks/terminal-snapshot.js";
 import { loadHookConfig, type HookConfig } from "../../src/hooks/config.js";
 import type { StorageBackendSelection } from "../../src/storage/backend.js";
@@ -280,6 +285,16 @@ describe("dispatchHook", () => {
     expect(ensureBootstrapped).not.toHaveBeenCalled();
   });
 
+  it("verifies the endpoint for a Codex child snapshot that lacks the tree session_id", async () => {
+    vi.mocked(ensureCoreEndpoint).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: true, port: 4242 });
+    vi.mocked(handleSessionSnapshot).mockClear();
+    const stdin = JSON.stringify({ client: "codex", agent_id: "child-thread" });
+    await dispatchHook("session-snapshot", stdin);
+    expect(ensureCoreEndpoint).toHaveBeenCalledOnce();
+    expect(handleSessionSnapshot).toHaveBeenCalledWith(stdin, { verifiedPort: 4242 });
+  });
+
   it("binds snapshot dispatch to the verified port when configuration changes afterward", async () => {
     vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: true, port: 3737 });
     vi.mocked(loadHookConfig).mockClear();
@@ -426,6 +441,29 @@ describe("dispatchHook", () => {
     expect(loadHookConfig).not.toHaveBeenCalled();
   });
 
+  it("routes pre-tool straight to its handler without bootstrap, repair or config load", async () => {
+    const payload = JSON.stringify({ session_id: "test", client: "codex", tool_name: "Bash" });
+    vi.mocked(handlePreToolUse).mockClear();
+    vi.mocked(ensureBootstrapped).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockClear();
+    vi.mocked(validateAndFixHooks).mockClear();
+    vi.mocked(loadHookConfig).mockClear();
+
+    const result = await dispatchHook("pre-tool", payload);
+
+    expect(result).toEqual({ exitCode: 0, stdout: "" });
+    expect(handlePreToolUse).toHaveBeenCalledTimes(1);
+    expect(handlePreToolUse).toHaveBeenCalledWith(payload);
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it("recognizes pre-tool as a valid hook command", () => {
+    expect(isHookCommand("pre-tool")).toBe(true);
+  });
+
   it("recognizes post-tool as a valid hook command", () => {
     expect(isHookCommand("post-tool")).toBe(true);
     expect(isHookCommand("invalid")).toBe(false);
@@ -491,6 +529,7 @@ describe("LCM_ENABLED=false", () => {
   const handlers = {
     compact: handlePreCompact,
     "post-tool": handlePostToolUse,
+    "pre-tool": handlePreToolUse,
     restore: handleSessionStart,
     "session-end": handleSessionEnd,
     "session-snapshot": handleSessionSnapshot,
@@ -525,6 +564,26 @@ describe("LCM_ENABLED=false", () => {
     ).resolves.toEqual({ exitCode: 0, stdout: "" });
 
     expect(handleUserPromptSubmit).not.toHaveBeenCalled();
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it("makes Codex subagent restore and snapshot hooks no-ops", async () => {
+    vi.clearAllMocks();
+    vi.stubEnv("LCM_ENABLED", "false");
+    const subagent = JSON.stringify({
+      session_id: "tree-root",
+      agent_id: "child-thread",
+      agent_transcript_path: "/rollouts/child.jsonl",
+      client: "codex",
+    });
+
+    await expect(dispatchHook("restore", subagent)).resolves.toEqual({ exitCode: 0, stdout: "" });
+    await expect(dispatchHook("session-snapshot", subagent)).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handleSessionStart).not.toHaveBeenCalled();
     expect(handleSessionSnapshot).not.toHaveBeenCalled();
     expect(ensureBootstrapped).not.toHaveBeenCalled();
     expect(ensureCoreEndpoint).not.toHaveBeenCalled();

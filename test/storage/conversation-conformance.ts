@@ -62,6 +62,22 @@ export async function exerciseConversationRepositoryConformance(
   expect((await repository.getConversation(first.conversationId))?.bootstrappedAt?.getTime())
     .toBe(firstBootstrap?.getTime());
 
+  // Parent linkage is keep-first, never cleared, and leaves updated_at alone.
+  expect((await repository.getConversation(first.conversationId))?.parentSessionId).toBeNull();
+  const beforeParent = await repository.getConversation(first.conversationId);
+  await repository.setParentSessionIdIfNull(first.conversationId, "parent-one");
+  await repository.setParentSessionIdIfNull(first.conversationId, "parent-two");
+  await repository.setParentSessionIdIfNull(999_999, "parent-one");
+  const afterParent = await repository.getConversation(first.conversationId);
+  expect(afterParent?.parentSessionId).toBe("parent-one");
+  expect(afterParent?.updatedAt.getTime()).toBe(beforeParent?.updatedAt.getTime());
+  expect((await repository.getConversation(second.conversationId))?.parentSessionId).toBeNull();
+  await expectNulRejected(() => repository.setParentSessionIdIfNull(
+    second.conversationId,
+    nulText,
+  ));
+  expect((await repository.getConversation(second.conversationId))?.parentSessionId).toBeNull();
+
   const createdMessages = await repository.createMessagesBulk([
     {
       conversationId: first.conversationId,
