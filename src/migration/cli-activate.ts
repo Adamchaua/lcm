@@ -20,6 +20,7 @@ import {
 } from "./cli-existing.js";
 import {
   combineCutoverRestart,
+  CUTOVER_RESTART_REASONS,
   manifestMovedSince,
   type MigrationCutoverCommandOutcome,
 } from "./cli-cutover.js";
@@ -396,7 +397,8 @@ async function mapActivationOutcome(args: Readonly<{
   if (restart.reason !== undefined) {
     return {
       status: "refuse", reason: restart.reason, generationId, ...(applied ? { applied: true as const } : {}),
-      next: ACTIVATE_NEXT_AFTER_SUCCESS,
+      // The grant swap and daemon start fix only a positively observed stale daemon.
+      next: restart.reason === CUTOVER_RESTART_REASONS.required ? ACTIVATE_NEXT_AFTER_SUCCESS : "report",
       sections: evidence, restart: restart.restart,
     };
   }

@@ -431,7 +431,10 @@ describe("activate: the activated outcome (exit 0 needs identity, manifest read-
   ])("%s", async (_name, restartVerdict, presence, reason) => {
     const { home, resolution } = settledActive();
     const result = await run(home, resolution, { _operationsForTesting: okOps(activated({ restart: restartVerdict, resumedFrom: "fresh" }), presence) });
-    expect(result).toMatchObject({ status: "refuse", reason, generationId: FIXTURE_GENERATION, applied: true, next: "swap-grants-then-start-daemon" });
+    expect(result).toMatchObject({
+      status: "refuse", reason, generationId: FIXTURE_GENERATION, applied: true,
+      next: reason === "cutover-restart-required" ? "swap-grants-then-start-daemon" : "report",
+    });
     expect((result as { restart: unknown }).restart).not.toBeNull();
   });
 
