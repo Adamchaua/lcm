@@ -337,7 +337,7 @@ describe("incident diagnostics runbook", () => {
       expect(start, section).toBeGreaterThanOrEqual(0);
       for (const heading of ["Evidence", "Interpretation", "Rollback", "Escalation"]) expect(body, `${section}: ${heading}`).toContain(`### ${heading}`);
     }
-    expect(source).toContain("statements_stats_reset");
+    expect(source).toContain("`statementsStatsReset` (the contract's `statements_stats_reset` value)");
     expect(source).toContain("same daemon");
     expect(source).toContain("A missing value is never zero");
   });

@@ -246,7 +246,8 @@ role.
 
 Use only `backendDiagnostics.telemetry.statements` from the approved jq bundle:
 status, operation IDs, cumulative numeric values, and
-`statements_stats_reset`. Do not query raw `pg_stat_statements`.
+`statementsStatsReset` (the contract's `statements_stats_reset` value). Do not
+query raw `pg_stat_statements`.
 
 ### Interpretation
 
