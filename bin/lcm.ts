@@ -21,6 +21,7 @@ import { performMigrationAbortCommand } from "../src/migration/cli-abort.js";
 import { performMigrationVerifyCommand } from "../src/migration/cli-verify.js";
 import { performMigrationResumeCommand } from "../src/migration/cli-resume.js";
 import { performMigrationReportCommand } from "../src/migration/cli-report.js";
+import { performMigrationActivateCommand } from "../src/migration/cli-activate.js";
 import {
   renderMigrationPlanEnvelope,
   renderMigrationDryRunEnvelope,
@@ -29,6 +30,7 @@ import {
   renderMigrationVerifyEnvelope,
   renderMigrationResumeEnvelope,
   renderMigrationReportEnvelope,
+  renderMigrationActivateEnvelope,
   renderMigrationUnexpectedFailureEnvelope,
 } from "../src/migration/cli-render.js";
 import type { MigrationCommandName } from "../src/migration/exit-classes.js";
@@ -2153,6 +2155,7 @@ export function registerMigrationCommand(program: Command): void {
   type MigrationJsonOptions = { help?: boolean; json?: boolean };
   type MigrationApplyOptions = MigrationJsonOptions & {
     confirmGeneration?: string;
+    confirmBackend?: string;
     generation?: string;
     dryRun?: boolean;
     maxRecords?: string;
@@ -2161,10 +2164,10 @@ export function registerMigrationCommand(program: Command): void {
   };
 
   const migrationCmd = new Command("migration")
-    .description("Reversible SQLite-to-PostgreSQL cutover (plan, dry-run, apply, resume, verify, report, abort)");
+    .description("Reversible SQLite-to-PostgreSQL cutover (plan, dry-run, apply, resume, verify, report, abort, activate)");
   migrationCmd.helpOption(false).option("-h, --help", "Show help");
   migrationCmd.action(async () => {
-    writeCliError("Usage: lcm migration <plan|dry-run|apply|resume|verify|report|abort> [--json]\n");
+    writeCliError("Usage: lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate> [--json]\n");
     exit(1);
   });
 
@@ -2304,6 +2307,29 @@ export function registerMigrationCommand(program: Command): void {
       });
       writeCliError("Migration abort finished.\n");
       emitMigrationEnvelope("abort", () => renderMigrationAbortEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("activate")
+    .description("Switch a verified generation to PostgreSQL. Afterwards swap the grants, then start the daemon")
+    .option("--generation <id>", "The generation to activate (default: the live maintenance hold)")
+    .option("--confirm-generation <id>", "The resolved generation id")
+    .option("--confirm-backend <backend>", "The backend activation switches to: postgresql")
+    .option("--dry-run", "Read the persisted state; evaluates nothing, so it never exits 0")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Activating the migration generation...\n");
+      const outcome = await performMigrationActivateCommand({
+        cwd: process.cwd(),
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        confirmBackend: opts.confirmBackend,
+        dryRun: opts.dryRun,
+      });
+      writeCliError("Migration activate finished.\n");
+      emitMigrationEnvelope("activate", () => renderMigrationActivateEnvelope(outcome), opts.json);
     });
 
   program.addCommand(migrationCmd);

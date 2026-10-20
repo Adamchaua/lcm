@@ -74,3 +74,30 @@ export function refuseUnlessConfirmed(input: Readonly<{
   return null;
 }
 
+/**
+ * The closed pair of reasons the `--confirm-backend` fence uses (plan-v5 Part
+ * A item 3). The literal is the backend the command switches to: the
+ * manifest's `destination.backend` for `activate` ("postgresql") and its
+ * `source.backend` for `rollback` ("sqlite"). The manifest invariant makes
+ * each the only legal value, so the fence confirms intent and does not detect
+ * the wrong direction.
+ */
+export const BACKEND_CONFIRMATION_REASONS: ConfirmationReasons = Object.freeze({
+  missing: "backend-confirmation-missing",
+  moved: "backend-confirmation-moved",
+});
+
+export function refuseUnlessBackendConfirmed(input: Readonly<{
+  expectedBackend: string;
+  confirmBackend: string | undefined;
+  generationId: string;
+}>): Readonly<{ status: "refuse"; reason: string; generationId: string }> | null {
+  if (input.confirmBackend === undefined) {
+    return { status: "refuse", reason: BACKEND_CONFIRMATION_REASONS.missing, generationId: input.generationId };
+  }
+  if (input.confirmBackend !== input.expectedBackend) {
+    return { status: "refuse", reason: BACKEND_CONFIRMATION_REASONS.moved, generationId: input.generationId };
+  }
+  return null;
+}
+

@@ -11,6 +11,7 @@ const state = vi.hoisted(() => ({
   resume: vi.fn(),
   verify: vi.fn(),
   report: vi.fn(),
+  activate: vi.fn(),
 }));
 
 vi.mock("node:process", async (importOriginal) => ({
@@ -51,6 +52,10 @@ vi.mock("../../src/migration/cli-verify.js", () => ({
 
 vi.mock("../../src/migration/cli-report.js", () => ({
   performMigrationReportCommand: state.report,
+}));
+
+vi.mock("../../src/migration/cli-activate.js", () => ({
+  performMigrationActivateCommand: state.activate,
 }));
 
 const { runCli } = await import("../../bin/lcm.js");
@@ -392,10 +397,40 @@ describe("lcm migration command group", () => {
     expect(stdoutText(out)).toContain("report-restart-required");
   });
 
+  it("activate: passes the generation, both confirmations and --dry-run through, and prints the grant-swap next step", async () => {
+    state.activate.mockResolvedValueOnce({
+      status: "ok", generationId: "gen-1", manifestPhase: "active", applied: true, next: "swap-grants-then-start-daemon",
+      evidence: { grantSwap: "required-before-daemon-start" }, restart: { answer: "satisfied", presence: "absent" },
+    });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "activate", "--generation", "gen-1", "--confirm-generation", "gen-1", "--confirm-backend", "postgresql", "--dry-run", "--json");
+    expect(state.activate).toHaveBeenCalledWith(expect.objectContaining({
+      generation: "gen-1", confirmGenerationId: "gen-1", confirmBackend: "postgresql", dryRun: true, cwd: process.cwd(),
+    }));
+    expect(process.exitCode).toBe(0);
+    expect(JSON.parse(stdoutText(out))).toMatchObject({
+      command: "activate", manifestPhase: "active", next: "swap-grants-then-start-daemon", restart: { answer: "satisfied", presence: "absent" },
+    });
+  });
+
+  it("activate: a stale running daemon exits 8, an interrupted activation exits 6, and a human summary still prints the next step", async () => {
+    state.activate.mockResolvedValueOnce({
+      status: "refuse", reason: "cutover-restart-required", generationId: "gen-1", applied: true, next: "swap-grants-then-start-daemon",
+      restart: { answer: "unsatisfied", presence: "running" },
+    });
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("migration", "activate", "--confirm-generation", "gen-1", "--confirm-backend", "postgresql");
+    expect(process.exitCode).toBe(8);
+    expect(stdoutText(out)).toContain("cutover-restart-required");
+    state.activate.mockResolvedValueOnce({ status: "refuse", reason: "activation-interrupted", generationId: "gen-1", applied: true, next: "activate" });
+    await invoke("migration", "activate", "--confirm-generation", "gen-1", "--confirm-backend", "postgresql", "--json");
+    expect(process.exitCode).toBe(6);
+  });
+
   it("lcm migration --help routes to the custom help page rather than any subcommand action", async () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     await expect(invoke("migration", "--help")).rejects.toThrow("exit:0");
-    expect(stdoutText(out)).toContain("lcm migration <plan|dry-run|apply|resume|verify|report|abort> [--json]");
+    expect(stdoutText(out)).toContain("lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate> [--json]");
     expect(state.plan).not.toHaveBeenCalled();
   });
 });

@@ -460,6 +460,81 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     reason: "abort-readback-mismatch", exitClass: "failed-operator-required",
     remedy: "The abort appeared to complete but its terminal state could not be confirmed on readback. Run `lcm doctor` and inspect the maintenance journal and manifest directly.",
   }),
+  // --- activate (plan-v6.1 B1, plan-v6.2): the closed outcome table. The
+  // refused reasons collapse into four classes; the evidence names the step
+  // and the upstream reason. ---
+  Object.freeze({
+    reason: "backend-confirmation-missing", exitClass: "refused-confirmation",
+    remedy: "Pass --confirm-backend with the backend this command switches to: postgresql for activate, sqlite for rollback. Nothing was changed.",
+  }),
+  Object.freeze({
+    reason: "backend-confirmation-moved", exitClass: "refused-confirmation",
+    remedy: "--confirm-backend does not match the backend this command switches to (postgresql for activate, sqlite for rollback). Nothing was changed.",
+  }),
+  Object.freeze({
+    reason: "activation-refused-precondition", exitClass: "refused-precondition",
+    remedy: "Activation was refused before it began any effect: the evidence names the step and the reason. Fix that condition, then run `lcm migration activate` again. `lcm migration report` shows the current state.",
+  }),
+  Object.freeze({
+    reason: "activation-refused-contention", exitClass: "refused-contention",
+    remedy: "Another actor holds the activation lease. Nothing was changed; wait for it to finish or expire, then run `lcm migration activate` again.",
+  }),
+  Object.freeze({
+    reason: "activation-refused-evidence", exitClass: "refused-evidence",
+    remedy: "Activation could not establish a fact it needs and refused before it began any effect: the evidence names the step and the reason. Run `lcm doctor` and `lcm migration report` before retrying.",
+  }),
+  Object.freeze({
+    reason: "activation-refused-resume", exitClass: "incomplete-recoverable",
+    remedy: "A pending effect on this generation is finished by `lcm migration resume`. Nothing was changed; run it with the same --confirm-generation.",
+  }),
+  Object.freeze({
+    reason: "activation-not-begun", exitClass: "refused-precondition",
+    remedy: "Activation was interrupted before its first durable effect, so the manifest is unchanged. A lease it took may be held until it expires (15 minutes) or a later run takes it over; run `lcm migration activate` again.",
+  }),
+  Object.freeze({
+    reason: "activation-interrupted", exitClass: "incomplete-recoverable",
+    remedy: "Activation was interrupted after beginning durable work. Run `lcm migration activate` again with the same confirmations; the re-entry finishes it. The evidence names the step, the cause and what is known to have been applied.",
+  }),
+  Object.freeze({
+    reason: "activation-publication-failed", exitClass: "refused-evidence",
+    remedy: "The backend publication did not complete: the evidence names its status. Run `lcm migration report` and inspect the evidence before deciding between `activate` again and `rollback`.",
+  }),
+  Object.freeze({
+    reason: "activation-post-publication-unhealthy", exitClass: "refused-evidence",
+    remedy: "The publication completed but the PostgreSQL target did not pass its health check, so the cutover is not complete. Fix the target (the evidence names the reason), then run `lcm migration activate` again.",
+  }),
+  Object.freeze({
+    reason: "activation-identity-mismatch", exitClass: "refused-evidence",
+    remedy: "Activation answered for a generation other than the one confirmed, so its result is not accepted. Run `lcm migration report` for each generation and inspect the evidence.",
+  }),
+  Object.freeze({
+    reason: "activation-readback-mismatch", exitClass: "refused-evidence",
+    remedy: "Activation reported success but the manifest does not read back as active with nothing pending. Run `lcm migration report` and inspect the evidence.",
+  }),
+  Object.freeze({
+    reason: "activation-invalid-input", exitClass: "refused-evidence",
+    remedy: "The activation request was rejected as invalid before anything ran. This is an internal defect; file an issue with the evidence.",
+  }),
+  Object.freeze({
+    reason: "activation-unexpected-state", exitClass: "refused-evidence",
+    remedy: "Activation found state it does not recognise and stopped. Run `lcm migration report` and inspect the evidence before retrying.",
+  }),
+  Object.freeze({
+    reason: "activation-dry-run-not-predictive", exitClass: "refused-evidence",
+    remedy: "The activation preview reads the persisted state but does not evaluate quiescence, coverage, the project-coverage refusal, the lease, target health or the census, so it cannot say activation would succeed. The evidence lists what it read and what it did not.",
+  }),
+  Object.freeze({
+    reason: "cutover-restart-required", exitClass: "restart-required",
+    remedy: "The durable selection is correct, but a running daemon still holds the previous startup backend. Swap the grants first (add the runtime grants, revoke the transfer grants), restart the daemon, then run `lcm migration report`.",
+  }),
+  Object.freeze({
+    reason: "cutover-restart-contradiction", exitClass: "refused-evidence",
+    remedy: "The daemon restart check and the daemon presence observation disagree, so neither can be trusted alone. Run `lcm daemon status`, resolve the difference, and run `lcm migration report`.",
+  }),
+  Object.freeze({
+    reason: "cutover-restart-unresolvable", exitClass: "refused-evidence",
+    remedy: "The daemon restart check could not be made. Run `lcm daemon status`, resolve the failure, and run `lcm migration report`.",
+  }),
 ] satisfies MigrationRefusalMapping[]);
 
 const REFUSAL_BY_REASON: ReadonlyMap<string, MigrationRefusalMapping> = new Map(

@@ -256,9 +256,11 @@ describe("printHelp — per-command detail", () => {
     out.mockClear();
     printHelp("migration");
     const migrationText = out.mock.calls.map(c => c[0]).join("");
-    expect(migrationText).toContain("lcm migration <plan|dry-run|apply|resume|verify|report|abort> [--json]");
+    expect(migrationText).toContain("lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate> [--json]");
     expect(migrationText).toContain("--confirm-generation <id>");
     expect(migrationText).toContain("Complete whichever recovery write");
+    expect(migrationText).toContain("--confirm-backend postgresql");
+    expect(migrationText).toContain("swap the grants");
     expect(migrationText).toContain("Never a silent fallback");
     expect(migrationText).toContain("docs/migration-operations.md");
   });

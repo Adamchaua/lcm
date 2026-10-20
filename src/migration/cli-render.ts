@@ -16,6 +16,7 @@ import type { MigrationAbortCommandOutcome } from "./cli-abort.js";
 import type { MigrationVerifyCommandOutcome } from "./cli-verify.js";
 import type { MigrationResumeCommandOutcome } from "./cli-resume.js";
 import type { MigrationReportOutcome } from "./cli-report.js";
+import type { MigrationCutoverCommandOutcome } from "./cli-cutover.js";
 import { MIGRATION_UNEXPECTED_FAILURE_REASON, unexpectedFailureEvidence } from "./boundary.js";
 
 /**
@@ -282,3 +283,36 @@ export function renderMigrationAbortEnvelope(outcome: MigrationAbortCommandOutco
   });
 }
 
+
+/** `activate` and `rollback` render identically: a refusal keeps every section the command read, and the restart observation. */
+function renderCutoverEnvelope(command: "activate" | "rollback", outcome: MigrationCutoverCommandOutcome): MigrationEnvelope {
+  if (outcome.status === "refuse") {
+    return refusalEnvelope({
+      command,
+      reason: outcome.reason,
+      evidenceDetail: outcome.evidence,
+      applied: outcome.applied ?? false,
+      generation: outcome.generationId,
+      next: outcome.next,
+      sections: outcome.sections,
+      restart: outcome.restart,
+    });
+  }
+  return okEnvelope({
+    command,
+    applied: outcome.applied,
+    generation: outcome.generationId,
+    manifestPhase: outcome.manifestPhase,
+    next: outcome.next,
+    evidence: outcome.evidence,
+    restart: outcome.restart,
+  });
+}
+
+export function renderMigrationActivateEnvelope(outcome: MigrationCutoverCommandOutcome): MigrationEnvelope {
+  return renderCutoverEnvelope("activate", outcome);
+}
+
+export function renderMigrationRollbackEnvelope(outcome: MigrationCutoverCommandOutcome): MigrationEnvelope {
+  return renderCutoverEnvelope("rollback", outcome);
+}

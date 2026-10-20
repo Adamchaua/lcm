@@ -7,6 +7,8 @@ import {
   renderMigrationVerifyEnvelope,
   renderMigrationResumeEnvelope,
   renderMigrationReportEnvelope,
+  renderMigrationActivateEnvelope,
+  renderMigrationRollbackEnvelope,
   renderMigrationUnexpectedFailureEnvelope,
 } from "../../src/migration/cli-render.js";
 import { migrationExitClassForName } from "../../src/migration/exit-classes.js";
@@ -346,6 +348,60 @@ describe("every command's ok and refusal envelopes keep outcome/exitCode agreeme
     ]) {
       expect(migrationExitClassForName(envelope.outcome).code).toBe(envelope.exitCode);
     }
+  });
+});
+
+
+describe("renderMigrationActivateEnvelope (and the cutover renderer rollback shares)", () => {
+  it("builds an ok envelope that carries the applied flag, the next step, the evidence and the restart observation", () => {
+    expect(renderMigrationActivateEnvelope({
+      status: "ok", generationId: "gen-1", manifestPhase: "active", applied: true, next: "swap-grants-then-start-daemon",
+      evidence: { grantSwap: "required-before-daemon-start" }, restart: { answer: "satisfied", presence: "absent" },
+    })).toMatchObject({
+      command: "activate", outcome: "ok", exitCode: 0, generation: "gen-1", manifestPhase: "active", applied: true,
+      next: "swap-grants-then-start-daemon", evidence: { grantSwap: "required-before-daemon-start" }, restart: { answer: "satisfied", presence: "absent" },
+    });
+  });
+
+  it("builds an ok envelope with no restart observation when none is given", () => {
+    expect(renderMigrationRollbackEnvelope({ status: "ok", generationId: "gen-1", manifestPhase: "rolled-back", applied: false, next: null, evidence: {} }))
+      .toMatchObject({ command: "rollback", exitCode: 0, restart: null, applied: false });
+  });
+
+  it.each([
+    ["backend-confirmation-missing", 3],
+    ["backend-confirmation-moved", 3],
+    ["activation-refused-precondition", 2],
+    ["activation-refused-contention", 4],
+    ["activation-refused-evidence", 5],
+    ["activation-refused-resume", 6],
+    ["activation-not-begun", 2],
+    ["activation-interrupted", 6],
+    ["activation-publication-failed", 5],
+    ["activation-post-publication-unhealthy", 5],
+    ["activation-identity-mismatch", 5],
+    ["activation-readback-mismatch", 5],
+    ["activation-invalid-input", 5],
+    ["activation-unexpected-state", 5],
+    ["activation-dry-run-not-predictive", 5],
+    ["cutover-restart-required", 8],
+    ["cutover-restart-contradiction", 5],
+    ["cutover-restart-unresolvable", 5],
+  ])("maps the refusal %s to exit %i", (reason, exit) => {
+    expect(renderMigrationActivateEnvelope({ status: "refuse", reason, generationId: "gen-1" })).toMatchObject({
+      command: "activate", exitCode: exit, generation: "gen-1", applied: false, restart: null, refusal: { reason },
+    });
+  });
+
+  it("keeps every section the command read, the restart observation, the next action and the applied flag on a refusal", () => {
+    const envelope = renderMigrationActivateEnvelope({
+      status: "refuse", reason: "cutover-restart-required", generationId: "gen-1", applied: true, next: "swap-grants-then-start-daemon",
+      evidence: "manifest-active", sections: { cell: 10, selectedBackend: "postgresql" }, restart: { answer: "unsatisfied", presence: "running" },
+    });
+    expect(envelope).toMatchObject({
+      exitCode: 8, applied: true, next: "swap-grants-then-start-daemon",
+      evidence: { cell: 10, selectedBackend: "postgresql", detail: "manifest-active" }, restart: { answer: "unsatisfied", presence: "running" },
+    });
   });
 });
 
