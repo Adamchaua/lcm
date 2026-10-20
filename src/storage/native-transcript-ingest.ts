@@ -11,7 +11,11 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
-import { isInheritedSubagentRecord, type CodexInheritedBoundary } from "../codex-transcript.js";
+import {
+  isInheritedSubagentRecord,
+  type CodexInheritedBoundary,
+  type CodexInheritedBoundaryInput,
+} from "../codex-transcript.js";
 import { NATIVE_PATTERNS, ScrubEngine } from "../scrub.js";
 import type { MessageRole } from "../store/conversation-store.js";
 import type {
@@ -450,7 +454,7 @@ export interface NativeTranscriptJsonlReadOptions {
   /** @internal Allows bounded unit tests without allocating ten MiB. */
   readonly maxRecordBytes?: number;
   /** Classify each record against this Codex inherited-history boundary. */
-  readonly codexInheritedBoundary?: CodexInheritedBoundary;
+  readonly codexInheritedBoundary?: CodexInheritedBoundaryInput;
   /**
    * Report physical progress only after this absolute byte boundary.
    * Crossing records are trimmed and rehashed from the boundary.
@@ -582,7 +586,7 @@ function snapshotNativeTranscriptJsonlReadOptions(
 }
 
 function snapshotInheritedBoundary(
-  boundary: CodexInheritedBoundary | undefined,
+  boundary: CodexInheritedBoundaryInput | undefined,
   format: NativeTranscriptFormat,
 ): CodexInheritedBoundary | undefined {
   if (boundary === undefined) return undefined;
@@ -590,13 +594,25 @@ function snapshotInheritedBoundary(
     boundary === null
     || typeof boundary !== "object"
     || format.clientName !== CODEX_NATIVE_TRANSCRIPT_FORMAT.clientName
-    || !Number.isSafeInteger(boundary.start)
-    || boundary.start < 0
-    || typeof boundary.paginated !== "boolean"
   ) {
     throw new NativeTranscriptConfigurationError("invalid-input");
   }
-  return Object.freeze({ start: boundary.start, paginated: boundary.paginated });
+  // The shape from before boundaries had a kind is the ordinal variant.
+  if (boundary.kind === "ordinal" || boundary.kind === undefined) {
+    if (!Number.isSafeInteger(boundary.start) || boundary.start < 0 || typeof boundary.paginated !== "boolean") {
+      throw new NativeTranscriptConfigurationError("invalid-input");
+    }
+    return Object.freeze({ kind: "ordinal", start: boundary.start, paginated: boundary.paginated });
+  }
+  if (boundary.kind === "copied-fork") {
+    if (boundary.pending === true && boundary.startRecord === undefined) {
+      return Object.freeze({ kind: "copied-fork", pending: true });
+    }
+    if (boundary.pending === undefined && Number.isSafeInteger(boundary.startRecord) && boundary.startRecord >= 0) {
+      return Object.freeze({ kind: "copied-fork", startRecord: boundary.startRecord });
+    }
+  }
+  throw new NativeTranscriptConfigurationError("invalid-input");
 }
 
 function ingestKey(
@@ -1007,7 +1023,7 @@ async function* readNativeTranscriptJsonlSnapshot(
       // values, so the scrubbed payload cannot be trusted to carry "ordinal".
       const inheritedHistory = config.inheritedBoundary === undefined
         ? undefined
-        : isInheritedSubagentRecord(parsed, config.inheritedBoundary);
+        : isInheritedSubagentRecord(parsed, config.inheritedBoundary, sourceOrdinal);
       const nativePayload = config.scrubber.scrubJson(parsed);
       const canonicalPayload = canonicalNativeTranscriptJson(nativePayload);
       if (Buffer.byteLength(canonicalPayload, "utf8") > config.maxRecordBytes) {
@@ -1904,7 +1920,7 @@ export interface NativeTranscriptBackfillOptions {
    * messages (they stay stored, unlinked). Unlike a messageMapper it keeps
    * quarantine-gap recovery.
    */
-  readonly codexInheritedBoundary?: CodexInheritedBoundary;
+  readonly codexInheritedBoundary?: CodexInheritedBoundaryInput;
   readonly messageResolver: ExactNativeTranscriptMessageResolver;
   readonly batchSize?: number;
   readonly clock?: () => Date;
