@@ -1067,8 +1067,8 @@ type OwnFenceRead =
 
 /** Re-read the lease row to continue from (re-entry): the row this
  * generation holds (released or not), positively no row, a row of another
- * publication or evidence digest (foreign: always lease-lost), or a read
- * that cannot be attributed. */
+ * publication or evidence digest (foreign: lease-lost except where
+ * SUCCESSOR_ROW_PHASES admits it), or a read that cannot be attributed. */
 async function readOwnFence(ctx: Context): Promise<OwnFenceRead> {
   const resolved = await resolveActivationLeaseFence(ctx.guard!, { projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
   if (resolved.kind === "absent") return { kind: "absent", detail: "no fenced lease row exists for this generation" };
@@ -1090,6 +1090,19 @@ async function readOwnFence(ctx: Context): Promise<OwnFenceRead> {
 const NO_OWN_FENCE_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new Set([
   "releasing", "released", "completed", "aborting", "config-restoring", "map-restoring", "abort-releasing", "aborted",
 ]);
+
+/**
+ * The subset of NO_OWN_FENCE_PHASES at which a row of another publication
+ * is admitted as well (Bug #1651): this publication's row was released
+ * before the journal reached released, so a successor publication (another
+ * home) may legitimately have acquired the released row, and only local
+ * authenticated finalization (released) or the terminal report (completed)
+ * remains; neither the drive nor S16 renews, releases, acquires or takes
+ * over that row. At releasing the coordinator still has to authenticate its
+ * own release from the row, and the abort family unwinds through it, so a
+ * foreign row stays lease-lost there.
+ */
+const SUCCESSOR_ROW_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new Set(["released", "completed"]);
 
 /**
  * Release the S2 lease of a run that ends before any durable effect (the
@@ -1818,10 +1831,12 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
       ctx.fence = own.fence;
     } else if (own.kind === "unresolvable") {
       return interrupted(ctx, "S13b", "lease-unresolvable", own.detail).exit;
-    } else if (own.kind === "foreign" || !(ownV2 !== null && NO_OWN_FENCE_PHASES.has(ownV2.phase))) {
-      // A row of another publication is always a lost lease. An absent row
-      // is lost unless the coordinator owns the fences for this phase
-      // (NO_OWN_FENCE_PHASES): then stepDrive continues without one.
+    } else if (!(ownV2 !== null && (own.kind === "foreign" ? SUCCESSOR_ROW_PHASES : NO_OWN_FENCE_PHASES).has(ownV2.phase))) {
+      // An absent row is lost unless the coordinator owns the fences for
+      // this phase (NO_OWN_FENCE_PHASES); a row of another publication is
+      // lost unless this publication has already released its own
+      // (SUCCESSOR_ROW_PHASES). Otherwise ctx.fence stays null and stepDrive
+      // continues without one, never touching a successor's row.
       return interrupted(ctx, "S13b", "lease-lost", own.detail).exit;
     }
     // A selection is recorded only after S10 began publish-activation, and

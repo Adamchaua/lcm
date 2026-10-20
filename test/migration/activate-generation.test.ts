@@ -2193,15 +2193,46 @@ describe("runMigrationActivation: the release tail and the abort family are driv
     expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("releasing");
   });
 
-  it("a fence of another publication or evidence digest stays lease-lost in the release tail; an unattributable read is lease-unresolvable", async () => {
+  it("crash at released with a successor publication's row present (Bug #1651): the retry finishes locally and never touches that row", async () => {
     const f = await fixture();
     await crashCoordinatorAt(f, "released");
+    // Another home acquired the released row for its own publication.
+    foreignRow(f, { machineId: "018f0b5d-ffff-7abc-8def-1234567890ab" });
+    const successor = { ...row(f)! };
+    const mutations = f.guard.calls.filter((c) => c !== "read").length;
+    const outcome = await f.run();
+    expectActivated(f, outcome, "publication-journal");
+    if (outcome.status !== "activated") return;
+    expect(outcome.successorFencingToken).toBeNull();
+    expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+    expect(row(f)).toEqual(successor);
+    expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("completed");
+  });
+
+  it("crash at completed with a successor publication's row present (Bug #1651): the retry settles the report and never touches that row", async () => {
+    const f = await fixture();
+    await crashCoordinatorAt(f, "completed");
+    foreignRow(f, { evidenceSha256: "f".repeat(64) });
+    const successor = { ...row(f)! };
+    const mutations = f.guard.calls.filter((c) => c !== "read").length;
+    const outcome = await f.run();
+    expectActivated(f, outcome, "publication-journal");
+    if (outcome.status !== "activated") return;
+    expect(outcome.successorFencingToken).toBeNull();
+    expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+    expect(row(f)).toEqual(successor);
+  });
+
+  it("a fence of another publication or evidence digest stays lease-lost at releasing; an unattributable read is lease-unresolvable", async () => {
+    const f = await fixture();
+    await crashCoordinatorAt(f, "releasing");
     foreignRow(f);
     expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", effectBegun: true, detail: "the fenced lease row names another publication" });
     foreignRow(f, { publicationId: f.publicationId, evidenceSha256: "d".repeat(64) });
     expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", detail: expect.stringContaining("does not match the expected") });
     f.guard.read = async (input) => { throw new PostgreSqlStorageOperationError("STORAGE_OPERATION_FAILED", { domain: "factory", operation: "read" }, "08006", true); };
     expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-unresolvable" });
+    expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("releasing");
   });
   it("the abort family is handled like the release tail: an absent own fence at abort-releasing reaches the drive without a lease continuation", async () => {
     const f = await fixture();
