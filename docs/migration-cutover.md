@@ -1026,7 +1026,10 @@ nothing to recover: fix the named condition and run again. Refusals name the
 step (`S0` through `S8`) and a closed reason such as `maintenance-not-held`,
 `lease-conflict`, `census-drift`, `project-map-drift` or `target-unhealthy`.
 Unresolvable readings (an unreadable journal, an ambiguous lease) are refusals
-too, distinct from a definite "no".
+too, distinct from a definite "no". A PostgreSQL failure while the census
+reads the destination (a lost connection, a refused privilege, a schema
+mismatch on the transfer session) is attributed exactly as the health check
+attributes it, `target-unhealthy` or `target-unresolvable` at `S7`.
 
 ### The activation role
 

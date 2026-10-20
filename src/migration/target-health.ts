@@ -222,6 +222,21 @@ function classifyFailure(error: unknown, stage: string): Attributed {
   return unresolvable("unknown", stage + " failed with an unrecognized error (" + name + ")");
 }
 
+/**
+ * The attribution this module applies to one failed stage, for a caller
+ * that observes the same target through another session (the activation
+ * orchestrator's S7 census). Only the StorageOperationError family is
+ * accepted, so the caller keeps deciding what an unrecognized error means;
+ * a readiness error for an unacceptable expectedOwner still throws
+ * MigrationTargetHealthError, as it does for the health check itself.
+ */
+export function classifyMigrationTargetFailure(
+  error: StorageOperationError,
+  stage: string,
+): Exclude<MigrationTargetHealthResult, { status: "healthy" }> {
+  return classifyFailure(error, stage);
+}
+
 function validateInput(input: MigrationTargetHealthInput): void {
   if (
     typeof input !== "object"

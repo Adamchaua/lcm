@@ -24,6 +24,7 @@ import {
   type ComposeBackendPublicationMaterialResult,
 } from "../storage/backend-publication-material.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
+import { StorageOperationError } from "../storage/errors.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlRuntimeHealth } from "../storage/postgresql/contracts.js";
 import {
   POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_KEY,
@@ -132,7 +133,7 @@ import {
   type MigrationManifest,
   type MigrationReportReference,
 } from "./protocol.js";
-import { checkMigrationTargetHealth, type MigrationTargetHealthResult, type MigrationTargetHealthRuntime } from "./target-health.js";
+import { checkMigrationTargetHealth, classifyMigrationTargetFailure, type MigrationTargetHealthResult, type MigrationTargetHealthRuntime } from "./target-health.js";
 import type { MigrationVerificationReport } from "./verification-report.js";
 import { MigrationVerificationReportStore, MigrationVerificationStoreError } from "./verification-store.js";
 import {
@@ -1202,22 +1203,45 @@ async function stepHealth(ctx: Context): Promise<Step<MigrationTargetHealthResul
   return refused(ctx, "S6", health.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", health.reason + ": " + health.detail);
 }
 
-/** S7: a NEW transfer snapshot, after the transfer schema check (amendment 4). */
+/** A target failure observed by S7 (the transfer schema check, the snapshot
+ * open, the census read): the StorageOperationError family, attributed
+ * exactly as S6 attributes the same failures, becomes the S6 refusal
+ * vocabulary (target-unhealthy / target-unresolvable). Anything else is
+ * not a target condition and is thrown. */
+function targetFailure(ctx: Context, error: unknown, stage: string): Exit {
+  if (!(error instanceof StorageOperationError)) throw error;
+  const attributed = classifyMigrationTargetFailure(error, stage);
+  return refused(ctx, "S7", attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", attributed.reason + ": " + attributed.detail);
+}
+
+/** S7: a NEW transfer snapshot, after the transfer schema check (amendment 4).
+ * Close failures still surface (plan-v7 S7); they are outside the attributed
+ * stages. */
 async function stepCensus(ctx: Context, scratchParent: string): Promise<Step<{ censusVector: MigrationCensusVector; canonicalDelta: MigrationCanonicalDelta }>> {
   const transfer = ctx.deps.createTransferRuntime(ctx.input.transferSettings);
   try {
-    await ctx.deps.verifyTransferSchema(transfer, { expectedOwner: ctx.input.expectedOwner, signal: ctx.input.signal });
-    const session = await transfer.openReadOnlySnapshot({ projectId: ctx.input.expectedIdentity.id, signal: ctx.input.signal });
+    let session: MigrationActivationSnapshot;
+    try {
+      await ctx.deps.verifyTransferSchema(transfer, { expectedOwner: ctx.input.expectedOwner, signal: ctx.input.signal });
+      session = await transfer.openReadOnlySnapshot({ projectId: ctx.input.expectedIdentity.id, signal: ctx.input.signal });
+    } catch (error) {
+      return targetFailure(ctx, error, "S7 transfer schema check and snapshot open");
+    }
     try {
       const identity = await identityCheck(ctx, session, "S7");
       if (isExit(identity)) return identity;
-      const read = await ctx.deps.readDestinationCensus(session, {
-        settings: ctx.input.transferSettings,
-        expectedOwner: ctx.input.expectedOwner,
-        expectedIdentity: ctx.input.expectedIdentity,
-        scratchParent,
-        signal: ctx.input.signal,
-      });
+      let read: Awaited<ReturnType<MigrationActivationDependencies["readDestinationCensus"]>>;
+      try {
+        read = await ctx.deps.readDestinationCensus(session, {
+          settings: ctx.input.transferSettings,
+          expectedOwner: ctx.input.expectedOwner,
+          expectedIdentity: ctx.input.expectedIdentity,
+          scratchParent,
+          signal: ctx.input.signal,
+        });
+      } catch (error) {
+        return targetFailure(ctx, error, "S7 census read");
+      }
       return ok({
         censusVector: ctx.deps.census.buildMigrationCensusVector(read.census),
         canonicalDelta: ctx.deps.census.buildMigrationCanonicalDelta(read.census),

@@ -26,6 +26,8 @@ import {
 } from "../../src/storage/postgresql/publication-guard.js";
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage/postgresql/publication-remote-guard.js";
 import { PostgreSqlRuntimeReadinessError, type PostgreSqlRuntimeReadiness } from "../../src/storage/postgresql/runtime-readiness.js";
+import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
+import { StorageOperationError } from "../../src/storage/errors.js";
 import { PORTABLE_RECORD_DOMAIN_ORDER, type PortableDomain } from "../../src/storage/portable-record.js";
 import {
   MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS,
@@ -2082,5 +2084,68 @@ describe("runMigrationActivation: pre-effect lease cleanup runs under its own bo
 
   it("the production dependencies carry the exported cleanup deadline", () => {
     expect(createMigrationActivationDependencies({ homeDir: "/nonexistent" }).leaseCleanupTimeoutMs).toBe(MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS);
+  });
+});
+
+describe("runMigrationActivation: S7 classifies target failures like S6 (PR #1628 review)", () => {
+  const row = (f: Fixture) => f.guard.rows.get(REMOTE)!;
+  const pgError = (sqlState: string | null, retryable = false) =>
+    new PostgreSqlStorageOperationError("STORAGE_OPERATION_FAILED", { domain: "factory", operation: "openSnapshot" }, sqlState, retryable);
+  const transferThrowing = (f: Fixture, error: unknown): MigrationActivationTransferRuntime => ({
+    ...f.deps.createTransferRuntime(SETTINGS),
+    openReadOnlySnapshot: async () => { throw error; },
+  });
+
+  it.each([
+    ["a definite readiness mismatch", new PostgreSqlRuntimeReadinessError("acl-shape", "inspectSchemaAcl"), "target-unhealthy", /^schema-mismatch: S7 transfer schema check and snapshot open: .*acl-shape/u],
+    ["readiness server-preflight", new PostgreSqlRuntimeReadinessError("server-preflight", "inspectServerReadiness"), "target-unresolvable", /^schema-check-indeterminate: /u],
+  ] as const)("the transfer schema check failing with %s refuses S7 and releases the lease", async (_name, error, reason, detail) => {
+    const f = await fixture();
+    const outcome = await f.run({ verifyTransferSchema: async () => { throw error; } });
+    expect(outcome).toMatchObject({ status: "refused", step: "S7", reason, effectBegun: false });
+    expect((outcome as { detail: string }).detail).toMatch(detail);
+    expect(row(f).releasedAt).not.toBeNull();
+    expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+  });
+
+  it.each([
+    ["a lost connection (SQLSTATE 08006)", pgError("08006"), "target-unresolvable", /^connection-failed: /u],
+    ["a refused privilege (SQLSTATE 42501)", pgError("42501"), "target-unhealthy", /^insufficient-privilege: /u],
+    ["a retryable driver error without SQLSTATE", pgError(null, true), "target-unresolvable", /^connection-failed: /u],
+  ] as const)("the snapshot open failing with %s refuses S7", async (_name, error, reason, detail) => {
+    const f = await fixture();
+    const outcome = await f.run({ createTransferRuntime: () => transferThrowing(f, error) });
+    expect(outcome).toMatchObject({ status: "refused", step: "S7", reason });
+    expect((outcome as { detail: string }).detail).toMatch(detail);
+    expect(row(f).releasedAt).not.toBeNull();
+  });
+
+  it("the census read failing with a storage error is attributed too: closed runtime unresolvable, other preflight facts unhealthy", async () => {
+    const f = await fixture();
+    const closed = await f.run({ readDestinationCensus: async () => { throw new StorageOperationError("STORAGE_CLOSED", "postgresql", undefined, "factory", "census"); } });
+    expect(closed).toMatchObject({ status: "refused", step: "S7", reason: "target-unresolvable", detail: expect.stringMatching(/^runtime-closed: S7 census read: /u) });
+    const g = await fixture();
+    const preflight = await g.run({ readDestinationCensus: async () => { throw new StorageOperationError("STORAGE_INITIALIZATION_FAILED", "postgresql", undefined, "factory", "census"); } });
+    expect(preflight).toMatchObject({ status: "refused", step: "S7", reason: "target-unhealthy", detail: expect.stringMatching(/^server-preflight: S7 census read: .*operation census/u) });
+  });
+
+  it("errors outside the storage family are not target conditions and are rethrown, from the open and from the read", async () => {
+    const f = await fixture();
+    await expect(f.run({ createTransferRuntime: () => transferThrowing(f, new RangeError("raw open")) })).rejects.toBeInstanceOf(RangeError);
+    expect(row(f).releasedAt).not.toBeNull();
+    const g = await fixture();
+    await expect(g.run({ readDestinationCensus: async () => { throw new TypeError("raw read"); } })).rejects.toBeInstanceOf(TypeError);
+    // A readiness error for an unacceptable expectedOwner is a programming error, thrown as the health check throws it.
+    const h = await fixture();
+    await expect(h.run({ verifyTransferSchema: async () => { throw new PostgreSqlRuntimeReadinessError("invalid-expected-owner", "inspectSchemaAcl"); } })).rejects.toMatchObject({ name: "MigrationTargetHealthError", reason: "invalid-input" });
+  });
+
+  it("on an effect-begun re-entry the S7 target failure is the roll-forward interruption and keeps the lease", async () => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-begin");
+    const outcome = await f.run({ verifyTransferSchema: async () => { throw new PostgreSqlRuntimeReadinessError("acl-shape", "inspectSchemaAcl"); } });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(/^S7 target-unhealthy on roll-forward: schema-mismatch: /u) });
+    expect(row(f).releasedAt).toBeNull();
+    expectActivated(f, await f.run(), "prepare-activation-pending");
   });
 });
