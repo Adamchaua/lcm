@@ -2101,9 +2101,8 @@ export function registerMachineCommand(program: Command): void {
 
 /**
  * Section 3's `lcm migration` command group -- `plan`, `dry-run`, `apply`,
- * `resume`, `verify`, `report` and `abort`. `activate` (#625) and
- * `rollback` (#626, #1433) are not registered until those land. Modelled on
- * `registerPostgreSqlCommand` above.
+ * `resume`, `verify`, `report`, `abort`, `activate` and `rollback`.
+ * Modelled on `registerPostgreSqlCommand` above.
  *
  * Every action handler is thin glue by design: call the orchestration
  * function from `src/migration/cli-*.ts`, call the matching `render*`
