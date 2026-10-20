@@ -98,16 +98,10 @@ export function migrationExitClassForName(name: MigrationExitClassName): Migrati
 /**
  * All nine commands issue #627's contract names. `status: "implemented"`
  * means the command is registered in `bin/lcm.ts` and has its own tests
- * (the runbook conformance test checks the registration in both directions):
- * `plan`, `dry-run`, `apply`, `resume`, `verify`, `report` and
- * `abort`. `activate` (#625) and `rollback` (#626, #1433) are recorded
- * as `status: "outline"` — named and given their documented postcondition
- * and emittable classes for the runbook and for those items' own
- * integration to bind to, but with no frozen test claiming that behaviour
- * exists yet. A frozen test against an outline command would either import
- * a module that does not exist (failing for the wrong reason) or be a
- * permanently skipped file (exactly the unrun check this item exists to
- * prevent) — neither is acceptable, so outlines are data, not tests.
+ * (the runbook conformance test checks the registration in both directions).
+ * All nine are implemented: `plan`, `dry-run`, `apply`, `resume`, `verify`,
+ * `report`, `abort`, `activate` and `rollback`. `outline` remains in the type
+ * for a command that is named before it is registered; none is outline now.
  */
 export type MigrationCommandName =
   | "plan" | "dry-run" | "apply" | "resume" | "verify"
@@ -142,26 +136,26 @@ export const MIGRATION_COMMAND_CONTRACTS: readonly MigrationCommandContract[] = 
   Object.freeze({
     command: "resume", status: "implemented",
     exitZeroPostcondition: "The router cell it executed reached its next durable checkpoint, and the manifest was read back at it. With --dry-run, the cell was named and nothing was run or predicted.",
-    canEmit: [0, 1, 2, 3, 4, 5, 7] as const,
+    canEmit: [0, 1, 2, 3, 4, 5, 6, 7, 8] as const,
   }),
   Object.freeze({
     command: "verify", status: "implemented",
-    exitZeroPostcondition: "The manifest reads verified with nothing pending and its verification report reference names a persisted, activation-eligible report. A verified generation is confirmed from that persisted evidence without writing.",
+    exitZeroPostcondition: "The manifest reads verified with nothing pending and its verification report reference names a persisted, activation-eligible report. A verified generation is confirmed from that persisted evidence without writing. With --dry-run, the computation found an eligible report and persisted nothing.",
     canEmit: [0, 1, 2, 3, 4, 5, 7] as const,
   }),
   Object.freeze({
     command: "report", status: "implemented",
-    exitZeroPostcondition: "Every reader that exists in this build was read without taking any lock, and no contradiction was found. Readers that belong to unmerged work print not-available-in-this-build.",
+    exitZeroPostcondition: "Every reader was read without taking any lock, and no contradiction was found.",
     canEmit: [0, 1, 2, 4, 5, 8] as const,
   }),
   Object.freeze({
-    command: "activate", status: "outline",
-    exitZeroPostcondition: "Manifest read back at its durable phase and the restart verifier answered satisfied.",
+    command: "activate", status: "implemented",
+    exitZeroPostcondition: "The call returned the confirmed generation's identity, the manifest reads active with nothing pending, and the restart matrix cell is satisfied (verdict satisfied, daemon absent or on the selected backend). --dry-run never exits 0.",
     canEmit: [0, 1, 2, 3, 4, 5, 6, 7, 8] as const,
   }),
   Object.freeze({
-    command: "rollback", status: "outline",
-    exitZeroPostcondition: "Manifest read back at rolled-back and the restart verifier answered satisfied.",
+    command: "rollback", status: "implemented",
+    exitZeroPostcondition: "The manifest reads rolled-back with nothing pending for the confirmed generation, read back from disk, and the sqlite restart matrix cell is satisfied. --dry-run never exits 0.",
     canEmit: [0, 1, 2, 3, 4, 5, 6, 7, 8] as const,
   }),
   Object.freeze({

@@ -325,11 +325,15 @@ cutoff: once the selection is back on SQLite, the daemon's passive sweep
 drains it (see [Passive learning](passive-learning.md)). Until that sweep
 has run, the backlog stays preserved and correctly routed.
 
-## Current rollout boundary: no operator command yet
+## Running it: `lcm migration rollback`
 
 Rollback publishes its configuration and project map through the same
 coordinator as activation, and it releases its PostgreSQL fence when the
 publication completes, so every LCM consumer sees SQLite selected once a
-rollback finishes. The orchestration is complete, but there is no CLI command
-or daemon trigger that starts it yet: the operator command (issue #627) will
-call the single internal entry point. Do not look for one in the meantime.
+rollback finishes. The operator command is
+`lcm migration rollback --confirm-generation <id> --confirm-backend sqlite`; it calls the single
+internal entry point, maps its seven refusal reasons to exit codes, checks that
+the manifest reads `rolled-back` and runs the SQLite restart check. The runbook,
+[Migration operations](migration-operations.md#rollback-and-its-limits), has the
+exit table. Rollback refuses while any other project is remotely bound, because
+the backend selection is global.

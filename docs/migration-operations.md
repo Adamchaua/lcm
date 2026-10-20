@@ -6,10 +6,10 @@ PostgreSQL destination. Read this in full before running `apply` against a proje
 
 ## Before you run `apply`: what it actually does to your installation
 
-**`apply` puts your installation into a maintenance hold that only `abort` can currently leave.**
-This is the single most important fact in this document, and it is stated here, first, because an
-operator who runs `apply` expecting it to be one step in a longer sequence needs to know before
-running it, not after.
+**`apply` puts your installation into a maintenance hold that only `activate` or `abort` can
+leave.** This is the single most important fact in this document, and it is stated here, first,
+because an operator who runs `apply` expecting it to be one step in a longer sequence needs to know
+before running it, not after.
 
 A successful `apply` captures your SQLite data, mints a migration manifest, and copies the captured
 data to the configured PostgreSQL destination. It does this under a maintenance hold on your local
@@ -17,28 +17,32 @@ installation. That hold is not released when `apply` finishes. While the hold is
 storage operations on this installation — hook writes, memory search, compaction, anything that
 touches local storage as a consumer — are fenced and will refuse or retry rather than proceed.
 
-**`activate` (the command that would complete the cutover by switching your installation over to
-the copied PostgreSQL data and releasing the hold) is not implemented in this release.** It ships
-with the activation work of this Epic, alongside `rollback` and the restart-verification step both
-depend on. Until then, the only way to leave the hold `apply` creates is `lcm migration abort`,
-which discards the hold and the captured snapshot and returns your installation to normal, unfenced
-SQLite operation. Nothing about your PostgreSQL destination is affected by `abort`; the copy, if it
-reached PostgreSQL, is simply not used.
+The cutover is a sequence, and every step is its own command:
 
-**What exists today, plainly:** `plan`, `dry-run`, `apply`, `resume`, `verify`, `report` and
-`abort` are registered, working commands. `activate` and `rollback` are **not registered and not
-available** -- there is no CLI command by those names to run, regardless of what this document or
-the CLI's internal contract data name them as (they are named because this Epic's design covers
-all nine eventual commands; naming a command is not the same as registering it). `resume` and
-`verify` carry a held generation through its dry-run, copy and verification checkpoints, and
-`report` tells you which of them to run next, but the final step past verification is not
-available. **`abort` is the only exit from a hold.**
+```text
+plan -> apply -> resume (until copied) -> verify -> activate -> swap the grants -> start the daemon
+                       \-> abort   (before activation: leaves the hold, discards the attempt)
+activated generation -> rollback   (returns to SQLite)
+```
 
-So: `apply` is not yet a step toward a completed cutover you can run today. It is currently useful
-for two things — proving that capture, manifest genesis, copy and verification work correctly
-against your real PostgreSQL target, and testing the mechanism ahead of the release that adds
-`activate`. If you need your installation to keep operating normally, either do not run `apply` yet,
-or run `abort` immediately afterward once you have confirmed what you needed to confirm.
+`lcm migration report` names the command that owns the state you are in; run it between steps. All
+nine commands are registered: `plan`, `dry-run`, `apply`, `resume`, `verify`, `report`, `abort`,
+`activate` and `rollback`.
+
+- **`activate` completes the cutover.** It switches the installation to the copied PostgreSQL data
+  and releases the hold. It runs entirely under the PostgreSQL **transfer role**, so after it
+  succeeds you must swap the grants **before starting the daemon**: add the runtime grants to the
+  daemon's runtime role, then revoke the transfer grants. See "The cutover: activate and the grant
+  swap" below.
+- **`abort` leaves the hold before activation.** It discards the hold and the captured snapshot's
+  standing and returns your installation to normal, unfenced SQLite operation. Nothing about your
+  PostgreSQL destination is affected by `abort`; the copy, if it reached PostgreSQL, is simply not
+  used.
+- **`rollback` returns an activated generation to SQLite.** It refuses while any other project is
+  remotely bound; see "Rollback and its limits".
+
+If you need your installation to keep operating normally in the meantime, either do not run `apply`
+yet, or run `abort` immediately afterward once you have confirmed what you needed to confirm.
 
 ## Configuration: `storage.backend` versus `storage.postgresql`
 
@@ -70,21 +74,37 @@ Every command accepts `--json`, which prints exactly one JSON document to stdout
 way.
 
 **Which command next.** Run `lcm migration report` first: it names the cell your installation is in
-(see "State routing" below) and the command that owns it. `resume`, `verify` and `abort` act on
-one generation, the live maintenance hold's by default. A hold that has already ended names no
-generation, so pass `--generation <id>` (`abort` and `report` use the journal's own generation).
-A mutating command also needs `--confirm-generation <id>`, equal to the generation it resolved; an
-omitted or different id refuses exit 3 with the home byte-identical, and the refusal reports the id
-to pass. If the generation's state belongs to another command the refusal names it (exit 2), or
-names `resume`/`verify` when a begun effect only that command can finish (exit 6).
+(see "State routing" below) and the command that owns it. `resume`, `verify`, `abort`, `activate` and
+`rollback` act on one generation, the live maintenance hold's by default. A hold that has already
+ended names no generation, so pass `--generation <id>` (`abort` and `report` use the journal's own
+generation). A mutating command also needs `--confirm-generation <id>`, equal to the generation it
+resolved; an omitted or different id refuses exit 3 with the home byte-identical, and the refusal
+reports the id to pass. If the generation's state belongs to another command the refusal names it
+(exit 2), or names `resume`/`verify` when a begun effect only that command can finish (exit 6).
+
+**`--confirm-backend`.** `activate` and `rollback` also need `--confirm-backend`. `activate` compares
+it with the backend the manifest says the generation switches to, `postgresql`; `rollback` compares
+it with the backend the manifest says it came from, `sqlite`. The manifest invariant makes each of
+those the only legal value, so the fence confirms that you meant the switch; it does not detect
+that you were about to go the wrong way. An omitted value refuses `backend-confirmation-missing`
+and a different one `backend-confirmation-moved` (both exit 3, nothing changed).
 
 **What `--dry-run` promises.** No migration state is written: not the journal, the manifest, the
 report store, the project map, or PostgreSQL project and alias rows. Coordination effects are
-listed in the envelope's `evidence.coordinationEffects`. `plan` and `apply --dry-run` read the
-candidate under the source append barrier; `resume --dry-run` and `verify --dry-run` take none (the
-fresh-verification lease and barrier belong to a path this release does not have). `resume
---dry-run` is route-only and `verify --dry-run` at a pending effect is too: they name the step and
-set `predictive: false`, because completing the step is what performs the checks.
+listed in the envelope's `evidence.coordinationEffects` and are allowed only where this table lists
+them:
+
+| Command | Coordination effects of `--dry-run` |
+| --- | --- |
+| `plan`, `apply` | read the candidate under the source append barrier |
+| `verify` (fresh, cell 22) | takes and releases the verification lease (`lcm.fenced_leases`) and takes the source append barrier |
+| `verify` (cells 23, 24), `resume`, `abort`, `activate`, `rollback` | none |
+
+`resume --dry-run` is route-only and `verify --dry-run` at a pending effect is too: they name the step
+and set `predictive: false`, because completing the step is what performs the checks. `activate
+--dry-run` and `rollback --dry-run` are never predictive and **never exit 0**: they say what they read
+and what they did not evaluate, and exit 5. A preview that could not evaluate the checks that decide
+the outcome must not read as a yes.
 
 ### `lcm migration plan [--json]`
 
@@ -154,7 +174,14 @@ again, or follow `report`'s `next`, to continue.
 | 21 | `dry-run-verified` or `copying`, or a pending copy effect | the copy only, stopping at `copied` |
 | 23 | pending verification effect | completes it from the persisted report, as `verify` does (no PostgreSQL) |
 | 6 | journal aborted, pending abort effect | completes the carried abort effect, as `abort` does |
-| 11, 12 | activation or rollback re-entry | refuses exit 7: those commands are not available in this release |
+| 11 | activation re-entry (a begun `activate`) | runs `activate` again: the same call, the same outcome table |
+| 12 | rollback re-entry (a begun `rollback`) | runs `rollback` again: the same call, the same outcome table |
+
+At cells 11 and 12 `resume --confirm-generation` is the fence; the backend literal `activate` and
+`rollback` ask for is read from the manifest, because the re-entry of a cutover that has already
+begun has no direction left to confirm. The outcome, including the restart observation and the
+grant-swap instruction, is the one `activate` or `rollback` would have printed, under `resume`'s
+name.
 
 The destination identity is the held one: the persisted local project identity and a read of the
 existing destination project. `resume` never creates either. `--dry-run` names the cell and runs
@@ -163,7 +190,7 @@ and exits 0 when routing itself succeeded.
 
 Exit 0 postcondition: the manifest was read back at the checkpoint the cell produces.
 
-### `lcm migration verify [--generation <id>] --confirm-generation <id> [--dry-run] [--json]`
+### `lcm migration verify [--generation <id>] --confirm-generation <id> [--dry-run] [--lease-ttl-ms <n>] [--json]`
 
 Mutating (unless `--dry-run` is given or the generation is already verified).
 
@@ -173,15 +200,25 @@ Mutating (unless `--dry-run` is given or the generation is already verified).
   `verify-destination-drift` when the report does not match the destination the copy sealed; both
   exit 5 with nothing written.
 - **Already verified** (cell 24): confirms from the persisted report and writes nothing.
-- **Copied, nothing pending** (cell 22): the fresh verification needs the project-map witness that the
-  activation work (#625) provides. It is not in this release, so `verify` refuses
-  `requires-625-project-map-witness` (exit 7) and changes nothing; no value is invented in its place.
-  `abort` remains available from this cell.
+- **Copied, nothing pending** (cell 22): the fresh verification. It needs the maintenance hold to
+  be held for this generation and it opens PostgreSQL. Every input comes from something that
+  already exists: the destination connection, migration role and project identity from the
+  configuration and the persisted identity (the same resolution `activate` uses); the sealed
+  destination digests and cluster identifier from the manifest; the queue-classification witness
+  from the captured snapshot's receipt reference; and the project-map witness from the project map.
+  A manifest that never recorded the destination's cluster identifier refuses
+  `verify-destination-drift`; nothing is invented in its place. It takes the verification lease
+  (`--lease-ttl-ms`, default 300000) and the source append barrier; contention for either, or
+  losing the lease, refuses `verify-contention` (exit 4) with no effect begun, and running it again
+  recomputes. A report with mismatches or incomplete coverage is kept as evidence, the generation
+  stays `copied`, and `verify` refuses `verify-not-eligible` (exit 5). `--dry-run` runs the same
+  computation and records nothing, taking and releasing the lease; it exits 0 only for a report that
+  would be eligible. `abort` remains available from this cell.
 
 `verify` never exits 6: it finishes its own pending effect.
 
 Exit 0 postcondition: the manifest reads `verified` with nothing pending and its verification report
-reference names a persisted, activation-eligible report.
+reference names a persisted, activation-eligible report. The next command is `activate`.
 
 ### `lcm migration report [--generation <id>] [--json]`
 
@@ -189,18 +226,26 @@ Read-only. It takes no lock, barrier or lease, runs no preflight and writes noth
 run at any time, including while another command works. It prints, as ids, digests, phases and
 booleans only: the journal and its phase, the snapshot class, the manifest phase, revision and
 pending effect, the verification report summary (clean, eligible, mismatch total, coverage), the
-router cell and `next`, and — when a selection is already durable — the daemon restart check.
-Readers that belong to the activation and rollback work print `not-available-in-this-build`.
+router cell and `next`, the activation and rollback evidence below, and — when a selection is
+already durable — the daemon restart check.
+
+The activation and rollback evidence is read with lock-free, three-valued readers, and each is
+shown as `present`, `absent` or `unresolvable`: the activation link, the activation report the
+manifest names, the generation bindings, the activation epoch, attempt and witness store
+(`rollbackEvidence`), the rollback report the manifest names, and the rollback authority artifact. A
+reader that could not answer, or a report the manifest names that is missing, is shown as such and
+makes the report exit 5 (`report-evidence-unresolvable`); an unresolvable entry is never read as
+absence.
 
 A non-zero exit still prints everything it read: 2 when no generation can be resolved, 4 for a
 foreign publication in flight, 5 for contradictory or unreadable evidence (including either restart
 observation failing), 8 when only a daemon restart is outstanding.
 
-Exit 0 postcondition: every reader that exists in this build was read and no contradiction was found.
+Exit 0 postcondition: every reader was read and no contradiction was found.
 
 ### `lcm migration abort [--generation <id>] --confirm-generation <id> [--dry-run] [--json]`
 
-Mutating (unless `--dry-run` is given). The only way to leave a maintenance hold in this release.
+Mutating (unless `--dry-run` is given). Leaves a maintenance hold before activation.
 Classifies the live maintenance journal and the manifest first, and only then completes whichever
 of the journal termination and the manifest settlement is still outstanding. Discards the captured
 snapshot's standing as a migration-in-progress; nothing on the PostgreSQL side is deleted or undone,
@@ -228,6 +273,102 @@ nothing; it still requires the token and refuses with the class the real run wou
 
 Exit 0 postcondition: the maintenance journal reads terminal and the manifest reads settled, both
 read back after the operation, not assumed from the operation reporting success.
+
+### `lcm migration activate [--generation <id>] --confirm-generation <id> --confirm-backend postgresql [--dry-run] [--json]`
+
+Mutating. Switches a verified generation to PostgreSQL and releases the maintenance hold. It owns
+cell 24 (held, `verified`), cell 11 (an activation that was begun and not finished) and the settled
+re-entry at cell 10 (the generation's own completed publication and an `active` manifest). It adds no
+algorithm of its own: it supplies the inputs the activation orchestration asks for and maps what it
+returns.
+
+**Inputs.** The PostgreSQL connection is the transfer-role connection that `verify` opens, resolved
+from `storage.postgresql` and its environment fallbacks, and it is passed as **both** of activation's
+settings, because activation runs entirely under the transfer role. The expected owner is the
+configured migration role and the expected identity is the persisted local identity with a read of
+the destination project. Nothing is written to `config.json`, and an input that cannot be resolved
+refuses before the call.
+
+**Fences.** `--confirm-generation` and `--confirm-backend postgresql` (see "Commands" above).
+
+**What it returns, and the exit it gets.**
+
+| Outcome | Exit | Meaning and next step |
+| --- | --- | --- |
+| activated, restart cell satisfied | 0 | The manifest reads `active` with nothing pending, the result names this generation, and no daemon holds a stale backend. **Next: swap the grants, then start the daemon.** |
+| activated, a running daemon holds the previous backend | 8 | The selection is durable and correct. Swap the grants, restart the daemon, run `report`. |
+| activated, the restart check and the presence observation disagree or cannot be made | 5 | `cutover-restart-contradiction` / `cutover-restart-unresolvable`. Run `lcm daemon status`, resolve it, run `report`. |
+| refused before any effect | 2, 4, 5 or 6 | `activation-refused-precondition` (2), `-contention` (4), `-evidence` (5), `-resume` (6); the evidence names the step (`S0`-`S8`) and the reason. Nothing changed. |
+| interrupted after an effect began | 6 | `activation-interrupted`. Run `activate` again with the same confirmations. The evidence names the step, the cause, what is known to have been applied and whether the report was stored. |
+| interrupted before any effect | 2 | `activation-not-begun`. The manifest is unchanged; run `activate` again. A lease it took is not claimed to be released: it expires after 15 minutes or the next run takes it over. |
+| the publication did not complete | 5 | `activation-publication-failed`; the evidence names its status. |
+| published but the target is not healthy | 5 | `activation-post-publication-unhealthy`. The cutover is **not** complete. Fix the target, then run `activate` again. |
+| a result for another generation, or one the manifest does not read back | 5 | `activation-identity-mismatch`, `activation-readback-mismatch`. Nothing is accepted as success. |
+| a thrown error | 5 | `activation-invalid-input`, `activation-unexpected-state`, or `unexpected-failure`. Never success and never exit 6. |
+
+The refusal classes by reason (each reason has exactly one): **exit 2** `manifest-absent`,
+`manifest-not-eligible`, `maintenance-not-held`, `quiescence-unsatisfied`, `coverage-unsatisfied`,
+`uncovered-projects` (a machine with stored data for more than one project is out of scope here),
+`verification-stale`, `identity-drift`, `project-map-drift`, `target-unhealthy`, `census-drift`,
+`class-coverage-incomplete`, `verification-mismatch`; **exit 4** `lease-conflict`; **exit 5**
+`manifest-unresolvable`, `maintenance-unresolvable`, `lease-unresolvable`, `quiescence-unresolvable`,
+`coverage-unresolvable`, `verification-unresolvable`, `target-unresolvable`, `evidence-unresolvable`,
+`state-unresolvable`; **exit 6** `pending-effect-foreign` when `resume` owns that pending effect, exit 2
+otherwise. A failed best-effort release of the lease is shown as `leaseReleaseFailed` in the
+evidence and nothing more.
+
+**`--dry-run`** reads the persisted state (the manifest, the verification report, the journals, the
+link, the artifact and the restart check) and lists `notEvaluated`: quiescence, coverage, the
+project-coverage refusal, the lease, target health and the census. Those are the checks that decide
+an activation, so the preview can never say it would succeed: it always refuses
+`activation-dry-run-not-predictive` (exit 5). No coordination effect is taken.
+
+**Grants.** Activation runs under the transfer role and never touches grants. After exit 0, swap the
+grants before starting the daemon: add the runtime grants to the daemon's runtime role, then revoke
+the transfer grants (the steps are in "The cutover: activate and the grant swap"). #1607 is the
+later improvement that will let the daemon's readiness admit the transfer role.
+
+**After the grant swap, use `report`, not `activate`.** `activate` runs under the transfer role and
+the swap revokes that role's grants, so a repeat is not meant to be run once the swap is done.
+`lcm migration report` reads the settled state without a connection.
+
+Exit 0 postcondition: the manifest reads `active` with nothing pending, the identity the call
+returned is the confirmed generation's, and the restart cell is satisfied (a restart verdict of
+satisfied, with the daemon absent or already on `postgresql`).
+
+### `lcm migration rollback [--generation <id>] --confirm-generation <id> --confirm-backend sqlite [--dry-run] [--json]`
+
+Mutating. Returns an activated generation to SQLite. It owns cell 12 (a rollback that was begun and
+not finished) and is allowed at cell 10 (`active`), cell 13 (`rolled-back`; running it again is the
+settled re-entry) and cell 24 (a verified generation that never activated). It decides nothing
+itself: eligibility, the rollback mode (`pre-write` or `post-write`), the quiescence check and the
+remote-binding refusal all belong to the rollback orchestration, which re-enters every interrupted
+state. **Rollback refuses while any other project is remotely bound**, because the backend selection
+is global (see "Rollback and its limits").
+
+**Fences.** `--confirm-generation` and `--confirm-backend sqlite`.
+
+| Outcome | Exit | Meaning and next step |
+| --- | --- | --- |
+| manifest `rolled-back`, nothing pending, read back; restart cell satisfied | 0 | The envelope carries the mode, the eligibility and the report. |
+| rolled back, a running daemon holds the previous backend | 8 | Restart the daemon, run `report`. |
+| rolled back, the restart check and presence disagree or cannot be made | 5 | `cutover-restart-contradiction` / `cutover-restart-unresolvable`. |
+| returned at another phase (the interrupted publication could not be proven complete and was abandoned) | 2 | `rollback-abandoned`, with the abandonment report. Nothing was rolled back and no restart check ran; run `rollback` again. |
+| a result the manifest does not read back as `rolled-back` | 5 | `rollback-readback-mismatch`. |
+| not eligible, or not quiescent | 2 | `rollback-refused-precondition`; the evidence names `not-eligible` or `quiescence-unsatisfied`. |
+| the rollback lease was lost or is held elsewhere | 4 | `rollback-contention`. Run `rollback` again; it re-enters what was begun. |
+| unresolvable evidence, drift, unresolvable inputs, unexpected state | 5 | `rollback-refused-evidence`; the evidence names `unresolvable`, `drift`, `input-unresolvable` or `unexpected-state`. |
+| any other thrown error | 5 | `unexpected-failure`. |
+
+`applied` is reported `true` for a refusal only when the manifest is read back changed (or cannot be
+read), so it does not claim a write that did not happen.
+
+**`--dry-run`** reads the route and the manifest only; it does not call the rollback orchestration
+to discover a mode. It lists `notEvaluated`: eligibility, mode, quiescence, lease, drift,
+remote-binding and restart, and exits 5 (`rollback-dry-run-not-predictive`).
+
+Exit 0 postcondition: the manifest reads `rolled-back` with nothing pending for the confirmed
+generation, read back from disk, and the SQLite restart cell is satisfied.
 
 ## What every command can refuse, and what to do about it
 
@@ -257,12 +398,26 @@ knowing by name:
 - `multi-machine-installation` (exit 2): this project is already linked to a PostgreSQL project
   (see "Configuration" above). Migration requires an unlinked, single-machine project.
 - `route-not-owner` (exit 2), `route-resume-required` (exit 6), `route-publication-in-flight` (exit 4),
-  `route-requires-activation` / `route-requires-rollback` / `route-operator-required` (exit 7),
+  `route-operator-required` (exit 7),
   `route-unresolvable` / `route-foreign-publication` / `route-contradiction` (exit 5): the router
   looked at the journal, manifest and snapshot of the generation and this command does not own that
   cell. The envelope's `next` names the command that does, when one does. Nothing was changed.
-- `existing-confirmation-missing` / `existing-confirmation-moved` (exit 3): `resume` or `verify` was not
-  given the resolved generation id. The refusal reports it in `generation`.
+- `existing-confirmation-missing` / `existing-confirmation-moved` (exit 3): `resume`, `verify`,
+  `activate` or `rollback` was not given the resolved generation id. The refusal reports it in
+  `generation`. `backend-confirmation-missing` / `backend-confirmation-moved` (exit 3) are the same for
+  `--confirm-backend`.
+- `activation-*` and `rollback-*` (exits 2, 4, 5, 6): the closed outcome tables of `activate` and
+  `rollback`, in their command sections above. `cutover-restart-required` (exit 8) is the one
+  that means the cutover is durable and a running daemon still holds the previous backend; swap the
+  grants if you have not, restart the daemon, and run `report`. `cutover-restart-contradiction` and
+  `cutover-restart-unresolvable` (exit 5) mean the two restart observations could not be trusted.
+- `verify-contention` (exit 4): the verification lease or the source append barrier is held
+  elsewhere, or the lease was lost; no effect was begun. `verify-not-eligible` (exit 5): the fresh
+  verification found mismatches or incomplete coverage; the report is kept and the generation stays
+  `copied`. `verify-project-map-drift` / `verify-project-map-unresolvable` (exit 5): the project map
+  does not match, or cannot be read for, the verification witness.
+- `report-evidence-unresolvable` (exit 5): a reader of the activation or rollback evidence could not
+  answer, or a report the manifest names is missing; the report still prints what it read.
 - `generation-required` / `generation-unknown` (exit 2), `generation-invalid` (exit 1): pass
   `--generation` naming a generation that exists.
 - `abort-nothing-to-abort` (exit 2): there is no hold to leave. Nothing to do.
@@ -296,16 +451,41 @@ would tell an operator a definite "no" when the honest answer was "unknown".
 | 3 | `refused-confirmation` | A mutating boundary was not confirmed |
 | 4 | `refused-contention` | Another actor holds the lock, barrier or lease |
 | 5 | `refused-evidence` | Evidence is absent, unattributable, or failed its comparison |
-| 6 | `incomplete-recoverable` | Durably begun, not terminal, and `resume` (or `verify`) can finish it; only a command that is not the owner of the cell exits 6, naming the one that is |
+| 6 | `incomplete-recoverable` | Durably begun, not terminal, and a re-run can finish it: `resume` (or `verify`) for a pending effect, `activate` for an interrupted activation. A command that is not the owner of the cell exits 6, naming the one that is |
 | 7 | `failed-operator-required` | No automatic path resolves this; a human must decide. Check `applied` for whether anything mutated |
-| 8 | `restart-required` | Durable state correct; a live daemon holds a stale startup backend; only `report` exits 8 in this release (see "Restarting the daemon after a selection") |
+| 8 | `restart-required` | Durable state correct; a live daemon holds a stale startup backend; `report`, `activate` and `rollback` exit 8 (see "Restarting the daemon after a selection") |
+
+## The JSON envelope
+
+With `--json`, every command prints exactly one document, written once at the end, with these eleven
+fields in this order. The set is frozen for `schemaVersion` 1; an addition would bump it.
+
+| Field | Meaning |
+| --- | --- |
+| `schemaVersion` | always `1` |
+| `command` | the command that ran |
+| `outcome` | the exit class name (see "The exit classes") |
+| `exitCode` | the exit code; always the code of `outcome` |
+| `generation` | the generation the command resolved, or `null` |
+| `manifestPhase` | the manifest phase the command read or produced, or `null` |
+| `applied` | `true` only when the command durably wrote something in this run, including before a refusal |
+| `next` | the command (or operator step) to run next, or `null` |
+| `evidence` | a flat map of ids, digests, phases, counts and booleans. Never a path, a URL, a message or a secret |
+| `refusal` | `null` on exit 0; otherwise `{ reason, remedy }`, a closed reason and static remedy text |
+| `restart` | the restart observation (`answer` and `presence`) for `report`, `activate` and `rollback`, or `null` |
+
+Evidence is checked before it is printed, on exit 0 as well as on a refusal: a value that looks like
+an absolute path or a credentialed URL, or is longer than 256 characters, makes the command print
+the closed `unexpected-failure` instead of leaking it. The refusal reasons are in "Machine-readable
+inventory"; each carries its exit class and its remedy.
 
 ## State routing: which command owns which situation
 
 This table exists so that every state your installation can be in has exactly one command that
 owns getting you out of it. `report` prints the cell number and `next`; every command that is not
 the owner refuses naming it (exit 2), or exit 6 when a begun effect only the owner can finish is
-pending. The same router decides for all of them, so they cannot disagree.
+pending. A non-owner at cell 11 exits 6 when an activation effect is pending and 2 otherwise; at
+cell 12 it exits 6. The same router decides for all of them, so they cannot disagree.
 
 | Cell | Maintenance journal | Snapshot | Manifest | Owner | Also allowed |
 | --- | --- | --- | --- | --- | --- |
@@ -315,16 +495,19 @@ pending. The same router decides for all of them, so they cannot disagree.
 | 19 | `held` | complete | `planned` | `resume` | `abort` |
 | 20 | `held` | complete | pending dry-run effect | `resume` | -- |
 | 21 | `held` | complete | `dry-run-verified`/`copying`, or a pending copy effect | `resume` | `abort` only with nothing pending |
-| 22 | `held` | complete | `copied` | `verify` (fresh: waits for #625) | `abort` |
+| 22 | `held` | complete | `copied` | `verify` (fresh computation) | `abort` |
 | 23 | `held` | any | pending verification effect | `verify` | `resume` |
-| 24 | `held` | complete | `verified` | `activate` (not available) | `verify` (confirms), `rollback`, `abort` |
+| 24 | `held` | complete | `verified` | `activate` | `verify` (confirms), `rollback`, `abort` |
 | 4 | `entering`/`held`, another generation | any | any | `abort` (acts on that live hold) | -- |
 | 5 | `maintenance-aborted` | any | absent or `aborted` | none -- settled; `apply` starts a fresh cutover | `abort` (confirms only) |
 | 6 | `maintenance-aborted` | any | pending abort effect | `abort` | `resume` |
 | 7 | `maintenance-aborted` | any | pending copy, dry-run or verification effect | none -- exit 7 | -- |
 | 8 | `maintenance-aborted` | any | begun-nothing phase before `verified` | `abort` (settles the manifest) | -- |
 | 9 | `maintenance-aborted` | any | anything else | none -- exit 5; `abort` is never called | -- |
-| 10-13 | publication or selection states, activation and rollback | any | `verified`, `active`, `rolling-back`, `rolled-back` | `activate`/`rollback` (not available): exit 7 | `resume` |
+| 10 | the generation's own completed publication | any | `active`, nothing pending | none -- settled; `report` | `activate` (settled re-entry), `rollback` |
+| 11 | the generation's own publication in flight or aborted, or a `selection-prepared`/`selection-completed` hold | any | `verified`, `activating`, or a pending activation effect | `activate` | `resume` |
+| 12 | not aborted | any | `rolling-back`, or a pending rollback effect | `rollback` | `resume` |
+| 13 | not aborted | any | `rolled-back`, nothing pending | none -- settled; `report` | `rollback` (settled re-entry) |
 | 2, 3 | a v2 publication | any | any | none -- exit 4 while in flight, exit 5 when foreign and finished | -- |
 | 1, 25 | unresolvable, or no row matches | -- | -- | none -- exit 5 | -- |
 
@@ -336,27 +519,48 @@ identity -- retrying after `abort` computes a fresh, later ordinal rather than r
 one, so a project that aborts many attempts will see its candidate generation numbers climb; this is
 expected and not a sign of a leak.
 
-## Commands not available today
+## The cutover: activate and the grant swap
 
-`activate` and `rollback` are named in this Epic's design and in the state-routing table above,
-because the design covers all nine eventual commands -- naming a command is not the same as
-registering it. **Neither is registered as a CLI command in this release.** There is nothing to run
-by those names. Where the table above names one of them as the owner of a state, `abort` (from a
-hold) remains the actual, working exit from that state today, and `resume` and `verify` refuse
-exit 7 rather than guess.
+Once `verify` has left the generation `verified`, the cutover finishes in this order. Do not reorder
+it.
 
-`rollback` specifically is not merely deferred by sequencing: its underlying orchestration has a
-known safety gap (tracked separately, issue #1433) that makes it safe to exist unregistered in this
-codebase but unsafe to expose as a runnable command. It will not be registered until that gap is
-closed, independent of when `activate` becomes available.
+1. `lcm migration activate --confirm-generation <id> --confirm-backend postgresql`. It runs under the
+   transfer role and, on exit 0, the selection is durable and the hold is released.
+2. **Swap the grants, before starting the daemon.** Activation proves that the transfer role could publish the selection; it does
+   not prove that the daemon can start, because the daemon enforces its exact runtime privilege
+   profile when it starts and that profile rejects the transfer grants. Add the reviewed runtime
+   grants to the daemon's runtime role, then revoke the transfer grants from the transfer role (or
+   drop it), so the runtime role is the schema's only non-owner grantee. Applying the runtime grants
+   before revoking the transfer grants is harmless, because readiness is evaluated only when the
+   daemon starts. The scripts and the procedure are in
+   [Migration cutover: after activation](migration-cutover.md#after-activation-the-grant-swap-and-the-daemon).
+   A later improvement, #1607, will let the daemon's readiness admit the transfer role next to the
+   runtime role; until then the swap is your step.
+3. Start (or restart) the daemon. It performs its own readiness check against the runtime role and
+   refuses to serve until it passes.
+4. Run `lcm migration report` until it exits 0 (see "Restarting the daemon after a selection").
 
-The fresh form of `verify` (a `copied` generation with nothing pending) also waits: it needs the
-project-map witness the activation work provides, and refuses `requires-625-project-map-witness`
-until then.
+`activate` prints the swap as its next step on exit 0 (`next` is `swap-grants-then-start-daemon` and
+the evidence carries `grantSwap: required-before-daemon-start`), and its exit 8 refusal repeats it.
 
-Do not read any of this as "coming soon": it is a statement of what you can and cannot do with this
-release, today. When `activate` and `rollback` do become available, this document will say so in
-the command reference above, the same way the other commands are documented there now.
+## Rollback and its limits
+
+`lcm migration rollback` returns an activated generation to SQLite: an exact reversal of the
+selection with no data copy when nothing was written to PostgreSQL after activation (`pre-write`),
+and a reconstruction from PostgreSQL otherwise (`post-write`). The mode is classified by the
+rollback orchestration and reported, never chosen by the CLI.
+
+**Rollback refuses while any other project is remotely bound.** The backend selection is global to
+the installation, so unwinding it for one project would also switch every other project that is
+bound to PostgreSQL back to SQLite. The refusal arrives as `rollback-refused-precondition` or
+`rollback-refused-evidence` (the evidence names `not-eligible` or `drift`), and the CLI neither
+pre-checks nor softens it. Moving several projects at once is separate, planned work (#1544);
+`activate` likewise refuses a machine that has stored data for more than one project
+(`uncovered-projects`).
+
+After a rollback the daemon must run on SQLite again. `rollback` runs the same two-observation
+restart check `report` does, against `sqlite`; exit 8 means a running daemon still holds
+`postgresql`.
 
 ## The maintenance hold, in more detail
 
@@ -372,7 +576,7 @@ before taking the hold (never assumed, and never refused merely because none is 
 "Daemon presence" below). If a daemon **is** running, ordinary consumer admission -- including that
 daemon's own passive-event sweep -- is fenced for the whole hold. A running daemon will log-and-
 retry rather than make progress for the duration of the window; this is expected non-progress, not
-corruption, and it resolves itself once the hold ends (via `abort` in this release). `apply` writes
+corruption, and it resolves itself once the hold ends (via `activate` or `abort`). `apply` writes
 one line to stderr, before it takes the hold, when a daemon is observed running, and records
 `daemonPresent` (and `daemonStorageBackend` when present) in its JSON evidence, as `plan` does.
 
@@ -392,8 +596,10 @@ warn about, not require.
 A durable selection can be correct while a daemon that started earlier still holds the previous
 startup backend; it refuses local requests until it restarts. `report` checks this only when a
 selection is already durable (an `active` manifest names postgresql; a `rolled-back` manifest or a
-settled abort names sqlite; a completed selection in the journal names its own target backend). It
-combines two independent observations, and neither decides alone:
+settled abort names sqlite; a completed selection in the journal names its own target backend).
+`activate` and `rollback` apply the same check to the selection they just made (postgresql and
+sqlite). It combines two independent observations, neither decides alone, and exit 0 needs the
+first row:
 
 | Restart check | Daemon presence | Exit |
 | --- | --- | --- |
@@ -403,8 +609,9 @@ combines two independent observations, and neither decides alone:
 | unsatisfied | anything else | 5 |
 | unresolvable | any | 5 |
 
-If either observation cannot be made, `report` exits 5. The loop is: run `lcm migration report`; on
-exit 8 run `lcm daemon restart`; run `report` again until it exits 0.
+If either observation cannot be made, `report`, `activate` and `rollback` exit 5. The loop is: after an
+activation, swap the grants first (see "The cutover: activate and the grant swap"); run
+`lcm migration report`; on exit 8 run `lcm daemon restart`; run `report` again until it exits 0.
 
 ## What is preserved, and what the probe bound means
 
@@ -430,7 +637,7 @@ A cutover, including a successful `apply`, **does not flush a pending local even
 Preserving pending events correctly and routing them to the right place on the next read is not the
 same as draining them -- nothing in this Epic currently guarantees that a retained backlog is
 processed to completion by any specific point in the migration sequence. **The daemon restart that
-accompanies eventual activation is what resumes processing** of anything still pending, not the
+follows activation is what resumes processing** of anything still pending, not the
 migration commands themselves. Do not assume a pending backlog is empty because `apply` succeeded.
 
 ## Fencing residue: what this command group does not protect against
@@ -457,12 +664,9 @@ command-contract, and refusal-reason constants by a dedicated test
 test fails -- this section is not prose, and keeping it manually in sync is not the mechanism that
 guarantees it stays accurate; the test is. Do not hand-edit this block without re-running that test.
 
-`status: "implemented"` means the command is registered and runnable today. `status: "outline"`
-means the command name and its eventual contract are documented for forward compatibility with the
-rest of this Epic, but the command itself does not exist yet -- see "Commands not available today"
-above. For an `outline` command, `canEmit` is the contract it will have once registered. It is
-not a claim that any registered command emits those classes today: exit 6 and exit 8, for example,
-are emitted by no registered command in this release.
+`status: "implemented"` means the command is registered and runnable. All nine commands are
+implemented, and a test checks that the commands registered in `bin/lcm.ts` are exactly the ones this
+block marks implemented. `canEmit` is the closed set of exit classes the command can produce.
 
 ```json
 {
@@ -564,13 +768,15 @@ are emitted by no registered command in this release.
         3,
         4,
         5,
-        7
+        6,
+        7,
+        8
       ]
     },
     {
       "command": "verify",
       "status": "implemented",
-      "exitZeroPostcondition": "The manifest reads verified with nothing pending and its verification report reference names a persisted, activation-eligible report. A verified generation is confirmed from that persisted evidence without writing.",
+      "exitZeroPostcondition": "The manifest reads verified with nothing pending and its verification report reference names a persisted, activation-eligible report. A verified generation is confirmed from that persisted evidence without writing. With --dry-run, the computation found an eligible report and persisted nothing.",
       "canEmit": [
         0,
         1,
@@ -584,7 +790,7 @@ are emitted by no registered command in this release.
     {
       "command": "report",
       "status": "implemented",
-      "exitZeroPostcondition": "Every reader that exists in this build was read without taking any lock, and no contradiction was found. Readers that belong to unmerged work print not-available-in-this-build.",
+      "exitZeroPostcondition": "Every reader was read without taking any lock, and no contradiction was found.",
       "canEmit": [
         0,
         1,
@@ -596,8 +802,8 @@ are emitted by no registered command in this release.
     },
     {
       "command": "activate",
-      "status": "outline",
-      "exitZeroPostcondition": "Manifest read back at its durable phase and the restart verifier answered satisfied.",
+      "status": "implemented",
+      "exitZeroPostcondition": "The call returned the confirmed generation's identity, the manifest reads active with nothing pending, and the restart matrix cell is satisfied (verdict satisfied, daemon absent or on the selected backend). --dry-run never exits 0.",
       "canEmit": [
         0,
         1,
@@ -612,8 +818,8 @@ are emitted by no registered command in this release.
     },
     {
       "command": "rollback",
-      "status": "outline",
-      "exitZeroPostcondition": "Manifest read back at rolled-back and the restart verifier answered satisfied.",
+      "status": "implemented",
+      "exitZeroPostcondition": "The manifest reads rolled-back with nothing pending for the confirmed generation, read back from disk, and the sqlite restart matrix cell is satisfied. --dry-run never exits 0.",
       "canEmit": [
         0,
         1,
@@ -984,16 +1190,6 @@ are emitted by no registered command in this release.
       "remedy": "This generation has durably begun work that only `lcm migration resume` (or `verify` where this refusal names it) can finish. Nothing was changed."
     },
     {
-      "reason": "route-requires-activation",
-      "exitClass": "failed-operator-required",
-      "remedy": "This generation is verified and awaits activation, which this build does not register. Nothing was changed; run `lcm migration report`."
-    },
-    {
-      "reason": "route-requires-rollback",
-      "exitClass": "failed-operator-required",
-      "remedy": "This generation is past activation and only rollback can settle it, which this build does not register. Nothing was changed; run `lcm migration report`."
-    },
-    {
       "reason": "route-operator-required",
       "exitClass": "failed-operator-required",
       "remedy": "No automatic command settles this generation's state. Nothing was changed; run `lcm migration report` and inspect the evidence."
@@ -1024,9 +1220,24 @@ are emitted by no registered command in this release.
       "remedy": "--confirm-generation does not match the resolved generation. Pass the id this refusal reports; nothing was changed."
     },
     {
-      "reason": "requires-625-project-map-witness",
-      "exitClass": "failed-operator-required",
-      "remedy": "A fresh verification needs the project-map witness that #625 provides, which this build does not include. Nothing was changed; the generation stays copied."
+      "reason": "verify-contention",
+      "exitClass": "refused-contention",
+      "remedy": "Another worker holds the verification lease or the source append barrier, or the lease was lost. No effect was begun; run `lcm migration verify` again."
+    },
+    {
+      "reason": "verify-not-eligible",
+      "exitClass": "refused-evidence",
+      "remedy": "The verification found mismatches or incomplete coverage. A non-eligible report is kept as evidence, and the generation stays copied. Run `lcm migration report` and inspect it."
+    },
+    {
+      "reason": "verify-project-map-drift",
+      "exitClass": "refused-evidence",
+      "remedy": "The project map no longer matches the generation's destination project. Nothing was changed; run `lcm doctor` and inspect the project map."
+    },
+    {
+      "reason": "verify-project-map-unresolvable",
+      "exitClass": "refused-evidence",
+      "remedy": "The project map could not be read for the verification witness. Run `lcm doctor` before retrying."
     },
     {
       "reason": "verify-report-identity-conflict",
@@ -1074,6 +1285,11 @@ are emitted by no registered command in this release.
       "remedy": "The journal records a completed selection without naming its backend. Nothing was changed; run `lcm doctor` and inspect the evidence."
     },
     {
+      "reason": "report-evidence-unresolvable",
+      "exitClass": "refused-evidence",
+      "remedy": "A reader of the activation or rollback evidence could not give an answer, or a report the manifest references is missing. The report still prints every section it read; run `lcm doctor` and inspect the evidence named as unresolvable or missing."
+    },
+    {
       "reason": "abort-carried-effect-mismatch",
       "exitClass": "refused-evidence",
       "remedy": "The pending abort effect on the manifest is not the one an abort of this generation begins. Nothing was changed; run `lcm doctor` and inspect the evidence."
@@ -1087,6 +1303,126 @@ are emitted by no registered command in this release.
       "reason": "abort-readback-mismatch",
       "exitClass": "failed-operator-required",
       "remedy": "The abort appeared to complete but its terminal state could not be confirmed on readback. Run `lcm doctor` and inspect the maintenance journal and manifest directly."
+    },
+    {
+      "reason": "backend-confirmation-missing",
+      "exitClass": "refused-confirmation",
+      "remedy": "Pass --confirm-backend with the backend this command switches to: postgresql for activate, sqlite for rollback. Nothing was changed."
+    },
+    {
+      "reason": "backend-confirmation-moved",
+      "exitClass": "refused-confirmation",
+      "remedy": "--confirm-backend does not match the backend this command switches to (postgresql for activate, sqlite for rollback). Nothing was changed."
+    },
+    {
+      "reason": "activation-refused-precondition",
+      "exitClass": "refused-precondition",
+      "remedy": "Activation was refused before it began any effect: the evidence names the step and the reason. Fix that condition, then run `lcm migration activate` again. `lcm migration report` shows the current state."
+    },
+    {
+      "reason": "activation-refused-contention",
+      "exitClass": "refused-contention",
+      "remedy": "Another actor holds the activation lease. Nothing was changed; wait for it to finish or expire, then run `lcm migration activate` again."
+    },
+    {
+      "reason": "activation-refused-evidence",
+      "exitClass": "refused-evidence",
+      "remedy": "Activation could not establish a fact it needs and refused before it began any effect: the evidence names the step and the reason. Run `lcm doctor` and `lcm migration report` before retrying."
+    },
+    {
+      "reason": "activation-refused-resume",
+      "exitClass": "incomplete-recoverable",
+      "remedy": "A pending effect on this generation is finished by `lcm migration resume`. Nothing was changed; run it with the same --confirm-generation."
+    },
+    {
+      "reason": "activation-not-begun",
+      "exitClass": "refused-precondition",
+      "remedy": "Activation was interrupted before its first durable effect, so the manifest is unchanged. A lease it took may be held until it expires (15 minutes) or a later run takes it over; run `lcm migration activate` again."
+    },
+    {
+      "reason": "activation-interrupted",
+      "exitClass": "incomplete-recoverable",
+      "remedy": "Activation was interrupted after beginning durable work. Run `lcm migration activate` again with the same confirmations; the re-entry finishes it. The evidence names the step, the cause and what is known to have been applied."
+    },
+    {
+      "reason": "activation-publication-failed",
+      "exitClass": "refused-evidence",
+      "remedy": "The backend publication did not complete: the evidence names its status. Run `lcm migration report` and inspect the evidence before deciding between `activate` again and `rollback`."
+    },
+    {
+      "reason": "activation-post-publication-unhealthy",
+      "exitClass": "refused-evidence",
+      "remedy": "The publication completed but the PostgreSQL target did not pass its health check, so the cutover is not complete. Fix the target (the evidence names the reason), then run `lcm migration activate` again."
+    },
+    {
+      "reason": "activation-identity-mismatch",
+      "exitClass": "refused-evidence",
+      "remedy": "Activation answered for a generation other than the one confirmed, so its result is not accepted. Run `lcm migration report` for each generation and inspect the evidence."
+    },
+    {
+      "reason": "activation-readback-mismatch",
+      "exitClass": "refused-evidence",
+      "remedy": "Activation reported success but the manifest does not read back as active with nothing pending. Run `lcm migration report` and inspect the evidence."
+    },
+    {
+      "reason": "activation-invalid-input",
+      "exitClass": "refused-evidence",
+      "remedy": "The activation request was rejected as invalid before anything ran. This is an internal defect; file an issue with the evidence."
+    },
+    {
+      "reason": "activation-unexpected-state",
+      "exitClass": "refused-evidence",
+      "remedy": "Activation found state it does not recognise and stopped. Run `lcm migration report` and inspect the evidence before retrying."
+    },
+    {
+      "reason": "activation-dry-run-not-predictive",
+      "exitClass": "refused-evidence",
+      "remedy": "The activation preview reads the persisted state but does not evaluate quiescence, coverage, the project-coverage refusal, the lease, target health or the census, so it cannot say activation would succeed. The evidence lists what it read and what it did not."
+    },
+    {
+      "reason": "cutover-restart-required",
+      "exitClass": "restart-required",
+      "remedy": "The durable selection is correct, but a running daemon still holds the previous startup backend. Swap the grants first (add the runtime grants, revoke the transfer grants), restart the daemon, then run `lcm migration report`."
+    },
+    {
+      "reason": "cutover-restart-contradiction",
+      "exitClass": "refused-evidence",
+      "remedy": "The daemon restart check and the daemon presence observation disagree, so neither can be trusted alone. Run `lcm daemon status`, resolve the difference, and run `lcm migration report`."
+    },
+    {
+      "reason": "cutover-restart-unresolvable",
+      "exitClass": "refused-evidence",
+      "remedy": "The daemon restart check could not be made. Run `lcm daemon status`, resolve the failure, and run `lcm migration report`."
+    },
+    {
+      "reason": "rollback-refused-precondition",
+      "exitClass": "refused-precondition",
+      "remedy": "Rollback refused because the generation is not eligible or the installation is not quiescent: the evidence names which. Rollback also refuses while any other project is remotely bound, because the backend selection is global. Fix the named condition, then run `lcm migration rollback` again."
+    },
+    {
+      "reason": "rollback-contention",
+      "exitClass": "refused-contention",
+      "remedy": "The rollback lease was lost or is held by another actor. Re-running `lcm migration rollback` with the same confirmations re-enters whatever was begun."
+    },
+    {
+      "reason": "rollback-refused-evidence",
+      "exitClass": "refused-evidence",
+      "remedy": "Rollback could not establish a fact it needs, or found state that contradicts the generation: the evidence names which. Run `lcm doctor` and `lcm migration report` and inspect the evidence before retrying."
+    },
+    {
+      "reason": "rollback-abandoned",
+      "exitClass": "refused-precondition",
+      "remedy": "An interrupted publication could not be proven complete, so rollback abandoned it and the generation returned to its previous phase with an abandonment report. Nothing was rolled back; run `lcm migration rollback` again."
+    },
+    {
+      "reason": "rollback-readback-mismatch",
+      "exitClass": "refused-evidence",
+      "remedy": "Rollback reported a result that the manifest does not read back as rolled-back with nothing pending. Run `lcm migration report` and inspect the evidence."
+    },
+    {
+      "reason": "rollback-dry-run-not-predictive",
+      "exitClass": "refused-evidence",
+      "remedy": "The rollback preview reads only the route and the manifest. It does not evaluate eligibility, mode, quiescence, the lease, drift, remote bindings or the restart check, so it cannot say rollback would succeed."
     }
   ]
 }

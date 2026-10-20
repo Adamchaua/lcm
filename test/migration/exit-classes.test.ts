@@ -61,11 +61,10 @@ describe("MIGRATION_COMMAND_CONTRACTS (section 5.1's per-command postcondition a
     expect(MIGRATION_COMMAND_CONTRACTS.map((entry) => entry.command)).toEqual(expectedCommands);
   });
 
-  it("marks plan, dry-run, apply, resume, verify, report and abort as implemented, and activate and rollback (which wait for #625 and #626) as outline", () => {
+  it("marks all nine commands implemented: none is outline any more", () => {
     const implemented = MIGRATION_COMMAND_CONTRACTS.filter((entry) => entry.status === "implemented").map((entry) => entry.command);
-    expect(implemented.sort()).toEqual(["abort", "apply", "dry-run", "plan", "report", "resume", "verify"].sort());
-    const outline = MIGRATION_COMMAND_CONTRACTS.filter((entry) => entry.status === "outline").map((entry) => entry.command);
-    expect(outline.sort()).toEqual(["activate", "rollback"].sort());
+    expect(implemented.sort()).toEqual([...expectedCommands].sort());
+    expect(MIGRATION_COMMAND_CONTRACTS.filter((entry) => entry.status === "outline")).toEqual([]);
   });
 
   it("gives every command a non-empty, never-'nothing threw' exit-zero postcondition, and every command can emit 0", () => {
@@ -110,9 +109,14 @@ describe("MIGRATION_COMMAND_CONTRACTS (section 5.1's per-command postcondition a
     expect(migrationCommandContract("abort").canEmit).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
   });
 
-  it("verify never emits 6 (it finishes its own pending effect) and resume never emits 6 or 8 (plan-v5 Part A item 2)", () => {
+  it("verify never emits 6 or 8 (it finishes its own pending effect), while resume emits what activate and rollback do at cells 11 and 12, which includes 6 and 8", () => {
     expect(migrationCommandContract("verify").canEmit).toEqual([0, 1, 2, 3, 4, 5, 7]);
-    expect(migrationCommandContract("resume").canEmit).toEqual([0, 1, 2, 3, 4, 5, 7]);
+    expect(migrationCommandContract("resume").canEmit).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    for (const code of [6, 8] as const) {
+      expect(migrationCommandContract("resume").canEmit).toContain(code);
+      expect(migrationCommandContract("activate").canEmit).toContain(code);
+      expect(migrationCommandContract("rollback").canEmit).toContain(code);
+    }
   });
 
   it("report emits exactly 0,1,2,4,5,8 and rollback gains 8 (plan-v5 Part A item 2)", () => {

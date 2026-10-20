@@ -78,12 +78,12 @@ describe("runbook machine-readable inventory (section 12 bidirectional conforman
     const sourceCopy = jsonRoundTrip(MIGRATION_COMMAND_CONTRACTS) as Array<{ command: string; status: string }>;
     const reportEntry = sourceCopy.find((entry) => entry.command === "activate");
     expect(reportEntry).toBeDefined();
-    reportEntry!.status = "implemented";
+    reportEntry!.status = "outline";
     expect(inventory.commands).not.toEqual(sourceCopy);
     const docCopy = JSON.parse(JSON.stringify(inventory.commands)) as Array<{ command: string; status: string }>;
     const docReportEntry = docCopy.find((entry) => entry.command === "activate");
     expect(docReportEntry).toBeDefined();
-    docReportEntry!.status = "implemented";
+    docReportEntry!.status = "outline";
     expect(docCopy).not.toEqual(jsonRoundTrip(MIGRATION_COMMAND_CONTRACTS));
   });
 
@@ -124,27 +124,73 @@ describe("runbook command registration (third leg: what bin/lcm.ts actually regi
     expect(registered).toEqual(implemented);
   });
 
-  it("never registers a command MIGRATION_COMMAND_CONTRACTS marks as outline (this is the specific check that would have caught reports earlier implemented status: a set-equality check alone would not distinguish an over-claim in the doc from an under-registration in the CLI)", () => {
+  it("registers all nine commands, activate and rollback included, and the contract table has no outline command left to leave unregistered", () => {
     const program = new Command();
     registerMigrationCommand(program);
     const migrationGroup = program.commands.find((command) => command.name() === "migration");
-    const registered = new Set(migrationGroup!.commands.map((command) => command.name()));
-    const outlineCommands = MIGRATION_COMMAND_CONTRACTS
-      .filter((entry) => entry.status === "outline")
-      .map((entry) => entry.command);
-    expect(outlineCommands.length).toBeGreaterThan(0);
-    for (const name of outlineCommands) {
-      expect(registered.has(name)).toBe(false);
-    }
+    const registered = migrationGroup!.commands.map((command) => command.name()).sort();
+    expect(registered).toEqual(["abort", "activate", "apply", "dry-run", "plan", "report", "resume", "rollback", "verify"]);
+    expect(MIGRATION_COMMAND_CONTRACTS.filter((entry) => entry.status === "outline")).toEqual([]);
   });
 });
 
-describe("runbook prose: rollback is named as unregistered with its own cited reason, not merely absent from the implemented set", () => {
-  it("states plainly that rollback is not registered and cites issue #1433 by number (the status field alone cannot carry why -- a reader needs to know this is a separate safety gap, not sequencing)", () => {
-    expect(runbookText).toContain("#1433");
-    const issueIndex = runbookText.indexOf("#1433");
-    const nearbyText = runbookText.slice(Math.max(0, issueIndex - 400), issueIndex + 400);
-    expect(nearbyText.toLowerCase()).toContain("rollback");
+describe("runbook prose: the obligations the cutover commands add (no mechanical backstop in the inventory block)", () => {
+  function section(heading: string): string {
+    const start = runbookText.indexOf(heading);
+    expect(start).toBeGreaterThan(-1);
+    const next = runbookText.indexOf(String.fromCharCode(10) + "## ", start + heading.length);
+    return runbookText.slice(start, next === -1 ? undefined : next);
+  }
+
+  it("tells the operator to swap the grants before starting the daemon, in the activate reference and the cutover section, and cites #1607 as the later improvement", () => {
+    const activate = section("### `lcm migration activate");
+    const cutover = section("## The cutover: activate and the grant swap");
+    for (const text of [activate, cutover]) {
+      expect(text).toMatch(/swap\s+the\s+grants/iu);
+      expect(text).toMatch(/runtime\s+grants/u);
+      expect(text).toMatch(/revoke\s+the\s+transfer\s+grants/iu);
+      expect(text).toMatch(/before\s+(starting|you\s+start)\s+the\s+daemon/iu);
+    }
+    expect(cutover).toContain("#1607");
+    expect(cutover.indexOf("Swap the grants")).toBeLessThan(cutover.indexOf("Start (or restart) the daemon"));
+  });
+
+  it("states rollback's remote-binding refusal (A14) in the rollback reference and the limits section", () => {
+    expect(section("### `lcm migration rollback")).toMatch(/refuses\s+while\s+any\s+other\s+project\s+is\s+remotely\s+bound/u);
+    expect(section("## Rollback and its limits")).toMatch(/refuses\s+while\s+any\s+other\s+project\s+is\s+remotely\s+bound/u);
+    expect(section("## Rollback and its limits")).toMatch(/backend\s+selection\s+is\s+global/u);
+  });
+
+  it("states that --confirm-backend confirms intent and does not detect the wrong direction, naming both literals", () => {
+    const commands = section("## Commands");
+    expect(commands).toMatch(/--confirm-backend/u);
+    expect(commands).toMatch(/only\s+legal\s+value/u);
+    expect(commands).toMatch(/does\s+not\s+detect/u);
+    expect(commands).toContain("`postgresql`");
+    expect(commands).toContain("`sqlite`");
+  });
+
+  it("documents the JSON envelope the Commands section points to, field by field", () => {
+    expect(runbookText).toContain('"The JSON envelope"');
+    const envelope = section("## The JSON envelope");
+    for (const field of ["schemaVersion", "command", "outcome", "exitCode", "generation", "manifestPhase", "applied", "next", "evidence", "refusal", "restart"]) {
+      expect(envelope).toContain("`" + field + "`");
+    }
+  });
+
+  it("lists the R5 coordination effects: only verify's fresh dry-run takes a lease and the barrier", () => {
+    const commands = section("## Commands");
+    expect(commands).toMatch(/verification lease/u);
+    expect(commands).toMatch(/source append barrier/u);
+  });
+
+  it("no longer says any command is missing, deferred or unregistered", () => {
+    expect(runbookText).not.toMatch(/not registered and not\s+available/u);
+    expect(runbookText).not.toContain("Commands not available today");
+    expect(runbookText).not.toContain("requires-625-project-map-witness");
+    expect(runbookText).not.toContain("not-available-in-this-build");
+    expect(runbookText).not.toContain("route-requires-activation");
+    expect(runbookText).not.toContain("route-requires-rollback");
   });
 });
 
