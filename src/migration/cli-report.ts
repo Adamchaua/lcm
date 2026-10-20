@@ -3,6 +3,7 @@ import { readDaemonConfigSnapshot, type StorageBackend } from "../daemon/config.
 import { configPath, daemonPidPath } from "../runtime-paths.js";
 import { checkActivationRestartAdmission, type ActivationRestartCheckResult } from "./activation-restart-check.js";
 import { classifyMigrationDaemonPresence, type MigrationDaemonPresence } from "./daemon-presence.js";
+import { combineMigrationRestart, type MigrationRestartClass } from "./cli-restart.js";
 import { classifyMigrationRecovery } from "./protocol.js";
 import { MigrationVerificationReportStore } from "./verification-store.js";
 import { MIGRATION_UNEXPECTED_FAILURE_REASON, unexpectedFailureEvidence, withMigrationBoundary } from "./boundary.js";
@@ -146,26 +147,23 @@ function selectedBackend(context: ExistingGenerationContext): StorageBackend | n
 
 type RestartOutcome = Readonly<{ reason?: string; restart: MigrationEnvelopeRestart | null; evidence: MigrationEvidence }>;
 
-/** Plan-v4 section 7's matrix: two observations, neither deciding alone. */
+const REPORT_RESTART_REASONS: Readonly<Record<Exclude<MigrationRestartClass, "ok">, string>> = Object.freeze({
+  required: "report-restart-required",
+  contradiction: "report-restart-contradiction",
+  unresolvable: "report-restart-unresolvable",
+});
+
 function combineRestart(
   verdict: ActivationRestartCheckResult,
   presence: MigrationDaemonPresence,
   selected: StorageBackend,
 ): RestartOutcome {
-  const presenceName = presence.status === "present" ? "running" : presence.status === "authoritatively-absent" ? "absent" : "unresolvable";
-  const restart = { answer: verdict.status, presence: presenceName } as const;
-  const evidence = { selectedBackend: selected, restartCheckReason: verdict.reason };
-  const stale = presence.status === "present" && presence.storageBackend !== selected;
-  const matching = presence.status === "present" && presence.storageBackend === selected;
-  if (verdict.status === "unresolvable") return { reason: "report-restart-unresolvable", restart, evidence };
-  if (verdict.status === "satisfied") {
-    return presence.status === "authoritatively-absent" || matching
-      ? { restart, evidence }
-      : { reason: "report-restart-contradiction", restart, evidence };
-  }
-  return stale
-    ? { reason: "report-restart-required", restart, evidence }
-    : { reason: "report-restart-contradiction", restart, evidence };
+  const combined = combineMigrationRestart(verdict, presence, selected);
+  return {
+    ...(combined.class === "ok" ? {} : { reason: REPORT_RESTART_REASONS[combined.class] }),
+    restart: combined.restart,
+    evidence: combined.evidence,
+  };
 }
 
 async function restartEvidence(
