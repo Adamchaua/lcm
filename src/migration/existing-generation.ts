@@ -79,6 +79,17 @@ function routeLink(result: ActivationGenerationLinkReadResult): MigrationRouteLi
   return { kind: result.state === "authoritatively-absent" ? "absent" : "unresolvable" };
 }
 
+/**
+ * Whether the journal is evidence that `generationId` exists: a hold naming
+ * it, or a journal that could not be read. A v2 publication is activation
+ * evidence, and activation requires the manifest this check already found
+ * absent, so no publication proves a manifest-less id.
+ */
+function journalNames(journal: MigrationRouteJournal, generationId: string): boolean {
+  if (journal.kind === "hold") return journal.generationId === generationId;
+  return journal.kind === "unresolvable";
+}
+
 export async function resolveExistingMigrationGeneration(
   input: ExistingGenerationInput,
 ): Promise<ExistingGenerationResolution> {
@@ -121,7 +132,12 @@ export async function resolveExistingMigrationGeneration(
   }
 
   const journal = routeJournal(observation);
-  if (manifestRoute.kind === "absent" && journal.kind === "absent") {
+  // An explicit id exists when its manifest is present, or when the journal
+  // names it: a hold for a different generation is that generation's
+  // evidence, not this one's, so a mistyped id refuses here instead of
+  // routing against a stranger's hold (row 4 still applies once the explicit
+  // id's own manifest exists). An unresolvable journal stays unresolvable.
+  if (manifestRoute.kind === "absent" && !journalNames(journal, generationId)) {
     return { status: "refuse", reason: "generation-unknown" };
   }
 

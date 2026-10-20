@@ -94,6 +94,34 @@ describe("resolveExistingMigrationGeneration", () => {
     expect(result).toEqual({ status: "refuse", reason: "generation-unknown" });
   });
 
+  it.each([
+    ["a live hold", hold("maintenance-held", "generation-other")],
+    ["an entering hold", hold("maintenance-entering", "generation-other")],
+    ["a terminal hold", hold("maintenance-aborted", "generation-other")],
+    ["a v2 publication", { kind: "publication", publicationId: "generation-other", phase: "completed" } as MigrationJournalObservation],
+  ])("refuses an explicit id with no manifest as unknown when the only journal is %s for another generation (Codex PR #1653: a typo must not route against a stranger's hold)", async (_name, observation) => {
+    const result = await resolveExistingMigrationGeneration({
+      homeDir: home(), generation: GEN, _operationsForTesting: { observeJournal: () => observation, classifySnapshot: absentSnapshot },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "generation-unknown" });
+  });
+
+  it("a hold naming the explicit id is evidence it exists even before its manifest (captured, genesis not yet run)", async () => {
+    const result = await resolveExistingMigrationGeneration({
+      homeDir: home(), generation: GEN, _operationsForTesting: { observeJournal: () => hold("maintenance-held"), classifySnapshot: complete },
+    });
+    expect(result).toMatchObject({ status: "resolved", context: { generationId: GEN, manifest: null } });
+  });
+
+  it("an explicit id with a manifest still routes to row 4 while another generation's hold is live (plan-v5 §3)", async () => {
+    const homeDir = home();
+    new MigrationManifestStore({ homeDir }).create(planned());
+    const result = await resolveExistingMigrationGeneration({
+      homeDir, generation: GEN, _operationsForTesting: { observeJournal: () => hold("maintenance-held", "generation-other"), classifySnapshot: complete },
+    });
+    expect(result).toMatchObject({ status: "resolved", context: { route: { row: 4, primary: "abort" } } });
+  });
+
   it("reads a present manifest once and routes its phase and pending effect (row 19: held, complete snapshot, planned)", async () => {
     const homeDir = home();
     new MigrationManifestStore({ homeDir }).create(planned());

@@ -698,11 +698,20 @@ describe("performMigrationAbortCommand: routed through rows 4 to 9 and the R7 ro
   });
 
   it("row 4: naming another generation while a hold is live acts on the live hold, confirmed by the live hold's id", async () => {
-    const { home, held } = await crashFixture(null);
+    const { home, held, store } = await crashFixture(null);
+    // The other generation exists: an earlier, settled one with its own manifest.
+    createFixtureManifest(store, "rolled-back", { generationId: "generation-9" });
     const wrong = await abortCommand({ homeDir: home, generation: "generation-9", confirmGenerationId: "generation-9" });
     expect(wrong).toEqual({ status: "refuse", reason: "abort-confirmation-moved", generationId: held.generationId });
     const right = await abortCommand({ homeDir: home, generation: "generation-9", confirmGenerationId: held.generationId });
     expect(right).toMatchObject({ status: "ok", generationId: held.generationId, applied: true });
+  });
+
+  it("naming a generation nothing records refuses generation-unknown and leaves the live hold alone (Codex PR #1653: a stranger's hold is not this id's evidence)", async () => {
+    const { home, held } = await crashFixture(null);
+    expect(await abortCommand({ homeDir: home, generation: "generation-9", confirmGenerationId: held.generationId }))
+      .toEqual({ status: "refuse", reason: "generation-unknown" });
+    expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-held");
   });
 
   it("passes a malformed --generation through as the resolver's usage refusal", async () => {

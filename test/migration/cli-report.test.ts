@@ -174,6 +174,8 @@ describe("report: rows with no owner and no way forward exit non-zero but still 
     ["row 3 (a foreign completed publication)", { kind: "publication", publicationId: "p", phase: "completed" }, "route-foreign-publication"],
   ])("%s", async (_name, observation, reason) => {
     const home = makeFixtureHome(roots);
+    // The named generation exists (its manifest is present); only the journal is foreign.
+    createFixtureManifest(new MigrationManifestStore({ homeDir: home }), "copied");
     const result = await performMigrationReportCommand({
       homeDir: home, generation: FIXTURE_GENERATION,
       _resolution: { _operationsForTesting: { observeJournal: () => observation as never, classifySnapshot: complete } },
@@ -181,6 +183,16 @@ describe("report: rows with no owner and no way forward exit non-zero but still 
     expect(result.reason).toBe(reason);
     expect(result.generationId).toBe(FIXTURE_GENERATION);
     expect(result.evidence).toMatchObject({ activationLink: "absent", generationBinding: "absent" });
+  });
+
+  it("an explicit --generation that nothing names refuses generation-unknown even while another generation holds, instead of reading that hold as this id (Codex PR #1653)", async () => {
+    const home = makeFixtureHome(roots);
+    createFixtureManifest(new MigrationManifestStore({ homeDir: home }), "copied");
+    const result = await performMigrationReportCommand({
+      homeDir: home, generation: "generation-typo",
+      _resolution: { _operationsForTesting: { observeJournal: () => ({ kind: "hold", journal: { phase: "maintenance-held", generationId: FIXTURE_GENERATION } }) as never, classifySnapshot: complete } },
+    });
+    expect(result).toMatchObject({ reason: "generation-unknown", generationId: null });
   });
 
   it("row 9 (an aborted journal beside a manifest no abort settles) exits as a contradiction", async () => {
