@@ -38,7 +38,7 @@ project can be authenticated as a local member of this machine.
 | --- | --- |
 | `cutover-set-enumeration-unresolvable` | The stored-data enumeration could not be read; its own reason is attached. |
 | `cutover-set-single-project` | Fewer than two projects have stored data. |
-| `cutover-set-uncovered-member` | A stored-data project has no project-map entry, or its canonical path authenticates a different project. Every such project is listed. |
+| `cutover-set-uncovered-member` | A stored-data project has no project-map entry, or its canonical path authenticates a different project (including an authority that names another project than the one it was supplied for). Every such project is listed. |
 | `cutover-set-member-unverifiable` | A project's source metadata could not be read or authenticated. Every such project is listed. |
 | `cutover-set-incomplete` | A stored-data project has no member generation. |
 | `cutover-set-unknown-member` | A member names a project without stored data. |

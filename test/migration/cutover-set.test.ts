@@ -14,6 +14,7 @@ import {
   SET_ID,
   SET_MACHINE_ID,
   authenticated,
+  fakeAuthority,
   generationIds,
   projectHash,
   setManifest,
@@ -35,6 +36,12 @@ function build(overrides: Partial<Parameters<typeof buildCutoverSetManifest>[0]>
 }
 
 describe("buildCutoverSetManifest", () => {
+  const swapped = (projectIndex: number, authorityIndex: number) => ({
+    physicalProjectId: projectHash(projectIndex),
+    status: "authenticated" as const,
+    authority: fakeAuthority(authorityIndex),
+  });
+
   it("names every stored-data project sorted by project, with a stable digest", () => {
     const result = build();
     expect(result.status).toBe("built");
@@ -97,6 +104,27 @@ describe("buildCutoverSetManifest", () => {
         authenticated(3),
       ),
     })).toMatchObject({ reason: "cutover-set-member-unverifiable", projects: [projectHash(2)] });
+  });
+
+  it("refuses an authenticated outcome whose authority names another project", () => {
+    const result = build({ resolution: resolved(authenticated(1), swapped(2, 3), authenticated(3)) });
+    expect(result).toMatchObject({
+      status: "refused", reason: "cutover-set-uncovered-member", projects: [projectHash(2)],
+    });
+    expect(result.status === "refused" && result.detail).toContain(projectHash(3));
+  });
+
+  it("lists every mismatched authority and uncovered project sorted", () => {
+    expect(build({
+      resolution: resolved(
+        swapped(3, 1),
+        { physicalProjectId: projectHash(2), status: "uncovered", detail: "no map entry" },
+        swapped(1, 3),
+      ),
+    })).toMatchObject({
+      status: "refused", reason: "cutover-set-uncovered-member",
+      projects: [projectHash(1), projectHash(2), projectHash(3)],
+    });
   });
 
   it("refuses a stored-data project without a member generation", () => {

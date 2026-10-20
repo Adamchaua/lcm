@@ -163,18 +163,28 @@ export function buildCutoverSetManifest(input: BuildCutoverSetInput): CutoverSet
       hashes,
     );
   }
-  for (const [status, reason] of [
-    ["uncovered", "cutover-set-uncovered-member"],
-    ["unverifiable", "cutover-set-member-unverifiable"],
-  ] as const) {
-    const failing = outcomes.filter((outcome) => outcome.status === status);
-    if (failing.length > 0) {
-      return refused(
-        reason,
-        failing.map((outcome) => `${outcome.physicalProjectId} (${(outcome as { detail: string }).detail})`).join("; "),
-        failing.map((outcome) => outcome.physicalProjectId),
-      );
-    }
+  // An authenticated outcome whose authority names another project is uncovered: it must never be built
+  // into a member under the wrong project.
+  const uncovered = outcomes.flatMap((outcome) => {
+    if (outcome.status === "uncovered") return [{ project: outcome.physicalProjectId, detail: outcome.detail }];
+    return outcome.status === "authenticated" && outcome.authority.physicalProjectId !== outcome.physicalProjectId
+      ? [{ project: outcome.physicalProjectId, detail: `authority belongs to project ${outcome.authority.physicalProjectId}` }]
+      : [];
+  });
+  if (uncovered.length > 0) {
+    return refused(
+      "cutover-set-uncovered-member",
+      uncovered.map(({ project, detail }) => `${project} (${detail})`).join("; "),
+      uncovered.map(({ project }) => project),
+    );
+  }
+  const unverifiable = outcomes.flatMap((outcome) => outcome.status === "unverifiable" ? [outcome] : []);
+  if (unverifiable.length > 0) {
+    return refused(
+      "cutover-set-member-unverifiable",
+      unverifiable.map((outcome) => `${outcome.physicalProjectId} (${outcome.detail})`).join("; "),
+      unverifiable.map((outcome) => outcome.physicalProjectId),
+    );
   }
   const authorities = outcomes.map((outcome) =>
     (outcome as Extract<CutoverSetMemberAuthorityOutcome, { status: "authenticated" }>).authority);
