@@ -29,7 +29,6 @@ import {
   BackendPublicationCoordinator,
   BackendPublicationJournalError,
   backendPublicationCanonicalSha256,
-  backendPublicationDirectory,
   backendPublicationJournalPath,
   backendPublicationMaterialWitness,
   readBackendMaintenanceJournal,

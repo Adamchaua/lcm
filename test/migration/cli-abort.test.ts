@@ -122,7 +122,7 @@ describe("performMigrationAbortCommand: real end-to-end paths", () => {
 
   it("is idempotent for real: aborting an already-aborted generation still reports ok with the same readback", async () => {
     const home = makeHome();
-    const held = await heldJournal(home);
+    await heldJournal(home);
     const coordinator = coordinatorFor(home);
     const first = await abortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });
     const second = await abortCommand({ confirmGenerationId: "generation-1", homeDir: home, coordinator });

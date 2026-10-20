@@ -404,7 +404,6 @@ describe("abort.ts's non-protocol-error fallback branches (deterministic injecti
 
 describe("abort.ts's protocol-error-instance branch, for the same fallback ternaries (the TRUE side of the same instanceof check)", () => {
   it("classifyMigrationAbortGate: preserves the MigrationProtocolError reason when the manifest store's read throws one", () => {
-    const home = makeHome();
     const fakeStore = {
       probeManifestPresence: () => ({ status: "present" as const }),
       read: () => { throw new MigrationProtocolError("recovery-required", "test"); },
