@@ -132,11 +132,13 @@ export type MigrationApplyThroughCaptureOutcome =
 /**
  * Which span the identity step runs in: `fresh` mints (plan-v5 Part B (3)),
  * `held` only reads. The span decides, from the journal it actually found,
- * never the preflight's earlier disposition.
+ * never the preflight's earlier disposition. The token is `null` on the
+ * entering-recovery path, which reads before any barrier exists; the held
+ * read is lock-free and never needs one.
  */
 export type MigrationApplyIdentityPath = "fresh" | "held";
 export type MigrationApplyIdentityResolver = (
-  token: BackendPublicationLockToken,
+  token: BackendPublicationLockToken | null,
   path: MigrationApplyIdentityPath,
 ) => Promise<MigrationExpectedIdentityResult>;
 
@@ -198,7 +200,7 @@ type IdentityStep =
 
 async function resolveIdentityUnderBarrier(
   input: MigrationApplyThroughCaptureInput,
-  token: BackendPublicationLockToken,
+  token: BackendPublicationLockToken | null,
   path: MigrationApplyIdentityPath,
 ): Promise<IdentityStep> {
   if (input.resolveExpectedIdentity === undefined) return { status: "resolved" };
@@ -396,6 +398,13 @@ async function recoverEnteringThenCapture(
   observedChecksumSha256: string,
 ): Promise<MigrationApplyThroughCaptureOutcome> {
   const classifyEnteringFailure = input._operationsForTesting?.classifyEnteringFailure ?? classifyEnteringRecoveryFailure;
+  // The held identity read is lock-free (readProjectMapIdentity, a SELECT)
+  // and must answer before the entering journal is promoted: a refusal here
+  // leaves the journal maintenance-entering, so the next apply recovers it
+  // again instead of continuing a hold this invocation wrote and then
+  // reported as not applied.
+  const identity = await resolveIdentityUnderBarrier(input, null, "held");
+  if (identity.status === "refuse") return identity;
   let heldJournal: BackendMaintenanceJournal;
   try {
     heldJournal = await coordinator.enterMaintenance({
@@ -423,7 +432,7 @@ async function recoverEnteringThenCapture(
   }
   return withBackendPublicationAppendBarrierAsync(
     input.homeDir,
-    (token) => captureUnderBarrier(input, heldJournal.generationId, heldJournal.checksumSha256, token),
+    (token) => captureUnderBarrier(input, heldJournal.generationId, heldJournal.checksumSha256, token, identity),
   );
 }
 

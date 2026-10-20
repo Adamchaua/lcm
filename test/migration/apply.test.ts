@@ -1154,3 +1154,46 @@ describe("performMigrationApplyThroughCapture, the identity step inside the span
     expect(captureSource).not.toHaveBeenCalled();
   });
 });
+
+describe("performMigrationApplyThroughCapture, recover-entering runs the held identity read before promoting the hold (review 3A P1)", () => {
+  async function enteringJournal() {
+    const fixture = await enrolled();
+    const coordinator = coordinatorFor(fixture.homeDir);
+    const generationId = `${fixture.base}-0`;
+    const authority = authenticateSqliteMigrationSource(fixture.cwd, fixture.homeDir);
+    const sentinel = migrationQueueEvidenceSentinel({ generationId, sourceSelectionSha256: authority.sourceSelectionSha256 });
+    const roster = migrationEntryRoster({ machineId: authority.machineIdentity.machineId, sentinelEvidenceSha256: sentinel });
+    await coordinator.enterMaintenance({ publicationId: generationId, generationId, sourceSelectionSha256: authority.sourceSelectionSha256, queueEvidenceSha256: sentinel, roster });
+    const path = backendPublicationJournalPath(fixture.homeDir);
+    const { checksumSha256: _checksum, ...payload } = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    writeFileSyncFs(path, `${JSON.stringify({ ...payload, phase: "maintenance-entering", checksumSha256: backendPublicationCanonicalSha256({ ...payload, phase: "maintenance-entering" }) })}\n`, { mode: 0o600 });
+    expect(readBackendMaintenanceJournal(fixture.homeDir)!.phase).toBe("maintenance-entering");
+    return { fixture, coordinator, generationId, before: readFileSync(path) };
+  }
+
+  it("a held identity refusal leaves the real entering journal untouched: no promotion to maintenance-held, the refusal is the resolver's own", async () => {
+    const { fixture, coordinator, before } = await enteringJournal();
+    const calls: Array<{ path: string; token: unknown }> = [];
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
+      resolveExpectedIdentity: async (token, path) => { calls.push({ path, token }); return { status: "refuse", reason: "local-identity-not-persisted" }; },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "local-identity-not-persisted" });
+    expect(calls).toEqual([{ path: "held", token: null }]);
+    expect(readBackendMaintenanceJournal(fixture.homeDir)!.phase).toBe("maintenance-entering");
+    expect(readFileSync(backendPublicationJournalPath(fixture.homeDir)).equals(before)).toBe(true);
+  });
+
+  it("a resolved held identity is read once, before the promotion, and carried into the recovered capture", async () => {
+    const { fixture, coordinator, generationId } = await enteringJournal();
+    const calls: string[] = [];
+    const IDENTITY = { id: "r", localProjectId: "l", canonical: fixture.cwd, remoteProjectId: "r", machineId: REGISTERED_MACHINE, selectedPath: fixture.cwd };
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
+      resolveExpectedIdentity: async (_token, path) => { calls.push(`${path}:${readBackendMaintenanceJournal(fixture.homeDir)!.phase}`); return { status: "resolved", expectedIdentity: IDENTITY }; },
+    });
+    expect(result).toMatchObject({ status: "captured", generationId, expectedIdentity: IDENTITY });
+    expect(calls).toEqual(["held:maintenance-entering"]);
+    expect(readBackendMaintenanceJournal(fixture.homeDir)!.phase).toBe("maintenance-held");
+  });
+});

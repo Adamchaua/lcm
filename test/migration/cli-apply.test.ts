@@ -455,19 +455,22 @@ describe("performMigrationApply: identity is minted only after the fence (plan-v
 
   it("a held span asks for the read-only identity step: the resolver sees a held disposition and nothing is recorded as minted", async () => {
     let disposition: string | undefined;
+    let token: unknown = "unset";
     const result = await performMigrationApply({
       cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", manifestStore: headStore(),
       _preflight: async () => readyPreflight(),
       _operationsForTesting: {
-        resolveExpectedIdentity: async (input) => { disposition = input.preflight.candidate.disposition; return { status: "refuse", reason: "destination-project-absent" }; },
+        resolveExpectedIdentity: async (input) => { disposition = input.preflight.candidate.disposition; token = input.publicationLockToken; return { status: "refuse", reason: "destination-project-absent" }; },
         performCapture: async (captureInput) => {
-          const identity = await captureInput.resolveExpectedIdentity!({}, "held");
+          // The entering-recovery path reads before any barrier exists and passes no token.
+          const identity = await captureInput.resolveExpectedIdentity!(null, "held");
           return identity.status === "refuse" ? identity : captured();
         },
       },
     });
     expect(result).toEqual({ status: "refuse", reason: "destination-project-absent" });
     expect(disposition).toBe("continue-held");
+    expect(token).toBeUndefined();
   });
 
   it.each(["recover-entering", "continue-held"] as const)("a %s hold never mints: the real resolver refuses an unpersisted local identity before any runtime is built, and the refusal reports nothing minted", async (disposition) => {

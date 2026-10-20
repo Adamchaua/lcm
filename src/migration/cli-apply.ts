@@ -223,7 +223,7 @@ async function runMigrationApply(input: MigrationApplyInput): Promise<MigrationA
         preflight: path === "fresh" ? preflight : { ...preflight, candidate: { disposition: "continue-held" } },
         cwd: input.cwd,
         homeDir: input.homeDir,
-        publicationLockToken: token,
+        ...(token === null ? {} : { publicationLockToken: token }),
       });
       if (path === "fresh") mutation = migrationApplyIdentityMutation(preview, result);
       return result;
