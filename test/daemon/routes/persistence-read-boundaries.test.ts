@@ -861,6 +861,7 @@ describe("persistence read route boundaries", () => {
   });
 
   it("returns common diagnostic snapshots and sanitizes aggregate failures", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_792_466_561_675);
     const diagnostics = backendDiagnosticFailure(new Error("private diagnostic canary"), "sqlite");
     const factory = injectedFactory();
     const controller = new AbortController();
@@ -882,6 +883,7 @@ describe("persistence read route boundaries", () => {
   });
 
   it("preserves configured backend identity across sanitized route failures", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_792_466_561_675);
     const unavailableDiagnostics = backendDiagnosticFailure(new Error("private unavailable"), "sqlite");
     const handlers = [
       ["stats", createStatsHandler],
